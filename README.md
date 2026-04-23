@@ -42,6 +42,3 @@ docker-compose up -d
 - `diary_save_entry`: Save a diary entry for a specific date.
 - `diary_search_entries`: Search diary entries.
 - `vault_get_category_summary`: Summarize facts in a specific category.
-
-## License
-Apache-2.0

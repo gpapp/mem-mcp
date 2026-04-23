@@ -48,7 +48,7 @@ services:
     # (Otherwise, it will run on CPU)
 
   mem-mcp:
-    build: mem-server
+    build: ./mem-mcp
     container_name: mem-mcp
     depends_on:
       - qdrant
