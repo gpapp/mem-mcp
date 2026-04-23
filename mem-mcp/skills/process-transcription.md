@@ -97,16 +97,18 @@ Use relative links between files, e.g.:
 ### 6. Memory Storage
 Store key facts in the memory system using appropriate categories. **Important: Use rich Markdown formatting in the `text` field for better readability in the Dashboard.**
 
-- `work`: General work-related information
-- `projects`: Project-specific details (use headers, lists, and links)
-- `clients`: Client/context-specific information
-- `people`: Personnel information and roles
-- `decisions`: Specific decisions made (use bold/italics for emphasis)
-- `actions`: Action items and follow-ups (use checkbox lists)
+**Metadata & Tags:**
+Always include a `metadata` dictionary with a `tags` list for categorization, e.g., `metadata={"tags": ["meeting", "strategy", "q3-planning"]}`.
 
 **Tool Usage:**
 - Use `create_fact(text, category, metadata)` for storing facts.
 - Use `link_facts(sourceFactId, targetFactId, relationshipType)` for creating relationships.
+
+**Linking Strategy:**
+Immediately after creating related facts, use `link_facts` to connect them. This builds the Knowledge Graph.
+- Connect **People** to **Projects** (REL: `WORKS_ON`)
+- Connect **Decisions** to **Projects** (REL: `DECIDED_FOR`)
+- Connect **Action Items** to **People** (REL: `ASSIGNED_TO`)
 
 **Example Markdown Fact:**
 ```markdown
@@ -121,29 +123,13 @@ Store key facts in the memory system using appropriate categories. **Important: 
 ### 7. Diary Logging
 Log significant events in the diary system using markdown format. Use `diary_save_entry(content, date)`.
 
-The diary should contain WHAT THE USER DID, not what was processed:
-- User attended meetings with specific participants
-- Decisions made by the user or user's team
-- Action items assigned to the user
-
-Example diary entry format:
-```markdown
-# [Date] - Diary Entry
-
-## Meetings Attended
-### Meeting: [Title] ([Time])
-- **Participants**: [Names with roles]
-- **Summary**: [What was discussed and decided]
-
-## Action Items
-- [ ] [Task] - Owner: [Name] - Due: [Date]
-```
+The diary should contain WHAT THE USER DID, not what was processed. Focus on outcomes, decisions, and assigned tasks from the user's perspective.
 
 ### 8. Cross-Reference Creation
-Create bidirectional links between related entities using `link_facts`.
+Create bidirectional links between related entities using `link_facts`. Ensure every important entity (Person, Project, Technology) is linked to its context.
 
 ### 9. Summary Generation
-Create summary documents and store them as a comprehensive memory entry in the `work` or `projects` category.
+Create summary documents and store them as a comprehensive memory entry in the `work` or `projects` category. Use a header like `# Meeting Summary: [Topic]` and include links to the specific facts created.
 
 ## Implementation Guidelines
 
@@ -152,15 +138,7 @@ Create summary documents and store them as a comprehensive memory entry in the `
 - Note when people state their roles explicitly
 - Identify decision points through language like "we decided", "action item", "we will"
 - **Formatting:** When creating a fact about a person, include their role and contact info in a structured Markdown block.
-
-## Example Application
-
-When processing a transcription, the skill would:
-1. Extract date, participants, and context.
-2. Identify entities (Technologies, Projects, etc.).
-3. **Save key facts to memory using `create_fact` (in Markdown format).**
-4. **Link related facts using `link_facts`.**
-5. **Log timeline information in the diary using `diary_save_entry`.**
+- **Graph Thinking:** Always ask "What does this fact relate to?" and create the link.
 
 ## Customization
 This skill can be adapted for different transcription formats by adjusting speaker patterns and category structures.
