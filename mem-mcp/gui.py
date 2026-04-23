@@ -84,19 +84,9 @@ _LANDING_HTML = """<!DOCTYPE html>
 
       <div class="step">
         <p><span class="step-num">2</span> <strong>Claude Desktop Config:</strong></p>
-        <p>Add this snippet to your <code>claude_desktop_config.json</code>:</p>
-        <pre><code>{
-  "mcpServers": {
-    "memory-vault": {
-      "url": "{{BASE_URL}}/mcp"
-      "timeout": 6000000,
-      "headers": {
-        "Accept": "text/event-stream",
-        "Authorization": "Basic {{AUTH_BASE64}}"
-      },
-    }
-  }
-}</code></pre>
+        <p>Run this command to add the MCP server to your Claude Desktop configuration:</p>
+        <pre><code>claude mcp add --transport http secure-api {{BASE_URL}}/mcp --header "Authorization: Basic {{AUTH_BASE64}}"
+        </code></pre>
       </div>
 
       <div class="step">
