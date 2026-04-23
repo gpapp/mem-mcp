@@ -291,6 +291,7 @@ _GUI_HTML = """<!DOCTYPE html>
                          padding: 1.25rem; box-shadow: var(--shadow); text-align: left; }
     .markdown-body { background: transparent !important; color: var(--text); text-align: left; }
     .markdown-body * { text-align: left; }
+  </style>
 </head>
 <body>
 
