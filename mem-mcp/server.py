@@ -26,7 +26,7 @@ mcp_cors = StarletteMiddleware(
     allow_credentials=True
 )
 # Enable CORS for the unified server
-web_app.add_middleware(mcp_cors,
+web_app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
