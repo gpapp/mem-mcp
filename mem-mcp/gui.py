@@ -342,7 +342,7 @@ _GUI_HTML = """<!DOCTYPE html>
   // ── Memories ──────────────────────────────────────────────────────────────
   async function loadMemories() {
     try {
-      memories = await api.get('api/memories');
+      memories = await api.get('memories');
       renderMemories();
     } catch(e) { document.getElementById('memories-list').innerHTML = '<p class="empty">⚠️ Could not load memories.</p>'; }
   }
@@ -397,7 +397,7 @@ _GUI_HTML = """<!DOCTYPE html>
     const cat  = document.getElementById('edit-cat-' + id).value.trim() || 'General';
     if (!text) return;
     try {
-      const updated = await api.put('api/memories/' + id, {text, category: cat});
+      const updated = await api.put('memories/' + id, {text, category: cat});
       const m = memories.find(x => x.id === id);
       if (m) { m.text = updated.text; m.category = updated.category; }
       renderMemories();
@@ -410,7 +410,7 @@ _GUI_HTML = """<!DOCTYPE html>
     const cat  = document.getElementById('new-category').value.trim() || 'General';
     if (!text) return;
     try {
-      const m = await api.post('api/memories', {text, category: cat});
+      const m = await api.post('memories', {text, category: cat});
       m.timestamp = new Date().toISOString();
       memories.push(m);
       renderMemories();
@@ -422,7 +422,7 @@ _GUI_HTML = """<!DOCTYPE html>
   async function deleteMemory(id) {
     if (!confirm('Delete this memory?')) return;
     try {
-      await api.delete('api/memories/' + id);
+      await api.delete('memories/' + id);
       memories = memories.filter(m => m.id !== id);
       renderMemories();
       toast('🗑️ Memory deleted');
@@ -434,7 +434,7 @@ _GUI_HTML = """<!DOCTYPE html>
     const el = document.getElementById('diary-list');
     el.innerHTML = '<p class="empty">Loading…</p>';
     try {
-      const entries = await api.get('api/diary');
+      const entries = await api.get('diary');
       if (!entries.length) { el.innerHTML = '<p class="empty">No diary entries yet.</p>'; return; }
       el.innerHTML = entries.map(d => `
         <div class="diary-entry">
@@ -449,7 +449,7 @@ _GUI_HTML = """<!DOCTYPE html>
     const date    = document.getElementById('diary-date').value.trim() || null;
     if (!content) return;
     try {
-      await api.post('api/diary', {content, date});
+      await api.post('diary', {content, date});
       document.getElementById('diary-content').value = '';
       document.getElementById('diary-date').value = '';
       toast('📖 Diary entry saved');
@@ -465,7 +465,7 @@ _GUI_HTML = """<!DOCTYPE html>
   // ── Init ──────────────────────────────────────────────────────────────────
   (async () => {
     try {
-      const info = await api.get('api/whoami');
+      const info = await api.get('whoami');
       document.getElementById('user-badge').textContent = '👤 ' + info.user;
     } catch(_) { document.getElementById('user-badge').textContent = ''; }
     loadMemories();
