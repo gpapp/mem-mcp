@@ -94,6 +94,7 @@
                 padding: .1rem .4rem; border-radius: 4px; margin-right: .3rem; margin-top: .4rem; }
 
     .markdown-body { background: transparent !important; color: var(--text); }
+    .markdown-body p:last-child { margin-bottom: 0; }
     .empty { color: var(--muted); font-size: .9rem; padding: 2rem 0; text-align: center; }
 
     /* ── Toast ── */
@@ -143,7 +144,7 @@
     <div class="form-row">
       <div>
         <label for="new-text">Fact / Memory</label>
-        <input id="new-text" placeholder="e.g. I prefer dark mode editors">
+        <textarea id="new-text" placeholder="e.g. I prefer dark mode editors" style="min-height:60px;"></textarea>
       </div>
       <div style="flex:0 1 180px;">
         <label for="new-category">Category</label>
@@ -264,10 +265,10 @@
     return `
     <div class="memory-item" id="mem-${m.id}">
       <div class="memory-text">
-        <div id="mem-text-${m.id}">${escHtml(m.text)}</div>
+        <div id="mem-text-${m.id}" class="markdown-body">${marked.parse(m.text)}</div>
         <div>${tags.map(t => `<span class="tag-badge">#${t}</span>`).join('')}</div>
-        <div class="edit-form" id="edit-form-${m.id}" style="display:none;">
-          <input id="edit-text-${m.id}" value="${escHtml(m.text)}">
+        <div class="edit-form" id="edit-form-${m.id}" style="display:none; flex-direction:column; gap:0.5rem; width:100%;">
+          <textarea id="edit-text-${m.id}" style="min-height:80px;">${escHtml(m.text)}</textarea>
           <input id="edit-cat-${m.id}" value="${escHtml(m.category)}" style="flex:0 1 120px;">
           <input id="edit-tags-${m.id}" value="${escHtml(tags.join(', '))}" placeholder="tags…">
           <button class="btn btn-primary btn-sm" onclick="saveEdit('${m.id}')">Save</button>
