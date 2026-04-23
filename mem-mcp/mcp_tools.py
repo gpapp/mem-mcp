@@ -23,7 +23,10 @@ mcp = FastMCP("Memory-Vault")
 # Helper: resolve current user inside an MCP tool call
 # ---------------------------------------------------------------------------
 def _current_user() -> str:
-    return mem.extract_user_from_headers(get_http_headers())
+    headers = get_http_headers()
+    user = mem.extract_user_from_headers(headers)
+    print(f"[MCP] Tool/Request for user: {user}")
+    return user
 
 
 # ---------------------------------------------------------------------------

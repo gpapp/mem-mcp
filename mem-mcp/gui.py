@@ -27,6 +27,11 @@ import memory as mem
 
 web_app = FastAPI(title="Memory Vault GUI")
 
+@web_app.middleware("http")
+async def log_gui_requests(request: Request, call_next):
+    print(f"[GUI] {request.method} {request.url.path}")
+    return await call_next(request)
+
 # Allow both /path and /path/ for all routes
 from fastapi.routing import APIRoute
 def toggle_strict_slashes(app: FastAPI):
@@ -63,7 +68,9 @@ class DiaryCreate(BaseModel):
 # ---------------------------------------------------------------------------
 
 def _user(request: Request) -> str:
-    return mem.extract_user_from_headers(dict(request.headers))
+    user = mem.extract_user_from_headers(dict(request.headers))
+    print(f"[GUI] API Request path: {request.url.path} (User: {user})")
+    return user
 
 
 # ---------------------------------------------------------------------------
