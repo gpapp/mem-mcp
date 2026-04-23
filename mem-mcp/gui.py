@@ -25,6 +25,99 @@ from typing import Optional
 
 import memory as mem
 
+_LANDING_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Memory Vault | Home</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --primary: #4f46e5; --bg: #f8fafc; --surface: #ffffff;
+      --border: #e5e7eb; --text: #111827; --muted: #6b7280;
+      --radius: 12px;
+    }
+    body { margin: 0; font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text); line-height: 1.6; }
+    .container { max-width: 800px; margin: 0 auto; padding: 4rem 1.5rem; }
+    
+    header { text-align: center; margin-bottom: 4rem; }
+    h1 { font-size: 2.5rem; font-weight: 800; margin-bottom: 1rem; letter-spacing: -1px; }
+    .badge { background: #eef2ff; color: var(--primary); padding: .4rem 1rem; border-radius: 99px; font-weight: 600; font-size: .9rem; }
+    
+    .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 2rem; box-shadow: 0 4px 12px rgba(0,0,0,.03); margin-bottom: 2rem; }
+    h2 { font-size: 1.25rem; font-weight: 700; margin-top: 0; display: flex; align-items: center; gap: .5rem; }
+    
+    pre { background: #1f2937; color: #f3f4f6; padding: 1.25rem; border-radius: 8px; overflow-x: auto; font-size: .9rem; }
+    code { font-family: 'JetBrains Mono', 'Fira Code', monospace; }
+    
+    .btn { display: inline-block; background: var(--primary); color: #fff; padding: .8rem 2rem; border-radius: 8px; text-decoration: none; font-weight: 600; transition: transform .15s; }
+    .btn:hover { transform: translateY(-2px); box-shadow: 0 4px 12px rgba(79,70,229,.3); }
+    
+    .step { margin-bottom: 1.5rem; }
+    .step-num { display: inline-block; width: 24px; height: 24px; background: var(--primary); color: #fff; text-align: center; line-height: 24px; border-radius: 50%; font-size: .8rem; font-weight: 700; margin-right: .5rem; }
+    
+    footer { text-align: center; color: var(--muted); font-size: .9rem; margin-top: 4rem; }
+    .url-tag { color: var(--primary); font-weight: 700; background: #eef2ff; padding: .1rem .4rem; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <span class="badge">Production Ready</span>
+      <h1>🧠 Memory Vault</h1>
+      <p>A unified knowledge graph and vector store for your personal memories.</p>
+      <div style="margin-top: 2rem;">
+        <a href="{{BASE_URL}}/gui" class="btn">Go to Dashboard →</a>
+      </div>
+    </header>
+
+    <div class="card">
+      <h2>🔌 MCP Endpoint Setup</h2>
+      <p>Connect your AI assistant (Claude Desktop, etc.) to your Memory Vault via the Model Context Protocol.</p>
+      
+      <div class="step">
+        <p><span class="step-num">1</span> Your Endpoint URL is:</p>
+        <p><code class="url-tag">{{BASE_URL}}/mcp</code></p>
+      </div>
+
+      <div class="step">
+        <p><span class="step-num">2</span> <strong>Claude Desktop Config:</strong></p>
+        <p>Add this snippet to your <code>claude_desktop_config.json</code>:</p>
+        <pre><code>{
+  "mcpServers": {
+    "memory-vault": {
+      "url": "{{BASE_URL}}/mcp"
+    }
+  }
+}</code></pre>
+      </div>
+
+      <div class="step">
+        <p><span class="step-num">3</span> <strong>Authentication:</strong></p>
+        <p>The server uses the credentials provided by your reverse proxy (Basic-Auth). Ensure your client supports sending auth headers if required.</p>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>✨ Key Features</h2>
+      <ul style="padding-left: 1.2rem;">
+        <li><strong>Vector Search</strong>: Semantic retrieval of facts and diary entries.</li>
+        <li><strong>Knowledge Graph</strong>: Automatic linking of entities in Neo4j.</li>
+        <li><strong>Diary History</strong>: Time-based personal journal with Markdown support.</li>
+        <li><strong>Multi-User</strong>: Isolated vaults based on proxy headers.</li>
+      </ul>
+    </div>
+
+    <footer>
+      Powered by FastMCP, FastAPI, Qdrant, and Neo4j.
+    </footer>
+  </div>
+</body>
+</html>
+"""
+
 web_app = FastAPI(title="Memory Vault GUI")
 
 @web_app.middleware("http")
@@ -602,6 +695,13 @@ _GUI_HTML = """<!DOCTYPE html>
 @web_app.get("/api/whoami", response_class=JSONResponse)
 async def api_whoami(request: Request):
     return {"user": _user(request)}
+
+
+@web_app.get("/", response_class=HTMLResponse)
+async def get_landing():
+    # Inject BASE_URL into the HTML
+    html = _LANDING_HTML.replace("{{BASE_URL}}", mem.BASE_URL)
+    return HTMLResponse(content=html)
 
 
 @web_app.get("/gui", response_class=HTMLResponse)
