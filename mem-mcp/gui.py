@@ -88,7 +88,12 @@ _LANDING_HTML = """<!DOCTYPE html>
         <pre><code>{
   "mcpServers": {
     "memory-vault": {
-      "url": "{{AUTH_USER}}:{{AUTH_PASS}}@{{BASE_URL}}/mcp"
+      "url": "{{BASE_URL}}/mcp"
+      "timeout": 6000000,
+      "headers": {
+        "Accept": "text/event-stream",
+        "Authorization": "Basic {{AUTH_BASE64}}"
+      },
     }
   }
 }</code></pre>
@@ -722,6 +727,7 @@ async def get_landing(request: Request):
     html = _LANDING_HTML.replace("{{BASE_URL}}", mem.BASE_URL)
     html = html.replace("{{AUTH_USER}}", auth_user)
     html = html.replace("{{AUTH_PASS}}", auth_pass)
+    html = html.replace("{{AUTH_BASE64}}", base64.b64encode(f"{auth_user}:{auth_pass}".encode("utf-8")).decode("utf-8"))
     
     return HTMLResponse(content=html)
 
