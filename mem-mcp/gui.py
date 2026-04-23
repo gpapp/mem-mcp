@@ -305,11 +305,16 @@ _GUI_HTML = """<!DOCTYPE html>
 
 <script>
   // ── Relative API helpers ──────────────────────────────────────────────────
+  // Use a base path relative to /gui to reach /api
+  const apiBase = window.location.pathname.endsWith('/') 
+    ? '../api' 
+    : './api';
+
   const api = {
-    get:    (url)       => fetch(url).then(r => r.ok ? r.json() : Promise.reject(r)),
-    post:   (url, body) => fetch(url, {method:'POST',  headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}).then(r => r.ok ? r.json() : Promise.reject(r)),
-    put:    (url, body) => fetch(url, {method:'PUT',   headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}).then(r => r.ok ? r.json() : Promise.reject(r)),
-    delete: (url)       => fetch(url, {method:'DELETE'}).then(r => r.ok ? r.json() : Promise.reject(r)),
+    get:    (url)       => fetch(`${apiBase}/${url}`).then(r => r.ok ? r.json() : Promise.reject(r)),
+    post:   (url, body) => fetch(`${apiBase}/${url}`, {method:'POST',  headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}).then(r => r.ok ? r.json() : Promise.reject(r)),
+    put:    (url, body) => fetch(`${apiBase}/${url}`, {method:'PUT',   headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}).then(r => r.ok ? r.json() : Promise.reject(r)),
+    delete: (url)       => fetch(`${apiBase}/${url}`, {method:'DELETE'}).then(r => r.ok ? r.json() : Promise.reject(r)),
   };
 
   // ── State ─────────────────────────────────────────────────────────────────
@@ -337,7 +342,7 @@ _GUI_HTML = """<!DOCTYPE html>
   // ── Memories ──────────────────────────────────────────────────────────────
   async function loadMemories() {
     try {
-      memories = await api.get('./api/memories');
+      memories = await api.get('api/memories');
       renderMemories();
     } catch(e) { document.getElementById('memories-list').innerHTML = '<p class="empty">⚠️ Could not load memories.</p>'; }
   }
@@ -392,7 +397,7 @@ _GUI_HTML = """<!DOCTYPE html>
     const cat  = document.getElementById('edit-cat-' + id).value.trim() || 'General';
     if (!text) return;
     try {
-      const updated = await api.put('./api/memories/' + id, {text, category: cat});
+      const updated = await api.put('api/memories/' + id, {text, category: cat});
       const m = memories.find(x => x.id === id);
       if (m) { m.text = updated.text; m.category = updated.category; }
       renderMemories();
@@ -405,7 +410,7 @@ _GUI_HTML = """<!DOCTYPE html>
     const cat  = document.getElementById('new-category').value.trim() || 'General';
     if (!text) return;
     try {
-      const m = await api.post('./api/memories', {text, category: cat});
+      const m = await api.post('api/memories', {text, category: cat});
       m.timestamp = new Date().toISOString();
       memories.push(m);
       renderMemories();
@@ -417,7 +422,7 @@ _GUI_HTML = """<!DOCTYPE html>
   async function deleteMemory(id) {
     if (!confirm('Delete this memory?')) return;
     try {
-      await api.delete('./api/memories/' + id);
+      await api.delete('api/memories/' + id);
       memories = memories.filter(m => m.id !== id);
       renderMemories();
       toast('🗑️ Memory deleted');
@@ -429,7 +434,7 @@ _GUI_HTML = """<!DOCTYPE html>
     const el = document.getElementById('diary-list');
     el.innerHTML = '<p class="empty">Loading…</p>';
     try {
-      const entries = await api.get('./api/diary');
+      const entries = await api.get('api/diary');
       if (!entries.length) { el.innerHTML = '<p class="empty">No diary entries yet.</p>'; return; }
       el.innerHTML = entries.map(d => `
         <div class="diary-entry">
@@ -444,7 +449,7 @@ _GUI_HTML = """<!DOCTYPE html>
     const date    = document.getElementById('diary-date').value.trim() || null;
     if (!content) return;
     try {
-      await api.post('./api/diary', {content, date});
+      await api.post('api/diary', {content, date});
       document.getElementById('diary-content').value = '';
       document.getElementById('diary-date').value = '';
       toast('📖 Diary entry saved');
@@ -459,11 +464,8 @@ _GUI_HTML = """<!DOCTYPE html>
 
   // ── Init ──────────────────────────────────────────────────────────────────
   (async () => {
-    // Show user – request headers are not directly readable from JS, so we
-    // fetch a lightweight endpoint and read it from the response or just show a placeholder.
-    // The server embeds the user in the page on first load via a dedicated endpoint.
     try {
-      const info = await api.get('./api/whoami');
+      const info = await api.get('api/whoami');
       document.getElementById('user-badge').textContent = '👤 ' + info.user;
     } catch(_) { document.getElementById('user-badge').textContent = ''; }
     loadMemories();

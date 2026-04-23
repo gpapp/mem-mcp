@@ -29,10 +29,6 @@ def run_mcp():
 # Entry point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    # Initialise DB connections once (synchronous bootstrap before the event
-    # loop is handed to uvicorn).
-    asyncio.run(mem.initialize_databases())
-
     # Start MCP in a background daemon thread
     mcp_thread = threading.Thread(target=run_mcp, daemon=True)
     mcp_thread.start()

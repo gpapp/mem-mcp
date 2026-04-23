@@ -10,6 +10,7 @@ Provides:
   - Low-level CRUD functions that keep Qdrant and Neo4j in sync
 """
 
+import asyncio
 import os
 import uuid
 import time
@@ -48,10 +49,54 @@ COLLECTION_NAME  = "ea_memories"
 DIARY_COLLECTION = "ea_diary"
 
 # ---------------------------------------------------------------------------
-# Global DB client references (populated by initialize_databases())
+# Global DB client references (lazily populated)
 # ---------------------------------------------------------------------------
-qdrant: Optional[AsyncQdrantClient] = None
-neo4j_driver = None
+_qdrant: Optional[AsyncQdrantClient] = None
+_neo4j_driver = None
+_db_initialized = False
+_db_lock = asyncio.Lock()
+
+async def get_qdrant() -> AsyncQdrantClient:
+    global _qdrant, _db_initialized
+    async with _db_lock:
+        if _qdrant is None:
+            _qdrant = AsyncQdrantClient(url=QDRANT_URL)
+        
+        if not _db_initialized:
+            if wait_for_service(QDRANT_URL, "Qdrant"):
+                try:
+                    cols = await _qdrant.get_collections()
+                    existing = [c.name for c in cols.collections]
+                    if COLLECTION_NAME not in existing:
+                        await _qdrant.create_collection(
+                            collection_name=COLLECTION_NAME,
+                            vectors_config=VectorParams(size=768, distance=Distance.COSINE),
+                        )
+                    if DIARY_COLLECTION not in existing:
+                        await _qdrant.create_collection(
+                            collection_name=DIARY_COLLECTION,
+                            vectors_config=VectorParams(size=768, distance=Distance.COSINE),
+                        )
+                    _db_initialized = True
+                except Exception as e:
+                    logger.error(f"Qdrant init error: {e}")
+    return _qdrant
+
+def get_neo4j():
+    global _neo4j_driver
+    if _neo4j_driver is None:
+        if wait_for_service(NEO4J_URL, "Neo4j"):
+            try:
+                _neo4j_driver = GraphDatabase.driver(NEO4J_URL, auth=(NEO4J_USER, NEO4J_PASS))
+                with _neo4j_driver.session() as s:
+                    s.run("CREATE INDEX user_id_index IF NOT EXISTS FOR (m:Memory) ON (m.userId)")
+                    s.run("CREATE INDEX diary_date_index IF NOT EXISTS FOR (d:DiaryEntry) ON (d.date)")
+            except Exception as e:
+                logger.error(f"Neo4j init error: {e}")
+    return _neo4j_driver
+
+# Removed top-level initialize_databases call and legacy globals
+
 
 # ---------------------------------------------------------------------------
 # Service readiness
@@ -75,45 +120,6 @@ def wait_for_service(url: str, label: str, max_retries: int = 5) -> bool:
             time.sleep(2)
     logger.warning(f"{label} not reachable after {max_retries} retries")
     return False
-
-
-# ---------------------------------------------------------------------------
-# Database initialisation (async – called from server startup)
-# ---------------------------------------------------------------------------
-async def initialize_databases():
-    global qdrant, neo4j_driver
-
-    if wait_for_service(QDRANT_URL, "Qdrant"):
-        try:
-            qdrant = AsyncQdrantClient(url=QDRANT_URL)
-            cols = await qdrant.get_collections()
-            existing = [c.name for c in cols.collections]
-
-            if COLLECTION_NAME not in existing:
-                await qdrant.create_collection(
-                    collection_name=COLLECTION_NAME,
-                    vectors_config=VectorParams(size=768, distance=Distance.COSINE),
-                )
-                logger.info(f"Created Qdrant collection: {COLLECTION_NAME}")
-
-            if DIARY_COLLECTION not in existing:
-                await qdrant.create_collection(
-                    collection_name=DIARY_COLLECTION,
-                    vectors_config=VectorParams(size=768, distance=Distance.COSINE),
-                )
-                logger.info(f"Created Qdrant collection: {DIARY_COLLECTION}")
-        except Exception as e:
-            logger.error(f"Qdrant init error: {e}")
-
-    if wait_for_service(NEO4J_URL, "Neo4j"):
-        try:
-            neo4j_driver = GraphDatabase.driver(NEO4J_URL, auth=(NEO4J_USER, NEO4J_PASS))
-            with neo4j_driver.session() as s:
-                s.run("CREATE INDEX user_id_index IF NOT EXISTS FOR (m:Memory) ON (m.userId)")
-                s.run("CREATE INDEX diary_date_index IF NOT EXISTS FOR (d:DiaryEntry) ON (d.date)")
-            logger.info("Neo4j ready")
-        except Exception as e:
-            logger.error(f"Neo4j init error: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +174,8 @@ def extract_user_from_headers(headers: dict) -> str:
 
 async def db_add_memory(text: str, category: str, user_id: str) -> str:
     """Insert a fact into Qdrant (vector) and Neo4j (graph). Returns the new ID."""
+    qdrant = await get_qdrant()
+    neo4j_driver = get_neo4j()
     if not qdrant or not neo4j_driver:
         raise RuntimeError("Database connections not established.")
 
@@ -207,6 +215,8 @@ async def db_update_memory(memory_id: str, text: str, category: str, user_id: st
     Update text (and optionally category) of an existing fact.
     Re-embeds and updates both stores. Returns True if the record was found.
     """
+    qdrant = await get_qdrant()
+    neo4j_driver = get_neo4j()
     if not qdrant or not neo4j_driver:
         raise RuntimeError("Database connections not established.")
 
@@ -244,6 +254,8 @@ async def db_update_memory(memory_id: str, text: str, category: str, user_id: st
 
 async def db_delete_memory(memory_id: str, user_id: str) -> bool:
     """Delete a fact from both stores. Returns True if found."""
+    qdrant = await get_qdrant()
+    neo4j_driver = get_neo4j()
     if not qdrant or not neo4j_driver:
         raise RuntimeError("Database connections not established.")
 
@@ -263,6 +275,7 @@ async def db_delete_memory(memory_id: str, user_id: str) -> bool:
 
 async def db_search_memories(query: str, user_id: str, limit: int = 5) -> list:
     """Vector-similarity search across the memories collection."""
+    qdrant = await get_qdrant()
     if not qdrant:
         raise RuntimeError("Qdrant not connected.")
 
@@ -287,6 +300,7 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5) -> list:
 
 def db_list_memories(user_id: str) -> list:
     """Return all facts for a user from Neo4j (no vector needed)."""
+    neo4j_driver = get_neo4j()
     if not neo4j_driver:
         raise RuntimeError("Neo4j not connected.")
 
@@ -313,6 +327,7 @@ def db_list_memories(user_id: str) -> list:
 
 def db_list_categories(user_id: str) -> list:
     """Return distinct category names for a user."""
+    neo4j_driver = get_neo4j()
     if not neo4j_driver:
         raise RuntimeError("Neo4j not connected.")
 
@@ -338,6 +353,8 @@ def _diary_id(user_id: str, entry_date: str) -> str:
 
 async def db_save_diary(content: str, user_id: str, date: Optional[str] = None) -> str:
     """Upsert a diary entry. Returns the entry date string."""
+    qdrant = await get_qdrant()
+    neo4j_driver = get_neo4j()
     if not qdrant or not neo4j_driver:
         raise RuntimeError("Database connections not established.")
 
@@ -371,6 +388,7 @@ async def db_save_diary(content: str, user_id: str, date: Optional[str] = None) 
 
 async def db_search_diary(query: str, user_id: str, limit: int = 3) -> list:
     """Vector-similarity search across the diary collection."""
+    qdrant = await get_qdrant()
     if not qdrant:
         raise RuntimeError("Qdrant not connected.")
 
@@ -395,6 +413,7 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3) -> list:
 
 def db_list_diary(user_id: str) -> list:
     """Return all diary entries for a user from Neo4j, newest first."""
+    neo4j_driver = get_neo4j()
     if not neo4j_driver:
         raise RuntimeError("Neo4j not connected.")
 
