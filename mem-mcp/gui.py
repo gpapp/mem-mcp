@@ -143,11 +143,13 @@ async def startup_event():
 class MemoryCreate(BaseModel):
     text: str
     category: str = "General"
+    tags: Optional[str] = ""
 
 
 class MemoryUpdate(BaseModel):
     text: str
     category: str = "General"
+    tags: Optional[str] = ""
 
 
 class DiaryCreate(BaseModel):
@@ -188,8 +190,9 @@ async def api_list_memories(request: Request):
 @web_app.post("/api/memories", response_class=JSONResponse, status_code=201)
 async def api_create_memory(request: Request, body: MemoryCreate):
     try:
-        doc_id = await mem.db_add_memory(body.text, body.category, _user(request))
-        return {"id": doc_id, "text": body.text, "category": body.category.strip().capitalize()}
+        metadata = {"tags": [t.strip() for t in body.tags.split(",") if t.strip()]} if body.tags else {}
+        doc_id = await mem.db_add_memory(body.text, body.category, _user(request), metadata)
+        return {"id": doc_id, "text": body.text, "category": body.category.strip().capitalize(), "metadata": metadata}
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
@@ -197,10 +200,11 @@ async def api_create_memory(request: Request, body: MemoryCreate):
 @web_app.put("/api/memories/{memory_id}", response_class=JSONResponse)
 async def api_update_memory(memory_id: str, request: Request, body: MemoryUpdate):
     try:
-        found = await mem.db_update_memory(memory_id, body.text, body.category, _user(request))
+        metadata = {"tags": [t.strip() for t in body.tags.split(",") if t.strip()]} if body.tags else {}
+        found = await mem.db_update_memory(memory_id, body.text, body.category, _user(request), metadata)
         if not found:
             raise HTTPException(status_code=404, detail="Memory not found or access denied.")
-        return {"id": memory_id, "text": body.text, "category": body.category.strip().capitalize()}
+        return {"id": memory_id, "text": body.text, "category": body.category.strip().capitalize(), "metadata": metadata}
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
@@ -226,6 +230,14 @@ async def api_list_categories(request: Request):
 async def api_list_diary(request: Request):
     try:
         return mem.db_list_diary(_user(request))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@web_app.get("/api/insights", response_class=JSONResponse)
+async def api_get_insights(request: Request):
+    try:
+        return mem.db_find_patterns(_user(request))
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
@@ -335,6 +347,8 @@ _GUI_HTML = """<!DOCTYPE html>
     .memory-text { flex: 1; font-size: .9rem; line-height: 1.5; }
     .memory-meta { font-size: .75rem; color: var(--muted); margin-top: .2rem; }
     .memory-actions { display: flex; gap: .4rem; flex-shrink: 0; }
+    .tag-badge { display: inline-block; background: #f1f5f9; color: #475569; font-size: .7rem; 
+                padding: .1rem .4rem; border-radius: 4px; margin-right: .3rem; margin-top: .4rem; }
 
     /* ── Edit form (inline) ── */
     .edit-form { margin-top: .5rem; display: flex; gap: .5rem; flex-wrap: wrap; }
@@ -395,6 +409,7 @@ _GUI_HTML = """<!DOCTYPE html>
 <div class="tabs">
   <button class="tab-btn active" onclick="switchTab('memories')">📝 Memories</button>
   <button class="tab-btn" onclick="switchTab('diary')">📖 Diary</button>
+  <button class="tab-btn" onclick="switchTab('insights')">✨ Insights</button>
 </div>
 
 <!-- ═══ MEMORIES PAGE ═══ -->
@@ -406,9 +421,13 @@ _GUI_HTML = """<!DOCTYPE html>
         <label for="new-text">Fact / Memory</label>
         <input id="new-text" placeholder="e.g. I prefer dark mode editors">
       </div>
-      <div style="flex:0 1 200px;">
+      <div style="flex:0 1 180px;">
         <label for="new-category">Category</label>
         <input id="new-category" placeholder="e.g. Preferences" value="General">
+      </div>
+      <div style="flex:0 1 180px;">
+        <label for="new-tags">Tags (comma separated)</label>
+        <input id="new-tags" placeholder="tag1, tag2">
       </div>
       <div style="flex:0 1 auto;padding-bottom:1px;">
         <label>&nbsp;</label>
@@ -455,7 +474,14 @@ _GUI_HTML = """<!DOCTYPE html>
   </div>
 </div>
 
-<div id="toast"></div>
+<!-- ═══ INSIGHTS PAGE ═══ -->
+<div id="page-insights" class="page">
+  <div class="card">
+    <h2 style="margin-top:0;">✨ Knowledge Patterns</h2>
+    <p class="muted" style="font-size:.9rem;margin-bottom:1.5rem;">Recurring themes discovered in your graph database.</p>
+    <div id="insights-list"></div>
+  </div>
+</div>
 
 <script>
   // ── API helpers ──────────────────────────────────────────────────────────
@@ -486,10 +512,11 @@ _GUI_HTML = """<!DOCTYPE html>
     document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
     document.getElementById('page-' + tab).classList.add('active');
     document.querySelectorAll('.tab-btn').forEach(b => {
-      if (b.textContent.toLowerCase().includes(tab === 'memories' ? 'memor' : 'diary'))
-        b.classList.add('active');
+      const label = b.textContent.toLowerCase();
+      if (label.includes(tab.slice(0,3))) b.classList.add('active');
     });
     if (tab === 'diary') loadDiary();
+    if (tab === 'insights') loadInsights();
   }
 
   // ── Memories ──────────────────────────────────────────────────────────────
@@ -516,14 +543,19 @@ _GUI_HTML = """<!DOCTYPE html>
 
   function renderMemoryItem(m) {
     const ts = m.timestamp ? m.timestamp.slice(0,10) : '';
+    const tags = (m.metadata && m.metadata.tags) || [];
+    const tagHtml = tags.map(t => `<span class="tag-badge">#${t}</span>`).join('');
+    
     return `
     <div class="memory-item" id="mem-${m.id}">
       <div class="memory-text">
         <div id="mem-text-${m.id}">${escHtml(m.text)}</div>
+        <div id="mem-tags-${m.id}">${tagHtml}</div>
         <div class="memory-meta">${ts ? '📅 '+ts : ''} <span style="opacity:.5;font-size:.7rem;">${m.id.slice(0,8)}…</span></div>
         <div class="edit-form" id="edit-form-${m.id}" style="display:none;">
           <input id="edit-text-${m.id}" value="${escHtml(m.text)}">
-          <input id="edit-cat-${m.id}" value="${escHtml(m.category)}" style="flex:0 1 160px;">
+          <input id="edit-cat-${m.id}" value="${escHtml(m.category)}" style="flex:0 1 120px;">
+          <input id="edit-tags-${m.id}" value="${escHtml(tags.join(', '))}" placeholder="tags…">
           <button class="btn btn-primary btn-sm" onclick="saveEdit('${m.id}')">Save</button>
           <button class="btn btn-ghost btn-sm" onclick="cancelEdit('${m.id}')">Cancel</button>
         </div>
@@ -548,11 +580,15 @@ _GUI_HTML = """<!DOCTYPE html>
   async function saveEdit(id) {
     const text = document.getElementById('edit-text-' + id).value.trim();
     const cat  = document.getElementById('edit-cat-' + id).value.trim() || 'General';
+    const tags = document.getElementById('edit-tags-' + id).value.trim();
     if (!text) return;
     try {
-      const updated = await api.put('memories/' + id, {text, category: cat});
+      const updated = await api.put('memories/' + id, {text, category: cat, tags});
       const m = memories.find(x => x.id === id);
-      if (m) { m.text = updated.text; m.category = updated.category; }
+      if (m) { 
+        m.text = updated.text; m.category = updated.category; 
+        m.metadata = updated.metadata; 
+      }
       renderMemories();
       toast('✅ Memory updated');
     } catch(e) { toast('❌ Update failed'); }
@@ -561,13 +597,15 @@ _GUI_HTML = """<!DOCTYPE html>
   async function addMemory() {
     const text = document.getElementById('new-text').value.trim();
     const cat  = document.getElementById('new-category').value.trim() || 'General';
+    const tags = document.getElementById('new-tags').value.trim();
     if (!text) return;
     try {
-      const m = await api.post('memories', {text, category: cat});
+      const m = await api.post('memories', {text, category: cat, tags});
       m.timestamp = new Date().toISOString();
       memories.push(m);
       renderMemories();
       document.getElementById('new-text').value = '';
+      document.getElementById('new-tags').value = '';
       toast('✅ Memory saved');
     } catch(e) { toast('❌ Could not save memory'); }
   }
@@ -670,6 +708,24 @@ _GUI_HTML = """<!DOCTYPE html>
       await loadDiary();
       if (date) selectDiaryEntry(date);
     } catch(e) { toast('❌ Could not save diary entry'); }
+  }
+
+  // ── Insights ──────────────────────────────────────────────────────────────
+  async function loadInsights() {
+    const el = document.getElementById('insights-list');
+    el.innerHTML = '<p class="empty">Analyzing graph…</p>';
+    try {
+      const patterns = await api.get('insights');
+      if (!patterns.length) { el.innerHTML = '<p class="empty">Not enough data to find patterns yet.</p>'; return; }
+      el.innerHTML = patterns.map(p => `
+        <div class="memory-item" style="border-left-color: var(--success);">
+          <div class="memory-text">
+            <strong>${p.pattern}</strong>
+            <div class="memory-meta">Found ${p.strength} associations in your knowledge graph.</div>
+          </div>
+        </div>
+      `).join('');
+    } catch(e) { el.innerHTML = '<p class="empty">⚠️ Could not load insights.</p>'; }
   }
 
   // ── Utilities ─────────────────────────────────────────────────────────────

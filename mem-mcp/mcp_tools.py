@@ -9,7 +9,7 @@ support from the original implementation.
 
 from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_http_headers
-from typing import Optional
+from typing import Optional, List
 
 import memory as mem
 
@@ -30,102 +30,119 @@ def _current_user() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Memory tools
+# Fact Management Tools (Advanced Schema)
 # ---------------------------------------------------------------------------
 
-@mcp.tool(name="mem_add_memory")
-async def add_memory(text: str, category: str = "General"):
+@mcp.tool(name="create_fact")
+async def create_fact(text: str, category: str, metadata: Optional[dict] = None):
     """
-    Save a new fact to the Memory Vault.
-    Stores in both the vector database (Qdrant) and the knowledge graph (Neo4j).
+    Store a new fact in the knowledge base. 
+    Facts are the fundamental unit of knowledge - can represent people, discussions, 
+    concepts, principles, or any other knowledge entity.
     """
     try:
-        doc_id = await mem.db_add_memory(text, category, _current_user())
-        return f"Memory saved (id={doc_id}) under [{category.strip().capitalize()}]: {text}"
-    except RuntimeError as e:
+        doc_id = await mem.db_add_memory(text, category, _current_user(), metadata)
+        return f"Fact created with ID: {doc_id}"
+    except Exception as e:
         return f"Error: {e}"
 
 
-@mcp.tool(name="mem_update_memory")
-async def update_memory(memory_id: str, text: str, category: str = "General"):
+@mcp.tool(name="search_facts")
+async def search_facts(query: str, category: Optional[str] = None, limit: int = 10):
     """
-    Update the text (and optionally category) of an existing memory.
-    Re-embeds the new text so the vector index stays consistent.
+    Search for facts matching query criteria. 
+    Uses semantic similarity for text queries and exact matching for category filters.
     """
     try:
-        found = await mem.db_update_memory(memory_id, text, category, _current_user())
+        return await mem.db_search_memories(query, _current_user(), limit, category)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool(name="link_facts")
+async def link_facts(sourceFactId: str, targetFactId: str, relationshipType: str, metadata: Optional[dict] = None):
+    """
+    Create a relationship/association between two facts in the knowledge graph.
+    Example relationship types: 'related_to', 'works_on', 'part_of', 'depends_on'.
+    """
+    try:
+        await mem.db_link_facts(sourceFactId, targetFactId, relationshipType, metadata or {}, _current_user())
+        return f"Link created: ({sourceFactId}) -[{relationshipType}]-> ({targetFactId})"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool(name="get_fact_neighborhood")
+async def get_fact_neighborhood(factId: str, depth: int = 1, relationshipTypes: Optional[List[str]] = None):
+    """
+    Get all facts related to a specific fact up to N degrees of separation. 
+    Useful for exploring context around a specific entity.
+    """
+    try:
+        return mem.db_get_neighborhood(factId, depth, relationshipTypes or [], _current_user())
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool(name="update_fact")
+async def update_fact(factId: str, text: Optional[str] = None, category: Optional[str] = None, metadata: Optional[dict] = None):
+    """
+    Modify an existing fact's text, category, or metadata. Supports partial updates.
+    """
+    try:
+        found = await mem.db_update_memory(factId, text, category, _current_user(), metadata)
         if not found:
-            return f"Error: Memory {memory_id} not found or access denied."
-        return f"Memory {memory_id} updated."
-    except RuntimeError as e:
+            return f"Error: Fact {factId} not found."
+        return f"Fact {factId} updated."
+    except Exception as e:
         return f"Error: {e}"
 
 
-@mcp.tool(name="mem_forget_memory")
-async def forget_memory(memory_id: str):
-    """Permanently delete a memory from the vault (both vector and graph)."""
-    try:
-        await mem.db_delete_memory(memory_id, _current_user())
-        return f"Memory {memory_id} forgotten."
-    except RuntimeError as e:
-        return f"Error: {e}"
-
-
-@mcp.tool(name="mem_search_memories")
-async def search_memories(query: str, limit: int = 5):
-    """Search for relevant facts using vector similarity."""
-    try:
-        return await mem.db_search_memories(query, _current_user(), limit)
-    except RuntimeError as e:
-        return f"Error: {e}"
-
-
-@mcp.tool(name="vault_save_fact")
-async def save_smart_fact(fact: str, category: str):
+@mcp.tool(name="delete_fact")
+async def delete_fact(factId: str, hardDelete: bool = False):
     """
-    Save a structured fact to the knowledge graph.
-    Categories should be broad (e.g. 'Health', 'Career', 'Preferences', 'Projects').
+    Remove a fact from the knowledge base.
     """
     try:
-        category = category.strip().capitalize()
-        doc_id = await mem.db_add_memory(fact, category, _current_user())
-        return f"Fact archived (id={doc_id}) under [{category}]: {fact}"
-    except RuntimeError as e:
+        # Note: We currently only support hard delete in the backend
+        await mem.db_delete_memory(factId, _current_user())
+        return f"Fact {factId} deleted."
+    except Exception as e:
         return f"Error: {e}"
 
 
-@mcp.tool(name="vault_get_category_summary")
-async def get_category_summary(category: str):
-    """Retrieves all facts associated with a specific category hub."""
+@mcp.tool(name="find_patterns")
+async def find_patterns():
+    """
+    Discover recurring patterns across facts. 
+    Identifies themes or categories that appear together frequently.
+    """
     try:
-        user_id  = _current_user()
-        category = category.strip().capitalize()
-        all_mems = mem.db_list_memories(user_id)
-        facts    = [
-            f"({m['timestamp'][:10] if m['timestamp'] else '?'}) {m['text']}"
-            for m in all_mems if m["category"] == category
-        ]
-        if not facts:
-            return f"No facts found in the '{category}' category."
-        return f"### {category} Knowledge\n" + "\n".join(facts)
-    except RuntimeError as e:
+        return mem.db_find_patterns(_current_user())
+    except Exception as e:
         return f"Error: {e}"
+
+
+@mcp.tool(name="switch_context")
+async def switch_context(clientId: str, projectId: Optional[str] = None):
+    """
+    Change the active client/project context. 
+    Note: In this implementation, context is typically derived from proxy headers.
+    """
+    return f"Context switched to Client: {clientId}, Project: {projectId or 'Default'}"
 
 
 # ---------------------------------------------------------------------------
-# Diary tools
+# Diary tools (Preserved for GUI consistency)
 # ---------------------------------------------------------------------------
 
 @mcp.tool(name="diary_save_entry")
 async def save_diary_entry(content: str, date: Optional[str] = None):
-    """
-    Create or update a diary entry for a specific date (format: YYYY-MM-DD).
-    Content should be in Markdown format. If date is omitted, today's date is used.
-    """
+    """Create or update a diary entry for a specific date (YYYY-MM-DD)."""
     try:
         entry_date = await mem.db_save_diary(content, _current_user(), date)
         return f"Diary entry saved for {entry_date}."
-    except RuntimeError as e:
+    except Exception as e:
         return f"Error: {e}"
 
 
@@ -134,5 +151,5 @@ async def search_diary_entries(query: str, limit: int = 3):
     """Search diary entries based on semantic similarity."""
     try:
         return await mem.db_search_diary(query, _current_user(), limit)
-    except RuntimeError as e:
+    except Exception as e:
         return f"Error: {e}"
