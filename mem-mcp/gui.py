@@ -27,6 +27,17 @@ import memory as mem
 
 web_app = FastAPI(title="Memory Vault GUI")
 
+# Allow both /path and /path/ for all routes
+from fastapi.routing import APIRoute
+def toggle_strict_slashes(app: FastAPI):
+    for route in app.routes:
+        if isinstance(route, APIRoute):
+            route.path_strict_slashes = False
+
+@web_app.on_event("startup")
+async def startup_event():
+    toggle_strict_slashes(web_app)
+
 
 # ---------------------------------------------------------------------------
 # Request / Response models
@@ -305,9 +316,11 @@ _GUI_HTML = """<!DOCTYPE html>
 
 <script>
   // ── Relative API helpers ──────────────────────────────────────────────────
-  // Use a base path relative to /gui to reach /api
-  const apiBase = window.location.pathname.endsWith('/') 
-    ? '../api' 
+  // Robustly find the API root by replacing the '/gui' part of the current path with '/api'
+  const currentPath = window.location.pathname;
+  const guiIndex = currentPath.lastIndexOf('/gui');
+  const apiBase = (guiIndex !== -1) 
+    ? currentPath.substring(0, guiIndex) + '/api'
     : './api';
 
   const api = {
