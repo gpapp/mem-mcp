@@ -195,7 +195,6 @@ async def get_landing(request: Request):
 
 
 @web_app.get("/gui", response_class=HTMLResponse)
-@web_app.get("/mcp/gui", response_class=HTMLResponse)
 async def get_gui(request: Request):
     ctx = _get_auth_context(request)
     html = _render_template("dashboard", BASE_URL=mem.BASE_URL, **ctx)
