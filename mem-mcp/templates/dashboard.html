@@ -200,11 +200,15 @@
   <div class="card">
     <h2 style="margin-top:0;">🔌 MCP Setup</h2>
     <p>Connect your AI assistant to this Vault.</p>
-    <label>Claude Desktop Command:</label>
-    <pre><code>claude mcp add --transport http memory-vault {{MCP_URL}} --header "Authorization: Basic {{AUTH_BASE64}}"</code></pre>
-    <div style="margin-top:1.5rem; background: var(--bg); padding: 1rem; border-radius: 8px; border: 1px dashed var(--primary);">
-        <p style="margin:0;"><strong>User:</strong> <code>{{AUTH_USER}}</code></p>
-        <p style="margin:.5rem 0 0 0;"><strong>Pass:</strong> <code>{{AUTH_PASS}}</code></p>
+    <div class="setup-grid">
+        <div style="flex:1;">
+            <label>Claude Desktop / Claude Code Command:</label>
+            <pre><code>claude mcp add --transport http memory-vault {{MCP_URL}} --header "Authorization: Basic {{AUTH_BASE64}}"</code></pre>
+        </div>
+    </div>
+    <div style="margin-top:1.5rem; background: var(--bg); padding: 1rem; border-radius: 8px; border: 1px dashed var(--primary); display: flex; gap: 2rem;">
+        <div><strong>User:</strong> <code>{{AUTH_USER}}</code></div>
+        <div><strong>Pass:</strong> <code>{{AUTH_PASS}}</code></div>
     </div>
   </div>
 </div>

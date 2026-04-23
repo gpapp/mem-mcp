@@ -63,3 +63,9 @@ async def diary_save_entry(content: str, date: Optional[str] = None):
 async def diary_search_entries(query: str, limit: int = 3):
     """Search diary entries."""
     return await mem.db_search_diary(query, _current_user(), limit)
+
+# ---------------------------------------------------------------------------
+# Skills & Resources
+# ---------------------------------------------------------------------------
+from mcp_skills import register_skills
+register_skills(mcp)
