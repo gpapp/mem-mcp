@@ -88,7 +88,7 @@ _LANDING_HTML = """<!DOCTYPE html>
         <pre><code>{
   "mcpServers": {
     "memory-vault": {
-      "url": "{{BASE_URL}}/mcp"
+      "url": "{{AUTH_USER}}:{{AUTH_PASS}}@{{BASE_URL}}/mcp"
     }
   }
 }</code></pre>
