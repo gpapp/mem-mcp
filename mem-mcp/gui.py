@@ -272,6 +272,23 @@ _GUI_HTML = """<!DOCTYPE html>
       opacity: 0; transform: translateY(8px); transition: all .25s; pointer-events: none; z-index: 999;
     }
     #toast.show { opacity: 1; transform: translateY(0); }
+
+    /* ── Diary Layout ── */
+    .diary-layout { display: flex; gap: 1.5rem; height: calc(100vh - 180px); min-height: 500px; }
+    .diary-sidebar { width: 220px; flex-shrink: 0; background: var(--surface); border: 1px solid var(--border); 
+                     border-radius: var(--radius); overflow-y: auto; display: flex; flex-direction: column; }
+    .diary-sidebar-header { padding: 1rem; border-bottom: 1px solid var(--border); font-weight: 700; font-size: .85rem; 
+                            text-transform: uppercase; color: var(--muted); display: flex; justify-content: space-between; align-items: center; }
+    .diary-date-item { padding: .75rem 1rem; cursor: pointer; border-bottom: 1px solid var(--bg); transition: all .15s; 
+                       font-size: .9rem; color: var(--text); font-weight: 500; }
+    .diary-date-item:hover { background: var(--bg); color: var(--primary); }
+    .diary-date-item.active { background: var(--primary-light); color: var(--primary); border-right: 3px solid var(--primary); }
+    
+    .diary-main { flex: 1; display: flex; flex-direction: column; gap: 1rem; overflow-y: auto; }
+    .diary-view-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); 
+                       padding: 2rem; box-shadow: var(--shadow); flex-grow: 1; }
+    .diary-editor-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); 
+                         padding: 1.25rem; box-shadow: var(--shadow); }
   </style>
 </head>
 <body>
@@ -311,20 +328,37 @@ _GUI_HTML = """<!DOCTYPE html>
 
 <!-- ═══ DIARY PAGE ═══ -->
 <div id="page-diary" class="page">
-  <div class="card" style="margin-bottom:1.25rem;">
-    <strong style="display:block;margin-bottom:.75rem;font-size:.95rem;">Write a diary entry</strong>
-    <div style="margin-bottom:.75rem;">
-      <label for="diary-date">Date (YYYY-MM-DD, blank = today)</label>
-      <input id="diary-date" placeholder="2025-01-15" style="max-width:200px;">
+  <div class="diary-layout">
+    <div class="diary-sidebar">
+      <div class="diary-sidebar-header">
+        <span>History</span>
+        <button class="btn btn-primary btn-sm" onclick="showDiaryEditor()">＋ New</button>
+      </div>
+      <div id="diary-dates-list"></div>
     </div>
-    <label for="diary-content">Content (Markdown supported)</label>
-    <textarea id="diary-content" placeholder="Today I…"></textarea>
-    <div style="margin-top:.75rem;text-align:right;">
-      <button class="btn btn-primary" onclick="saveDiary()">💾 Save Entry</button>
+    
+    <div class="diary-main">
+      <!-- Editor View -->
+      <div id="diary-editor" class="diary-editor-card" style="display:none;">
+        <strong style="display:block;margin-bottom:.75rem;font-size:.95rem;">Write a diary entry</strong>
+        <div style="margin-bottom:.75rem;">
+          <label for="diary-date">Date (YYYY-MM-DD, blank = today)</label>
+          <input id="diary-date" placeholder="2025-01-15" style="max-width:200px;">
+        </div>
+        <label for="diary-content">Content (Markdown supported)</label>
+        <textarea id="diary-content" placeholder="Today I…"></textarea>
+        <div style="margin-top:.75rem; display: flex; justify-content: space-between;">
+          <button class="btn btn-ghost" onclick="cancelDiaryEdit()">Cancel</button>
+          <button class="btn btn-primary" onclick="saveDiary()">💾 Save Entry</button>
+        </div>
+      </div>
+
+      <!-- Display View -->
+      <div id="diary-viewer" class="diary-view-card">
+        <div id="diary-view-content" class="empty">Select an entry from the sidebar or create a new one.</div>
+      </div>
     </div>
   </div>
-
-  <div id="diary-list"></div>
 </div>
 
 <div id="toast"></div>
@@ -342,6 +376,8 @@ _GUI_HTML = """<!DOCTYPE html>
 
   // ── State ─────────────────────────────────────────────────────────────────
   let memories = [];
+  let diaryEntries = [];
+  let activeDiaryDate = null;
 
   // ── Toast ─────────────────────────────────────────────────────────────────
   function toast(msg, ms=2500) {
@@ -454,17 +490,80 @@ _GUI_HTML = """<!DOCTYPE html>
 
   // ── Diary ─────────────────────────────────────────────────────────────────
   async function loadDiary() {
-    const el = document.getElementById('diary-list');
-    el.innerHTML = '<p class="empty">Loading…</p>';
+    const datesEl = document.getElementById('diary-dates-list');
+    datesEl.innerHTML = '<p class="empty">Loading…</p>';
     try {
-      const entries = await api.get('diary');
-      if (!entries.length) { el.innerHTML = '<p class="empty">No diary entries yet.</p>'; return; }
-      el.innerHTML = entries.map(d => `
-        <div class="diary-entry">
-          <span class="diary-date-badge">📅 ${d.date}</span>
-          <div class="markdown-body">${marked.parse(d.content || '')}</div>
-        </div>`).join('');
-    } catch(e) { el.innerHTML = '<p class="empty">⚠️ Could not load diary.</p>'; }
+      diaryEntries = await api.get('diary');
+      renderDiarySidebar();
+      if (diaryEntries.length > 0 && !activeDiaryDate) {
+        selectDiaryEntry(diaryEntries[0].date);
+      }
+    } catch(e) { datesEl.innerHTML = '<p class="empty">⚠️ Error loading diary.</p>'; }
+  }
+
+  function renderDiarySidebar() {
+    const el = document.getElementById('diary-dates-list');
+    if (!diaryEntries.length) { el.innerHTML = '<p class="empty">No entries.</p>'; return; }
+    
+    // Sort dates descending
+    const sorted = [...diaryEntries].sort((a,b) => b.date.localeCompare(a.date));
+    
+    el.innerHTML = sorted.map(d => `
+      <div class="diary-date-item ${d.date === activeDiaryDate ? 'active' : ''}" onclick="selectDiaryEntry('${d.date}')">
+        📅 ${d.date}
+      </div>`).join('');
+  }
+
+  function selectDiaryEntry(date) {
+    activeDiaryDate = date;
+    const entry = diaryEntries.find(d => d.date === date);
+    renderDiarySidebar();
+    
+    document.getElementById('diary-editor').style.display = 'none';
+    document.getElementById('diary-viewer').style.display = 'block';
+    
+    const viewEl = document.getElementById('diary-view-content');
+    if (entry) {
+      viewEl.innerHTML = `
+        <span class="diary-date-badge">📅 ${entry.date}</span>
+        <div class="markdown-body">${marked.parse(entry.content || '')}</div>
+        <div style="margin-top: 2rem; text-align: right;">
+          <button class="btn btn-ghost btn-sm" onclick="editCurrentEntry()">✏️ Edit</button>
+        </div>
+      `;
+    } else {
+      viewEl.innerHTML = '<p class="empty">Select an entry.</p>';
+    }
+  }
+
+  function showDiaryEditor() {
+    activeDiaryDate = null;
+    renderDiarySidebar();
+    document.getElementById('diary-viewer').style.display = 'none';
+    document.getElementById('diary-editor').style.display = 'block';
+    document.getElementById('diary-date').value = new Date().toISOString().slice(0,10);
+    document.getElementById('diary-content').value = '';
+    document.getElementById('diary-content').focus();
+  }
+
+  function cancelDiaryEdit() {
+    if (diaryEntries.length > 0) {
+      selectDiaryEntry(diaryEntries[0].date);
+    } else {
+      document.getElementById('diary-editor').style.display = 'none';
+      document.getElementById('diary-view-content').innerHTML = '<p class="empty">No entries.</p>';
+    }
+  }
+
+  function editCurrentEntry() {
+    const entry = diaryEntries.find(d => d.date === activeDiaryDate);
+    if (!entry) return;
+    
+    document.getElementById('diary-viewer').style.display = 'none';
+    document.getElementById('diary-editor').style.display = 'block';
+    document.getElementById('diary-date').value = entry.date;
+    document.getElementById('diary-content').value = entry.content;
+    document.getElementById('diary-content').focus();
   }
 
   async function saveDiary() {
@@ -473,10 +572,9 @@ _GUI_HTML = """<!DOCTYPE html>
     if (!content) return;
     try {
       await api.post('diary', {content, date});
-      document.getElementById('diary-content').value = '';
-      document.getElementById('diary-date').value = '';
       toast('📖 Diary entry saved');
-      if (document.getElementById('page-diary').classList.contains('active')) loadDiary();
+      await loadDiary();
+      if (date) selectDiaryEntry(date);
     } catch(e) { toast('❌ Could not save diary entry'); }
   }
 
