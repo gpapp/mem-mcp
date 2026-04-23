@@ -329,6 +329,7 @@
     document.getElementById('diary-editor').style.display = 'none'; document.getElementById('diary-viewer').style.display = 'block';
     const viewEl = document.getElementById('diary-view-content');
     if (entry) {
+      viewEl.classList.remove('empty');
       viewEl.innerHTML = `<span class="diary-date-badge">📅 ${entry.date}</span><div class="markdown-body">${marked.parse(entry.content || '')}</div>
                           <div style="margin-top:2rem;text-align:right;"><button class="btn btn-ghost btn-sm" onclick="editCurrentEntry()">✏️ Edit</button></div>`;
     }
