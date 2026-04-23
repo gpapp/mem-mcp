@@ -57,8 +57,7 @@ services:
     networks:
       - memory-net
     ports:
-      - "127.0.0.1:8086:8080"
-      - "127.0.0.1:8087:8000"
+      - "127.0.0.1:8086:8080"      
     environment:
       - MEM_PROVIDER=ollama
       - MEM_LLM_MODEL=phi4-mini
