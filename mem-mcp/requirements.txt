@@ -1,0 +1,10 @@
+pip
+uv
+fastmcp
+fastapi
+qdrant-client
+neo4j
+ollama
+httpx
+uvicorn
+markdown2

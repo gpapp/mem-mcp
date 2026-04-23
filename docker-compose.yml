@@ -1,0 +1,92 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    restart: always
+             # No ports exposed to the host network for security
+    networks:
+      - memory-net
+    volumes:
+      - ./qdrant_storage:/qdrant/storage
+
+
+# Graph Database (The Relationship Mapper)
+  neo4j:
+    image: neo4j:5.26.0
+    container_name: neo4j
+    restart: always
+    networks:
+      - memory-net
+    environment:
+      - NEO4J_AUTH=neo4j/${NEO_PASS}
+      - NEO4J_PLUGINS=["apoc"] # Recommended for EA graph analysis
+        # Force Bolt to use internal encryption if you connect via bolt+s
+      - NEO4J_dbms_connector_bolt_tls__level=DISABLED
+      - NEO4J_dbms_security_procedures_unrestricted=apoc.*
+      - NEO4J_dbms_security_procedures_allowlist=apoc.*
+      - NEO4J_server_memory_heap_initial__size=512m
+      - NEO4J_server_memory_heap_max__size=1g
+      - NEO4J_server_memory_pagecache_size=512m
+    volumes:
+      - ./neo4j_data:/data
+      - ./neo4j_logs:/logs
+
+  ollama:
+    image: alpine/ollama:latest
+    container_name: ollama
+    restart: always
+    volumes:
+      - ./ollama_data:/root/.ollama
+    networks:
+      - memory-net
+    environment:
+      - OLLAMA_VULKAN=1
+      - OLLAMA_CONTEXT_LENGTH=16332
+      - OLLAMA_FLASH_ATTENTION=True
+      - OLLAMA_KV_CACHE_TYPE=q8_0
+    # If you have an NVIDIA GPU, add the deploy section here
+    # (Otherwise, it will run on CPU)
+
+  mem-mcp:
+    build: mem-server
+    container_name: mem-mcp
+    depends_on:
+      - qdrant
+      - neo4j
+      - ollama
+    networks:
+      - memory-net
+    ports:
+      - "127.0.0.1:8086:8080"
+      - "127.0.0.1:8087:8000"
+    environment:
+      - MEM_PROVIDER=ollama
+      - MEM_LLM_MODEL=phi4-mini
+      #- MEM_LLM_MODEL=gemma4:e2b
+      - MEM_LLM_URL=http://ollama:11434
+      - HTTPX_TIMEOUT=600.0
+      - REQUESTS_TIMEOUT=600
+
+      - MEM_EMBEDDER_PROVIDER=ollama
+      - MEM_EMBEDDER_MODEL=nomic-ea
+      #- MEM_EMBEDDER_MODEL=nomic-embed-text
+      - MEM_EMBEDDER_URL=http://ollama:11434
+        # Vector Store (Qdrant)
+      - MEM_VECTOR_STORE_PROVIDER=qdrant
+      - MEM_QDRANT_URL=http://qdrant:6333
+
+        # Graph Store (Neo4j)
+      - MEM_ENABLE_GRAPH=true
+      - MEM_NEO4J_URL=bolt://neo4j:7687
+      - MEM_NEO4J_USER=neo4j
+      - MEM_NEO4J_PASSWORD=${NEO_PASS}
+
+    volumes:
+      - MEM_model_cache:/root/.cache/fastembed
+
+volumes:
+  MEM_model_cache:
+
+networks:
+  memory-net:
+    driver: bridge
