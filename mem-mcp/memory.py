@@ -399,7 +399,7 @@ def db_find_patterns(user_id: str) -> list:
 
 
 def db_list_memories(user_id: str) -> list:
-    """Return all facts for a user from Neo4j (no vector needed)."""
+    """Return all facts for a user from Neo4j with metadata and links."""
     neo4j_driver = get_neo4j()
     if not neo4j_driver:
         raise RuntimeError("Neo4j not connected.")
@@ -408,21 +408,33 @@ def db_list_memories(user_id: str) -> list:
         result = s.run(
             """
             MATCH (c:Category)<-[:IN_CATEGORY]-(f:Fact {userId: $userId})
-            RETURN f.id as id, f.text as text, c.name as category,
-                   f.timestamp as timestamp
+            OPTIONAL MATCH (f)-[r]->(target:Fact {userId: $userId})
+            WHERE type(r) <> 'IN_CATEGORY' AND type(r) <> 'KNOWS'
+            RETURN f, c.name as category, 
+                   collect({rel: type(r), target_id: target.id, target_text: target.text}) as links
             ORDER BY c.name ASC, f.timestamp DESC
             """,
             userId=user_id,
         )
-        return [
-            {
-                "id":        r["id"],
-                "text":      r["text"],
+        memories = []
+        for r in result:
+            f_node = r["f"]
+            # Extract metadata (all properties except core ones)
+            core_keys = {"id", "text", "category", "timestamp", "userId"}
+            metadata = {k: v for k, v in f_node.items() if k not in core_keys}
+            
+            # Clean up links (remove null targets)
+            links = [l for l in r["links"] if l.get("target_id")]
+
+            memories.append({
+                "id":        f_node["id"],
+                "text":      f_node["text"],
                 "category":  r["category"],
-                "timestamp": r["timestamp"].iso_format() if r["timestamp"] else None,
-            }
-            for r in result
-        ]
+                "timestamp": f_node["timestamp"].iso_format() if f_node.get("timestamp") else None,
+                "metadata":  metadata,
+                "links":     links
+            })
+        return memories
 
 
 def db_list_categories(user_id: str) -> list:
