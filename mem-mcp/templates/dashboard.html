@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Memory Vault</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <style>
+    :root {
+      --primary: #4f46e5; --primary-light: #eef2ff; --primary-dark: #3730a3;
+      --danger: #ef4444; --danger-light: #fef2f2;
+      --success: #10b981;
+      --bg: #f8fafc; --surface: #ffffff;
+      --border: #e5e7eb; --text: #111827; --muted: #6b7280;
+      --radius: 10px; --shadow: 0 1px 3px rgba(0,0,0,.08);
+    }
+    *, *::before, *::after { box-sizing: border-box; }
+    body { margin: 0; font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text); }
+
+    /* ── Nav ── */
+    nav {
+      background: var(--primary); color: #fff;
+      padding: .9rem 1.5rem; display: flex; align-items: center;
+      justify-content: space-between; position: sticky; top: 0; z-index: 100;
+      box-shadow: 0 2px 8px rgba(79,70,229,.35);
+    }
+    nav h1 { margin: 0; font-size: 1.15rem; font-weight: 700; letter-spacing: -.3px; }
+    #user-badge { font-size: .82rem; opacity: .9; background: rgba(255,255,255,.15);
+                  padding: .2rem .7rem; border-radius: 99px; }
+
+    /* ── Tabs ── */
+    .tabs { display: flex; gap: .25rem; padding: 1rem 1.5rem .25rem;
+            border-bottom: 2px solid var(--border); background: var(--surface); }
+    .tab-btn { padding: .5rem 1.1rem; border: none; background: none; cursor: pointer;
+               font: 500 .9rem 'Inter', sans-serif; color: var(--muted); border-radius: 6px 6px 0 0;
+               transition: all .15s; }
+    .tab-btn.active { color: var(--primary); background: var(--primary-light);
+                      border-bottom: 2px solid var(--primary); margin-bottom: -2px; }
+    .tab-btn:hover:not(.active) { background: var(--bg); }
+
+    /* ── Layout ── */
+    .page { display: none; padding: 1.5rem; max-width: 1100px; margin: 0 auto; }
+    .page.active { display: block; }
+
+    /* ── Cards & forms ── */
+    .card { background: var(--surface); border: 1px solid var(--border);
+            border-radius: var(--radius); padding: 1.25rem; box-shadow: var(--shadow); }
+    .card + .card { margin-top: 1rem; }
+    input, textarea, select {
+      width: 100%; padding: .55rem .8rem; border: 1px solid var(--border);
+      border-radius: 7px; font: .9rem 'Inter', sans-serif; color: var(--text);
+      background: var(--bg); transition: border .15s;
+    }
+    input:focus, textarea:focus, select:focus {
+      outline: none; border-color: var(--primary); background: #fff;
+    }
+    textarea { resize: vertical; min-height: 100px; }
+    .form-row { display: flex; gap: .75rem; align-items: flex-end; flex-wrap: wrap; }
+    .form-row > * { flex: 1 1 160px; }
+    label { display: block; font-size: .8rem; font-weight: 600; color: var(--muted);
+            margin-bottom: .3rem; text-transform: uppercase; letter-spacing: .5px; }
+
+    /* ── Buttons ── */
+    .btn { padding: .5rem 1rem; border: none; border-radius: 7px; cursor: pointer;
+           font: 600 .85rem 'Inter', sans-serif; transition: all .15s; white-space: nowrap; }
+    .btn-primary { background: var(--primary); color: #fff; }
+    .btn-primary:hover { background: var(--primary-dark); }
+    .btn-ghost { background: var(--bg); color: var(--muted); border: 1px solid var(--border); }
+    .btn-ghost:hover { background: var(--border); }
+    .btn-danger { background: var(--danger-light); color: var(--danger); }
+    .btn-danger:hover { background: #fca5a5; }
+    .btn-sm { padding: .3rem .65rem; font-size: .78rem; }
+
+    /* ── Memory list ── */
+    .category-header {
+      font-size: .75rem; font-weight: 700; text-transform: uppercase; letter-spacing: 1px;
+      color: var(--primary); padding: 1.1rem 0 .4rem; border-bottom: 1px solid var(--primary-light);
+      margin-bottom: .5rem;
+    }
+    .memory-item {
+      display: flex; align-items: flex-start; gap: .75rem;
+      background: var(--surface); border: 1px solid var(--border);
+      border-left: 3px solid var(--primary); border-radius: var(--radius);
+      padding: .75rem 1rem; margin-bottom: .5rem;
+      transition: box-shadow .15s;
+    }
+    .memory-item:hover { box-shadow: 0 2px 8px rgba(79,70,229,.1); }
+    .memory-text { flex: 1; font-size: .9rem; line-height: 1.5; }
+    .memory-meta { font-size: .75rem; color: var(--muted); margin-top: .2rem; }
+    .memory-actions { display: flex; gap: .4rem; flex-shrink: 0; }
+    .tag-badge { display: inline-block; background: #f1f5f9; color: #475569; font-size: .7rem; 
+                padding: .1rem .4rem; border-radius: 4px; margin-right: .3rem; margin-top: .4rem; }
+
+    .markdown-body { background: transparent !important; color: var(--text); }
+    .empty { color: var(--muted); font-size: .9rem; padding: 2rem 0; text-align: center; }
+
+    /* ── Toast ── */
+    #toast {
+      position: fixed; bottom: 1.5rem; right: 1.5rem;
+      background: #1f2937; color: #fff; padding: .65rem 1.1rem;
+      border-radius: 8px; font-size: .85rem; box-shadow: 0 4px 12px rgba(0,0,0,.2);
+      opacity: 0; transform: translateY(8px); transition: all .25s; pointer-events: none; z-index: 999;
+    }
+    #toast.show { opacity: 1; transform: translateY(0); }
+
+    /* ── Diary Layout ── */
+    .diary-layout { display: flex; gap: 1.5rem; height: calc(100vh - 180px); min-height: 500px; }
+    .diary-sidebar { width: 220px; flex-shrink: 0; background: var(--surface); border: 1px solid var(--border); 
+                     border-radius: var(--radius); overflow-y: auto; display: flex; flex-direction: column; }
+    .diary-sidebar-header { padding: 1rem; border-bottom: 1px solid var(--border); font-weight: 700; font-size: .85rem; 
+                            text-transform: uppercase; color: var(--muted); display: flex; justify-content: space-between; align-items: center; }
+    .diary-date-item { padding: .75rem 1rem; cursor: pointer; border-bottom: 1px solid var(--bg); transition: all .15s; 
+                       font-size: .9rem; color: var(--text); font-weight: 500; }
+    .diary-date-item:hover { background: var(--bg); color: var(--primary); }
+    .diary-date-item.active { background: var(--primary-light); color: var(--primary); border-right: 3px solid var(--primary); }
+    .diary-main { flex: 1; display: flex; flex-direction: column; gap: 1rem; overflow-y: auto; text-align: left; }
+    .diary-view-card, .diary-editor-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); 
+                                           padding: 1.5rem; box-shadow: var(--shadow); }
+    
+    pre { background: #1f2937; color: #f3f4f6; padding: 1rem; border-radius: 8px; overflow-x: auto; font-size: .85rem; }
+  </style>
+</head>
+<body>
+
+<nav>
+  <h1>🧠 Memory Vault</h1>
+  <span id="user-badge">Loading…</span>
+</nav>
+
+<div class="tabs">
+  <button class="tab-btn active" onclick="switchTab('memories')">📝 Memories</button>
+  <button class="tab-btn" onclick="switchTab('diary')">📖 Diary</button>
+  <button class="tab-btn" onclick="switchTab('insights')">✨ Insights</button>
+  <button class="tab-btn" onclick="switchTab('setup')">🔌 Setup</button>
+</div>
+
+<!-- ═══ MEMORIES PAGE ═══ -->
+<div id="page-memories" class="page active">
+  <div class="card" style="margin-bottom:1.25rem;">
+    <strong style="display:block;margin-bottom:.75rem;font-size:.95rem;">Add a new memory</strong>
+    <div class="form-row">
+      <div>
+        <label for="new-text">Fact / Memory</label>
+        <input id="new-text" placeholder="e.g. I prefer dark mode editors">
+      </div>
+      <div style="flex:0 1 180px;">
+        <label for="new-category">Category</label>
+        <input id="new-category" placeholder="e.g. Preferences" value="General">
+      </div>
+      <div style="flex:0 1 180px;">
+        <label for="new-tags">Tags (comma separated)</label>
+        <input id="new-tags" placeholder="tag1, tag2">
+      </div>
+      <div style="flex:0 1 auto;padding-bottom:1px;">
+        <label>&nbsp;</label>
+        <button class="btn btn-primary" onclick="addMemory()">＋ Add</button>
+      </div>
+    </div>
+  </div>
+  <div id="memories-list"></div>
+</div>
+
+<!-- ═══ DIARY PAGE ═══ -->
+<div id="page-diary" class="page">
+  <div class="diary-layout">
+    <div class="diary-sidebar">
+      <div class="diary-sidebar-header">
+        <span>History</span>
+        <button class="btn btn-primary btn-sm" onclick="showDiaryEditor()">＋ New</button>
+      </div>
+      <div id="diary-dates-list"></div>
+    </div>
+    <div class="diary-main">
+      <div id="diary-editor" class="diary-editor-card" style="display:none;">
+        <textarea id="diary-content" placeholder="Today I…"></textarea>
+        <div style="margin-top:.75rem; display: flex; justify-content: space-between;">
+          <button class="btn btn-ghost" onclick="cancelDiaryEdit()">Cancel</button>
+          <button class="btn btn-primary" onclick="saveDiary()">💾 Save Entry</button>
+        </div>
+      </div>
+      <div id="diary-viewer" class="diary-view-card">
+        <div id="diary-view-content" class="empty">Select an entry from the sidebar.</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ INSIGHTS PAGE ═══ -->
+<div id="page-insights" class="page">
+  <div class="card">
+    <h2 style="margin-top:0;">✨ Knowledge Patterns</h2>
+    <div id="insights-list"></div>
+  </div>
+</div>
+
+<!-- ═══ SETUP PAGE (Landing as Tab) ═══ -->
+<div id="page-setup" class="page">
+  <div class="card">
+    <h2 style="margin-top:0;">🔌 MCP Setup</h2>
+    <p>Connect your AI assistant to this Vault.</p>
+    <label>Claude Desktop Command:</label>
+    <pre><code>claude mcp add --transport http memory-vault {{BASE_URL}}/mcp --header "Authorization: Basic {{AUTH_BASE64}}"</code></pre>
+    <div style="margin-top:1.5rem; background: var(--bg); padding: 1rem; border-radius: 8px; border: 1px dashed var(--primary);">
+        <p style="margin:0;"><strong>User:</strong> <code>{{AUTH_USER}}</code></p>
+        <p style="margin:.5rem 0 0 0;"><strong>Pass:</strong> <code>{{AUTH_PASS}}</code></p>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+  const apiBase = "{{BASE_URL}}/api";
+  const api = {
+    get:    (url)       => fetch(`${apiBase}/${url}`).then(r => r.ok ? r.json() : Promise.reject(r)),
+    post:   (url, body) => fetch(`${apiBase}/${url}`, {method:'POST',  headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}).then(r => r.ok ? r.json() : Promise.reject(r)),
+    put:    (url, body) => fetch(`${apiBase}/${url}`, {method:'PUT',   headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}).then(r => r.ok ? r.json() : Promise.reject(r)),
+    delete: (url)       => fetch(`${apiBase}/${url}`, {method:'DELETE'}).then(r => r.ok ? r.json() : Promise.reject(r)),
+  };
+
+  let memories = [], diaryEntries = [], activeDiaryDate = null;
+
+  function toast(msg, ms=2500) {
+    const el = document.getElementById('toast');
+    el.textContent = msg; el.classList.add('show');
+    setTimeout(() => el.classList.remove('show'), ms);
+  }
+
+  function switchTab(tab) {
+    document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.getElementById('page-' + tab).classList.add('active');
+    document.querySelectorAll('.tab-btn').forEach(b => {
+      if (b.textContent.toLowerCase().includes(tab.slice(0,3))) b.classList.add('active');
+    });
+    if (tab === 'diary') loadDiary();
+    if (tab === 'insights') loadInsights();
+  }
+
+  async function loadMemories() {
+    try { memories = await api.get('memories'); renderMemories(); }
+    catch(e) { document.getElementById('memories-list').innerHTML = '<p class="empty">⚠️ Could not load memories.</p>'; }
+  }
+
+  function renderMemories() {
+    const el = document.getElementById('memories-list');
+    if (!memories.length) { el.innerHTML = '<p class="empty">No memories yet.</p>'; return; }
+    const groups = {};
+    memories.forEach(m => { (groups[m.category] = groups[m.category] || []).push(m); });
+    el.innerHTML = Object.keys(groups).sort().map(cat => `
+      <div class="category-header">${cat}</div>
+      ${groups[cat].map(m => renderMemoryItem(m)).join('')}
+    `).join('');
+  }
+
+  function renderMemoryItem(m) {
+    const tags = (m.metadata && m.metadata.tags) || [];
+    return `
+    <div class="memory-item" id="mem-${m.id}">
+      <div class="memory-text">
+        <div id="mem-text-${m.id}">${escHtml(m.text)}</div>
+        <div>${tags.map(t => `<span class="tag-badge">#${t}</span>`).join('')}</div>
+        <div class="edit-form" id="edit-form-${m.id}" style="display:none;">
+          <input id="edit-text-${m.id}" value="${escHtml(m.text)}">
+          <input id="edit-cat-${m.id}" value="${escHtml(m.category)}" style="flex:0 1 120px;">
+          <input id="edit-tags-${m.id}" value="${escHtml(tags.join(', '))}" placeholder="tags…">
+          <button class="btn btn-primary btn-sm" onclick="saveEdit('${m.id}')">Save</button>
+          <button class="btn btn-ghost btn-sm" onclick="cancelEdit('${m.id}')">Cancel</button>
+        </div>
+      </div>
+      <div class="memory-actions">
+        <button class="btn btn-ghost btn-sm" id="edit-btn-${m.id}" onclick="startEdit('${m.id}')">✏️</button>
+        <button class="btn btn-danger btn-sm" onclick="deleteMemory('${m.id}')">🗑️</button>
+      </div>
+    </div>`;
+  }
+
+  function startEdit(id) { document.getElementById('edit-form-' + id).style.display = 'flex'; document.getElementById('edit-btn-' + id).style.display = 'none'; }
+  function cancelEdit(id) { document.getElementById('edit-form-' + id).style.display = 'none'; document.getElementById('edit-btn-' + id).style.display = ''; }
+
+  async function saveEdit(id) {
+    const text = document.getElementById('edit-text-' + id).value.trim();
+    const cat  = document.getElementById('edit-cat-' + id).value.trim() || 'General';
+    const tags = document.getElementById('edit-tags-' + id).value.trim();
+    if (!text) return;
+    try {
+      const updated = await api.put('memories/' + id, {text, category: cat, tags});
+      const m = memories.find(x => x.id === id);
+      if (m) { m.text = updated.text; m.category = updated.category; m.metadata = updated.metadata; }
+      renderMemories(); toast('✅ Updated');
+    } catch(e) { toast('❌ Failed'); }
+  }
+
+  async function addMemory() {
+    const text = document.getElementById('new-text').value.trim();
+    const cat  = document.getElementById('new-category').value.trim() || 'General';
+    const tags = document.getElementById('new-tags').value.trim();
+    if (!text) return;
+    try {
+      const m = await api.post('memories', {text, category: cat, tags});
+      memories.push(m); renderMemories();
+      document.getElementById('new-text').value = ''; document.getElementById('new-tags').value = '';
+      toast('✅ Saved');
+    } catch(e) { toast('❌ Error'); }
+  }
+
+  async function deleteMemory(id) {
+    if (!confirm('Delete?')) return;
+    try { await api.delete('memories/' + id); memories = memories.filter(m => m.id !== id); renderMemories(); toast('🗑️ Deleted'); }
+    catch(e) { toast('❌ Error'); }
+  }
+
+  async function loadDiary() {
+    try { diaryEntries = await api.get('diary'); renderDiarySidebar(); if (diaryEntries.length && !activeDiaryDate) selectDiaryEntry(diaryEntries[0].date); }
+    catch(e) { document.getElementById('diary-dates-list').innerHTML = '<p class="empty">⚠️ Error</p>'; }
+  }
+
+  function renderDiarySidebar() {
+    const el = document.getElementById('diary-dates-list');
+    if (!diaryEntries.length) { el.innerHTML = '<p class="empty">No entries.</p>'; return; }
+    el.innerHTML = [...diaryEntries].sort((a,b) => b.date.localeCompare(a.date)).map(d => `
+      <div class="diary-date-item ${d.date === activeDiaryDate ? 'active' : ''}" onclick="selectDiaryEntry('${d.date}')">📅 ${d.date}</div>`).join('');
+  }
+
+  function selectDiaryEntry(date) {
+    activeDiaryDate = date; const entry = diaryEntries.find(d => d.date === date); renderDiarySidebar();
+    document.getElementById('diary-editor').style.display = 'none'; document.getElementById('diary-viewer').style.display = 'block';
+    const viewEl = document.getElementById('diary-view-content');
+    if (entry) {
+      viewEl.innerHTML = `<span class="diary-date-badge">📅 ${entry.date}</span><div class="markdown-body">${marked.parse(entry.content || '')}</div>
+                          <div style="margin-top:2rem;text-align:right;"><button class="btn btn-ghost btn-sm" onclick="editCurrentEntry()">✏️ Edit</button></div>`;
+    }
+  }
+
+  function showDiaryEditor() { activeDiaryDate = null; renderDiarySidebar(); document.getElementById('diary-viewer').style.display = 'none'; document.getElementById('diary-editor').style.display = 'block'; document.getElementById('diary-content').value = ''; }
+  function cancelDiaryEdit() { if (diaryEntries.length) selectDiaryEntry(diaryEntries[0].date); else document.getElementById('diary-editor').style.display = 'none'; }
+  function editCurrentEntry() {
+    const entry = diaryEntries.find(d => d.date === activeDiaryDate); if (!entry) return;
+    document.getElementById('diary-viewer').style.display = 'none'; document.getElementById('diary-editor').style.display = 'block'; document.getElementById('diary-content').value = entry.content;
+  }
+
+  async function saveDiary() {
+    const content = document.getElementById('diary-content').value.trim(); if (!content) return;
+    try { await api.post('diary', {content}); toast('📖 Saved'); await loadDiary(); } catch(e) { toast('❌ Error'); }
+  }
+
+  async function loadInsights() {
+    const el = document.getElementById('insights-list'); el.innerHTML = '<p class="empty">Analyzing…</p>';
+    try {
+      const patterns = await api.get('insights');
+      if (!patterns.length) { el.innerHTML = '<p class="empty">No patterns yet.</p>'; return; }
+      el.innerHTML = patterns.map(p => `
+        <div class="memory-item" style="border-left-color: var(--success);"><div class="memory-text"><strong>${p.pattern}</strong><div class="memory-meta">${p.strength} associations.</div></div></div>
+      `).join('');
+    } catch(e) { el.innerHTML = '<p class="empty">⚠️ Error</p>'; }
+  }
+
+  function escHtml(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+  (async () => {
+    try { const info = await api.get('whoami'); document.getElementById('user-badge').textContent = '👤 ' + info.user; } catch(_) {}
+    loadMemories();
+  })();
+</script>
+</body>
+</html>
