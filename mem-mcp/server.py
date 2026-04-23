@@ -17,8 +17,16 @@ from mcp_tools import mcp
 from gui import web_app
 from fastapi.middleware.cors import CORSMiddleware
 
+from starlette.middleware import Middleware as StarletteMiddleware
+mcp_cors = StarletteMiddleware(
+    CORSMiddleware, 
+    allow_origins=["*"], 
+    allow_methods=["*"], 
+    allow_headers=["*"],
+    allow_credentials=True
+)
 # Enable CORS for the unified server
-web_app.add_middleware(
+web_app.add_middleware(mcp_cors,
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
@@ -29,18 +37,12 @@ web_app.add_middleware(
 # ---------------------------------------------------------------------------
 # Merge MCP into the Web GUI app
 # ---------------------------------------------------------------------------
-# We use transport="sse" and path="/" because we are mounting it under /mcp.
-# This makes the SSE endpoint exactly http://host:port/mcp/
-from starlette.middleware import Middleware as StarletteMiddleware
-mcp_cors = StarletteMiddleware(
-    CORSMiddleware, 
-    allow_origins=["*"], 
-    allow_methods=["*"], 
-    allow_headers=["*"],
-    allow_credentials=True
-)
-mcp_app = mcp.http_app(transport="sse", path="/", middleware=[mcp_cors])
-web_app.mount("/mcp", mcp_app)
+# We use transport="http" (streamable-http) and path="/" because we are mounting it under /mcp.
+# This makes the endpoint exactly http://host:port/mcp/
+mcp_app = mcp.http_app(transport="http", path="/", middleware=[mcp_cors])
+# We mount at / so that the proxy's /mcp/ hits the MCP server directly.
+# GUI and API routes will take precedence because they were defined first.
+web_app.mount("/", mcp_app)
 
 # Ensure MCP lifespan is handled by the parent app
 from contextlib import asynccontextmanager
@@ -52,6 +54,8 @@ async def lifespan(app):
 
 web_app.router.lifespan_context = lifespan
 
+
+from fastapi.responses import RedirectResponse
 
 if __name__ == "__main__":
     print(f"--- Memory Vault Unified Server starting ---")

@@ -184,7 +184,19 @@ def _get_auth_context(request: Request):
             if ":" in decoded:
                 auth_user, auth_pass = decoded.split(":", 1)
         except Exception: pass
-    return {"AUTH_USER": auth_user, "AUTH_PASS": auth_pass, "AUTH_BASE64": auth_b64}
+    
+    # Intelligently calculate MCP_URL
+    # If BASE_URL already ends in /mcp, don't append it again
+    mcp_url = f"{mem.BASE_URL}/mcp"
+    if mem.BASE_URL.endswith("/mcp"):
+        mcp_url = mem.BASE_URL
+        
+    return {
+        "AUTH_USER": auth_user, 
+        "AUTH_PASS": auth_pass, 
+        "AUTH_BASE64": auth_b64,
+        "MCP_URL": mcp_url
+    }
 
 
 @web_app.get("/", response_class=HTMLResponse)
