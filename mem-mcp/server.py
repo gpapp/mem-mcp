@@ -33,7 +33,8 @@ if __name__ == "__main__":
     mcp_thread = threading.Thread(target=run_mcp, daemon=True)
     mcp_thread.start()
 
-    print("--- MCP server starting on http://0.0.0.0:8000 ---")
-    print("--- Web GUI starting on http://0.0.0.0:8080/gui ---")
+    print(f"--- MCP server starting on http://0.0.0.0:8000 ---")
+    print(f"--- Web GUI starting on http://0.0.0.0:8080/gui ---")
+    print(f"--- BASE_URL configured as: {mem.BASE_URL or 'None (using relative)'} ---")
 
     uvicorn.run(web_app, host="0.0.0.0", port=8080)

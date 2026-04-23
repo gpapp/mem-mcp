@@ -80,6 +80,7 @@ services:
       - MEM_NEO4J_URL=bolt://neo4j:7687
       - MEM_NEO4J_USER=neo4j
       - MEM_NEO4J_PASSWORD=${NEO_PASS}
+      - BASE_URL=${BASE_URL}
 
     volumes:
       - MEM_model_cache:/root/.cache/fastembed
