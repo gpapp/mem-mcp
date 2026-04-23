@@ -70,6 +70,14 @@ def _user(request: Request) -> str:
 # REST API
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# REST API (All routes under /api)
+# ---------------------------------------------------------------------------
+
+@web_app.get("/api/ping")
+async def api_ping():
+    return {"status": "ok", "version": "1.2", "base_url": mem.BASE_URL}
+
 @web_app.get("/api/memories", response_class=JSONResponse)
 async def api_list_memories(request: Request):
     try:
@@ -315,13 +323,8 @@ _GUI_HTML = """<!DOCTYPE html>
 <div id="toast"></div>
 
 <script>
-  // ── Relative API helpers ──────────────────────────────────────────────────
-  // Robustly find the API root by replacing the '/gui' part of the current path with '/api'
-  const currentPath = window.location.pathname;
-  const guiIndex = currentPath.lastIndexOf('/gui');
-  const apiBase = (guiIndex !== -1) 
-    ? currentPath.substring(0, guiIndex) + '/api'
-    : './api';
+  // ── API helpers ──────────────────────────────────────────────────────────
+  const apiBase = "{{BASE_URL}}/api";
 
   const api = {
     get:    (url)       => fetch(`${apiBase}/${url}`).then(r => r.ok ? r.json() : Promise.reject(r)),
@@ -495,5 +498,8 @@ async def api_whoami(request: Request):
 
 
 @web_app.get("/gui", response_class=HTMLResponse)
+@web_app.get("/mcp/gui", response_class=HTMLResponse)
 async def get_gui():
-    return HTMLResponse(content=_GUI_HTML)
+    # Inject BASE_URL into the HTML
+    html = _GUI_HTML.replace("{{BASE_URL}}", mem.BASE_URL)
+    return HTMLResponse(content=html)

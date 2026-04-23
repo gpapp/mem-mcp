@@ -44,6 +44,7 @@ NEO4J_PASS     = os.getenv("MEM_NEO4J_PASSWORD",  "password")
 OLLAMA_URL     = os.getenv("MEM_LLM_URL",         os.getenv("MEM_EMBEDDER_URL", "http://ollama:11434"))
 EMBED_MODEL    = os.getenv("MEM_EMBEDDER_MODEL",  "nomic-embed-text")
 HTTP_TIMEOUT   = float(os.getenv("HTTPX_TIMEOUT", "600.0"))
+BASE_URL       = os.getenv("BASE_URL",            "").rstrip("/")
 
 COLLECTION_NAME  = "ea_memories"
 DIARY_COLLECTION = "ea_diary"
