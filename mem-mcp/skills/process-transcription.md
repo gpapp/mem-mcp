@@ -19,11 +19,15 @@ Use this skill when you have:
 - Create backup or working copies if needed
 - Set up output directory structure for organized results
 
-### 2. Metadata Extraction
+### 2. Metadata Extraction and Transcription Correction
 - Extract date/time from filename
 - Identify meeting title/topic from content headers
 - Determine meeting context (internal team, client discussion, etc.)
 - Note duration if available in content
+- **Transcription Correction Step**: Use `search_facts` with the query "correction" or specific terms from the transcription that look like potential mispronunciations.
+    - Look for facts in the **'Corrections'** category.
+    - Apply these corrections to the transcription text (e.g., fixing recurring misspellings of names, technical terms, or company names).
+    - If a correction is found in memory, prioritize it over the transcription text.
 
 ### 3. Participant and Role Identification
 - Scan for speaker labels (e.g., "[00:00:00] SPEAKER:", "[Speaker Name]")
