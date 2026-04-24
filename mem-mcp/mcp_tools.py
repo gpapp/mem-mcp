@@ -1,9 +1,9 @@
 """
 mcp_tools.py – FastMCP tool definitions for the Memory Vault.
 """
-from fastmcp import FastMCP
+from fastmcp import FastMCP, Context
 from fastmcp.server.dependencies import get_http_headers
-from typing import Optional, List
+from typing import Optional, List, Any
 import memory as mem
 
 # Using a safe name and explicitly disabling any potential conflicting features
@@ -71,6 +71,70 @@ async def memory_find_duplicates(category: str = "People", limit: int = 50, thre
     Returns grouped clusters of similar items for manual deduplication.
     """
     return await mem.db_find_duplicates(_current_user(), category, limit, threshold)
+
+@mcp.tool()
+async def memory_merge_facts(masterId: str, duplicateIds: List[str]):
+    """
+    Merge multiple duplicate facts into a single master fact on the server.
+    This moves all relationships and combines metadata (tags, aliases, etc.).
+    """
+    await mem.db_merge_memories(masterId, duplicateIds, _current_user())
+    return f"Successfully merged {len(duplicateIds)} facts into {masterId}"
+
+@mcp.tool()
+async def transcription_cleanup(text: str, participants: Optional[List[str]] = None, ctx: Context = None):
+    """
+    Clean up a raw transcription, identify speakers, and remove filler words on the server.
+    Uses local LLM for short contexts and can use sampling for longer ones.
+    """
+    prompt = f"""
+    Please clean up this raw transcription. 
+    Participants: {participants if participants else 'Unknown (identify from context)'}
+    
+    TRANSCRIPTION:
+    {text}
+    
+    OUTPUT FORMAT:
+    Return only the cleaned transcript with [Speaker Name]: labels.
+    """
+    system = "You are a professional transcriptionist. Fix speaker turns, remove filler words (um, uh, like), and correct obvious transcription errors."
+
+    # Use sampling if context is available and text is long (> 2000 chars)
+    if ctx and len(text) > 2000:
+        try:
+            # We sample from the calling LLM for high-quality / long context
+            resp = await ctx.create_message(
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": prompt}
+                ]
+            )
+            return resp.content[0].text if resp.content else "Error: Empty response from sampling."
+        except Exception as e:
+            # Fallback to local if sampling fails
+            pass
+
+    # Default to local Ollama
+    return await mem.get_llm_completion(prompt, system)
+
+@mcp.tool()
+async def memory_suggest_merge(cluster_json: str, ctx: Context = None):
+    """
+    Analyze a cluster of potential duplicates and suggest a Master record and merge strategy.
+    Uses LLM reasoning to evaluate which record is most complete.
+    """
+    prompt = f"""
+    Analyze these potential duplicate memories and suggest which one should be the 'Master' record.
+    Explain why and what information from other records should be merged into it.
+    
+    CLUSTER DATA:
+    {cluster_json}
+    """
+    system = "You are a data deduplication expert. Identify the most complete and accurate record in a cluster."
+
+    # Use local Ollama for this evaluation
+    return await mem.get_llm_completion(prompt, system)
+
 
 # ---------------------------------------------------------------------------
 # Skills & Resources

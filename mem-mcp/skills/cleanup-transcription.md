@@ -31,9 +31,9 @@ Use this skill when you have:
 - **Accuracy**: Maintain consistent speaker labeling throughout the transcript.
 
 ### 4. Transcription Cleanup
-- **Fix Speech Issues**: Remove filler words (um, uh, like), stutters, and false starts.
-- **Apply Corrections**: Replace mispronounced or mistranscribed words with the correct versions found in memory.
-- **Improve Readability**: Ensure proper punctuation and sentence structure while preserving the original meaning.
+- **Tool**: Use `transcription_cleanup` with the transcription text and the identified participants list.
+- This tool handles the removal of filler words and speaker identification on the server.
+- **Final Review**: Review the cleaned output and ensure any "Stored Corrections" from memory were applied correctly.
 
 ### 5. Final Output Structure
 Produce the final output in two parts:

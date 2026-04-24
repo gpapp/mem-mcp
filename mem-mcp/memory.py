@@ -137,6 +137,23 @@ async def get_embedding(text: str) -> List[float]:
         return resp.json()["embedding"]
 
 
+async def get_llm_completion(prompt: str, system: Optional[str] = None) -> str:
+    """Run a local LLM completion using Ollama."""
+    model = os.getenv("MEM_LLM_MODEL", "llama3")
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "stream": False
+        }
+        if system:
+            payload["system"] = system
+            
+        resp = await client.post(f"{OLLAMA_URL}/api/generate", json=payload)
+        resp.raise_for_status()
+        return resp.json()["response"]
+
+
 # ---------------------------------------------------------------------------
 # User extraction
 #   Supports:
@@ -637,6 +654,48 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
     final_clusters.sort(key=lambda x: x["avg_similarity"], reverse=True)
     
     return final_clusters
+
+
+async def db_merge_memories(master_id: str, duplicate_ids: List[str], user_id: str):
+    """
+    Merge multiple duplicate facts into a single master fact.
+    Moves all relationships to the master and deletes duplicates.
+    Uses APOC for efficient graph refactoring.
+    """
+    qdrant = await get_qdrant()
+    neo4j_driver = get_neo4j()
+    if not qdrant or not neo4j_driver:
+        raise RuntimeError("Database connections not established.")
+
+    with neo4j_driver.session() as s:
+        # Merge nodes in Neo4j
+        # We use apoc.refactor.mergeNodes to combine properties and relationships
+        s.run(
+            """
+            MATCH (master:Fact {id: $masterId, userId: $userId})
+            MATCH (dup:Fact) WHERE dup.id IN $duplicateIds AND dup.userId = $userId
+            WITH master, collect(dup) as dups
+            CALL apoc.refactor.mergeNodes([master] + dups, {
+                properties: {
+                    id: 'discard',
+                    text: 'discard',
+                    userId: 'discard',
+                    timestamp: 'discard',
+                    category: 'discard',
+                    `*`: 'combine'
+                },
+                mergeRels: true
+            }) YIELD node
+            RETURN count(*)
+            """,
+            masterId=master_id, duplicateIds=duplicate_ids, userId=user_id
+        )
+
+    # Delete duplicates from Qdrant
+    await qdrant.delete(
+        collection_name=COLLECTION_NAME,
+        points_selector=duplicate_ids,
+    )
 
 
 # ---------------------------------------------------------------------------

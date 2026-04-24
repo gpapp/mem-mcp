@@ -52,11 +52,10 @@ Please help me deduplicate entries in the '{category}' category.
 
 FOLLOW THIS WORKFLOW:
 1. Run 'memory_find_duplicates' with category='{category}'.
-2. For each cluster found, analyze the members.
-3. Propose a 'Master' record and identify what information to merge from others.
-4. IMPORTANT: Consolidate all unique data and links to the Master record BEFORE deleting duplicates.
-5. PERFORMANCE: Feel free to call multiple tools (update, link, delete) in a single response once the plan is confirmed.
-6. Execute the updates and deletions only after I confirm.
+2. For each cluster found, use 'memory_suggest_merge' to analyze the members and identify the 'Master' record.
+3. Review the suggestion and use the 'memory_merge_facts' tool to perform the consolidation on the server.
+4. PERFORMANCE: Using these specialized tools is much more efficient than manual logic.
+5. Execute the merge only after I confirm.
 
 Be careful not to lose important context or relationships.
 """
