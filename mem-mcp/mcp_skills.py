@@ -60,3 +60,28 @@ FOLLOW THIS WORKFLOW:
 
 Be careful not to lose important context or relationships.
 """
+    @mcp.resource("skill://cleanup-transcription")
+    def resource_skill_cleanup() -> str:
+        """The workflow for cleaning up transcriptions, identifying speakers, and summarizing."""
+        import os
+        path = os.path.join(os.path.dirname(__file__), "skills", "cleanup-transcription.md")
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+
+    @mcp.prompt("cleanup-transcription")
+    def prompt_cleanup_transcription(transcription_text: str, participants: Optional[str] = None) -> str:
+        """Instructions for cleaning up a transcription and identifying speakers."""
+        participant_info = f"PARTICIPANTS LIST: {participants}" if participants else "PARTICIPANTS LIST: Not provided. Please ask the user if you cannot identify them from memory."
+        return f"""
+Please clean up the following meeting transcription according to the 'cleanup-transcription' skill guidelines.
+
+CORE TASKS:
+1. Search Memory: Use 'search_facts' to find relevant projects, participants, and corrections.
+2. Participant Verification: {participant_info}
+3. Speaker Identification: Map generic speaker labels to actual names. Use direct addressing or deductive guessing.
+4. Transcription Cleanup: Remove filler words and fix errors using stored corrections.
+5. Produce Output: Provide a Cleaned Transcript followed by a Summary of Main Points.
+
+TRANSCRIPTION CONTENT:
+{transcription_text}
+"""

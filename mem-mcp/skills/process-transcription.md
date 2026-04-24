@@ -21,9 +21,8 @@ Use this skill when you have:
 
 ### 2. Metadata Extraction and Transcription Correction
 - Extract date/time from filename
-- Identify meeting title/topic from content headers
+- Identify meeting title/topic from content headers and provided information
 - Determine meeting context (internal team, client discussion, etc.)
-- Note duration if available in content
 - **Transcription Correction Step**: Use `search_facts` with the query "correction" or specific terms from the transcription that look like potential mispronunciations.
     - Look for facts in the **'Corrections'** category.
     - Apply these corrections to the transcription text (e.g., fixing recurring misspellings of names, technical terms, or company names).
@@ -36,6 +35,7 @@ Use this skill when you have:
 - Note affiliations/teams when mentioned (SAP, Deutsche Bank, specific departments)
 
 ### 4. Content Analysis and Entity Extraction
+Every transcription is linked to a client and a project. Make sure to link them to the appropriate facts.
 Process the transcription to identify:
 
 **People:**
@@ -43,6 +43,7 @@ Process the transcription to identify:
 - Roles and responsibilities
 - Contact/context information
 - Relationships to projects/topics
+- Always link them to clients and projects
 
 **Projects/Initiatives:**
 - Project names and descriptions
