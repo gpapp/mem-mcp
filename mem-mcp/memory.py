@@ -18,6 +18,7 @@ import socket
 import logging
 import base64
 import httpx
+import numpy as np
 from typing import List, Optional
 from datetime import datetime
 
@@ -453,6 +454,152 @@ def db_list_categories(user_id: str) -> list:
             userId=user_id,
         )
         return [r["category"] for r in result]
+
+
+async def db_find_duplicates(user_id: str, category: str = "People", limit: int = 50, threshold: float = 0.75):
+    """
+    Find potential duplicates in a category using embedding similarity and clustering.
+    """
+    qdrant = await get_qdrant()
+    neo4j_driver = get_neo4j()
+    if not qdrant or not neo4j_driver:
+        raise RuntimeError("Database connections not established.")
+
+    # 1. Fetch items from Neo4j
+    with neo4j_driver.session() as s:
+        result = s.run(
+            """
+            MATCH (f:Fact {userId: $userId, category: $category})
+            RETURN f
+            LIMIT $limit
+            """,
+            userId=user_id, category=category.strip().capitalize(), limit=limit
+        )
+        items = []
+        for r in result:
+            f_node = r["f"]
+            # Extract metadata (all properties except core ones)
+            core_keys = {"id", "text", "category", "timestamp", "userId"}
+            metadata = {k: v for k, v in f_node.items() if k not in core_keys}
+            
+            items.append({
+                "id": f_node["id"],
+                "text": f_node["text"],
+                "category": f_node.get("category"),
+                "metadata": metadata
+            })
+
+    if not items:
+        return []
+
+    # 2. Get vectors from Qdrant
+    ids = [item["id"] for item in items]
+    points = await qdrant.retrieve(
+        collection_name=COLLECTION_NAME,
+        ids=ids,
+        with_vectors=True
+    )
+    
+    # Map id to vector
+    vectors = {p.id: p.vector for p in points if p.vector}
+    
+    # Filter items that have vectors
+    items_with_vectors = [item for item in items if item["id"] in vectors]
+    if not items_with_vectors:
+        return []
+
+    # 3. Compute similarity and find pairs
+    candidate_pairs = []
+    num_items = len(items_with_vectors)
+    for i in range(num_items):
+        for j in range(i + 1, num_items):
+            id_i = items_with_vectors[i]["id"]
+            id_j = items_with_vectors[j]["id"]
+            vec_i = np.array(vectors[id_i])
+            vec_j = np.array(vectors[id_j])
+            
+            # Cosine similarity
+            norm_i = np.linalg.norm(vec_i)
+            norm_j = np.linalg.norm(vec_j)
+            if norm_i == 0 or norm_j == 0:
+                continue
+                
+            similarity = np.dot(vec_i, vec_j) / (norm_i * norm_j)
+            
+            if similarity >= threshold:
+                candidate_pairs.append((i, j, float(similarity)))
+
+    # 4. Cluster using Union-Find
+    parent = list(range(num_items))
+    def find(i):
+        if parent[i] == i:
+            return i
+        parent[i] = find(parent[i])
+        return parent[i]
+
+    def union(i, j):
+        root_i = find(i)
+        root_j = find(j)
+        if root_i != root_j:
+            parent[root_i] = root_j
+
+    for i, j, score in candidate_pairs:
+        union(i, j)
+
+    # Group into clusters
+    clusters_map = {}
+    for i in range(num_items):
+        root = find(i)
+        if root not in clusters_map:
+            clusters_map[root] = []
+        clusters_map[root].append(i)
+
+    # Format results
+    final_clusters = []
+    cluster_id_counter = 1
+    for root, member_indices in clusters_map.items():
+        if len(member_indices) < 2:
+            continue
+        
+        members = []
+        cluster_scores = []
+        for idx in member_indices:
+            item = items_with_vectors[idx]
+            # Find similarity with other members in the cluster
+            # We use the average similarity of this item to other members
+            item_scores = []
+            for i, j, score in candidate_pairs:
+                if (i == idx and j in member_indices) or (j == idx and i in member_indices):
+                    item_scores.append(score)
+            
+            avg_item_sim = sum(item_scores) / len(item_scores) if item_scores else 1.0
+            cluster_scores.extend(item_scores)
+            
+            # Merge metadata into top level for easier reading, like the user example
+            member_info = {
+                "id": item["id"],
+                "text": item["text"],
+                "similarity": round(avg_item_sim, 4)
+            }
+            member_info.update(item["metadata"])
+            members.append(member_info)
+        
+        avg_similarity = sum(cluster_scores) / len(cluster_scores) if cluster_scores else 0.0
+        
+        recommendation = "MERGE - high overlap" if avg_similarity > 0.9 else "MERGE - verify and combine"
+        
+        final_clusters.append({
+            "cluster_id": cluster_id_counter,
+            "members": members,
+            "avg_similarity": round(avg_similarity, 4),
+            "recommendation": recommendation
+        })
+        cluster_id_counter += 1
+
+    # Sort clusters by avg_similarity DESC
+    final_clusters.sort(key=lambda x: x["avg_similarity"], reverse=True)
+    
+    return final_clusters
 
 
 # ---------------------------------------------------------------------------

@@ -31,3 +31,26 @@ CORE TASKS:
 TRANSCRIPTION CONTENT:
 {transcription_text}
 """
+
+    @mcp.resource("skill://memory-deduplication")
+    def resource_skill_deduplication() -> str:
+        """The workflow for identifying and merging duplicate entities in memory."""
+        import os
+        path = os.path.join(os.path.dirname(__file__), "skills", "memory-deduplication.md")
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+
+    @mcp.prompt("memory-deduplication")
+    def prompt_memory_deduplication(category: str = "People") -> str:
+        """Instructions for performing deduplication on a specific category."""
+        return f"""
+Please help me deduplicate entries in the '{category}' category.
+
+FOLLOW THIS WORKFLOW:
+1. Run 'memory_find_duplicates' with category='{category}'.
+2. For each cluster found, analyze the members.
+3. Propose a 'Master' record and identify what information to merge from others.
+4. Execute the updates and deletions only after I confirm.
+
+Be careful not to lose important context or relationships.
+"""

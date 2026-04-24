@@ -63,6 +63,14 @@ async def diary_save_entry(content: str, date: Optional[str] = None):
 async def diary_search_entries(query: str, limit: int = 3):
     """Search diary entries."""
     return await mem.db_search_diary(query, _current_user(), limit)
+    
+@mcp.tool()
+async def memory_find_duplicates(category: str = "People", limit: int = 50, threshold: float = 0.75, group_by: Optional[str] = "first_name"):
+    """
+    Find potential duplicate entries in memory by comparing embeddings similarity ranking.
+    Returns grouped clusters of similar items for manual deduplication.
+    """
+    return await mem.db_find_duplicates(_current_user(), category, limit, threshold)
 
 # ---------------------------------------------------------------------------
 # Skills & Resources
