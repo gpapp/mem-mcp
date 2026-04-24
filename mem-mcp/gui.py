@@ -39,7 +39,9 @@ web_app = FastAPI(title="Memory Vault GUI")
 
 @web_app.middleware("http")
 async def log_gui_requests(request: Request, call_next):
-    print(f"[GUI] {request.method} {request.url.path}")
+    # Only log if path is not root or ping to avoid keepalive noise
+    if request.url.path not in ["/", "/api/ping"]:
+        print(f"[GUI] {request.method} {request.url.path}")
     return await call_next(request)
 
 # Allow both /path and /path/ for all routes
