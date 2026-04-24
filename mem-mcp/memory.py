@@ -240,11 +240,22 @@ async def db_update_memory(memory_id: str, text: Optional[str], category: Option
     # Qdrant Update
     vector = await get_embedding(new_text) if text is not None else None
     
-    payload = dict(old_fact)
+    # Prepare payload, converting Neo4j types to JSON-serializable ones
+    payload = {}
+    for k, v in dict(old_fact).items():
+        if hasattr(v, "iso_format"):
+            payload[k] = v.iso_format()
+        else:
+            payload[k] = v
+
     if text is not None: payload["text"] = new_text
     if category is not None: payload["category"] = new_cat
     if metadata:
         current_meta = payload.get("metadata", {})
+        if isinstance(current_meta, str): # Safety check if metadata was stored as string
+             import json
+             try: current_meta = json.loads(current_meta)
+             except: current_meta = {}
         current_meta.update(new_meta)
         payload["metadata"] = current_meta
 
@@ -252,7 +263,7 @@ async def db_update_memory(memory_id: str, text: Optional[str], category: Option
         collection_name=COLLECTION_NAME,
         points=[PointStruct(
             id=memory_id,
-            vector=vector or await get_embedding(new_text), # Fallback to existing text embedding if needed
+            vector=vector or await get_embedding(new_text),
             payload=payload,
         )],
     )
@@ -422,7 +433,10 @@ def db_list_memories(user_id: str) -> list:
             f_node = r["f"]
             # Extract metadata (all properties except core ones)
             core_keys = {"id", "text", "category", "timestamp", "userId"}
-            metadata = {k: v for k, v in f_node.items() if k not in core_keys}
+            metadata = {}
+            for k, v in f_node.items():
+                if k not in core_keys:
+                    metadata[k] = v.iso_format() if hasattr(v, "iso_format") else v
             
             # Clean up links (remove null targets)
             links = [l for l in r["links"] if l.get("target_id")]
@@ -480,7 +494,10 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
             f_node = r["f"]
             # Extract metadata (all properties except core ones)
             core_keys = {"id", "text", "category", "timestamp", "userId"}
-            metadata = {k: v for k, v in f_node.items() if k not in core_keys}
+            metadata = {}
+            for k, v in f_node.items():
+                if k not in core_keys:
+                    metadata[k] = v.iso_format() if hasattr(v, "iso_format") else v
             
             items.append({
                 "id": f_node["id"],
