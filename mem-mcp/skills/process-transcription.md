@@ -94,14 +94,29 @@ Use relative links between files, e.g.:
 - Link to project: [[Project Name]]
 - Link to principle: [[Principle Name]]
 
-### 6. Memory Storage
+### 6. Entity Resolution and Deduplication
+**CRITICAL**: Before creating a new fact (especially for **People** and **Projects**), search the memory to see if the entity already exists.
+- Use `search_facts` with the entity name or variations.
+- If a match is found:
+    - Use `update_fact` to merge new information into the existing record.
+    - Do NOT create a duplicate entry.
+- If no match is found, use `create_fact`.
+
+### 7. Handling Ambiguity
+If a name or entity is mentioned that could refer to multiple people or is unclear:
+- **Flag it**: Call it out in your response.
+- **Human-in-the-Loop**: If you have low confidence in resolving an entity, STOP and ask the user for clarification before creating or updating the fact.
+- Example: "I see a mention of 'Rafael', but I have two people named Rafael in memory. Should I link this to [[Rafael Papp]] or [[Rafael Silva]]?"
+
+### 8. Memory Storage
 Store key facts in the memory system using appropriate categories. **Important: Use rich Markdown formatting in the `text` field for better readability in the Dashboard.**
 
 **Metadata & Tags:**
 Always include a `metadata` dictionary with a `tags` list for categorization, e.g., `metadata={"tags": ["meeting", "strategy", "q3-planning"]}`.
 
 **Tool Usage:**
-- Use `create_fact(text, category, metadata)` for storing facts.
+- Use `create_fact(text, category, metadata)` for storing NEW facts.
+- Use `update_fact(factId, text, category, metadata)` for MERGING into existing facts.
 - Use `link_facts(sourceFactId, targetFactId, relationshipType)` for creating relationships.
 
 **Linking Strategy:**
@@ -120,15 +135,15 @@ Immediately after creating related facts, use `link_facts` to connect them. This
 - [ ] Sync with [[Rafael]]
 ```
 
-### 7. Diary Logging
+### 9. Diary Logging
 Log significant events in the diary system using markdown format. Use `diary_save_entry(content, date)`.
 
 The diary should contain WHAT THE USER DID, not what was processed. Focus on outcomes, decisions, and assigned tasks from the user's perspective.
 
-### 8. Cross-Reference Creation
+### 10. Cross-Reference Creation
 Create bidirectional links between related entities using `link_facts`. Ensure every important entity (Person, Project, Technology) is linked to its context.
 
-### 9. Summary Generation
+### 11. Summary Generation
 Create summary documents and store them as a comprehensive memory entry in the `work` or `projects` category. Use a header like `# Meeting Summary: [Topic]` and include links to the specific facts created.
 
 ## Implementation Guidelines
@@ -139,6 +154,9 @@ Create summary documents and store them as a comprehensive memory entry in the `
 - Identify decision points through language like "we decided", "action item", "we will"
 - **Formatting:** When creating a fact about a person, include their role and contact info in a structured Markdown block.
 - **Graph Thinking:** Always ask "What does this fact relate to?" and create the link.
+
+## Efficiency: Multi-Tool Execution
+You are encouraged to call multiple tools in a single response to process the transcription efficiently. You can batch several `create_fact` and `link_facts` calls together, followed by a `diary_save_entry` in one go.
 
 ## Customization
 This skill can be adapted for different transcription formats by adjusting speaker patterns and category structures.

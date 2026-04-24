@@ -36,7 +36,10 @@ If the duplicate records have relationships (links) to other facts:
 - Use `link_facts` to recreate those relationships pointing to the Master ID.
 
 ### 6. Delete Duplicates
-Once the Master record is updated and all links are preserved, use `delete_fact` to remove the redundant records.
+**CRITICAL**: Only use `delete_fact` after you are certain that all unique information from the duplicate has been successfully moved to the Master record.
+
+## Efficiency: Multi-Tool Execution
+You are encouraged to call multiple tools in a single response to perform the merge efficiently. For example, you can call several `update_fact` and `link_facts` followed by `delete_fact` calls in one go.
 
 ## Examples of "Duplicate" Patterns
 - **People**: "Kate" vs "Katarina" (same role/company).
