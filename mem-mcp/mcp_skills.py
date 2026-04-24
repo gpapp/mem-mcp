@@ -8,6 +8,16 @@ import memory as mem
 def register_skills(mcp: FastMCP):
     """Register skills and resources to the given FastMCP instance."""
 
+    @mcp.prompt("find-skills")
+    def prompt_find_skills() -> str:
+        """Instructions for discovering and using available skill workflows."""
+        return """
+You are a multi-skilled assistant. To handle complex tasks, you should:
+1. Use 'find_skills' to see the list of available specialized workflows.
+2. Use 'get_skill_workflow' with the name of a skill to read its full documentation.
+3. Follow the instructions in the skill documentation to complete the user's request.
+"""
+
     @mcp.resource("skill://process-transcription")
     def resource_skill_transcription() -> str:
         """The master workflow for processing meeting transcriptions into the Knowledge Graph."""
@@ -32,9 +42,10 @@ CORE TASKS:
 7. Save key facts and links.
 8. Log the summary in the diary using 'diary_save_entry'.
 9. PERFORMANCE: Batch multiple 'create_fact' and 'link_facts' calls into a single response for maximum efficiency.
-
 TRANSCRIPTION CONTENT:
 {transcription_text}
+
+TIP: Use 'find_skills' to discover other related workflows like 'cleanup-transcription'.
 """
 
     @mcp.resource("skill://memory-deduplication")
@@ -59,6 +70,8 @@ FOLLOW THIS WORKFLOW:
 5. Execute the merge only after I confirm.
 
 Be careful not to lose important context or relationships.
+
+TIP: Use 'find_skills' to see other data management workflows.
 """
     @mcp.resource("skill://cleanup-transcription")
     def resource_skill_cleanup() -> str:
@@ -81,7 +94,8 @@ CORE TASKS:
 3. Speaker Identification: Map generic speaker labels to actual names. Use direct addressing or deductive guessing.
 4. Transcription Cleanup: Remove filler words and fix errors using stored corrections.
 5. Produce Output: Provide a Cleaned Transcript followed by a Summary of Main Points.
-
 TRANSCRIPTION CONTENT:
 {transcription_text}
+
+TIP: Use 'get_skill_workflow' to read the full 'cleanup-transcription' guidelines if needed.
 """
