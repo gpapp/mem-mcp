@@ -698,6 +698,36 @@ async def db_merge_memories(master_id: str, duplicate_ids: List[str], user_id: s
     )
 
 
+async def db_smart_merge_memories(master_id: str, duplicate_ids: List[str], user_id: str):
+    """
+    Advanced merge that uses an LLM to consolidate multiple descriptions into one.
+    """
+    neo4j_driver = get_neo4j()
+    
+    # 1. Fetch current texts
+    with neo4j_driver.session() as s:
+        res = s.run(
+            "MATCH (f:Fact) WHERE f.id IN ([ $masterId ] + $duplicateIds) AND f.userId = $userId RETURN f.text as text",
+            masterId=master_id, duplicateIds=duplicate_ids, userId=user_id
+        )
+        texts = [r["text"] for r in res]
+        
+    if not texts:
+        return
+
+    # 2. Use LLM to consolidate
+    prompt = "Combine the following separate memories about the same entity into one single, cohesive, and detailed markdown-formatted description. Preserve all important facts and links. Avoid repetition.\n\n" + "\n---\n".join(texts)
+    system = "You are a knowledge graph curator. Consolidate overlapping information while preserving all unique details and context."
+    
+    new_text = await get_llm_completion(prompt, system)
+    
+    # 3. Update master with consolidated text (this also updates vector)
+    await db_update_memory(master_id, new_text, None, user_id)
+    
+    # 4. Perform the graph-level merge (relationships and other metadata)
+    await db_merge_memories(master_id, duplicate_ids, user_id)
+
+
 # ---------------------------------------------------------------------------
 # Diary helpers
 # ---------------------------------------------------------------------------

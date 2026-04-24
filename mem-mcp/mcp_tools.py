@@ -73,13 +73,17 @@ async def memory_find_duplicates(category: str = "People", limit: int = 50, thre
     return await mem.db_find_duplicates(_current_user(), category, limit, threshold)
 
 @mcp.tool()
-async def memory_merge_facts(masterId: str, duplicateIds: List[str]):
+async def memory_merge_facts(masterId: str, duplicateIds: List[str], smart: bool = False):
     """
     Merge multiple duplicate facts into a single master fact on the server.
-    This moves all relationships and combines metadata (tags, aliases, etc.).
+    If 'smart' is True, uses an LLM to consolidate the text descriptions into a cohesive whole.
+    This moves all relationships and combines metadata.
     """
-    await mem.db_merge_memories(masterId, duplicateIds, _current_user())
-    return f"Successfully merged {len(duplicateIds)} facts into {masterId}"
+    if smart:
+        await mem.db_smart_merge_memories(masterId, duplicateIds, _current_user())
+    else:
+        await mem.db_merge_memories(masterId, duplicateIds, _current_user())
+    return f"Successfully merged {len(duplicateIds)} facts into {masterId} (Smart Merge: {smart})"
 
 @mcp.tool()
 async def transcription_cleanup(text: str, participants: Optional[List[str]] = None, ctx: Context = None):

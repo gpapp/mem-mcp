@@ -2,6 +2,7 @@
 mcp_skills.py – MCP Skill and Resource definitions.
 """
 from fastmcp import FastMCP
+from typing import Optional
 import memory as mem
 
 def register_skills(mcp: FastMCP):
