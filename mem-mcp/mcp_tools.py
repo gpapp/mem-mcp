@@ -139,6 +139,31 @@ async def memory_suggest_merge(cluster_json: str, ctx: Context = None):
     # Use local Ollama for this evaluation
     return await mem.get_llm_completion(prompt, system)
 
+@mcp.tool()
+async def find_skills():
+    """
+    Scan the skills/ directory and list all available skill workflows.
+    Use this to discover new capabilities without a server restart.
+    """
+    import os
+    skills_dir = os.path.join(os.path.dirname(__file__), "skills")
+    if not os.path.exists(skills_dir):
+        return []
+    return [f[:-3] for f in os.listdir(skills_dir) if f.endswith(".md")]
+
+@mcp.tool()
+async def get_skill_workflow(skillName: str):
+    """
+    Retrieve the detailed markdown workflow for a specific skill.
+    Allows the LLM to understand and execute complex workflows stored as documentation.
+    """
+    import os
+    path = os.path.join(os.path.dirname(__file__), "skills", f"{skillName}.md")
+    if not os.path.exists(path):
+        return f"Skill '{skillName}' not found."
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
 
 # ---------------------------------------------------------------------------
 # Skills & Resources
