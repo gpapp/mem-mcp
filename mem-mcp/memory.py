@@ -378,16 +378,36 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
         query_filter=filt,
         limit=limit,
     )
-    return [
-        {
+    results = []
+    query_lower = query.lower()
+    for r in result.points:
+        score = r.score
+        metadata = r.payload.get("metadata", {})
+        aliases = metadata.get("aliases", {})
+        
+        # Boost score if query matches an alias
+        if aliases and isinstance(aliases, dict):
+            for alias, confidence in aliases.items():
+                if query_lower == alias.lower():
+                    # Exact alias match. Boost based on confidence.
+                    try: score += (float(confidence) * 0.2)
+                    except: pass
+                elif query_lower in alias.lower() or alias.lower() in query_lower:
+                    # Partial match
+                    try: score += (float(confidence) * 0.05)
+                    except: pass
+                    
+        results.append({
             "id":       r.id,
             "text":     r.payload.get("text", ""),
             "category": r.payload.get("category", ""),
-            "metadata": r.payload.get("metadata", {}),
-            "score":    r.score,
-        }
-        for r in result.points
-    ]
+            "metadata": metadata,
+            "score":    score,
+        })
+    
+    # Re-sort by updated score
+    results.sort(key=lambda x: x["score"], reverse=True)
+    return results
 
 
 def db_find_patterns(user_id: str) -> list:
@@ -703,3 +723,73 @@ def db_list_diary(user_id: str) -> list:
             userId=user_id,
         )
         return [{"date": r["date"], "content": r["content"]} for r in result]
+
+
+def db_get_graph(user_id: str) -> dict:
+    """Return the entire knowledge graph for a user (nodes and edges)."""
+    neo4j_driver = get_neo4j()
+    if not neo4j_driver:
+        raise RuntimeError("Neo4j not connected.")
+
+    with neo4j_driver.session() as s:
+        result = s.run(
+            """
+            MATCH (f:Fact {userId: $userId})
+            OPTIONAL MATCH (f)-[r]->(m)
+            WHERE (m:Fact AND m.userId = $userId) OR (m:Category)
+            RETURN f, type(r) as rel_type, m
+            """,
+            userId=user_id
+        )
+        
+        node_map = {}
+        edges = []
+        seen_edges = set()
+        
+        for r in result:
+            f = r["f"]
+            if f["id"] not in node_map:
+                node_map[f["id"]] = {
+                    "id": f["id"],
+                    "label": "Fact",
+                    "title": f["text"],
+                    "group": f.get("category", "General")
+                }
+            
+            m = r["m"]
+            rel = r["rel_type"]
+            if m and rel:
+                # Category nodes have 'name', Facts have 'id'
+                m_label = "Category" if "name" in m and "id" not in m else "Fact"
+                m_id = m.get("name") if m_label == "Category" else m.get("id")
+                
+                if m_id not in node_map:
+                    if m_label == "Category":
+                        node_map[m_id] = {
+                            "id": m_id,
+                            "label": "Category",
+                            "title": m["name"],
+                            "group": "CategoryNode"
+                        }
+                    else:
+                        node_map[m_id] = {
+                            "id": m["id"],
+                            "label": "Fact",
+                            "title": m["text"],
+                            "group": m.get("category", "General")
+                        }
+                
+                edge_sig = (f["id"], m_id, rel)
+                if edge_sig not in seen_edges:
+                    seen_edges.add(edge_sig)
+                    edges.append({
+                        "from": f["id"],
+                        "to": m_id,
+                        "label": rel
+                    })
+                
+        return {
+            "nodes": list(node_map.values()),
+            "edges": edges
+        }
+

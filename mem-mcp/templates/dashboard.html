@@ -7,6 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
   <style>
     :root {
       --primary: #4f46e5; --primary-light: #eef2ff; --primary-dark: #3730a3;
@@ -136,6 +137,7 @@
   <button class="tab-btn active" onclick="switchTab('memories')">📝 Memories</button>
   <button class="tab-btn" onclick="switchTab('diary')">📖 Diary</button>
   <button class="tab-btn" onclick="switchTab('insights')">✨ Insights</button>
+  <button class="tab-btn" onclick="switchTab('graph')">🕸️ Graph</button>
   <button class="tab-btn" onclick="switchTab('setup')">🔌 Setup</button>
 </div>
 
@@ -198,6 +200,14 @@
   </div>
 </div>
 
+<!-- ═══ GRAPH PAGE ═══ -->
+<div id="page-graph" class="page">
+  <div class="card" style="height: calc(100vh - 180px); display: flex; flex-direction: column;">
+    <h2 style="margin-top:0;">🕸️ Knowledge Graph</h2>
+    <div id="graph-container" style="flex: 1; border: 1px solid var(--border); border-radius: 8px; background: #fff;"></div>
+  </div>
+</div>
+
 <!-- ═══ SETUP PAGE (Landing as Tab) ═══ -->
 <div id="page-setup" class="page">
   <div class="card">
@@ -244,6 +254,7 @@
     });
     if (tab === 'diary') loadDiary();
     if (tab === 'insights') loadInsights();
+    if (tab === 'graph') loadGraph();
   }
 
   async function loadMemories() {
@@ -366,6 +377,55 @@
         <div class="memory-item" style="border-left-color: var(--success);"><div class="memory-text"><strong>${p.pattern}</strong><div class="memory-meta">${p.strength} associations.</div></div></div>
       `).join('');
     } catch(e) { el.innerHTML = '<p class="empty">⚠️ Error</p>'; }
+  }
+
+  let network = null;
+  async function loadGraph() {
+    const container = document.getElementById('graph-container');
+    container.innerHTML = '<p class="empty">Loading graph...</p>';
+    try {
+      const data = await api.get('graph');
+      container.innerHTML = '';
+      
+      const nodes = new vis.DataSet(data.nodes.map(n => ({
+        id: n.id,
+        label: n.label === 'Category' ? n.title : truncateText(n.title, 20),
+        title: n.title, // tooltip on hover
+        group: n.group,
+        shape: n.label === 'Category' ? 'box' : 'dot',
+        size: n.label === 'Category' ? 20 : 10,
+        font: { size: 12, face: 'Inter' }
+      })));
+      
+      const edges = new vis.DataSet(data.edges.map(e => ({
+        from: e.from,
+        to: e.to,
+        label: e.label,
+        font: { size: 10, align: 'middle' },
+        arrows: 'to',
+        color: { color: '#e5e7eb', highlight: '#4f46e5' }
+      })));
+      
+      const networkData = { nodes: nodes, edges: edges };
+      const options = {
+        nodes: { borderWidth: 1, shadow: true },
+        edges: { width: 1, smooth: { type: 'continuous' } },
+        physics: {
+          barnesHut: { gravitationalConstant: -2000, centralGravity: 0.3, springLength: 95 },
+          stabilization: { iterations: 150 }
+        },
+        interaction: { hover: true, tooltipDelay: 200 }
+      };
+      
+      network = new vis.Network(container, networkData, options);
+    } catch(e) {
+      container.innerHTML = '<p class="empty">⚠️ Error loading graph.</p>';
+    }
+  }
+
+  function truncateText(text, maxLen) {
+    if (!text) return "";
+    return text.length > maxLen ? text.substring(0, maxLen) + '...' : text;
   }
 
   function escHtml(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }

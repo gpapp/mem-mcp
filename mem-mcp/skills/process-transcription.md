@@ -102,17 +102,28 @@ Use relative links between files, e.g.:
     - Do NOT create a duplicate entry.
 - If no match is found, use `create_fact`.
 
-### 7. Handling Ambiguity
-If a name or entity is mentioned that could refer to multiple people or is unclear:
-- **Flag it**: Call it out in your response.
-- **Human-in-the-Loop**: If you have low confidence in resolving an entity, STOP and ask the user for clarification before creating or updating the fact.
+### 7. Handling Ambiguity and Mispronunciations (Aliases)
+People are often referred to by first names or their names might be mispronounced in the transcription.
+- **Aliases**: Create an `aliases` dictionary mapping potential name variations to a confidence score (0.0 to 1.0). For example: `{"Tim Lohman": 1.0, "Tim": 0.7, "Tim Loman": 0.9}`.
+- **Flag it**: Call out ambiguous names in your response.
+- **Human-in-the-Loop**: If you have low confidence in resolving an entity (e.g., multiple matches for "Tim"), STOP and ask the user for clarification before creating or updating the fact.
 - Example: "I see a mention of 'Rafael', but I have two people named Rafael in memory. Should I link this to [[Rafael Papp]] or [[Rafael Silva]]?"
 
 ### 8. Memory Storage
 Store key facts in the memory system using appropriate categories. **Important: Use rich Markdown formatting in the `text` field for better readability in the Dashboard.**
 
 **Metadata & Tags:**
-Always include a `metadata` dictionary with a `tags` list for categorization, e.g., `metadata={"tags": ["meeting", "strategy", "q3-planning"]}`.
+Always include a `metadata` dictionary with a `tags` list for categorization.
+For People, include the `aliases` dictionary in the metadata: `metadata={"tags": ["person", "engineering"], "aliases": {"Tim Lohman": 1.0, "Tim Loman": 0.9, "Tim": 0.7}}`.
+
+**Text Body Enhancements for Search:**
+To ensure vector search finds these aliases, append them to the bottom of the Markdown text.
+```markdown
+### Person: Tim Lohman
+**Role:** Lead Engineer
+...
+**Aliases:** Tim Lohman (100%), Tim Loman (90%), Tim (70%)
+```
 
 **Tool Usage:**
 - Use `create_fact(text, category, metadata)` for storing NEW facts.

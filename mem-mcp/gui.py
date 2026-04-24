@@ -158,6 +158,14 @@ async def api_get_insights(request: Request):
         raise HTTPException(status_code=503, detail=str(e))
 
 
+@web_app.get("/api/graph", response_class=JSONResponse)
+async def api_get_graph(request: Request):
+    try:
+        return mem.db_get_graph(_user(request))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
 @web_app.post("/api/diary", response_class=JSONResponse, status_code=201)
 async def api_save_diary(request: Request, body: DiaryCreate):
     try:

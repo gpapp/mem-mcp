@@ -25,9 +25,9 @@ CORE TASKS:
 1. Extract Metadata (Date, Topic, Context).
 2. Identify Participants and their Roles.
 3. Extract Entities (People, Projects, Technologies, Decisions, Action Items).
-4. Entity Resolution: Search for existing people/projects before creating new facts.
+4. Entity Resolution: Search for existing people/projects before creating new facts. Consider possible aliases.
 5. Deduplication: Merge new information into existing facts using 'update_fact' instead of creating duplicates.
-6. Ambiguity: If a name is ambiguous or confidence is low, STOP and ask the user for clarification.
+6. Ambiguity & Aliases: If a name is ambiguous or confidence is low, STOP and ask the user for clarification. Create an 'aliases' dictionary with confidences for mispronunciations or first names, and add it to the metadata and markdown text.
 7. Save key facts and links.
 8. Log the summary in the diary using 'diary_save_entry'.
 9. PERFORMANCE: Batch multiple 'create_fact' and 'link_facts' calls into a single response for maximum efficiency.
