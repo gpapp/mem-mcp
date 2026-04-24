@@ -20,6 +20,7 @@ or common proxy headers – identical logic to the MCP server.
 
 import os
 import base64
+import logging
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
@@ -37,10 +38,18 @@ def _render_template(name: str, **context) -> str:
 
 web_app = FastAPI(title="Memory Vault GUI")
 
+# Suppress noisy uvicorn access logs for the root path (MCP heartbeats)
+class EndpointFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return msg.find("GET / ") == -1 and msg.find("GET /api/ping") == -1
+
+logging.getLogger("uvicorn.access").addFilter(EndpointFilter())
+
 @web_app.middleware("http")
 async def log_gui_requests(request: Request, call_next):
-    # Only log if path is not root or ping to avoid keepalive noise
-    if request.url.path not in ["/", "/api/ping"]:
+    # Log only interesting GUI/API requests
+    if request.url.path not in ["/", "/api/ping", "/favicon.ico"]:
         print(f"[GUI] {request.method} {request.url.path}")
     return await call_next(request)
 

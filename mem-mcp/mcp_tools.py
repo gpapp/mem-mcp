@@ -1,10 +1,11 @@
-"""
-mcp_tools.py – FastMCP tool definitions for the Memory Vault.
-"""
+import os
+import logging
 from fastmcp import FastMCP, Context
 from fastmcp.server.dependencies import get_http_headers
 from typing import Optional, List, Any
 import memory as mem
+
+logger = logging.getLogger("memory-vault")
 
 # Using a safe name and explicitly disabling any potential conflicting features
 mcp = FastMCP("MemoryVault")
@@ -103,8 +104,8 @@ async def transcription_cleanup(text: str, participants: Optional[List[str]] = N
     """
     system = "You are a professional transcriptionist. Fix speaker turns, remove filler words (um, uh, like), and correct obvious transcription errors."
 
-    # Use sampling if context is available and text is long (> 2000 chars)
-    if ctx and len(text) > 2000:
+    # Use sampling if context is available and text is moderately long (> 1000 chars)
+    if ctx and len(text) > 1000:
         try:
             # We sample from the calling LLM for high-quality / long context
             resp = await ctx.create_message(
@@ -113,10 +114,15 @@ async def transcription_cleanup(text: str, participants: Optional[List[str]] = N
                     {"role": "user", "content": prompt}
                 ]
             )
-            return resp.content[0].text if resp.content else "Error: Empty response from sampling."
+            if resp and resp.content:
+                return resp.content[0].text
         except Exception as e:
-            # Fallback to local if sampling fails
-            pass
+            # Log the error (this will show in server logs)
+            logger.warning(f"MCP Sampling failed, falling back to local LLM: {e}")
+
+    # Guard against huge texts hitting local Ollama if sampling failed or is missing
+    if len(text) > 10000 and not ctx:
+         return "Error: Transcription too large (>10k chars) for local processing and MCP sampling is unavailable in this client."
 
     # Default to local Ollama
     return await mem.get_llm_completion(prompt, system)

@@ -100,6 +100,28 @@
     .markdown-body p:last-child { margin-bottom: 0; }
     .empty { color: var(--muted); font-size: .9rem; padding: 2rem 0; text-align: center; }
 
+    /* ── Memories Page Layout ── */
+    .memories-layout { display: flex; gap: 1.5rem; }
+    .memories-sidebar { width: 220px; flex-shrink: 0; }
+    .memories-main { flex: 1; min-width: 0; }
+    
+    .sidebar-list { list-style: none; padding: 0; margin: 0; }
+    .sidebar-item { 
+      padding: .6rem .8rem; cursor: pointer; border-radius: 6px; 
+      font-size: .88rem; color: var(--muted); transition: all .15s;
+      display: flex; justify-content: space-between; align-items: center;
+    }
+    .sidebar-item:hover { background: var(--primary-light); color: var(--primary); }
+    .sidebar-item.active { background: var(--primary); color: #fff; font-weight: 600; }
+    .sidebar-item .count { font-size: .7rem; opacity: .7; }
+
+    .search-row { display: flex; gap: .75rem; margin-bottom: 1rem; align-items: center; }
+    .search-input-wrapper { position: relative; flex: 1; }
+    .search-input-wrapper i { position: absolute; left: .7rem; top: 50%; transform: translateY(-50%); color: var(--muted); }
+    .search-input { padding-left: 1.2rem; }
+    
+    .sort-select { width: auto; font-size: .85rem; padding: .4rem .6rem; }
+
     /* ── Toast ── */
     #toast {
       position: fixed; bottom: 1.5rem; right: 1.5rem;
@@ -143,28 +165,60 @@
 
 <!-- ═══ MEMORIES PAGE ═══ -->
 <div id="page-memories" class="page active">
-  <div class="card" style="margin-bottom:1.25rem;">
-    <strong style="display:block;margin-bottom:.75rem;font-size:.95rem;">Add a new memory</strong>
-    <div class="form-row">
-      <div>
-        <label for="new-text">Fact / Memory</label>
-        <textarea id="new-text" placeholder="e.g. I prefer dark mode editors" style="min-height:60px;"></textarea>
-      </div>
-      <div style="flex:0 1 180px;">
-        <label for="new-category">Category</label>
-        <input id="new-category" placeholder="e.g. Preferences" value="General">
-      </div>
-      <div style="flex:0 1 180px;">
-        <label for="new-tags">Tags (comma separated)</label>
-        <input id="new-tags" placeholder="tag1, tag2">
-      </div>
-      <div style="flex:0 1 auto;padding-bottom:1px;">
-        <label>&nbsp;</label>
-        <button class="btn btn-primary" onclick="addMemory()">＋ Add</button>
+  <div class="memories-layout">
+    <!-- Sidebar -->
+    <div class="memories-sidebar">
+      <div class="card" style="padding: 1rem;">
+        <label>Categories</label>
+        <ul id="categories-sidebar" class="sidebar-list">
+          <li class="sidebar-item active" onclick="setCategory(null)">All Memories</li>
+        </ul>
       </div>
     </div>
+
+    <!-- Main Content -->
+    <div class="memories-main">
+      <div class="card" style="margin-bottom:1.25rem;">
+        <div style="display:flex; justify-content: space-between; align-items: center; margin-bottom:.75rem;">
+          <strong style="font-size:.95rem;">Add a new memory</strong>
+          <button class="btn btn-ghost btn-sm" onclick="toggleAddForm()">Toggle Form</button>
+        </div>
+        <div id="add-memory-form" class="form-row">
+          <div style="flex: 2;">
+            <label for="new-text">Fact / Memory</label>
+            <textarea id="new-text" placeholder="e.g. I prefer dark mode editors" style="min-height:60px;"></textarea>
+          </div>
+          <div style="flex: 1;">
+            <label for="new-category">Category</label>
+            <input id="new-category" list="category-datalist" placeholder="e.g. Preferences" value="General">
+            <datalist id="category-datalist"></datalist>
+          </div>
+          <div style="flex: 1;">
+            <label for="new-tags">Tags (comma separated)</label>
+            <input id="new-tags" placeholder="tag1, tag2">
+          </div>
+          <div style="flex: 0;">
+            <label>&nbsp;</label>
+            <button class="btn btn-primary" onclick="addMemory()">＋ Add</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="search-row">
+        <div class="search-input-wrapper">
+          <input type="text" id="search-query" class="search-input" placeholder="Search memories..." oninput="renderMemories()">
+        </div>
+        <select id="sort-order" class="sort-select" onchange="renderMemories()">
+          <option value="newest">Newest First</option>
+          <option value="oldest">Oldest First</option>
+          <option value="alphabetical">Alphabetical</option>
+          <option value="category">By Category</option>
+        </select>
+      </div>
+
+      <div id="memories-list"></div>
+    </div>
   </div>
-  <div id="memories-list"></div>
 </div>
 
 <!-- ═══ DIARY PAGE ═══ -->
@@ -238,6 +292,8 @@
   };
 
   let memories = [], diaryEntries = [], activeDiaryDate = null;
+  let insightsLoaded = false, graphLoaded = false;
+  let activeCategory = null;
 
   function toast(msg, ms=2500) {
     const el = document.getElementById('toast');
@@ -252,25 +308,84 @@
     document.querySelectorAll('.tab-btn').forEach(b => {
       if (b.textContent.toLowerCase().includes(tab.slice(0,3))) b.classList.add('active');
     });
-    if (tab === 'diary') loadDiary();
-    if (tab === 'insights') loadInsights();
-    if (tab === 'graph') loadGraph();
+    if (tab === 'memories' && !memories.length) loadMemories();
+    if (tab === 'diary' && !diaryEntries.length) loadDiary();
+    if (tab === 'insights' && !insightsLoaded) loadInsights();
+    if (tab === 'graph' && !graphLoaded) loadGraph();
   }
 
   async function loadMemories() {
-    try { memories = await api.get('memories'); renderMemories(); }
+    try { 
+      memories = await api.get('memories'); 
+      renderMemories(); 
+      renderCategorySidebar();
+    }
     catch(e) { document.getElementById('memories-list').innerHTML = '<p class="empty">⚠️ Could not load memories.</p>'; }
+  }
+
+  function renderCategorySidebar() {
+    const el = document.getElementById('categories-sidebar');
+    const counts = {};
+    memories.forEach(m => { counts[m.category] = (counts[m.category] || 0) + 1; });
+    const categories = Object.keys(counts).sort();
+    
+    el.innerHTML = `<li class="sidebar-item ${activeCategory === null ? 'active' : ''}" onclick="setCategory(null)">
+      All Memories <span class="count">${memories.length}</span>
+    </li>` + categories.map(cat => `
+      <li class="sidebar-item ${activeCategory === cat ? 'active' : ''}" onclick="setCategory('${cat}')">
+        ${cat} <span class="count">${counts[cat]}</span>
+      </li>
+    `).join('');
+    
+    // Also update datalist for add form
+    const datalist = document.getElementById('category-datalist');
+    datalist.innerHTML = categories.map(cat => `<option value="${cat}">`).join('');
+  }
+
+  function setCategory(cat) {
+    activeCategory = cat;
+    renderCategorySidebar();
+    renderMemories();
+  }
+
+  function toggleAddForm() {
+    const form = document.getElementById('add-memory-form');
+    form.style.display = form.style.display === 'none' ? 'flex' : 'none';
   }
 
   function renderMemories() {
     const el = document.getElementById('memories-list');
-    if (!memories.length) { el.innerHTML = '<p class="empty">No memories yet.</p>'; return; }
+    const query = document.getElementById('search-query').value.toLowerCase();
+    const sort = document.getElementById('sort-order').value;
+
+    let filtered = memories.filter(m => {
+      const matchCat = activeCategory === null || m.category === activeCategory;
+      const matchQuery = !query || m.text.toLowerCase().includes(query) || m.category.toLowerCase().includes(query);
+      return matchCat && matchQuery;
+    });
+
+    // Sorting
+    filtered.sort((a, b) => {
+      if (sort === 'newest') return (b.id || "").localeCompare(a.id || "");
+      if (sort === 'oldest') return (a.id || "").localeCompare(b.id || "");
+      if (sort === 'alphabetical') return a.text.localeCompare(b.text);
+      if (sort === 'category') return a.category.localeCompare(b.category) || a.text.localeCompare(b.text);
+      return 0;
+    });
+
+    if (!filtered.length) { el.innerHTML = '<p class="empty">No matching memories found.</p>'; return; }
+    
     const groups = {};
-    memories.forEach(m => { (groups[m.category] = groups[m.category] || []).push(m); });
-    el.innerHTML = Object.keys(groups).sort().map(cat => `
-      <div class="category-header">${cat}</div>
-      ${groups[cat].map(m => renderMemoryItem(m)).join('')}
-    `).join('');
+    // Only group by category if sorting by category
+    if (sort === 'category') {
+      filtered.forEach(m => { (groups[m.category] = groups[m.category] || []).push(m); });
+      el.innerHTML = Object.keys(groups).sort().map(cat => `
+        <div class="category-header">${cat}</div>
+        ${groups[cat].map(m => renderMemoryItem(m)).join('')}
+      `).join('');
+    } else {
+      el.innerHTML = filtered.map(m => renderMemoryItem(m)).join('');
+    }
   }
 
   function renderMemoryItem(m) {
@@ -321,7 +436,9 @@
     if (!text) return;
     try {
       const m = await api.post('memories', {text, category: cat, tags});
-      memories.push(m); renderMemories();
+      memories.push(m); 
+      renderCategorySidebar();
+      renderMemories();
       document.getElementById('new-text').value = ''; document.getElementById('new-tags').value = '';
       toast('✅ Saved');
     } catch(e) { toast('❌ Error'); }
@@ -372,6 +489,7 @@
     const el = document.getElementById('insights-list'); el.innerHTML = '<p class="empty">Analyzing…</p>';
     try {
       const patterns = await api.get('insights');
+      insightsLoaded = true;
       if (!patterns.length) { el.innerHTML = '<p class="empty">No patterns yet.</p>'; return; }
       el.innerHTML = patterns.map(p => `
         <div class="memory-item" style="border-left-color: var(--success);"><div class="memory-text"><strong>${p.pattern}</strong><div class="memory-meta">${p.strength} associations.</div></div></div>
@@ -385,6 +503,7 @@
     container.innerHTML = '<p class="empty">Loading graph...</p>';
     try {
       const data = await api.get('graph');
+      graphLoaded = true;
       container.innerHTML = '';
       
       const nodes = new vis.DataSet(data.nodes.map(n => ({
