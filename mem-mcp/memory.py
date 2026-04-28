@@ -151,7 +151,8 @@ async def get_llm_completion(prompt: str, system: Optional[str] = None) -> str:
         }
         if system:
             payload["system"] = system
-            
+
+        logger.info(f"[Ollama] GENERATE request to {OLLAMA_URL} with model={model}. Prompt length: {len(prompt)} chars.")
         resp = await client.post(f"{OLLAMA_URL}/api/generate", json=payload)
         resp.raise_for_status()
         return resp.json()["response"]

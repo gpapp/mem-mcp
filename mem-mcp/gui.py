@@ -82,6 +82,11 @@ class MemoryUpdate(BaseModel):
     category: str = "General"
     tags: Optional[str] = ""
 
+class MemoryLink(BaseModel):
+    sourceId: str
+    targetId: str
+    relType: str
+
 
 class DiaryCreate(BaseModel):
     content: str
@@ -132,6 +137,14 @@ async def api_update_memory(memory_id: str, request: Request, body: MemoryUpdate
         if not found:
             raise HTTPException(status_code=404, detail="Memory not found or access denied.")
         return {"id": memory_id, "title": body.title, "text": body.text, "category": body.category.strip().capitalize(), "metadata": metadata}
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+@web_app.post("/api/memories/link", response_class=JSONResponse, status_code=201)
+async def api_link_memory(request: Request, body: MemoryLink):
+    try:
+        await mem.db_link_facts(body.sourceId, body.targetId, body.relType, {}, _user(request))
+        return {"status": "linked"}
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 

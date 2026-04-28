@@ -404,7 +404,7 @@
         <div id="mem-text-${m.id}" class="markdown-body">${marked.parse(m.text)}</div>
         <div class="memory-meta">
           ${tags.map(t => `<span class="tag-badge">#${t}</span>`).join('')}
-          ${(m.links || []).map(l => `<span class="link-badge">🔗 ${l.rel} &rarr; ${escHtml(l.target_title || l.target_text.substring(0, 30))}</span>`).join('')}
+          ${(m.links || []).map(l => `<span class="link-badge" onclick="jumpToMemory('${l.target_id}')" style="cursor:pointer;" title="Click to view">🔗 ${l.rel} &rarr; ${escHtml(l.target_title || l.target_text.substring(0, 30))}</span>`).join('')}
         </div>
         <div class="edit-form" id="edit-form-${m.id}" style="display:none; flex-direction:column; gap:0.5rem; width:100%;">
           <input id="edit-title-${m.id}" value="${escHtml(m.title || '')}" placeholder="Title...">
@@ -418,16 +418,78 @@
             <button class="btn btn-primary btn-sm" onclick="saveEdit('${m.id}')">Save</button>
           </div>
         </div>
+        <div class="link-form" id="link-form-${m.id}" style="display:none; flex-direction:column; gap:0.5rem; width:100%; margin-top:0.5rem; padding: 0.5rem; background: var(--bg); border-radius: 4px; border: 1px solid var(--border);">
+          <div style="font-size: 0.8rem; font-weight: 600;">Link to another memory</div>
+          <select id="link-target-${m.id}" style="width: 100%; padding: 0.4rem; border: 1px solid var(--border); border-radius: 4px;">
+             ${memories.filter(x => x.id !== m.id).map(x => `<option value="${x.id}">${escHtml(x.title || (x.text ? x.text.substring(0, 40) : 'Unnamed'))}</option>`).join('')}
+          </select>
+          <input id="link-rel-${m.id}" placeholder="Relationship type (e.g. KNOWS, WORKS_ON)" style="width: 100%; padding: 0.4rem; border: 1px solid var(--border); border-radius: 4px;">
+          <div style="display:flex; gap:0.5rem; justify-content:flex-end;">
+            <button class="btn btn-ghost btn-sm" onclick="cancelLink('${m.id}')">Cancel</button>
+            <button class="btn btn-primary btn-sm" onclick="saveLink('${m.id}')">Link</button>
+          </div>
+        </div>
       </div>
       <div class="memory-actions">
-        <button class="btn btn-ghost btn-sm" id="edit-btn-${m.id}" onclick="startEdit('${m.id}')">✏️</button>
-        <button class="btn btn-danger btn-sm" onclick="deleteMemory('${m.id}')">🗑️</button>
+        <button class="btn btn-ghost btn-sm" onclick="openInGraph('${m.id}')" title="View in Graph">🕸️</button>
+        <button class="btn btn-ghost btn-sm" id="link-btn-${m.id}" onclick="startLink('${m.id}')" title="Link Memory">🔗</button>
+        <button class="btn btn-ghost btn-sm" id="edit-btn-${m.id}" onclick="startEdit('${m.id}')" title="Edit Memory">✏️</button>
+        <button class="btn btn-danger btn-sm" onclick="deleteMemory('${m.id}')" title="Delete Memory">🗑️</button>
       </div>
     </div>`;
   }
 
-  function startEdit(id) { document.getElementById('edit-form-' + id).style.display = 'flex'; document.getElementById('edit-btn-' + id).style.display = 'none'; }
+  function startEdit(id) { document.getElementById('edit-form-' + id).style.display = 'flex'; document.getElementById('edit-btn-' + id).style.display = 'none'; cancelLink(id); }
   function cancelEdit(id) { document.getElementById('edit-form-' + id).style.display = 'none'; document.getElementById('edit-btn-' + id).style.display = ''; }
+
+  function startLink(id) { document.getElementById('link-form-' + id).style.display = 'flex'; document.getElementById('link-btn-' + id).style.display = 'none'; cancelEdit(id); }
+  function cancelLink(id) { document.getElementById('link-form-' + id).style.display = 'none'; document.getElementById('link-btn-' + id).style.display = ''; }
+
+  async function saveLink(id) {
+    const targetId = document.getElementById('link-target-' + id).value;
+    const relType = document.getElementById('link-rel-' + id).value.trim();
+    if (!targetId || !relType) { toast('⚠️ Relationship type required'); return; }
+    try {
+      await api.post('memories/link', {sourceId: id, targetId: targetId, relType: relType});
+      toast('🔗 Linked');
+      cancelLink(id);
+      await loadMemories();
+    } catch(e) { toast('❌ Error linking'); }
+  }
+
+  function jumpToMemory(targetId) {
+    switchTab('memories');
+    const m = memories.find(x => x.id === targetId);
+    if (m && activeCategory !== null && activeCategory !== m.category) {
+      setCategory(null);
+    }
+    document.getElementById('search-query').value = '';
+    renderMemories();
+
+    setTimeout(() => {
+      const el = document.getElementById('mem-' + targetId);
+      if (el) {
+        el.scrollIntoView({behavior: 'smooth', block: 'center'});
+        el.style.transition = 'box-shadow 0.3s ease';
+        el.style.boxShadow = '0 0 0 3px var(--primary)';
+        setTimeout(() => el.style.boxShadow = 'none', 2000);
+      }
+    }, 150);
+  }
+
+  async function openInGraph(id) {
+    switchTab('graph');
+    if (!graphLoaded) await loadGraph();
+    if (network) {
+      setTimeout(() => {
+        network.focus(id, {
+          scale: 1.5,
+          animation: { duration: 1000, easingFunction: 'easeInOutQuad' }
+        });
+        network.selectNodes([id]);
+      }, 500);
+    }
+  }
 
   async function saveEdit(id) {
     const title = document.getElementById('edit-title-' + id).value.trim();
@@ -506,7 +568,7 @@
           <span style="font-size:0.8rem; color:var(--muted);">${dayEntries.length} entries today</span>
         </div>
         ${dayEntries.map((entry, idx) => {
-          const mentions = (entry.mentions || []).map(m => `<span class="link-badge">👤 ${escHtml(m.title || m.text.substring(0,20))}</span>`).join('');
+          const mentions = (entry.mentions || []).map(m => `<span class="link-badge" onclick="jumpToMemory('${m.id}')" style="cursor:pointer;" title="Click to view">👤 ${escHtml(m.title || m.text.substring(0,20))}</span>`).join('');
           const time = entry.timestamp ? new Date(entry.timestamp).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}) : '';
           
           return `
