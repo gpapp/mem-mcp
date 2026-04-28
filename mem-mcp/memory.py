@@ -699,9 +699,10 @@ async def db_merge_memories(master_id: str, duplicate_ids: List[str], user_id: s
     )
 
 
-async def db_smart_merge_memories(master_id: str, duplicate_ids: List[str], user_id: str):
+async def db_smart_merge_memories(master_id: str, duplicate_ids: List[str], user_id: str, ctx: Any = None):
     """
     Advanced merge that uses an LLM to consolidate multiple descriptions into one.
+    Uses MCP sampling if context is available and prompt is long.
     """
     neo4j_driver = get_neo4j()
     
@@ -720,7 +721,19 @@ async def db_smart_merge_memories(master_id: str, duplicate_ids: List[str], user
     prompt = "Combine the following separate memories about the same entity into one single, cohesive, and detailed markdown-formatted description. Preserve all important facts and links. Avoid repetition.\n\n" + "\n---\n".join(texts)
     system = "You are a knowledge graph curator. Consolidate overlapping information while preserving all unique details and context."
     
-    new_text = await get_llm_completion(prompt, system)
+    # Use MCP sampling if context is available and prompt is moderately long (> 1000 chars)
+    if ctx and hasattr(ctx, "sample") and len(prompt) > 1000:
+        try:
+            result = await ctx.sample(prompt, system_prompt=system)
+            if result and result.text:
+                new_text = result.text
+            else:
+                new_text = await get_llm_completion(prompt, system)
+        except Exception as e:
+            logger.warning(f"MCP Sampling failed during smart merge, falling back to local LLM: {e}")
+            new_text = await get_llm_completion(prompt, system)
+    else:
+        new_text = await get_llm_completion(prompt, system)
     
     # 3. Update master with consolidated text (this also updates vector)
     await db_update_memory(master_id, new_text, None, user_id)

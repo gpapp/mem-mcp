@@ -8,38 +8,36 @@ Maintain a clean, high-quality knowledge base by merging similar entities into a
 ## Workflow
 
 ### 1. Identify Potential Duplicates
-Run the `memory_find_duplicates` tool to scan the memory for clusters of similar items.
+Use the `find_duplicates` tool to scan the memory for clusters of similar items.
 - **Category**: Defaults to "People", but can be used for any category.
-- **Threshold**: Adjust the similarity threshold (default 0.75). Higher values (0.9+) find near-exact matches; lower values (0.7-0.8) find fuzzy matches.
+- **Threshold**: Adjust the similarity threshold (default 0.75).
+- **Result**: You will receive a list of clusters with an `avg_similarity` score and a basic recommendation.
 
-### 2. Analyze Clusters
-For each cluster returned:
-- Compare the `text` and `metadata` of all members.
-- Look for overlapping fields like `role`, `company`, `email`, or `topics`.
-- High `avg_similarity` suggests a strong candidate for merging.
+### 2. Analyze Clusters and Select Master
+Use the `suggest_merge` tool to analyze a specific cluster and get a recommendation for the **Master** record.
+- Pass the cluster JSON to the tool.
+- The tool uses LLM reasoning to determine which record is the most complete and accurate.
+- It identifies specific details from other records that should be preserved.
 
-### 3. Select the Master Record
-Choose one record to be the "Master". Criteria for selection:
-- Most complete information.
-- Most recent timestamp.
-- Better structured metadata.
+### 3. Perform Smart Merge
+Execute the consolidation using the `merge_facts` tool with `smart=True`.
+- **masterId**: The ID of the record you want to keep.
+- **duplicateIds**: A list of IDs to merge into the master.
+- **smart**: Always set to `True` for complex entities like People or Projects.
+- **Outcome**: This tool automatically:
+    1. Consolidates all text descriptions into a single cohesive Markdown summary.
+    2. Migrates all graph relationships from duplicates to the Master.
+    3. Merges metadata (tags, aliases, etc.).
+    4. Deletes the duplicate records.
 
-### 4. Consolidate Information
-Use `update_fact` to move valuable information from the duplicates into the Master record.
-- Update the `text` to include missing context.
-- Merge `metadata` dictionaries.
-- Ensure the `category` is consistent.
-
-### 5. Re-link Relationships
-If the duplicate records have relationships (links) to other facts:
-- Use `get_fact_neighborhood` on the duplicate IDs to see what they are linked to.
-- Use `link_facts` to recreate those relationships pointing to the Master ID.
-
-### 6. Delete Duplicates
-**CRITICAL**: Only use `delete_fact` after you are certain that all unique information from the duplicate has been successfully moved to the Master record.
+### 4. Verification and Re-linking
+After a merge, verify the results:
+- Use `get_fact_neighborhood` on the Master ID to see the new consolidated graph.
+- If any links were missed or need manual adjustment, use `link_facts`.
+- If the text needs further refinement, use `update_fact`.
 
 ## Efficiency: Multi-Tool Execution
-You are encouraged to call multiple tools in a single response to perform the merge efficiently. For example, you can call several `update_fact` and `link_facts` followed by `delete_fact` calls in one go.
+You are encouraged to call multiple tools in a single response. For example, you can call `find_duplicates` and then process multiple clusters with `suggest_merge` and `merge_facts` in subsequent turns.
 
 ## Examples of "Duplicate" Patterns
 - **People**: "Kate" vs "Katarina" (same role/company).
@@ -47,5 +45,5 @@ You are encouraged to call multiple tools in a single response to perform the me
 - **Concepts**: "Vector DB" vs "Vector Databases".
 
 ## Tips
-- Always verify high-threshold matches manually; high similarity doesn't always mean identity.
-- Use the `recommendation` field in the tool output as a starting guide.
+- **Human-in-the-Loop**: If a merge seems risky or data might be lost, STOP and ask the user for confirmation.
+- **Manual Merge**: For simple facts where you don't need LLM consolidation, you can use `merge_facts` with `smart=False`.

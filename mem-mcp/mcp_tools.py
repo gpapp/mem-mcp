@@ -76,7 +76,7 @@ async def diary_search_entries(query: str, limit: int = 3):
     return await mem.db_search_diary(query, _current_user(), limit)
     
 @mcp.tool()
-async def memory_find_duplicates(category: str = "People", limit: int = 50, threshold: float = 0.75, group_by: Optional[str] = "first_name"):
+async def find_duplicates(category: str = "People", limit: int = 50, threshold: float = 0.75, group_by: Optional[str] = "first_name"):
     """
     Find potential duplicate entries in memory by comparing embeddings similarity ranking.
     Returns grouped clusters of similar items for manual deduplication.
@@ -84,14 +84,14 @@ async def memory_find_duplicates(category: str = "People", limit: int = 50, thre
     return await mem.db_find_duplicates(_current_user(), category, limit, threshold)
 
 @mcp.tool()
-async def memory_merge_facts(masterId: str, duplicateIds: List[str], smart: bool = False):
+async def merge_facts(masterId: str, duplicateIds: List[str], smart: bool = False, ctx: Context = None):
     """
     Merge multiple duplicate facts into a single master fact on the server.
     If 'smart' is True, uses an LLM to consolidate the text descriptions into a cohesive whole.
     This moves all relationships and combines metadata.
     """
     if smart:
-        await mem.db_smart_merge_memories(masterId, duplicateIds, _current_user())
+        await mem.db_smart_merge_memories(masterId, duplicateIds, _current_user(), ctx)
     else:
         await mem.db_merge_memories(masterId, duplicateIds, _current_user())
     return f"Successfully merged {len(duplicateIds)} facts into {masterId} (Smart Merge: {smart})"
@@ -100,7 +100,7 @@ async def memory_merge_facts(masterId: str, duplicateIds: List[str], smart: bool
 async def transcription_cleanup(text: str, participants: Optional[List[str]] = None, ctx: Context = None):
     """
     Clean up a raw transcription, identify speakers, and remove filler words on the server.
-    Uses local LLM for short contexts and can use sampling for longer ones.
+    Uses local LLM for short contexts and MCP sampling for longer ones.
     """
     prompt = f"""
     Please clean up this raw transcription. 
@@ -114,20 +114,13 @@ async def transcription_cleanup(text: str, participants: Optional[List[str]] = N
     """
     system = "You are a professional transcriptionist. Fix speaker turns, remove filler words (um, uh, like), and correct obvious transcription errors."
 
-    # Use sampling if context is available and text is moderately long (> 1000 chars)
+    # Use MCP sampling if context is available and text is moderately long (> 1000 chars)
     if ctx and len(text) > 1000:
         try:
-            # We sample from the calling LLM for high-quality / long context
-            resp = await ctx.create_message(
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": prompt}
-                ]
-            )
-            if resp and resp.content:
-                return resp.content[0].text
+            result = await ctx.sample(prompt, system_prompt=system)
+            if result and result.text:
+                return result.text
         except Exception as e:
-            # Log the error (this will show in server logs)
             logger.warning(f"MCP Sampling failed, falling back to local LLM: {e}")
 
     # Guard against huge texts hitting local Ollama if sampling failed or is missing
@@ -138,7 +131,7 @@ async def transcription_cleanup(text: str, participants: Optional[List[str]] = N
     return await mem.get_llm_completion(prompt, system)
 
 @mcp.tool()
-async def memory_suggest_merge(cluster_json: str, ctx: Context = None):
+async def suggest_merge(cluster_json: str, ctx: Context = None):
     """
     Analyze a cluster of potential duplicates and suggest a Master record and merge strategy.
     Uses LLM reasoning to evaluate which record is most complete.
@@ -152,7 +145,16 @@ async def memory_suggest_merge(cluster_json: str, ctx: Context = None):
     """
     system = "You are a data deduplication expert. Identify the most complete and accurate record in a cluster."
 
-    # Use local Ollama for this evaluation
+    # Use MCP sampling if context is available and prompt is moderately long (> 1000 chars)
+    if ctx and len(cluster_json) > 1000:
+        try:
+            result = await ctx.sample(prompt, system_prompt=system)
+            if result and result.text:
+                return result.text
+        except Exception as e:
+            logger.warning(f"MCP Sampling failed in suggest_merge, falling back to local LLM: {e}")
+
+    # Default to local Ollama
     return await mem.get_llm_completion(prompt, system)
 
 @mcp.tool()

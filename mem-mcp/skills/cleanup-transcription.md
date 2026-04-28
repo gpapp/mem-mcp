@@ -54,4 +54,6 @@ Produce the final output in two parts:
 
 - **Entity Linking**: Ensure all mentioned people and projects are linked using [[Name]] syntax.
 - **Ambiguity**: If you are unsure about a speaker identification, flag it (e.g., "[00:12:00] **Unidentified (possibly John?)**").
-- **Multi-Tool**: You can use `search_facts` multiple times to resolve different entities.
+
+## Efficiency: Multi-Tool Execution
+You are encouraged to call multiple tools in a single response. For example, you can call `transcription_cleanup` and then process the results with multiple `create_fact`, `link_facts`, and `diary_save_entry` calls in one go.
