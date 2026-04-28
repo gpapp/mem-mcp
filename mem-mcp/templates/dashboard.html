@@ -663,6 +663,18 @@
       };
       
       network = new vis.Network(container, networkData, options);
+
+      // Add double-click event to navigate to the memory
+      network.on("doubleClick", function (params) {
+        if (params.nodes.length > 0) {
+          const nodeId = params.nodes[0];
+          // Check if it's a memory (not a category node which might not be in the memories array directly)
+          const m = memories.find(x => x.id === nodeId);
+          if (m) {
+            jumpToMemory(nodeId);
+          }
+        }
+      });
     } catch(e) {
       container.innerHTML = '<p class="empty">⚠️ Error loading graph.</p>';
     }
