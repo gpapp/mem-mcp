@@ -388,22 +388,67 @@ def db_get_neighborhood(fact_id: str, depth: int, rel_types: List[str], user_id:
 
 
 async def db_search_memories(query: str, user_id: str, limit: int = 5, category: Optional[str] = None) -> list:
-    """Vector-similarity search with optional category filter."""
+    """Vector-similarity search with optional category filter. Also does a basic substring match on titles."""
     qdrant = await get_qdrant()
-    if not qdrant:
-        raise RuntimeError("Qdrant not connected.")
+    neo4j_driver = get_neo4j()
+    if not qdrant or not neo4j_driver:
+        raise RuntimeError("Databases not connected.")
 
+    # 1. Neo4j exact/substring match on title or aliases
+    # We do a quick lookup for nodes containing the query
+    exact_matches = []
+    query_lower = query.lower()
+
+    with neo4j_driver.session() as s:
+        cypher = """
+        MATCH (f:Fact {userId: $userId})
+        WHERE toLower(f.title) CONTAINS toLower($query)
+           OR toLower(f.text) CONTAINS toLower($query)
+        """
+        if category:
+            cypher += " AND f.category = $category"
+        cypher += " RETURN f LIMIT $limit"
+
+        params = {"userId": user_id, "query": query, "limit": limit}
+        if category:
+            params["category"] = category.strip().capitalize()
+
+        neo_result = s.run(cypher, **params)
+        for r in neo_result:
+            f = r["f"]
+            # Construct a result matching Qdrant format
+            meta = {k: v for k, v in f.items() if k not in {"id", "text", "title", "category", "timestamp", "userId"}}
+
+            score = 1.0
+            title = f.get("title", "")
+            if title and query_lower == title.lower():
+                score = 2.0
+            elif title and query_lower in title.lower():
+                score = 1.5
+
+            exact_matches.append({
+                "id": f["id"],
+                "text": f["text"],
+                "title": f.get("title"),
+                "category": f.get("category"),
+                "score": score,
+                "metadata": meta
+            })
+
+    # 2. Qdrant vector search
     vec    = await get_embedding(query)
     conditions = [FieldCondition(key="userId", match=MatchValue(value=user_id))]
     if category:
         conditions.append(FieldCondition(key="category", match=MatchValue(value=category.strip().capitalize())))
-    
+
     filt   = Filter(must=conditions)
+    # Fetch more results initially so we can re-rank them with our manual boosts
+    fetch_limit = max(limit * 5, 50)
     result = await qdrant.query_points(
         collection_name=COLLECTION_NAME,
         query=vec,
         query_filter=filt,
-        limit=limit,
+        limit=fetch_limit,
     )
     results = []
     query_lower = query.lower()
@@ -440,10 +485,21 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
             "score": score,
             "metadata": metadata
         })
-    
-    # Re-sort by updated score
-    results.sort(key=lambda x: x["score"], reverse=True)
-    return results
+
+    # Merge exact matches and vector results, deduplicating by ID
+    merged_results = {}
+    for r in results:
+        merged_results[r["id"]] = r
+
+    for r in exact_matches:
+        if r["id"] in merged_results:
+            merged_results[r["id"]]["score"] = max(merged_results[r["id"]]["score"], r["score"])
+        else:
+            merged_results[r["id"]] = r
+
+    final_list = list(merged_results.values())
+    final_list.sort(key=lambda x: x["score"], reverse=True)
+    return final_list[:limit]
 
 
 def db_find_patterns(user_id: str) -> list:
@@ -536,15 +592,17 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
     if not qdrant or not neo4j_driver:
         raise RuntimeError("Database connections not established.")
 
-    # 1. Fetch items from Neo4j
+    # 1. Fetch items from Neo4j (fetch a larger pool to ensure we don't miss duplicates)
+    fetch_limit = max(limit * 5, 500)
     with neo4j_driver.session() as s:
         result = s.run(
             """
             MATCH (f:Fact {userId: $userId, category: $category})
             RETURN f
+            ORDER BY f.timestamp DESC
             LIMIT $limit
             """,
-            userId=user_id, category=category.strip().capitalize(), limit=limit
+            userId=user_id, category=category.strip().capitalize(), limit=fetch_limit
         )
         items = []
         for r in result:
@@ -609,8 +667,9 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
                 ti, tj = title_i.strip().lower(), title_j.strip().lower()
                 if ti == tj:
                     similarity = max(similarity, 1.0)
-                elif ti in tj or tj in ti:
-                    similarity += 0.15
+                elif (len(ti) > 3 and ti in tj) or (len(tj) > 3 and tj in ti):
+                    # If one title contains the other, give a heavy boost so it crosses the threshold
+                    similarity = max(similarity + 0.25, 0.9)
 
             if similarity >= threshold:
                 candidate_pairs.append((i, j, float(similarity)))
@@ -712,6 +771,7 @@ async def db_merge_memories(master_id: str, duplicate_ids: List[str], user_id: s
                 properties: {
                     id: 'discard',
                     text: 'discard',
+                    title: 'discard',
                     userId: 'discard',
                     timestamp: 'discard',
                     category: 'discard',
