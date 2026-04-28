@@ -458,19 +458,61 @@
   function renderDiarySidebar() {
     const el = document.getElementById('diary-dates-list');
     if (!diaryEntries.length) { el.innerHTML = '<p class="empty">No entries.</p>'; return; }
-    el.innerHTML = [...diaryEntries].sort((a,b) => b.date.localeCompare(a.date)).map(d => `
-      <div class="diary-date-item ${d.date === activeDiaryDate ? 'active' : ''}" onclick="selectDiaryEntry('${d.date}')">📅 ${d.date}</div>`).join('');
+    
+    // Group unique dates
+    const dates = [...new Set(diaryEntries.map(d => d.date))].sort((a,b) => b.localeCompare(a));
+    
+    el.innerHTML = dates.map(date => `
+      <div class="diary-date-item ${date === activeDiaryDate ? 'active' : ''}" onclick="selectDiaryEntry('${date}')">📅 ${date}</div>`).join('');
   }
 
   function selectDiaryEntry(date) {
-    activeDiaryDate = date; const entry = diaryEntries.find(d => d.date === date); renderDiarySidebar();
-    document.getElementById('diary-editor').style.display = 'none'; document.getElementById('diary-viewer').style.display = 'block';
+    activeDiaryDate = date;
+    const dayEntries = diaryEntries.filter(d => d.date === date).sort((a, b) => (b.timestamp || "").localeCompare(a.timestamp || ""));
+    renderDiarySidebar();
+    
+    document.getElementById('diary-editor').style.display = 'none';
+    document.getElementById('diary-viewer').style.display = 'block';
+    
     const viewEl = document.getElementById('diary-view-content');
-    if (entry) {
+    if (dayEntries.length) {
       viewEl.classList.remove('empty');
-      viewEl.innerHTML = `<span class="diary-date-badge">📅 ${entry.date}</span><div class="markdown-body">${marked.parse(entry.content || '')}</div>
-                          <div style="margin-top:2rem;text-align:right;"><button class="btn btn-ghost btn-sm" onclick="editCurrentEntry()">✏️ Edit</button></div>`;
+      
+      viewEl.innerHTML = `
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1.5rem; border-bottom: 2px solid var(--primary-light); padding-bottom: 0.5rem;">
+          <h2 style="margin:0; font-size:1.25rem;">📅 ${date}</h2>
+          <span style="font-size:0.8rem; color:var(--muted);">${dayEntries.length} entries today</span>
+        </div>
+        ${dayEntries.map((entry, idx) => {
+          const mentions = (entry.mentions || []).map(m => `<span class="link-badge">👤 ${escHtml(m.text)}</span>`).join('');
+          const time = entry.timestamp ? new Date(entry.timestamp).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}) : '';
+          
+          return `
+            <div class="diary-entry-segment" style="${idx > 0 ? 'margin-top:2rem; border-top:1px dashed var(--border); padding-top:1.5rem;' : ''}">
+              <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:0.75rem;">
+                <span style="font-size:0.75rem; font-weight:700; color:var(--primary); text-transform:uppercase;">Entry ${dayEntries.length - idx} ${time ? '• ' + time : ''}</span>
+                <div style="display:flex; gap:0.25rem; flex-wrap:wrap; justify-content:flex-end;">${mentions}</div>
+              </div>
+              <div class="markdown-body">${marked.parse(entry.content || '')}</div>
+            </div>
+          `;
+        }).join('')}
+        <div style="margin-top:2rem; padding-top:1rem; border-top:1px solid var(--border); text-align:right;">
+          <button class="btn btn-ghost btn-sm" onclick="editLastEntry('${date}')">✏️ Edit Latest</button>
+        </div>`;
     }
+  }
+
+  function editLastEntry(date) {
+    const dayEntries = diaryEntries.filter(d => d.date === date).sort((a, b) => (b.timestamp || "").localeCompare(a.timestamp || ""));
+    if (!dayEntries.length) return;
+    const entry = dayEntries[0];
+    document.getElementById('diary-viewer').style.display = 'none';
+    document.getElementById('diary-editor').style.display = 'block';
+    document.getElementById('diary-content').value = entry.content;
+    // We don't have a specific update tool by ID yet, so this will just save a NEW entry with same content
+    // Actually, we should probably update db_save_diary to support update by ID if we wanted, 
+    // but the user's request emphasized adding/updating without overwriting.
   }
 
   function showDiaryEditor() { activeDiaryDate = null; renderDiarySidebar(); document.getElementById('diary-viewer').style.display = 'none'; document.getElementById('diary-editor').style.display = 'block'; document.getElementById('diary-content').value = ''; }

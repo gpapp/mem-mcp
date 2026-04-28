@@ -23,8 +23,18 @@ async def create_fact(text: str, category: str, metadata: Optional[dict] = None)
 
 @mcp.tool()
 async def search_facts(query: str, category: Optional[str] = None, limit: int = 10):
-    """Search for facts matching query criteria."""
+    """
+    Search for facts matching query criteria.
+    - query: semantic search string
+    - category: optional filter (e.g. 'People', 'Client', 'Preferences') to limit output
+    - limit: maximum number of results
+    """
     return await mem.db_search_memories(query, _current_user(), limit, category)
+
+@mcp.tool()
+async def list_categories():
+    """List all distinct categories currently used in the memory vault."""
+    return mem.db_list_categories(_current_user())
 
 @mcp.tool()
 async def link_facts(sourceFactId: str, targetFactId: str, relationshipType: str, metadata: Optional[dict] = None):

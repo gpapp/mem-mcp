@@ -154,6 +154,8 @@ Immediately after creating related facts, use `link_facts` to connect them. This
 ### 9. Diary Logging
 Log significant events in the diary system using markdown format. Use `diary_save_entry(content, date)`.
 
+**Multiple Entries:** You are encouraged to save multiple small diary entries for the same day rather than one giant one. This reduces context overload and allows for more granular retrieval. 
+
 The diary should contain WHAT THE USER DID, not what was processed. Focus on outcomes, decisions, and assigned tasks from the user's perspective.
 
 ### 10. Cross-Reference Creation

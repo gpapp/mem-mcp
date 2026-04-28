@@ -738,20 +738,21 @@ def _diary_id(user_id: str, entry_date: str) -> str:
 
 
 async def db_save_diary(content: str, user_id: str, date: Optional[str] = None) -> str:
-    """Upsert a diary entry. Returns the entry date string."""
+    """Save a diary entry (allows multiple entries per day). Returns the entry date string."""
     qdrant = await get_qdrant()
     neo4j_driver = get_neo4j()
     if not qdrant or not neo4j_driver:
         raise RuntimeError("Database connections not established.")
 
     entry_date = date if date else datetime.now().strftime("%Y-%m-%d")
+    doc_id     = str(uuid.uuid4())
     vector     = await get_embedding(content)
 
-    # Qdrant (deterministic id keeps one entry per user/date)
+    # Qdrant
     await qdrant.upsert(
         collection_name=DIARY_COLLECTION,
         points=[PointStruct(
-            id=_diary_id(user_id, entry_date),
+            id=doc_id,
             vector=vector,
             payload={"content": content, "date": entry_date, "userId": user_id},
         )],
@@ -762,21 +763,62 @@ async def db_save_diary(content: str, user_id: str, date: Optional[str] = None) 
         s.run(
             """
             MERGE (u:User {id: $userId})
-            MERGE (d:DiaryEntry {date: $date, userId: $userId})
-            SET d.content = $content, d.updatedAt = datetime()
+            CREATE (d:DiaryEntry {id: $id, date: $date, content: $content, 
+                                 userId: $userId, timestamp: datetime()})
             MERGE (u)-[:WROTE_DIARY]->(d)
             """,
-            userId=user_id, date=entry_date, content=content,
+            userId=user_id, date=entry_date, content=content, id=doc_id
         )
+
+        # Automatic linking to People and Client facts
+        # 1. Fetch relevant facts
+        res = s.run(
+            """
+            MATCH (f:Fact {userId: $userId})
+            WHERE f.category IN ['People', 'Client']
+            RETURN f.id as id, f.text as text, f.aliases as aliases
+            """,
+            userId=user_id
+        )
+        
+        content_lower = content.lower()
+        mentioned_ids = []
+        for r in res:
+            name = r["text"].lower()
+            # Check for name or aliases
+            if name in content_lower:
+                mentioned_ids.append(r["id"])
+                continue
+            
+            aliases = r["aliases"]
+            if aliases:
+                if isinstance(aliases, list):
+                    if any(a.lower() in content_lower for a in aliases):
+                        mentioned_ids.append(r["id"])
+                elif isinstance(aliases, dict):
+                    if any(a.lower() in content_lower for a in aliases.keys()):
+                        mentioned_ids.append(r["id"])
+
+        # 2. Create MENTIONS links using the unique doc_id
+        if mentioned_ids:
+            s.run(
+                """
+                MATCH (d:DiaryEntry {id: $id, userId: $userId})
+                MATCH (f:Fact) WHERE f.id IN $factIds
+                MERGE (d)-[:MENTIONS]->(f)
+                """,
+                id=doc_id, userId=user_id, factIds=mentioned_ids
+            )
 
     return entry_date
 
 
 async def db_search_diary(query: str, user_id: str, limit: int = 3) -> list:
-    """Vector-similarity search across the diary collection."""
+    """Vector-similarity search across the diary collection with mention enrichment."""
     qdrant = await get_qdrant()
-    if not qdrant:
-        raise RuntimeError("Qdrant not connected.")
+    neo4j_driver = get_neo4j()
+    if not qdrant or not neo4j_driver:
+        raise RuntimeError("Database connections not established.")
 
     vec    = await get_embedding(query)
     filt   = Filter(must=[FieldCondition(key="userId", match=MatchValue(value=user_id))])
@@ -787,18 +829,34 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3) -> list:
         limit=limit,
         with_payload=True,
     )
-    return [
-        {
-            "date":    r.payload.get("date"),
-            "content": r.payload.get("content"),
-            "score":   r.score,
-        }
-        for r in result.points
-    ]
+    
+    entries = []
+    for r in result.points:
+        date = r.payload.get("date")
+        content = r.payload.get("content")
+        
+        # Enrich with mentions from Neo4j
+        mentions = []
+        with neo4j_driver.session() as s:
+            m_res = s.run(
+                "MATCH (d:DiaryEntry {date: $date, userId: $userId})-[:MENTIONS]->(f:Fact) RETURN f.id as id, f.text as text",
+                date=date, userId=user_id
+            )
+            mentions = [{"id": mr["id"], "text": mr["text"]} for mr in m_res]
+            
+        entries.append({
+            "id": r.id,
+            "date": date,
+            "content": content,
+            "score": r.score,
+            "timestamp": None, # Qdrant payload doesn't have it yet, we could fetch from Neo4j if needed
+            "mentions": mentions
+        })
+    return entries
 
 
 def db_list_diary(user_id: str) -> list:
-    """Return all diary entries for a user from Neo4j, newest first."""
+    """Return all diary entries for a user from Neo4j with mention links, grouped by date."""
     neo4j_driver = get_neo4j()
     if not neo4j_driver:
         raise RuntimeError("Neo4j not connected.")
@@ -807,12 +865,22 @@ def db_list_diary(user_id: str) -> list:
         result = s.run(
             """
             MATCH (d:DiaryEntry {userId: $userId})
-            RETURN d.date as date, d.content as content
-            ORDER BY d.date DESC
+            OPTIONAL MATCH (d)-[:MENTIONS]->(f:Fact)
+            RETURN d.id as id, d.date as date, d.content as content, d.timestamp as timestamp,
+                   collect({id: f.id, text: f.text}) as mentions
+            ORDER BY d.date DESC, d.timestamp DESC
             """,
             userId=user_id,
         )
-        return [{"date": r["date"], "content": r["content"]} for r in result]
+        return [
+            {
+                "id": r["id"],
+                "date": r["date"], 
+                "content": r["content"], 
+                "timestamp": r["timestamp"].iso_format() if r.get("timestamp") and hasattr(r["timestamp"], "iso_format") else None,
+                "mentions": [m for m in r["mentions"] if m.get("id")]
+            } for r in result
+        ]
 
 
 def db_get_graph(user_id: str) -> dict:
