@@ -1,5 +1,5 @@
 """
-server.py – Entry point for the Memory Vault.
+server.py  - Entry point for the Memory Vault.
 
 Starts a unified FastAPI server that handles:
   • MCP server  → /mcp
