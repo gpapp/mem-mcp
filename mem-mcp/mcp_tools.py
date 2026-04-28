@@ -16,10 +16,15 @@ def _current_user() -> str:
     return user
 
 @mcp.tool()
-async def create_fact(text: str, category: str, metadata: Optional[dict] = None):
-    """Store a new fact in the knowledge base."""
-    doc_id = await mem.db_add_memory(text, category, _current_user(), metadata)
-    return f"Fact created with ID: {doc_id}"
+async def add_fact(title: str, text: str, category: str):
+    """
+    Save a new fact or memory to the knowledge graph.
+    'title' should be a concise header for the fact.
+    'text' should be the detailed content of the fact.
+    'category' should be one of: People, Technology, Client, Project, Event, Tool.
+    """
+    memory_id = await mem.db_add_memory(text, category, _current_user(), title=title)
+    return f"Successfully added memory with ID: {memory_id}"
 
 @mcp.tool()
 async def search_facts(query: str, category: Optional[str] = None, limit: int = 10):
@@ -48,10 +53,14 @@ async def get_fact_neighborhood(factId: str, depth: int = 1, relationshipTypes: 
     return mem.db_get_neighborhood(factId, depth, relationshipTypes or [], _current_user())
 
 @mcp.tool()
-async def update_fact(factId: str, text: Optional[str] = None, category: Optional[str] = None, metadata: Optional[dict] = None):
-    """Update an existing fact."""
-    found = await mem.db_update_memory(factId, text, category, _current_user(), metadata)
-    return f"Fact {factId} updated" if found else f"Error: {factId} not found"
+async def update_fact(memoryId: str, title: Optional[str] = None, text: Optional[str] = None, category: Optional[str] = None):
+    """
+    Update an existing memory by ID. Provide only the fields that need updating.
+    """
+    success = await mem.db_update_memory(memoryId, title, text, category, _current_user())
+    if success:
+        return f"Successfully updated memory {memoryId}"
+    return f"Error: Memory {memoryId} not found or unauthorized."
 
 @mcp.tool()
 async def delete_fact(factId: str):
@@ -81,7 +90,11 @@ async def find_duplicates(category: str = "People", limit: int = 50, threshold: 
     Find potential duplicate entries in memory by comparing embeddings similarity ranking.
     Returns grouped clusters of similar items for manual deduplication.
     """
-    return await mem.db_find_duplicates(_current_user(), category, limit, threshold)
+    try:
+        return await mem.db_find_duplicates(_current_user(), category, limit, threshold)
+    except Exception as e:
+        logger.exception(f"Error in find_duplicates: {e}")
+        return f"Error: {str(e)}"
 
 @mcp.tool()
 async def merge_facts(masterId: str, duplicateIds: List[str], smart: bool = False, ctx: Context = None):
@@ -115,9 +128,13 @@ async def transcription_cleanup(text: str, participants: Optional[List[str]] = N
     system = "You are a professional transcriptionist. Fix speaker turns, remove filler words (um, uh, like), and correct obvious transcription errors."
 
     # Use MCP sampling if context is available and text is moderately long (> 1000 chars)
-    if ctx and len(text) > 1000:
+    if ctx and hasattr(ctx, "sample") and len(text) > 1000:
         try:
-            result = await ctx.sample(prompt, system_prompt=system)
+            from mcp.types import SamplingMessage, TextContent
+            result = await ctx.sample(
+                messages=[SamplingMessage(role="user", content=TextContent(type="text", text=prompt))],
+                system_prompt=system
+            )
             if result and result.text:
                 return result.text
         except Exception as e:
@@ -146,9 +163,13 @@ async def suggest_merge(cluster_json: str, ctx: Context = None):
     system = "You are a data deduplication expert. Identify the most complete and accurate record in a cluster."
 
     # Use MCP sampling if context is available and prompt is moderately long (> 1000 chars)
-    if ctx and len(cluster_json) > 1000:
+    if ctx and hasattr(ctx, "sample") and len(cluster_json) > 1000:
         try:
-            result = await ctx.sample(prompt, system_prompt=system)
+            from mcp.types import SamplingMessage, TextContent
+            result = await ctx.sample(
+                messages=[SamplingMessage(role="user", content=TextContent(type="text", text=prompt))],
+                system_prompt=system
+            )
             if result and result.text:
                 return result.text
         except Exception as e:

@@ -93,7 +93,8 @@ def get_neo4j():
             try:
                 _neo4j_driver = GraphDatabase.driver(NEO4J_URL, auth=(NEO4J_USER, NEO4J_PASS))
                 with _neo4j_driver.session() as s:
-                    s.run("CREATE INDEX user_id_index IF NOT EXISTS FOR (m:Memory) ON (m.userId)")
+                    s.run("CREATE INDEX fact_user_id_index IF NOT EXISTS FOR (f:Fact) ON (f.userId)")
+                    s.run("CREATE INDEX fact_category_index IF NOT EXISTS FOR (f:Fact) ON (f.category)")
                     s.run("CREATE INDEX diary_date_index IF NOT EXISTS FOR (d:DiaryEntry) ON (d.date)")
             except Exception as e:
                 logger.error(f"Neo4j init error: {e}")
@@ -193,7 +194,7 @@ def extract_user_from_headers(headers: dict) -> str:
 # CRUD helpers – single source of truth for Qdrant + Neo4j consistency
 # ---------------------------------------------------------------------------
 
-async def db_add_memory(text: str, category: str, user_id: str, metadata: Optional[dict] = None) -> str:
+async def db_add_memory(text: str, category: str, user_id: str, metadata: Optional[dict] = None, title: Optional[str] = None) -> str:
     """Insert a fact into Qdrant (vector) and Neo4j (graph). Returns the new ID."""
     qdrant = await get_qdrant()
     neo4j_driver = get_neo4j()
@@ -203,10 +204,12 @@ async def db_add_memory(text: str, category: str, user_id: str, metadata: Option
     doc_id   = str(uuid.uuid4())
     category = category.strip().capitalize()
     meta     = metadata or {}
-    vector   = await get_embedding(text)
+    # Use title + text for embedding for better context if title exists
+    embed_text = f"{title}: {text}" if title else text
+    vector   = await get_embedding(embed_text)
 
     # Qdrant
-    payload = {"text": text, "category": category, "userId": user_id, "metadata": meta}
+    payload = {"text": text, "title": title, "category": category, "userId": user_id, "metadata": meta}
     await qdrant.upsert(
         collection_name=COLLECTION_NAME,
         points=[PointStruct(
@@ -222,22 +225,22 @@ async def db_add_memory(text: str, category: str, user_id: str, metadata: Option
             """
             MERGE (u:User {id: $userId})
             MERGE (c:Category {name: $category})
-            CREATE (f:Fact {id: $id, text: $text, category: $category,
+            CREATE (f:Fact {id: $id, text: $text, title: $title, category: $category,
                             timestamp: datetime(), userId: $userId})
             SET f += $metadata
             CREATE (u)-[:KNOWS]->(f)
             CREATE (f)-[:IN_CATEGORY]->(c)
             """,
-            userId=user_id, category=category, id=doc_id, text=text,
+            userId=user_id, category=category, id=doc_id, text=text, title=title,
             metadata=meta
         )
 
     return doc_id
 
 
-async def db_update_memory(memory_id: str, text: Optional[str], category: Optional[str], user_id: str, metadata: Optional[dict] = None) -> bool:
+async def db_update_memory(memory_id: str, title: Optional[str], text: Optional[str], category: Optional[str], user_id: str, metadata: Optional[dict] = None) -> bool:
     """
-    Update text, category, or metadata of an existing fact.
+    Update title, text, category, or metadata of an existing fact.
     Re-embeds if text changes. Returns True if the record was found.
     """
     qdrant = await get_qdrant()
@@ -253,11 +256,14 @@ async def db_update_memory(memory_id: str, text: Optional[str], category: Option
         old_fact = existing["f"]
 
     new_text = text if text is not None else old_fact.get("text")
+    new_title = title if title is not None else old_fact.get("title")
     new_cat  = category.strip().capitalize() if category else old_fact.get("category")
-    new_meta = metadata or {} # We merge in tool layer or here? Let's merge.
+    new_meta = metadata or {} 
     
     # Qdrant Update
-    vector = await get_embedding(new_text) if text is not None else None
+    # Re-embed if text OR title changes
+    embed_text = f"{new_title}: {new_text}" if new_title else new_text
+    vector = await get_embedding(embed_text) if (text is not None or title is not None) else None
     
     # Prepare payload, converting Neo4j types to JSON-serializable ones
     payload = {}
@@ -268,6 +274,7 @@ async def db_update_memory(memory_id: str, text: Optional[str], category: Option
             payload[k] = v
 
     if text is not None: payload["text"] = new_text
+    if title is not None: payload["title"] = new_title
     if category is not None: payload["category"] = new_cat
     if metadata:
         current_meta = payload.get("metadata", {})
@@ -282,7 +289,7 @@ async def db_update_memory(memory_id: str, text: Optional[str], category: Option
         collection_name=COLLECTION_NAME,
         points=[PointStruct(
             id=memory_id,
-            vector=vector or await get_embedding(new_text),
+            vector=vector or await get_embedding(embed_text),
             payload=payload,
         )],
     )
@@ -292,7 +299,7 @@ async def db_update_memory(memory_id: str, text: Optional[str], category: Option
         s.run(
             """
             MATCH (f:Fact {id: $id, userId: $userId})
-            SET f.text = $text, f.category = $category, f.updatedAt = datetime()
+            SET f.text = $text, f.title = $title, f.category = $category, f.updatedAt = datetime()
             SET f += $metadata
             WITH f
             OPTIONAL MATCH (f)-[r:IN_CATEGORY]->(:Category)
@@ -301,7 +308,7 @@ async def db_update_memory(memory_id: str, text: Optional[str], category: Option
             MERGE (c:Category {name: $category})
             CREATE (f)-[:IN_CATEGORY]->(c)
             """,
-            id=memory_id, userId=user_id, text=new_text, category=new_cat, metadata=new_meta
+            id=memory_id, userId=user_id, text=new_text, title=new_title, category=new_cat, metadata=new_meta
         )
     return True
 
@@ -415,13 +422,14 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
                     # Partial match
                     try: score += (float(confidence) * 0.05)
                     except: pass
-                    
+        
         results.append({
-            "id":       r.id,
-            "text":     r.payload.get("text", ""),
-            "category": r.payload.get("category", ""),
-            "metadata": metadata,
-            "score":    score,
+            "id": r.id,
+            "text": r.payload.get("text"),
+            "title": r.payload.get("title"),
+            "category": r.payload.get("category"),
+            "score": score,
+            "metadata": metadata
         })
     
     # Re-sort by updated score
@@ -462,7 +470,7 @@ def db_list_memories(user_id: str) -> list:
             OPTIONAL MATCH (f)-[r]->(target:Fact {userId: $userId})
             WHERE type(r) <> 'IN_CATEGORY' AND type(r) <> 'KNOWS'
             RETURN f, c.name as category, 
-                   collect({rel: type(r), target_id: target.id, target_text: target.text}) as links
+                   collect({rel: type(r), target_id: target.id, target_text: target.text, target_title: target.title}) as links
             ORDER BY c.name ASC, f.timestamp DESC
             """,
             userId=user_id,
@@ -471,7 +479,7 @@ def db_list_memories(user_id: str) -> list:
         for r in result:
             f_node = r["f"]
             # Extract metadata (all properties except core ones)
-            core_keys = {"id", "text", "category", "timestamp", "userId"}
+            core_keys = {"id", "text", "title", "category", "timestamp", "userId"}
             metadata = {}
             for k, v in f_node.items():
                 if k not in core_keys:
@@ -483,6 +491,7 @@ def db_list_memories(user_id: str) -> list:
             memories.append({
                 "id":        f_node["id"],
                 "text":      f_node["text"],
+                "title":     f_node.get("title"),
                 "category":  r["category"],
                 "timestamp": f_node["timestamp"].iso_format() if f_node.get("timestamp") else None,
                 "metadata":  metadata,
@@ -509,7 +518,7 @@ def db_list_categories(user_id: str) -> list:
         return [r["category"] for r in result]
 
 
-async def db_find_duplicates(user_id: str, category: str = "People", limit: int = 50, threshold: float = 0.75):
+async def db_find_duplicates(user_id: str, category: str = "People", limit: int = 50, threshold: float = 0.85):
     """
     Find potential duplicates in a category using embedding similarity and clustering.
     """
@@ -541,6 +550,7 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
             items.append({
                 "id": f_node["id"],
                 "text": f_node["text"],
+                "title": f_node.get("title"),
                 "category": f_node.get("category"),
                 "metadata": metadata
             })
@@ -635,6 +645,7 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
             member_info = {
                 "id": item["id"],
                 "text": item["text"],
+                "title": item["title"],
                 "similarity": round(avg_item_sim, 4)
             }
             member_info.update(item["metadata"])
@@ -725,7 +736,11 @@ async def db_smart_merge_memories(master_id: str, duplicate_ids: List[str], user
     # Use MCP sampling if context is available and prompt is moderately long (> 1000 chars)
     if ctx and hasattr(ctx, "sample") and len(prompt) > 1000:
         try:
-            result = await ctx.sample(prompt, system_prompt=system)
+            from mcp.types import SamplingMessage, TextContent
+            result = await ctx.sample(
+                messages=[SamplingMessage(role="user", content=TextContent(type="text", text=prompt))],
+                system_prompt=system
+            )
             if result and result.text:
                 new_text = result.text
             else:
@@ -881,7 +896,7 @@ def db_list_diary(user_id: str) -> list:
             MATCH (d:DiaryEntry {userId: $userId})
             OPTIONAL MATCH (d)-[:MENTIONS]->(f:Fact)
             RETURN d.id as id, d.date as date, d.content as content, d.timestamp as timestamp,
-                   collect({id: f.id, text: f.text}) as mentions
+                   collect({id: f.id, text: f.text, title: f.title}) as mentions
             ORDER BY d.date DESC, d.timestamp DESC
             """,
             userId=user_id,
@@ -924,7 +939,7 @@ def db_get_graph(user_id: str) -> dict:
                 node_map[f["id"]] = {
                     "id": f["id"],
                     "label": "Fact",
-                    "title": f["text"],
+                    "title": f.get("title") or f["text"],
                     "group": f.get("category", "General")
                 }
             

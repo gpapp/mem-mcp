@@ -71,12 +71,14 @@ async def startup_event():
 
 class MemoryCreate(BaseModel):
     text: str
+    title: Optional[str] = None
     category: str = "General"
     tags: Optional[str] = ""
 
 
 class MemoryUpdate(BaseModel):
     text: str
+    title: Optional[str] = None
     category: str = "General"
     tags: Optional[str] = ""
 
@@ -116,8 +118,8 @@ async def api_list_memories(request: Request):
 async def api_create_memory(request: Request, body: MemoryCreate):
     try:
         metadata = {"tags": [t.strip() for t in body.tags.split(",") if t.strip()]} if body.tags else {}
-        doc_id = await mem.db_add_memory(body.text, body.category, _user(request), metadata)
-        return {"id": doc_id, "text": body.text, "category": body.category.strip().capitalize(), "metadata": metadata}
+        doc_id = await mem.db_add_memory(body.text, body.category, _user(request), metadata, title=body.title)
+        return {"id": doc_id, "text": body.text, "title": body.title, "category": body.category.strip().capitalize(), "metadata": metadata}
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
@@ -126,10 +128,10 @@ async def api_create_memory(request: Request, body: MemoryCreate):
 async def api_update_memory(memory_id: str, request: Request, body: MemoryUpdate):
     try:
         metadata = {"tags": [t.strip() for t in body.tags.split(",") if t.strip()]} if body.tags else {}
-        found = await mem.db_update_memory(memory_id, body.text, body.category, _user(request), metadata)
+        found = await mem.db_update_memory(memory_id, body.text, body.category, _user(request), metadata, title=body.title)
         if not found:
             raise HTTPException(status_code=404, detail="Memory not found or access denied.")
-        return {"id": memory_id, "text": body.text, "category": body.category.strip().capitalize(), "metadata": metadata}
+        return {"id": memory_id, "text": body.text, "title": body.title, "category": body.category.strip().capitalize(), "metadata": metadata}
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
