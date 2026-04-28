@@ -128,10 +128,10 @@ async def api_create_memory(request: Request, body: MemoryCreate):
 async def api_update_memory(memory_id: str, request: Request, body: MemoryUpdate):
     try:
         metadata = {"tags": [t.strip() for t in body.tags.split(",") if t.strip()]} if body.tags else {}
-        found = await mem.db_update_memory(memory_id, body.text, body.category, _user(request), metadata, title=body.title)
+        found = await mem.db_update_memory(memory_id, body.title, body.text, body.category, _user(request), metadata)
         if not found:
             raise HTTPException(status_code=404, detail="Memory not found or access denied.")
-        return {"id": memory_id, "text": body.text, "title": body.title, "category": body.category.strip().capitalize(), "metadata": metadata}
+        return {"id": memory_id, "title": body.title, "text": body.text, "category": body.category.strip().capitalize(), "metadata": metadata}
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
