@@ -667,9 +667,22 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
                 ti, tj = title_i.strip().lower(), title_j.strip().lower()
                 if ti == tj:
                     similarity = max(similarity, 1.0)
-                elif (len(ti) > 3 and ti in tj) or (len(tj) > 3 and tj in ti):
-                    # If one title contains the other, give a heavy boost so it crosses the threshold
-                    similarity = max(similarity + 0.25, 0.9)
+                else:
+                    # Tokenize to check for matching words (e.g. matching first names or last names)
+                    ti_words = set(ti.split())
+                    tj_words = set(tj.split())
+                    common_words = ti_words.intersection(tj_words)
+
+                    if common_words:
+                        # Filter out very short common words to avoid matching on 'the', 'a', etc. (unless it's a name)
+                        valid_common = [w for w in common_words if len(w) > 2 or category.strip().capitalize() == "People"]
+                        if valid_common:
+                            # Boost based on ratio of matched words to the shorter title
+                            min_words = min(len(ti_words), len(tj_words))
+                            match_ratio = len(valid_common) / min_words if min_words > 0 else 0
+
+                            boost = 0.25 * match_ratio
+                            similarity = max(similarity + boost, 0.86 if match_ratio >= 1.0 else similarity + boost)
 
             if similarity >= threshold:
                 candidate_pairs.append((i, j, float(similarity)))
