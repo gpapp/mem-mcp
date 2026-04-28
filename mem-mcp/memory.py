@@ -410,7 +410,15 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
         score = r.score
         metadata = r.payload.get("metadata", {})
         aliases = metadata.get("aliases", {})
-        
+        title = r.payload.get("title")
+
+        # Boost score if query matches the title
+        if title:
+            if query_lower == title.lower():
+                score += 0.5
+            elif query_lower in title.lower() or title.lower() in query_lower:
+                score += 0.2
+
         # Boost score if query matches an alias
         if aliases and isinstance(aliases, dict):
             for alias, confidence in aliases.items():
@@ -589,9 +597,20 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
             norm_j = np.linalg.norm(vec_j)
             if norm_i == 0 or norm_j == 0:
                 continue
-                
+
             similarity = np.dot(vec_i, vec_j) / (norm_i * norm_j)
-            
+
+            title_i = items_with_vectors[i].get("title")
+            title_j = items_with_vectors[j].get("title")
+
+            # Boost similarity based on title matches
+            if title_i and title_j:
+                ti, tj = title_i.strip().lower(), title_j.strip().lower()
+                if ti == tj:
+                    similarity = max(similarity, 1.0)
+                elif ti in tj or tj in ti:
+                    similarity += 0.15
+
             if similarity >= threshold:
                 candidate_pairs.append((i, j, float(similarity)))
 

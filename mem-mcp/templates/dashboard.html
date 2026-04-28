@@ -364,7 +364,8 @@
 
     let filtered = memories.filter(m => {
       const matchCat = activeCategory === null || m.category === activeCategory;
-      const matchQuery = !query || m.text.toLowerCase().includes(query) || m.category.toLowerCase().includes(query);
+      const mTitle = m.title ? m.title.toLowerCase() : '';
+      const matchQuery = !query || m.text.toLowerCase().includes(query) || mTitle.includes(query) || m.category.toLowerCase().includes(query);
       return matchCat && matchQuery;
     });
 
