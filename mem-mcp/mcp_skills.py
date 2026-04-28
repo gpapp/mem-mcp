@@ -63,15 +63,13 @@ TIP: Use 'find_skills' to discover other related workflows like 'cleanup-transcr
 Please help me deduplicate entries in the '{category}' category.
 
 FOLLOW THIS WORKFLOW:
-1. Run 'memory_find_duplicates' with category='{category}'.
-2. For each cluster found, use 'memory_suggest_merge' to analyze the members and identify the 'Master' record.
-3. Review the suggestion and use the 'memory_merge_facts' tool to perform the consolidation on the server.
+1. Run 'find_duplicates' with category='{category}'.
+2. For each cluster found, use 'suggest_merge' to analyze the members and identify the 'Master' record.
+3. Review the suggestion and use the 'merge_facts' tool to perform the consolidation on the server.
 4. PERFORMANCE: Using these specialized tools is much more efficient than manual logic.
 5. Execute the merge only after I confirm.
 
 Be careful not to lose important context or relationships.
-
-TIP: Use 'find_skills' to see other data management workflows.
 """
     @mcp.resource("skill://cleanup-transcription")
     def resource_skill_cleanup() -> str:
