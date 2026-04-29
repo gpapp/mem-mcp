@@ -11,6 +11,8 @@ const transport = new SSEClientTransport(new URL(REMOTE_URL), {
   eventSourceInitDict: { headers: { "Authorization": AUTH_HEADER } },
   requestInit: { headers: { "Authorization": AUTH_HEADER } }
 });
+transport.onclose = () => console.log("Transport closed");
+transport.onerror = (error) => console.error("Transport error details:", error);
 
 const client = new Client({ name: "bridge-client", version: "1.0.0" }, { capabilities: { sampling: {} } });
 await client.connect(transport);

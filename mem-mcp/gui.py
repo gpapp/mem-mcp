@@ -240,14 +240,14 @@ async def get_landing(request: Request):
     return HTMLResponse(content=html)
 
 
-@web_app.get("/api/download/mcp-bridge.js", response_class=Response)
+@web_app.get("/api/download/mcp-bridge.mjs", response_class=Response)
 async def download_mcp_bridge(request: Request):
     ctx = _get_auth_context(request)
-    js_content = _render_template("mcp-bridge", ext="js", BASE_URL=mem.BASE_URL, **ctx)
+    js_content = _render_template("mcp-bridge", ext="mjs", BASE_URL=mem.BASE_URL, **ctx)
     return Response(
         content=js_content,
         media_type="application/javascript",
-        headers={"Content-Disposition": 'attachment; filename="mcp-bridge.js"'}
+        headers={"Content-Disposition": 'attachment; filename="mcp-bridge.mjs"'}
     )
 
 @web_app.get("/gui", response_class=HTMLResponse)
