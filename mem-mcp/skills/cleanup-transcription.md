@@ -31,9 +31,10 @@ Use this skill when you have:
 - **Accuracy**: Maintain consistent speaker labeling throughout the transcript.
 
 ### 4. Transcription Cleanup
-- **Tool**: Use `transcription_cleanup` with the transcription text and the identified participants list.
-- This tool handles the removal of filler words and speaker identification on the server.
-- **Final Review**: Review the cleaned output and ensure any "Stored Corrections" from memory were applied correctly.
+- **Tool**: Call `transcription_cleanup` with the transcription text and the identified participants list.
+- The tool returns the raw text with metadata and cleanup instructions — **you** perform the actual cleanup using the instructions provided.
+- Apply any "Stored Corrections" from memory (step 1) to fix recurring misspellings.
+- Produce the cleaned transcript in `[Speaker Name]: <text>` format, removing filler words and correcting errors.
 
 ### 5. Final Output Structure
 Produce the final output in two parts:
@@ -56,4 +57,4 @@ Produce the final output in two parts:
 - **Ambiguity**: If you are unsure about a speaker identification, flag it (e.g., "[00:12:00] **Unidentified (possibly John?)**").
 
 ## Efficiency: Multi-Tool Execution
-You are encouraged to call multiple tools in a single response. For example, you can call `transcription_cleanup` and then process the results with multiple `create_fact`, `link_facts`, and `diary_save_entry` calls in one go.
+You are encouraged to call multiple tools in a single response. For example, you can call `transcription_cleanup` and `search_facts` in parallel, then process all results together.

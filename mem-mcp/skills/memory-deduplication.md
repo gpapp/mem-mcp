@@ -14,29 +14,41 @@ Use the `find_duplicates` tool to scan the memory for clusters of similar items.
 - **Result**: You will receive a list of clusters with an `avg_similarity` score and a basic recommendation.
 
 ### 2. Analyze Clusters and Select Master
-Use the `suggest_merge` tool to analyze a specific cluster and get a recommendation for the **Master** record.
+Use the `suggest_merge` tool for each cluster to get a structured comparison.
 - Pass the cluster JSON to the tool.
-- The tool uses LLM reasoning to determine which record is the most complete and accurate.
-- It identifies specific details from other records that should be preserved.
+- The tool returns all records sorted by completeness (field count + text length) with a `suggested_master_id`.
+- **Your job**: Review the records, confirm or override the suggested master, and identify which details from the other records must be preserved in the consolidated text.
 
-### 3. Perform Smart Merge
-Execute the consolidation using the `merge_facts` tool with `smart=True`.
-- **masterId**: The ID of the record you want to keep.
-- **duplicateIds**: A list of IDs to merge into the master.
-- **smart**: Always set to `True` for complex entities like People or Projects.
-- **Outcome**: This tool automatically:
-    1. Consolidates all text descriptions into a single cohesive Markdown summary.
-    2. Safely migrates all missing graph relationships from duplicates to the Master (preventing duplicate edges natively). Do NOT manually link them afterwards.
-    3. Merges node properties (tags, aliases, etc.).
-    4. Deletes the duplicate records.
+### 3. Smart Merge (client-side consolidation)
+Execute the consolidation in three steps:
 
-### 4. Verification
+**Step A** — Fetch texts for consolidation:
+Call `merge_facts(masterId=<master_id>, duplicateIds=[...], smart=True)`.
+- The tool returns the full text and relationships of every record in the cluster.
+- Do NOT skip this — you need the graph relationship data.
+
+**Step B** — Write the consolidated text:
+Using the returned records, write a single comprehensive Markdown text that:
+1. Preserves EVERY unique fact, name, date, decision, role, and technical detail from ALL records.
+2. Does NOT generalize or drop granular specifics.
+3. Uses sections/bullets if the entity has multiple distinct topics.
+4. Incorporates any listed graph relationships into the narrative.
+
+**Step C** — Apply and complete:
+1. `update_fact(memoryId=<master_id>, text=<consolidated_text>)` — update the master with your consolidated text.
+2. `merge_facts(masterId=<master_id>, duplicateIds=[...], smart=False)` — move all graph relationships from duplicates to master and delete the duplicate nodes.
+
+### 4. Simple Merge (no text consolidation needed)
+For simple facts where the records are nearly identical and no LLM consolidation is needed:
+- Call `merge_facts(masterId=<master_id>, duplicateIds=[...], smart=False)` directly.
+
+### 5. Verification
 After a merge, verify the results:
-- Use `get_fact_neighborhood` on the Master ID to see the new consolidated graph.
+- Use `get_fact_neighborhood` on the Master ID to see the consolidated graph.
 - If the text needs further refinement, use `update_fact`.
 
 ## Efficiency: Multi-Tool Execution
-You are encouraged to call multiple tools in a single response. For example, you can call `find_duplicates` and then process multiple clusters with `suggest_merge` and `merge_facts` in subsequent turns.
+You are encouraged to call multiple tools in a single response. For example, you can call `find_duplicates` and then process multiple clusters with `suggest_merge` in the same turn, then handle the merges cluster by cluster.
 
 ## Examples of "Duplicate" Patterns
 - **People**: "Kate" vs "Katarina" (same role/company).
@@ -45,4 +57,4 @@ You are encouraged to call multiple tools in a single response. For example, you
 
 ## Tips
 - **Human-in-the-Loop**: If a merge seems risky or data might be lost, STOP and ask the user for confirmation.
-- **Manual Merge**: For simple facts where you don't need LLM consolidation, you can use `merge_facts` with `smart=False`.
+- **Relationship Safety**: The graph merge (`smart=False`) automatically prevents duplicate edges. Do NOT manually re-link after a merge.

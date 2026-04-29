@@ -105,7 +105,7 @@ Use relative links between files, e.g.:
 - If a match is found:
     - Use `update_fact` to merge new information into the existing record.
     - Do NOT create a duplicate entry.
-- If no match is found, use `create_fact`.
+- If no match is found, use `add_fact`.
 
 ### 7. Handling Ambiguity and Mispronunciations (Aliases)
 People are often referred to by first names or their names might be mispronounced in the transcription.
@@ -131,7 +131,7 @@ To ensure vector search finds these aliases, append them to the bottom of the Ma
 ```
 
 **Tool Usage:**
-- Use `create_fact(text, category, metadata)` for storing NEW facts.
+- Use `add_fact(text, category, metadata)` for storing NEW facts.
 - Use `update_fact(factId, text, category, metadata)` for MERGING into existing facts.
 - Use `link_facts(sourceFactId, targetFactId, relationshipType)` for creating relationships.
 
@@ -174,7 +174,7 @@ Create summary documents and store them as a comprehensive memory entry in the `
 - **Graph Thinking:** Always ask "What does this fact relate to?" and create the link.
 
 ## Efficiency: Multi-Tool Execution
-You are encouraged to call multiple tools in a single response to process the transcription efficiently. You can batch several `create_fact` and `link_facts` calls together, followed by a `diary_save_entry` in one go.
+You are encouraged to call multiple tools in a single response to process the transcription efficiently. You can batch several `add_fact` and `link_facts` calls together, followed by a `diary_save_entry` in one go.
 
 ## Customization
 This skill can be adapted for different transcription formats by adjusting speaker patterns and category structures.
