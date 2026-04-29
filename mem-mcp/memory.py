@@ -415,14 +415,14 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
     with neo4j_driver.session() as s:
         cypher = """
         MATCH (f:Fact {userId: $userId})
-        WHERE toLower(f.title) CONTAINS toLower($query)
-           OR toLower(f.text) CONTAINS toLower($query)
+        WHERE toLower(f.title) CONTAINS toLower($query_str)
+           OR toLower(f.text) CONTAINS toLower($query_str)
         """
         if category:
             cypher += " AND f.category = $category"
         cypher += " RETURN f LIMIT $limit"
 
-        params = {"userId": user_id, "query": query, "limit": limit}
+        params = {"userId": user_id, "query_str": query, "limit": limit}
         if category:
             params["category"] = category.strip().capitalize()
 
