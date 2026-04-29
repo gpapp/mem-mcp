@@ -133,7 +133,8 @@ async def transcription_cleanup(text: str, ctx: Context, participants: Optional[
             from mcp.types import SamplingMessage, TextContent
             result = await ctx.sample(
                 messages=[SamplingMessage(role="user", content=TextContent(type="text", text=prompt))],
-                system_prompt=system
+                system_prompt=system,
+                max_tokens=2000
             )
             if result and result.text:
                 return result.text
@@ -168,7 +169,8 @@ async def suggest_merge(cluster_json: str, ctx: Context):
             from mcp.types import SamplingMessage, TextContent
             result = await ctx.sample(
                 messages=[SamplingMessage(role="user", content=TextContent(type="text", text=prompt))],
-                system_prompt=system
+                system_prompt=system,
+                max_tokens=2000
             )
             if result and result.text:
                 return result.text
@@ -202,6 +204,26 @@ async def get_skill_workflow(skillName: str):
         return f"Skill '{skillName}' not found."
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
+
+@mcp.tool()
+async def debug_client_capabilities(ctx: Context):
+    """
+    Log and return the client capabilities announced by the MCP client.
+    Use this to debug if sampling or other features are supported by the client.
+    """
+    caps = "Unknown"
+    if hasattr(ctx, "session"):
+        # The underlying ServerSession in mcp-python holds client_capabilities
+        caps_obj = getattr(ctx.session, "client_capabilities", None)
+        caps = str(caps_obj) if caps_obj else "None found on session"
+
+    elif hasattr(ctx, "request_context"):
+        # Alternative location depending on FastMCP internal mapping
+        caps_obj = getattr(ctx.request_context, "client_capabilities", None)
+        caps = str(caps_obj) if caps_obj else "None found on request_context"
+
+    logger.info(f"DEBUG CAPABILITIES - MCP Client Capabilities: {caps}")
+    return f"Client capabilities announced: {caps}"
 
 
 # ---------------------------------------------------------------------------

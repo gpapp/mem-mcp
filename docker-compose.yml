@@ -83,6 +83,7 @@ services:
 
     volumes:
       - MEM_model_cache:/root/.cache/fastembed
+      - ./mem-mcp/logs:/app/logs
 
 volumes:
   MEM_model_cache:
