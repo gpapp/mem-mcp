@@ -273,13 +273,40 @@
     <p>Connect your AI assistant to this Vault.</p>
     <div class="setup-grid">
         <div style="flex:1;">
-            <label>Claude Desktop / Claude Code Command:</label>
+            <label>Standard Connection (HTTP SSE):</label>
             <pre><code>claude mcp add --transport http memory-vault {{MCP_URL}} --header "Authorization: Basic {{AUTH_BASE64}}"</code></pre>
         </div>
     </div>
+
     <div style="margin-top:1.5rem; background: var(--bg); padding: 1rem; border-radius: 8px; border: 1px dashed var(--primary); display: flex; gap: 2rem;">
         <div><strong>User:</strong> <code>{{AUTH_USER}}</code></div>
         <div><strong>Pass:</strong> <code>{{AUTH_PASS}}</code></div>
+    </div>
+
+    <div style="margin-top: 2.5rem; padding-top: 1.5rem; border-top: 1px solid var(--border);">
+      <h3 style="margin-top:0;">🚀 Local Proxy Bridge (Recommended for Sampling Support)</h3>
+      <p style="font-size: 0.9rem; color: var(--muted); margin-bottom: 1rem;">
+        Some clients (like Claude Code) disable advanced features like sampling over HTTP.
+        You can use a local Node.js bridge script to connect via <code>stdio</code>, unlocking full capabilities.
+      </p>
+
+      <ol style="font-size: 0.9rem; padding-left: 1.5rem; margin-bottom: 1.5rem;">
+        <li style="margin-bottom: 0.75rem;">
+          <a href="{{BASE_URL}}/api/download/mcp-bridge.js" class="btn btn-primary btn-sm" style="display: inline-block; text-decoration: none; margin-bottom: 0.5rem;">
+            ⬇️ Download mcp-bridge.js
+          </a><br>
+          <em>The downloaded file is already pre-configured with your secure credentials and server URL.</em>
+        </li>
+        <li style="margin-bottom: 0.75rem;">
+          <strong>Install dependencies</strong> in the folder where you saved the script:<br>
+          <pre style="margin-top: 0.5rem;"><code>npm init -y
+npm install @modelcontextprotocol/sdk</code></pre>
+        </li>
+        <li>
+          <strong>Connect Claude Code</strong> to your local bridge:<br>
+          <pre style="margin-top: 0.5rem;"><code>claude mcp add memory-vault-local node mcp-bridge.js</code></pre>
+        </li>
+      </ol>
     </div>
   </div>
 </div>

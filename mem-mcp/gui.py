@@ -22,14 +22,14 @@ import os
 import base64
 import logging
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 from typing import Optional
 
 import memory as mem
 
-def _render_template(name: str, **context) -> str:
-    path = os.path.join(os.path.dirname(__file__), "templates", f"{name}.html")
+def _render_template(name: str, ext: str = "html", **context) -> str:
+    path = os.path.join(os.path.dirname(__file__), "templates", f"{name}.{ext}")
     with open(path, "r", encoding="utf-8") as f:
         html = f.read()
     for k, v in context.items():
@@ -239,6 +239,16 @@ async def get_landing(request: Request):
     html = _render_template("landing", BASE_URL=mem.BASE_URL, **ctx)
     return HTMLResponse(content=html)
 
+
+@web_app.get("/api/download/mcp-bridge.js", response_class=Response)
+async def download_mcp_bridge(request: Request):
+    ctx = _get_auth_context(request)
+    js_content = _render_template("mcp-bridge", ext="js", BASE_URL=mem.BASE_URL, **ctx)
+    return Response(
+        content=js_content,
+        media_type="application/javascript",
+        headers={"Content-Disposition": 'attachment; filename="mcp-bridge.js"'}
+    )
 
 @web_app.get("/gui", response_class=HTMLResponse)
 async def get_gui(request: Request):
