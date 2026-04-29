@@ -220,8 +220,7 @@ def _get_auth_context(request: Request):
         except Exception: pass
     
     # Intelligently calculate MCP_URL
-    # If BASE_URL already ends in /mcp, don't append it again
-    mcp_url = f"{mem.BASE_URL}/mcp/"
+    mcp_url = f"{mem.BASE_URL}/mcp"
     if mem.BASE_URL.endswith("/mcp"):
         mcp_url = mem.BASE_URL
         

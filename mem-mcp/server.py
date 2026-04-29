@@ -37,10 +37,9 @@ web_app.add_middleware(
 # ---------------------------------------------------------------------------
 # Merge MCP into the Web GUI app
 # ---------------------------------------------------------------------------
-# We use transport="http" (streamable-http) and path="/" because we are mounting it under /mcp.
-# This makes the endpoint exactly http://host:port/mcp/
-mcp_app = mcp.http_app(transport="sse", path="/", middleware=[mcp_cors])
-# We mount at / so that the proxy's /mcp/ hits the MCP server directly.
+# We use transport="http" (streamable-http) and path="/mcp" because we want the endpoint to be /mcp and /messages
+mcp_app = mcp.http_app(transport="sse", path="/mcp", middleware=[mcp_cors])
+# We mount at / so that the proxy's /mcp hits the MCP server directly.
 # GUI and API routes will take precedence because they were defined first.
 web_app.mount("/", mcp_app)
 
