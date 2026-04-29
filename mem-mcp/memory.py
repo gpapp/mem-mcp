@@ -786,8 +786,85 @@ async def db_merge_memories(master_id: str, duplicate_ids: List[str], user_id: s
         raise RuntimeError("Database connections not established.")
 
     with neo4j_driver.session() as s:
-        # Merge nodes in Neo4j
-        # We use apoc.refactor.mergeNodes to combine properties and relationships
+        # 1. Read relationships into memory from master
+        master_rels_res = s.run(
+            """
+            MATCH (master:Fact {id: $masterId, userId: $userId})
+            OPTIONAL MATCH (master)-[out_r]->(out_t)
+            OPTIONAL MATCH (in_t)-[in_r]->(master)
+            RETURN
+                collect(DISTINCT {type: type(out_r), target: out_t.id, props: properties(out_r), dir: 'out'}) as out_rels,
+                collect(DISTINCT {type: type(in_r), source: in_t.id, props: properties(in_r), dir: 'in'}) as in_rels
+            """,
+            masterId=master_id, userId=user_id
+        ).single()
+
+        master_out = {(r['type'], r['target']) for r in master_rels_res['out_rels'] if r.get('type')}
+        master_in = {(r['type'], r['source']) for r in master_rels_res['in_rels'] if r.get('type')}
+
+        # 2. Read relationships from duplicates
+        dup_rels_res = s.run(
+            """
+            MATCH (dup:Fact) WHERE dup.id IN $duplicateIds AND dup.userId = $userId
+            OPTIONAL MATCH (dup)-[out_r]->(out_t) WHERE out_t.id <> $masterId AND NOT out_t.id IN $duplicateIds
+            OPTIONAL MATCH (in_t)-[in_r]->(dup) WHERE in_t.id <> $masterId AND NOT in_t.id IN $duplicateIds
+            RETURN
+                collect(DISTINCT {type: type(out_r), target: out_t.id, props: properties(out_r), dir: 'out'}) as out_rels,
+                collect(DISTINCT {type: type(in_r), source: in_t.id, props: properties(in_r), dir: 'in'}) as in_rels
+            """,
+            masterId=master_id, duplicateIds=duplicate_ids, userId=user_id
+        ).single()
+
+        missing_out = []
+        for r in dup_rels_res['out_rels']:
+            if not r.get('type'): continue
+            key = (r['type'], r['target'])
+            if key not in master_out:
+                missing_out.append(r)
+                master_out.add(key)
+
+        missing_in = []
+        for r in dup_rels_res['in_rels']:
+            if not r.get('type'): continue
+            key = (r['type'], r['source'])
+            if key not in master_in:
+                missing_in.append(r)
+                master_in.add(key)
+
+        # 3. Create missing edges on the merge target (master)
+        for r in missing_out:
+            s.run(
+                """
+                MATCH (master:Fact {id: $masterId, userId: $userId})
+                MATCH (target {id: $targetId})
+                CALL apoc.create.relationship(master, $relType, $props, target) YIELD rel
+                RETURN rel
+                """,
+                masterId=master_id, userId=user_id, targetId=r['target'], relType=r['type'], props=r['props']
+            )
+
+        for r in missing_in:
+            s.run(
+                """
+                MATCH (master:Fact {id: $masterId, userId: $userId})
+                MATCH (source {id: $sourceId})
+                CALL apoc.create.relationship(source, $relType, $props, master) YIELD rel
+                RETURN rel
+                """,
+                masterId=master_id, userId=user_id, sourceId=r['source'], relType=r['type'], props=r['props']
+            )
+
+        # 4. Delete relationships on duplicates before merging nodes so APOC doesn't duplicate them
+        s.run(
+            """
+            MATCH (dup:Fact) WHERE dup.id IN $duplicateIds AND dup.userId = $userId
+            MATCH (dup)-[r]-()
+            DELETE r
+            """,
+            duplicateIds=duplicate_ids, userId=user_id
+        )
+
+        # 5. Merge node properties (and delete duplicate nodes)
         s.run(
             """
             MATCH (master:Fact {id: $masterId, userId: $userId})
@@ -802,8 +879,7 @@ async def db_merge_memories(master_id: str, duplicate_ids: List[str], user_id: s
                     timestamp: 'discard',
                     category: 'discard',
                     `*`: 'combine'
-                },
-                mergeRels: true
+                }
             }) YIELD node
             RETURN count(*)
             """,
