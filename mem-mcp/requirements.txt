@@ -8,3 +8,4 @@ ollama
 httpx
 uvicorn
 markdown2
+openai

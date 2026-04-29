@@ -7,8 +7,28 @@ import memory as mem
 
 logger = logging.getLogger("memory-vault")
 
-# Using a safe name and explicitly disabling any potential conflicting features
-mcp = FastMCP("MemoryVault")
+def get_sampling_handler():
+    try:
+        from fastmcp.client.sampling.handlers.openai import OpenAISamplingHandler
+        from openai import AsyncOpenAI
+
+        ollama_url = os.getenv("MEM_LLM_URL", "http://ollama:11434")
+        llm_model = os.getenv("MEM_LLM_MODEL", "llama3")
+
+        return OpenAISamplingHandler(
+            client=AsyncOpenAI(base_url=f"{ollama_url}/v1", api_key="ollama"),
+            default_model=llm_model
+        )
+    except Exception as e:
+        logger.warning(f"Could not load OpenAISamplingHandler: {e}")
+        return None
+
+# Initialize FastMCP with the built-in sampling fallback behavior
+mcp = FastMCP(
+    "MemoryVault",
+    sampling_handler=get_sampling_handler(),
+    sampling_handler_behavior="fallback"
+)
 
 def _current_user() -> str:
     headers = get_http_headers()
@@ -116,36 +136,34 @@ async def transcription_cleanup(text: str, ctx: Context, participants: Optional[
     Uses local LLM for short contexts and MCP sampling for longer ones.
     """
     prompt = f"""
-    Please clean up this raw transcription. 
+    Please clean up this raw transcription.
     Participants: {participants if participants else 'Unknown (identify from context)'}
-    
+
     TRANSCRIPTION:
     {text}
-    
+
     OUTPUT FORMAT:
     Return only the cleaned transcript with [Speaker Name]: labels.
     """
     system = "You are a professional transcriptionist. Fix speaker turns, remove filler words (um, uh, like), and correct obvious transcription errors."
 
-    # Use MCP sampling if context is available and text is moderately long (> 1000 chars)
-    if ctx and hasattr(ctx, "sample") and len(text) > 1000:
-        try:
-            from mcp.types import SamplingMessage, TextContent
-            result = await ctx.sample(
-                messages=[SamplingMessage(role="user", content=TextContent(type="text", text=prompt))],
-                system_prompt=system,
-                max_tokens=2000
-            )
-            if result and result.text:
-                return result.text
-        except Exception as e:
-            logger.warning(f"MCP Sampling failed, falling back to local LLM: {e}")
+    if len(text) > 10000 and getattr(mcp, "sampling_handler", None) is None and (not hasattr(ctx.request_context, "client_capabilities") or getattr(ctx.request_context.client_capabilities, "sampling", None) is None):
+         return "Error: Transcription too large (>10k chars) for local processing and MCP sampling/fallback is unavailable."
 
-    # Guard against huge texts hitting local Ollama if sampling failed or is missing
-    if len(text) > 10000 and not ctx:
-         return "Error: Transcription too large (>10k chars) for local processing and MCP sampling is unavailable in this client."
+    try:
+        from mcp.types import SamplingMessage, TextContent
+        # FastMCP transparently routes to the client OR Ollama fallback handler based on capabilities
+        result = await ctx.sample(
+            messages=[SamplingMessage(role="user", content=TextContent(type="text", text=prompt))],
+            system_prompt=system,
+            max_tokens=2000
+        )
+        if result and result.text:
+            return result.text
+    except Exception as e:
+        logger.error(f"Sampling completely failed (even with fallback): {e}")
 
-    # Default to local Ollama
+    # Final ditch effort if the fallback mechanism crashed
     return await mem.get_llm_completion(prompt, system)
 
 @mcp.tool()
@@ -157,27 +175,25 @@ async def suggest_merge(cluster_json: str, ctx: Context):
     prompt = f"""
     Analyze these potential duplicate memories and suggest which one should be the 'Master' record.
     Explain why and what information from other records should be merged into it.
-    
+
     CLUSTER DATA:
     {cluster_json}
     """
     system = "You are a data deduplication expert. Identify the most complete and accurate record in a cluster."
 
-    # Use MCP sampling if context is available and prompt is moderately long (> 1000 chars)
-    if ctx and hasattr(ctx, "sample") and len(cluster_json) > 1000:
-        try:
-            from mcp.types import SamplingMessage, TextContent
-            result = await ctx.sample(
-                messages=[SamplingMessage(role="user", content=TextContent(type="text", text=prompt))],
-                system_prompt=system,
-                max_tokens=2000
-            )
-            if result and result.text:
-                return result.text
-        except Exception as e:
-            logger.warning(f"MCP Sampling failed in suggest_merge, falling back to local LLM: {e}")
+    try:
+        from mcp.types import SamplingMessage, TextContent
+        result = await ctx.sample(
+            messages=[SamplingMessage(role="user", content=TextContent(type="text", text=prompt))],
+            system_prompt=system,
+            max_tokens=2000
+        )
+        if result and result.text:
+            return result.text
+    except Exception as e:
+        logger.error(f"Sampling completely failed in suggest_merge: {e}")
 
-    # Default to local Ollama
+    # Final ditch effort
     return await mem.get_llm_completion(prompt, system)
 
 @mcp.tool()

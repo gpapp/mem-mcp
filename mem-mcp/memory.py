@@ -971,22 +971,20 @@ async def db_smart_merge_memories(master_id: str, duplicate_ids: List[str], user
         "-----------------------\n"
     ) + "\n\n-----------------------\n\n".join(texts)
     
-    # Use MCP sampling if context is available and prompt is moderately long (> 1000 chars)
-    if ctx and hasattr(ctx, "sample") and len(prompt) > 1000:
-        try:
-            from mcp.types import SamplingMessage, TextContent
-            result = await ctx.sample(
-                messages=[SamplingMessage(role="user", content=TextContent(type="text", text=prompt))],
-                system_prompt=system
-            )
-            if result and result.text:
-                new_text = result.text
-            else:
-                new_text = await get_llm_completion(prompt, system)
-        except Exception as e:
-            logger.warning(f"MCP Sampling failed during smart merge, falling back to local LLM: {e}")
+    # FastMCP fallback handler handles the delegation to Ollama or Client automatically
+    try:
+        from mcp.types import SamplingMessage, TextContent
+        result = await ctx.sample(
+            messages=[SamplingMessage(role="user", content=TextContent(type="text", text=prompt))],
+            system_prompt=system,
+            max_tokens=2000
+        )
+        if result and result.text:
+            new_text = result.text
+        else:
             new_text = await get_llm_completion(prompt, system)
-    else:
+    except Exception as e:
+        logger.warning(f"MCP Sampling completely failed during smart merge: {e}")
         new_text = await get_llm_completion(prompt, system)
     
     # 3. Update master with consolidated text (this also updates vector)
