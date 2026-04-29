@@ -212,15 +212,16 @@ async def debug_client_capabilities(ctx: Context):
     Use this to debug if sampling or other features are supported by the client.
     """
     caps = "Unknown"
-    if hasattr(ctx, "session"):
-        # The underlying ServerSession in mcp-python holds client_capabilities
-        caps_obj = getattr(ctx.session, "client_capabilities", None)
-        caps = str(caps_obj) if caps_obj else "None found on session"
-
-    elif hasattr(ctx, "request_context"):
-        # Alternative location depending on FastMCP internal mapping
-        caps_obj = getattr(ctx.request_context, "client_capabilities", None)
-        caps = str(caps_obj) if caps_obj else "None found on request_context"
+    try:
+        # FastMCP Context object exposes session, which is the underlying ServerSession
+        session = getattr(ctx, "session", None)
+        if session and hasattr(session, "client_capabilities"):
+            caps = str(session.client_capabilities)
+        else:
+            # Let's inspect what's actually on the object to debug it
+            caps = f"No client_capabilities found. Context attrs: {dir(ctx)}. Session attrs: {dir(session) if session else 'None'}"
+    except Exception as e:
+        caps = f"Error extracting capabilities: {e}"
 
     logger.info(f"DEBUG CAPABILITIES - MCP Client Capabilities: {caps}")
     return f"Client capabilities announced: {caps}"
