@@ -29,7 +29,7 @@ from qdrant_client.models import (
     Filter, FieldCondition, MatchValue,
 )
 from neo4j import GraphDatabase
-
+from fastmcp import Context
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -99,9 +99,6 @@ def get_neo4j():
             except Exception as e:
                 logger.error(f"Neo4j init error: {e}")
     return _neo4j_driver
-
-# Removed top-level initialize_databases call and legacy globals
-
 
 # ---------------------------------------------------------------------------
 # Service readiness
@@ -920,7 +917,7 @@ async def db_merge_memories(master_id: str, duplicate_ids: List[str], user_id: s
     )
 
 
-async def db_smart_merge_memories(master_id: str, duplicate_ids: List[str], user_id: str, ctx: Any):
+async def db_smart_merge_memories(master_id: str, duplicate_ids: List[str], user_id: str, ctx: Context):
     """
     Advanced merge that uses an LLM to consolidate multiple descriptions into one.
     Uses MCP sampling if context is available and prompt is long.
