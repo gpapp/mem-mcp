@@ -29,7 +29,6 @@ from qdrant_client.models import (
     Filter, FieldCondition, MatchValue,
 )
 from neo4j import GraphDatabase
-from fastmcp import Context
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -918,80 +917,32 @@ async def db_merge_memories(master_id: str, duplicate_ids: List[str], user_id: s
     )
 
 
-async def db_smart_merge_memories(master_id: str, duplicate_ids: List[str], user_id: str, ctx: Context):
+async def db_get_texts_for_merge(master_id: str, duplicate_ids: List[str], user_id: str) -> list:
     """
-    Advanced merge that uses an LLM to consolidate multiple descriptions into one.
-    Uses MCP sampling if context is available and prompt is long.
+    Fetch texts and relationships for all records in a merge operation.
+    Returns structured data for the client to consolidate.
     """
     neo4j_driver = get_neo4j()
-    
-    # 1. Fetch current texts and relationships
     with neo4j_driver.session() as s:
         res = s.run(
             """
             MATCH (f:Fact) WHERE f.id IN ([ $masterId ] + $duplicateIds) AND f.userId = $userId
             OPTIONAL MATCH (f)-[r]->(target:Fact) WHERE type(r) <> 'IN_CATEGORY' AND type(r) <> 'KNOWS' AND target.userId = $userId
-            RETURN f.text as text, f.title as title, collect({rel: type(r), target_title: target.title, target_text: target.text}) as links
+            RETURN f.id as id, f.title as title, f.text as text,
+                   collect({rel: type(r), target_title: target.title}) as links
             """,
             masterId=master_id, duplicateIds=duplicate_ids, userId=user_id
         )
-        texts = []
+        records = []
         for r in res:
-            entry = f"**{r['title'] or 'Untitled'}**\n{r['text']}"
             links = [l for l in r["links"] if l.get("rel")]
-            if links:
-                entry += "\n\n**Known Graph Relationships:**\n"
-                for l in links:
-                    target_desc = l.get('target_title') or (l.get('target_text', '')[:50] + "...")
-                    entry += f"- {l['rel']} -> {target_desc}\n"
-            texts.append(entry)
-        
-    if not texts:
-        return
-
-    # 2. Use LLM to consolidate
-    system = (
-        "You are a meticulous knowledge graph curator. Your job is to consolidate multiple overlapping "
-        "descriptions into one comprehensive master record. You MUST preserve ALL specific details: "
-        "names, dates, technical specifics, numbers, roles, affiliations, and action items. "
-        "Do NOT generalize or summarize away granular facts."
-    )
-
-    prompt = (
-        "Combine the following separate memories about the same entity into one single, cohesive, "
-        "and detailed markdown-formatted description.\n\n"
-        "CRITICAL INSTRUCTIONS:\n"
-        "1. Extract and include EVERY unique fact, name, date, decision, role, and technical detail from ALL provided memories.\n"
-        "2. Do NOT summarize or generalize. Instead, synthesize all granular information into a readable, comprehensive format.\n"
-        "3. Use markdown bullet points or sections if there are multiple distinct topics (e.g., 'Background', 'Interactions', 'Technical Details').\n"
-        "4. Preserve ANY markdown links (e.g. [text](url) or [[text]]) that exist in the original texts.\n"
-        "5. Incorporate any 'Known Graph Relationships' explicitly mentioned in the inputs into the text narrative.\n"
-        "6. Avoid repeating the same exact information, but do not lose nuance when resolving overlapping facts.\n\n"
-        "MEMORIES TO CONSOLIDATE:\n"
-        "-----------------------\n"
-    ) + "\n\n-----------------------\n\n".join(texts)
-    
-    # FastMCP fallback handler handles the delegation to Ollama or Client automatically
-    try:
-        from mcp.types import SamplingMessage, TextContent
-        result = await ctx.sample(
-            messages=[SamplingMessage(role="user", content=TextContent(type="text", text=prompt))],
-            system_prompt=system,
-            max_tokens=2000
-        )
-        if result and result.text:
-            new_text = result.text
-        else:
-            new_text = await get_llm_completion(prompt, system)
-    except Exception as e:
-        logger.warning(f"MCP Sampling completely failed during smart merge: {e}")
-        new_text = await get_llm_completion(prompt, system)
-    
-    # 3. Update master with consolidated text (this also updates vector)
-    await db_update_memory(master_id, new_text, None, user_id)
-    
-    # 4. Perform the graph-level merge (relationships and other metadata)
-    await db_merge_memories(master_id, duplicate_ids, user_id)
+            records.append({
+                "id": r["id"],
+                "title": r["title"] or "Untitled",
+                "text": r["text"] or "",
+                "relationships": [f"{l['rel']} -> {l.get('target_title', 'Unknown')}" for l in links],
+            })
+    return records
 
 
 # ---------------------------------------------------------------------------
