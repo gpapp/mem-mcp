@@ -130,71 +130,68 @@ async def merge_facts(masterId: str, duplicateIds: List[str], ctx: Context, smar
     return f"Successfully merged {len(duplicateIds)} facts into {masterId} (Smart Merge: {smart})"
 
 @mcp.tool()
-async def transcription_cleanup(text: str, ctx: Context, participants: Optional[List[str]] = None):
+async def transcription_cleanup(text: str, participants: Optional[List[str]] = None):
     """
-    Clean up a raw transcription, identify speakers, and remove filler words on the server.
-    Uses local LLM for short contexts and MCP sampling for longer ones.
+    Prepare a raw transcription for cleanup by the client.
+    Returns the text with metadata and instructions — the client performs the actual cleanup.
     """
-    prompt = f"""
-    Please clean up this raw transcription.
-    Participants: {participants if participants else 'Unknown (identify from context)'}
-
-    TRANSCRIPTION:
-    {text}
-
-    OUTPUT FORMAT:
-    Return only the cleaned transcript with [Speaker Name]: labels.
-    """
-    system = "You are a professional transcriptionist. Fix speaker turns, remove filler words (um, uh, like), and correct obvious transcription errors."
-
-    if len(text) > 10000 and getattr(mcp, "sampling_handler", None) is None and (not hasattr(ctx.request_context, "client_capabilities") or getattr(ctx.request_context.client_capabilities, "sampling", None) is None):
-         return "Error: Transcription too large (>10k chars) for local processing and MCP sampling/fallback is unavailable."
-
-    try:
-        from mcp.types import SamplingMessage, TextContent
-        # FastMCP transparently routes to the client OR Ollama fallback handler based on capabilities
-        result = await ctx.sample(
-            messages=[SamplingMessage(role="user", content=TextContent(type="text", text=prompt))],
-            system_prompt=system,
-            max_tokens=2000
-        )
-        if result and result.text:
-            return result.text
-    except Exception as e:
-        logger.error(f"Sampling completely failed (even with fallback): {e}")
-
-    # Final ditch effort if the fallback mechanism crashed
-    return await mem.get_llm_completion(prompt, system)
+    return {
+        "raw_transcription": text,
+        "known_participants": participants or [],
+        "word_count": len(text.split()),
+        "char_count": len(text),
+        "instructions": (
+            "Clean up this transcription:\n"
+            "1. Assign '[Speaker Name]:' labels — use known_participants or infer from context\n"
+            "2. Remove filler words: um, uh, like, you know, sort of\n"
+            "3. Fix obvious transcription errors and incomplete sentences\n"
+            "4. Preserve all meaningful content verbatim"
+        ),
+    }
 
 @mcp.tool()
-async def suggest_merge(cluster_json: str, ctx: Context):
+async def suggest_merge(cluster_json: str):
     """
-    Analyze a cluster of potential duplicates and suggest a Master record and merge strategy.
-    Uses LLM reasoning to evaluate which record is most complete.
+    Analyze a cluster of potential duplicates and return a structured comparison
+    for the client to evaluate. The client decides which record is the master
+    and what to merge, then calls merge_facts to execute.
     """
-    prompt = f"""
-    Analyze these potential duplicate memories and suggest which one should be the 'Master' record.
-    Explain why and what information from other records should be merged into it.
-
-    CLUSTER DATA:
-    {cluster_json}
-    """
-    system = "You are a data deduplication expert. Identify the most complete and accurate record in a cluster."
+    import json
 
     try:
-        from mcp.types import SamplingMessage, TextContent
-        result = await ctx.sample(
-            messages=[SamplingMessage(role="user", content=TextContent(type="text", text=prompt))],
-            system_prompt=system,
-            max_tokens=2000
-        )
-        if result and result.text:
-            return result.text
+        records = json.loads(cluster_json)
     except Exception as e:
-        logger.error(f"Sampling completely failed in suggest_merge: {e}")
+        return f"Error parsing cluster JSON: {e}"
 
-    # Final ditch effort
-    return await mem.get_llm_completion(prompt, system)
+    if not isinstance(records, list) or not records:
+        return "Empty or invalid cluster data."
+
+    analyzed = []
+    for r in records:
+        text = r.get("text") or ""
+        non_empty = sum(1 for v in r.values() if v not in (None, "", []))
+        analyzed.append({
+            "id": r.get("id"),
+            "title": r.get("title", ""),
+            "text": text,
+            "date": r.get("date") or r.get("updatedAt") or "",
+            "extra_fields": {k: v for k, v in r.items() if k not in ("id", "title", "text", "date", "updatedAt", "similarity")},
+            "_completeness": {"text_length": len(text), "non_empty_fields": non_empty},
+        })
+
+    analyzed.sort(key=lambda x: (x["_completeness"]["non_empty_fields"], x["_completeness"]["text_length"]), reverse=True)
+    top = analyzed[0]
+
+    return {
+        "record_count": len(analyzed),
+        "records_by_completeness": analyzed,
+        "suggested_master_id": top["id"],
+        "suggested_master_title": top["title"],
+        "note": (
+            "Records are sorted by completeness (field count, then text length). "
+            "Review all records, confirm or override the suggested master, then call merge_facts."
+        ),
+    }
 
 @mcp.tool()
 async def find_skills():
