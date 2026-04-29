@@ -211,25 +211,25 @@ async def debug_client_capabilities(ctx: Context):
     Log and return the client capabilities announced by the MCP client.
     Use this to debug if sampling or other features are supported by the client.
     """
-    caps = "Unknown"
     try:
-        # Check FastMCP's internal parameters for the raw initialization payload
-        session = getattr(ctx, "session", None)
-        caps = "Unknown"
-        if session and hasattr(session, "client_params"):
-            client_params = session.client_params
-            if client_params and hasattr(client_params, "capabilities"):
-                # Usually ClientCapabilities object from mcp-python
-                caps = str(client_params.capabilities)
-            else:
-                caps = "Client params found but no capabilities."
+        # Access client information from the context
+        if hasattr(ctx, "request_context"):
+            client_info = getattr(ctx.request_context, "client_capabilities", None)
+            info_name = getattr(ctx.request_context.session.client_params, "client_info", "Unknown") if hasattr(ctx.request_context, "session") else "Unknown"
         else:
-            caps = "No client_params found on session."
-    except Exception as e:
-        caps = f"Error extracting capabilities: {e}"
+            session = getattr(ctx, "session", None)
+            client_params = getattr(session, "client_params", None)
+            client_info = getattr(client_params, "capabilities", None)
+            info_name = getattr(client_params, "client_info", "Unknown")
 
-    logger.info(f"DEBUG CAPABILITIES - MCP Client Capabilities: {caps}")
-    return f"Client capabilities announced: {caps}"
+        return {
+            "client_name": str(info_name),
+            "supports_sampling": hasattr(client_info, "sampling") and getattr(client_info, "sampling") is not None,
+            "supports_roots": hasattr(client_info, "roots") and getattr(client_info, "roots") is not None,
+            "raw_capabilities": str(client_info)
+        }
+    except Exception as e:
+        return {"error": f"Error extracting capabilities: {e}"}
 
 
 # ---------------------------------------------------------------------------

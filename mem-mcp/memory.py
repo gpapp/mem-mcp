@@ -35,6 +35,7 @@ from fastmcp import Context
 # ---------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("memory-vault")
+logging.getLogger("mcp").setLevel(logging.DEBUG)
 
 # ---------------------------------------------------------------------------
 # Configuration
