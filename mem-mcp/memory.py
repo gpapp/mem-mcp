@@ -400,7 +400,7 @@ def db_get_neighborhood(fact_id: str, depth: int, rel_types: List[str], user_id:
         return nodes
 
 
-async def db_search_memories(query: str, user_id: str, limit: int = 5, category: Optional[str] = None) -> list:
+async def db_search_memories(query: str, user_id: str, limit: int = 5, category: Optional[str] = None, top_p: float = 0.4) -> list:
     """Vector-similarity search with optional category filter. Also does a basic substring match on titles."""
     qdrant = await get_qdrant()
     neo4j_driver = get_neo4j()
@@ -413,11 +413,18 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
     query_lower = query.lower()
 
     with neo4j_driver.session() as s:
-        cypher = """
-        MATCH (f:Fact {userId: $userId})
-        WHERE toLower(f.title) CONTAINS toLower($query_str)
-           OR toLower(f.text) CONTAINS toLower($query_str)
-        """
+        # Only do broad CONTAINS match on text if the query is reasonably long to avoid massive irrelevant noise
+        if len(query) > 3:
+            cypher = """
+            MATCH (f:Fact {userId: $userId})
+            WHERE toLower(f.title) CONTAINS toLower($query_str)
+               OR toLower(f.text) CONTAINS toLower($query_str)
+            """
+        else:
+            cypher = """
+            MATCH (f:Fact {userId: $userId})
+            WHERE toLower(f.title) CONTAINS toLower($query_str)
+            """
         if category:
             cypher += " AND f.category = $category"
         cypher += " RETURN f LIMIT $limit"
@@ -462,6 +469,7 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
         query=vec,
         query_filter=filt,
         limit=fetch_limit,
+        score_threshold=top_p,
     )
     results = []
     query_lower = query.lower()
@@ -1055,7 +1063,7 @@ async def db_save_diary(content: str, user_id: str, date: Optional[str] = None) 
     return entry_date
 
 
-async def db_search_diary(query: str, user_id: str, limit: int = 3) -> list:
+async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float = 0.4) -> list:
     """Vector-similarity search across the diary collection with mention enrichment."""
     qdrant = await get_qdrant()
     neo4j_driver = get_neo4j()
@@ -1070,6 +1078,7 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3) -> list:
         query_filter=filt,
         limit=limit,
         with_payload=True,
+        score_threshold=top_p,
     )
     
     entries = []

@@ -27,14 +27,14 @@ async def add_fact(title: str, text: str, category: str):
     return f"Successfully added memory with ID: {memory_id}"
 
 @mcp.tool()
-async def search_facts(query: str, category: Optional[str] = None, limit: int = 10):
+async def search_facts(query: str, category: Optional[str] = None, limit: int = 10, top_p: float = 0.4):
     """
     Search for facts matching query criteria.
     - query: semantic search string
     - category: optional filter (e.g. 'People', 'Client', 'Preferences') to limit output
     - limit: maximum number of results
     """
-    return await mem.db_search_memories(query, _current_user(), limit, category)
+    return await mem.db_search_memories(query, _current_user(), limit, category, top_p)
 
 @mcp.tool()
 async def list_categories():
@@ -80,9 +80,9 @@ async def diary_save_entry(content: str, date: Optional[str] = None):
     return f"Saved for {entry_date}"
 
 @mcp.tool()
-async def diary_search_entries(query: str, limit: int = 3):
+async def diary_search_entries(query: str, limit: int = 3, top_p: float = 0.4):
     """Search diary entries."""
-    return await mem.db_search_diary(query, _current_user(), limit)
+    return await mem.db_search_diary(query, _current_user(), limit, top_p)
     
 @mcp.tool()
 async def find_duplicates(category: str = "People", limit: int = 50, threshold: float = 0.75, group_by: Optional[str] = "first_name"):
