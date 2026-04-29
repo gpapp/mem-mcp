@@ -5,11 +5,11 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 
 // Configuration
 const REMOTE_URL = "{{BASE_URL}}";
-const AUTH_HEADER = "{{AUTH_BASE64}}"; // Your encoded credentials
+const AUTH_HEADER = "Basic {{AUTH_BASE64}}"; // Your encoded credentials
 
 const transport = new SSEClientTransport(new URL(REMOTE_URL), {
-  eventSourceInitDict: { headers: { "Authorization": AUTH_HEADER } },
-  requestInit: { headers: { "Authorization": AUTH_HEADER } }
+  eventSourceInitDict: { headers: { "Authorization": AUTH_HEADER, "Accept": "text/event-stream" } },
+  requestInit: { headers: { "Authorization": AUTH_HEADER, "Content-Type": "application/json" } }
 });
 transport.onclose = () => console.log("Transport closed");
 transport.onerror = (error) => console.error("Transport error details:", error);
