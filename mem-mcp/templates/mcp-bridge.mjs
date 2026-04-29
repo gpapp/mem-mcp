@@ -4,7 +4,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 
 // Configuration
-const REMOTE_URL = "{{BASE_URL}}/";
+const REMOTE_URL = "{{BASE_URL}}/mcp";
 const AUTH_HEADER = "Basic {{AUTH_BASE64}}"; // Your encoded credentials
 
 const transport = new SSEClientTransport(new URL(REMOTE_URL), {

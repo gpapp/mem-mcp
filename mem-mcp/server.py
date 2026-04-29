@@ -37,7 +37,7 @@ web_app.add_middleware(
 # ---------------------------------------------------------------------------
 # Merge MCP into the Web GUI app
 # ---------------------------------------------------------------------------
-# We use transport="http" (streamable-http) and path="/mcp" because we want the endpoint to be /mcp and /messages
+# SSE transport: GET /mcp opens the SSE stream, POST /messages/ receives client messages.
 mcp_app = mcp.http_app(transport="sse", path="/mcp", middleware=[mcp_cors])
 # We mount at / so that the proxy's /mcp hits the MCP server directly.
 # GUI and API routes will take precedence because they were defined first.
@@ -61,4 +61,10 @@ if __name__ == "__main__":
     print(f"--- Base URL: {mem.BASE_URL or 'Relative'} ---")
     print(f"--- All services on port 8080: /gui, /api, /mcp ---")
 
-    uvicorn.run(web_app, host="0.0.0.0", port=8080)
+    # Extract nginx proxy prefix from BASE_URL so the SSE endpoint event
+    # includes the full path the client needs to POST back through the proxy.
+    # e.g. BASE_URL=https://host/mcp → root_path=/mcp → endpoint event=/mcp/messages/
+    from urllib.parse import urlparse
+    root_path = urlparse(mem.BASE_URL).path.rstrip("/") if mem.BASE_URL else ""
+
+    uvicorn.run(web_app, host="0.0.0.0", port=8080, root_path=root_path)

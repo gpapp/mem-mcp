@@ -273,8 +273,8 @@
     <p>Connect your AI assistant to this Vault.</p>
     <div class="setup-grid">
         <div style="flex:1;">
-            <label>Standard Connection (HTTP SSE):</label>
-            <pre><code>claude mcp add --transport http memory-vault {{MCP_URL}} --header "Authorization: Basic {{AUTH_BASE64}}"</code></pre>
+            <label>Standard Connection (SSE):</label>
+            <pre><code>claude mcp add --transport sse memory-vault {{MCP_URL}} --header "Authorization: Basic {{AUTH_BASE64}}"</code></pre>
         </div>
     </div>
 
