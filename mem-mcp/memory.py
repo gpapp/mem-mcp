@@ -153,22 +153,41 @@ async def get_llm_completion(prompt: str, system: Optional[str] = None) -> str:
             payload["system"] = system
 
         logger.info(f"[Ollama] GENERATE request to {OLLAMA_URL} with model={model}. Prompt length: {len(prompt)} chars.")
-        resp = await client.post(f"{OLLAMA_URL}/api/generate", json=payload)
-        resp.raise_for_status()
-        response_text = resp.json()["response"]
 
-        # Log prompt and response to file for validation
+        # Log prompt upfront in case of timeout
+        timestamp = datetime.now().isoformat().replace(":", "-")
+        log_file = f"logs/ollama_generate_{timestamp}.txt"
         try:
             os.makedirs("logs", exist_ok=True)
-            timestamp = datetime.now().isoformat().replace(":", "-")
-            with open(f"logs/ollama_generate_{timestamp}.txt", "w", encoding="utf-8") as f:
+            with open(log_file, "w", encoding="utf-8") as f:
                 f.write(f"=== SYSTEM ===\n{system or 'None'}\n\n")
                 f.write(f"=== PROMPT ===\n{prompt}\n\n")
-                f.write(f"=== RESPONSE ===\n{response_text}\n")
+                f.write(f"=== RESPONSE ===\n[Pending or Timeout]\n")
         except Exception as e:
-            logger.error(f"Failed to write Ollama log: {e}")
+            logger.error(f"Failed to write initial Ollama log: {e}")
 
-        return response_text
+        try:
+            resp = await client.post(f"{OLLAMA_URL}/api/generate", json=payload)
+            resp.raise_for_status()
+            response_text = resp.json()["response"]
+
+            # Update log with actual response
+            try:
+                with open(log_file, "w", encoding="utf-8") as f:
+                    f.write(f"=== SYSTEM ===\n{system or 'None'}\n\n")
+                    f.write(f"=== PROMPT ===\n{prompt}\n\n")
+                    f.write(f"=== RESPONSE ===\n{response_text}\n")
+            except Exception as e:
+                pass
+
+            return response_text
+        except Exception as api_err:
+            try:
+                with open(log_file, "a", encoding="utf-8") as f:
+                    f.write(f"\n[ERROR] {str(api_err)}\n")
+            except Exception:
+                pass
+            raise api_err
 
 
 # ---------------------------------------------------------------------------
@@ -901,7 +920,7 @@ async def db_merge_memories(master_id: str, duplicate_ids: List[str], user_id: s
     )
 
 
-async def db_smart_merge_memories(master_id: str, duplicate_ids: List[str], user_id: str, ctx: Any = None):
+async def db_smart_merge_memories(master_id: str, duplicate_ids: List[str], user_id: str, ctx: Any):
     """
     Advanced merge that uses an LLM to consolidate multiple descriptions into one.
     Uses MCP sampling if context is available and prompt is long.

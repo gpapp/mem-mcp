@@ -97,7 +97,7 @@ async def find_duplicates(category: str = "People", limit: int = 50, threshold: 
         return f"Error: {str(e)}"
 
 @mcp.tool()
-async def merge_facts(masterId: str, duplicateIds: List[str], smart: bool = False, ctx: Context = None):
+async def merge_facts(masterId: str, duplicateIds: List[str], ctx: Context, smart: bool = False):
     """
     Merge multiple duplicate facts into a single master fact on the server.
     If 'smart' is True, uses an LLM to consolidate the text descriptions into a cohesive whole.
@@ -110,7 +110,7 @@ async def merge_facts(masterId: str, duplicateIds: List[str], smart: bool = Fals
     return f"Successfully merged {len(duplicateIds)} facts into {masterId} (Smart Merge: {smart})"
 
 @mcp.tool()
-async def transcription_cleanup(text: str, participants: Optional[List[str]] = None, ctx: Context = None):
+async def transcription_cleanup(text: str, ctx: Context, participants: Optional[List[str]] = None):
     """
     Clean up a raw transcription, identify speakers, and remove filler words on the server.
     Uses local LLM for short contexts and MCP sampling for longer ones.
@@ -148,7 +148,7 @@ async def transcription_cleanup(text: str, participants: Optional[List[str]] = N
     return await mem.get_llm_completion(prompt, system)
 
 @mcp.tool()
-async def suggest_merge(cluster_json: str, ctx: Context = None):
+async def suggest_merge(cluster_json: str, ctx: Context):
     """
     Analyze a cluster of potential duplicates and suggest a Master record and merge strategy.
     Uses LLM reasoning to evaluate which record is most complete.
