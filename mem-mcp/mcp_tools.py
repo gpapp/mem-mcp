@@ -26,7 +26,6 @@ def get_sampling_handler():
 # Initialize FastMCP with the built-in sampling fallback behavior
 mcp = FastMCP(
     "MemoryVault",
-    capabilities={"sampling": {}},  # ← ADD THIS LINE
     sampling_handler=get_sampling_handler(),
     sampling_handler_behavior="fallback"
 )
