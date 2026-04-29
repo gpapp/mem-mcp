@@ -220,9 +220,8 @@ def _get_auth_context(request: Request):
         except Exception: pass
     
     # Intelligently calculate MCP_URL
+    # If BASE_URL is https://hass.securemail.hu/mcp, we want the mcp_url to be https://hass.securemail.hu/mcp/mcp
     mcp_url = f"{mem.BASE_URL}/mcp"
-    if mem.BASE_URL.endswith("/mcp"):
-        mcp_url = mem.BASE_URL
         
     return {
         "AUTH_USER": auth_user, 
