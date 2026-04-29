@@ -213,13 +213,18 @@ async def debug_client_capabilities(ctx: Context):
     """
     caps = "Unknown"
     try:
-        # FastMCP Context object exposes session, which is the underlying ServerSession
+        # Check FastMCP's internal parameters for the raw initialization payload
         session = getattr(ctx, "session", None)
-        if session and hasattr(session, "client_capabilities"):
-            caps = str(session.client_capabilities)
+        caps = "Unknown"
+        if session and hasattr(session, "client_params"):
+            client_params = session.client_params
+            if client_params and hasattr(client_params, "capabilities"):
+                # Usually ClientCapabilities object from mcp-python
+                caps = str(client_params.capabilities)
+            else:
+                caps = "Client params found but no capabilities."
         else:
-            # Let's inspect what's actually on the object to debug it
-            caps = f"No client_capabilities found. Context attrs: {dir(ctx)}. Session attrs: {dir(session) if session else 'None'}"
+            caps = "No client_params found on session."
     except Exception as e:
         caps = f"Error extracting capabilities: {e}"
 
