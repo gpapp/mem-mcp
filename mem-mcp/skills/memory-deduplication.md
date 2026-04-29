@@ -26,14 +26,13 @@ Execute the consolidation using the `merge_facts` tool with `smart=True`.
 - **smart**: Always set to `True` for complex entities like People or Projects.
 - **Outcome**: This tool automatically:
     1. Consolidates all text descriptions into a single cohesive Markdown summary.
-    2. Migrates all graph relationships from duplicates to the Master.
-    3. Merges metadata (tags, aliases, etc.).
+    2. Safely migrates all missing graph relationships from duplicates to the Master (preventing duplicate edges natively). Do NOT manually link them afterwards.
+    3. Merges node properties (tags, aliases, etc.).
     4. Deletes the duplicate records.
 
-### 4. Verification and Re-linking
+### 4. Verification
 After a merge, verify the results:
 - Use `get_fact_neighborhood` on the Master ID to see the new consolidated graph.
-- If any links were missed or need manual adjustment, use `link_facts`.
 - If the text needs further refinement, use `update_fact`.
 
 ## Efficiency: Multi-Tool Execution
