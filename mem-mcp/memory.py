@@ -824,13 +824,26 @@ async def db_smart_merge_memories(master_id: str, duplicate_ids: List[str], user
     """
     neo4j_driver = get_neo4j()
     
-    # 1. Fetch current texts
+    # 1. Fetch current texts and relationships
     with neo4j_driver.session() as s:
         res = s.run(
-            "MATCH (f:Fact) WHERE f.id IN ([ $masterId ] + $duplicateIds) AND f.userId = $userId RETURN f.text as text",
+            """
+            MATCH (f:Fact) WHERE f.id IN ([ $masterId ] + $duplicateIds) AND f.userId = $userId
+            OPTIONAL MATCH (f)-[r]->(target:Fact) WHERE type(r) <> 'IN_CATEGORY' AND type(r) <> 'KNOWS' AND target.userId = $userId
+            RETURN f.text as text, f.title as title, collect({rel: type(r), target_title: target.title, target_text: target.text}) as links
+            """,
             masterId=master_id, duplicateIds=duplicate_ids, userId=user_id
         )
-        texts = [r["text"] for r in res]
+        texts = []
+        for r in res:
+            entry = f"**{r['title'] or 'Untitled'}**\n{r['text']}"
+            links = [l for l in r["links"] if l.get("rel")]
+            if links:
+                entry += "\n\n**Known Graph Relationships:**\n"
+                for l in links:
+                    target_desc = l.get('target_title') or (l.get('target_text', '')[:50] + "...")
+                    entry += f"- {l['rel']} -> {target_desc}\n"
+            texts.append(entry)
         
     if not texts:
         return
@@ -850,7 +863,9 @@ async def db_smart_merge_memories(master_id: str, duplicate_ids: List[str], user
         "1. Extract and include EVERY unique fact, name, date, decision, role, and technical detail from ALL provided memories.\n"
         "2. Do NOT summarize or generalize. Instead, synthesize all granular information into a readable, comprehensive format.\n"
         "3. Use markdown bullet points or sections if there are multiple distinct topics (e.g., 'Background', 'Interactions', 'Technical Details').\n"
-        "4. Avoid repeating the same exact information, but do not lose nuance when resolving overlapping facts.\n\n"
+        "4. Preserve ANY markdown links (e.g. [text](url) or [[text]]) that exist in the original texts.\n"
+        "5. Incorporate any 'Known Graph Relationships' explicitly mentioned in the inputs into the text narrative.\n"
+        "6. Avoid repeating the same exact information, but do not lose nuance when resolving overlapping facts.\n\n"
         "MEMORIES TO CONSOLIDATE:\n"
         "-----------------------\n"
     ) + "\n\n-----------------------\n\n".join(texts)
