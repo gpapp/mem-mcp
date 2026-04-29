@@ -155,7 +155,20 @@ async def get_llm_completion(prompt: str, system: Optional[str] = None) -> str:
         logger.info(f"[Ollama] GENERATE request to {OLLAMA_URL} with model={model}. Prompt length: {len(prompt)} chars.")
         resp = await client.post(f"{OLLAMA_URL}/api/generate", json=payload)
         resp.raise_for_status()
-        return resp.json()["response"]
+        response_text = resp.json()["response"]
+
+        # Log prompt and response to file for validation
+        try:
+            os.makedirs("logs", exist_ok=True)
+            timestamp = datetime.now().isoformat().replace(":", "-")
+            with open(f"logs/ollama_generate_{timestamp}.txt", "w", encoding="utf-8") as f:
+                f.write(f"=== SYSTEM ===\n{system or 'None'}\n\n")
+                f.write(f"=== PROMPT ===\n{prompt}\n\n")
+                f.write(f"=== RESPONSE ===\n{response_text}\n")
+        except Exception as e:
+            logger.error(f"Failed to write Ollama log: {e}")
+
+        return response_text
 
 
 # ---------------------------------------------------------------------------
@@ -823,8 +836,24 @@ async def db_smart_merge_memories(master_id: str, duplicate_ids: List[str], user
         return
 
     # 2. Use LLM to consolidate
-    prompt = "Combine the following separate memories about the same entity into one single, cohesive, and detailed markdown-formatted description. Preserve all important facts and links. Avoid repetition.\n\n" + "\n---\n".join(texts)
-    system = "You are a knowledge graph curator. Consolidate overlapping information while preserving all unique details and context."
+    system = (
+        "You are a meticulous knowledge graph curator. Your job is to consolidate multiple overlapping "
+        "descriptions into one comprehensive master record. You MUST preserve ALL specific details: "
+        "names, dates, technical specifics, numbers, roles, affiliations, and action items. "
+        "Do NOT generalize or summarize away granular facts."
+    )
+
+    prompt = (
+        "Combine the following separate memories about the same entity into one single, cohesive, "
+        "and detailed markdown-formatted description.\n\n"
+        "CRITICAL INSTRUCTIONS:\n"
+        "1. Extract and include EVERY unique fact, name, date, decision, role, and technical detail from ALL provided memories.\n"
+        "2. Do NOT summarize or generalize. Instead, synthesize all granular information into a readable, comprehensive format.\n"
+        "3. Use markdown bullet points or sections if there are multiple distinct topics (e.g., 'Background', 'Interactions', 'Technical Details').\n"
+        "4. Avoid repeating the same exact information, but do not lose nuance when resolving overlapping facts.\n\n"
+        "MEMORIES TO CONSOLIDATE:\n"
+        "-----------------------\n"
+    ) + "\n\n-----------------------\n\n".join(texts)
     
     # Use MCP sampling if context is available and prompt is moderately long (> 1000 chars)
     if ctx and hasattr(ctx, "sample") and len(prompt) > 1000:
