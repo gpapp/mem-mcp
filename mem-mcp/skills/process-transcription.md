@@ -154,7 +154,9 @@ Immediately after creating related facts, use `link_facts` to connect them. This
 ### 9. Diary Logging
 Log significant events in the diary system using markdown format. Use `diary_save_entry(content, date)`.
 
-**Multiple Entries:** You are encouraged to save multiple small diary entries for the same day rather than one giant one. This reduces context overload and allows for more granular retrieval. 
+**Important — append-only:** Every call to `diary_save_entry` creates a brand-new entry. It never updates or overwrites an existing entry for that date. Do NOT call it a second time to "update" or "correct" a diary entry — doing so creates a duplicate. Write the complete, final content in a single call per topic.
+
+**Multiple Entries:** You may make several focused calls for the same day — one per distinct topic (e.g., one for decisions, one for action items). Each becomes its own independently searchable entry. Do NOT create overlapping entries about the same topic.
 
 The diary should contain WHAT THE USER DID, not what was processed. Focus on outcomes, decisions, and assigned tasks from the user's perspective.
 
