@@ -161,7 +161,9 @@ Log significant events in the diary system using markdown format. Use `diary_sav
 
 **Before writing diary entries — check what already exists:**
 Use `diary_search_entries` with the meeting topic, date, or project name to find any entries already logged for this session.
-- If entries exist for this date/meeting: only write entries for topics NOT already covered. Do NOT re-log what is already recorded.
+- If entries exist for this date/meeting: compare them against the new information.
+    - If a topic has **new information**: write a fresh entry that captures the complete updated picture (old context + new additions). Label it clearly, e.g. `[Updated] Decisions — <topic>`.
+    - If a topic is **unchanged**: skip it — do not re-log identical content.
 - If no relevant entries exist: proceed normally.
 
 **Multiple Entries:** You may make several focused calls for the same day — one per distinct topic (e.g., one for decisions, one for action items). Each becomes its own independently searchable entry. Do NOT create overlapping entries about the same topic.
