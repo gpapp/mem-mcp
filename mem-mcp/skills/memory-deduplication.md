@@ -13,42 +13,41 @@ Use the `find_duplicates` tool to scan the memory for clusters of similar items.
 - **Threshold**: Adjust the similarity threshold (default 0.75).
 - **Result**: You will receive a list of clusters with an `avg_similarity` score and a basic recommendation.
 
-### 2. Analyze Clusters and Select Master
-Use the `suggest_merge` tool for each cluster to get a structured comparison.
-- Pass the cluster JSON to the tool.
-- The tool returns all records sorted by completeness (field count + text length) with a `suggested_master_id`.
-- **Your job**: Review the records, confirm or override the suggested master, and identify which details from the other records must be preserved in the consolidated text.
+### 2. Analyze Each Cluster
+Use the `suggest_merge` tool for each cluster.
+- The tool returns all records sorted by completeness with a `suggested_master_id`.
+- **Your job**: Read every record's `text` and `extra_fields`. Decide which ID should be the master (confirm or override the suggestion). Then write a single consolidated title and text that preserves **every** unique fact, name, date, decision, and technical detail from all records.
 
-### 3. Smart Merge (client-side consolidation)
-Execute the consolidation in three steps:
+**Consolidation rules:**
+1. Preserve every unique fact — do NOT generalize or drop granular specifics.
+2. Use sections/bullets if the entity has multiple distinct topics.
+3. Incorporate any listed graph relationships into the narrative.
+4. Resolve overlapping facts without losing nuance.
 
-**Step A** — Fetch texts for consolidation:
-Call `merge_facts(masterId=<master_id>, duplicateIds=[...], smart=True)`.
-- The tool returns the full text and relationships of every record in the cluster.
-- Do NOT skip this — you need the graph relationship data.
+### 3. Execute the Merge
+Call `merge_facts` with the master ID, duplicate IDs, and your consolidated content:
 
-**Step B** — Write the consolidated text:
-Using the returned records, write a single comprehensive Markdown text that:
-1. Preserves EVERY unique fact, name, date, decision, role, and technical detail from ALL records.
-2. Does NOT generalize or drop granular specifics.
-3. Uses sections/bullets if the entity has multiple distinct topics.
-4. Incorporates any listed graph relationships into the narrative.
+```
+merge_facts(
+    masterId = <chosen master ID>,
+    duplicateIds = [<all other IDs in the cluster>],
+    mergedTitle = <consolidated title>,
+    mergedText = <consolidated text>
+)
+```
 
-**Step C** — Apply and complete:
-1. `update_fact(memoryId=<master_id>, text=<consolidated_text>)` — update the master with your consolidated text.
-2. `merge_facts(masterId=<master_id>, duplicateIds=[...], smart=False)` — move all graph relationships from duplicates to master and delete the duplicate nodes.
+This tool:
+1. Updates the master record with your merged title and text (and re-indexes the vector).
+2. Moves all graph relationships from the duplicate nodes to the master.
+3. Deletes the duplicate nodes.
 
-### 4. Simple Merge (no text consolidation needed)
-For simple facts where the records are nearly identical and no LLM consolidation is needed:
-- Call `merge_facts(masterId=<master_id>, duplicateIds=[...], smart=False)` directly.
-
-### 5. Verification
+### 4. Verification
 After a merge, verify the results:
-- Use `get_fact_neighborhood` on the Master ID to see the consolidated graph.
+- Use `get_fact_neighborhood` on the Master ID to confirm the consolidated graph.
 - If the text needs further refinement, use `update_fact`.
 
 ## Efficiency: Multi-Tool Execution
-You are encouraged to call multiple tools in a single response. For example, you can call `find_duplicates` and then process multiple clusters with `suggest_merge` in the same turn, then handle the merges cluster by cluster.
+Call `find_duplicates` first, then process all clusters: call `suggest_merge` for each cluster in the same response, read all results, write consolidated content for each, then execute all `merge_facts` calls together.
 
 ## Examples of "Duplicate" Patterns
 - **People**: "Kate" vs "Katarina" (same role/company).
@@ -57,4 +56,4 @@ You are encouraged to call multiple tools in a single response. For example, you
 
 ## Tips
 - **Human-in-the-Loop**: If a merge seems risky or data might be lost, STOP and ask the user for confirmation.
-- **Relationship Safety**: The graph merge (`smart=False`) automatically prevents duplicate edges. Do NOT manually re-link after a merge.
+- **Relationship Safety**: `merge_facts` automatically prevents duplicate edges. Do NOT manually re-link after a merge.

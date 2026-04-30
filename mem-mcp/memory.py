@@ -917,32 +917,6 @@ async def db_merge_memories(master_id: str, duplicate_ids: List[str], user_id: s
     )
 
 
-async def db_get_texts_for_merge(master_id: str, duplicate_ids: List[str], user_id: str) -> list:
-    """
-    Fetch texts and relationships for all records in a merge operation.
-    Returns structured data for the client to consolidate.
-    """
-    neo4j_driver = get_neo4j()
-    with neo4j_driver.session() as s:
-        res = s.run(
-            """
-            MATCH (f:Fact) WHERE f.id IN ([ $masterId ] + $duplicateIds) AND f.userId = $userId
-            OPTIONAL MATCH (f)-[r]->(target:Fact) WHERE type(r) <> 'IN_CATEGORY' AND type(r) <> 'KNOWS' AND target.userId = $userId
-            RETURN f.id as id, f.title as title, f.text as text,
-                   collect({rel: type(r), target_title: target.title}) as links
-            """,
-            masterId=master_id, duplicateIds=duplicate_ids, userId=user_id
-        )
-        records = []
-        for r in res:
-            links = [l for l in r["links"] if l.get("rel")]
-            records.append({
-                "id": r["id"],
-                "title": r["title"] or "Untitled",
-                "text": r["text"] or "",
-                "relationships": [f"{l['rel']} -> {l.get('target_title', 'Unknown')}" for l in links],
-            })
-    return records
 
 
 # ---------------------------------------------------------------------------

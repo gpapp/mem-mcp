@@ -117,36 +117,22 @@ async def find_duplicates(category: str = "People", limit: int = 50, threshold: 
         return f"Error: {str(e)}"
 
 @mcp.tool()
-async def merge_facts(masterId: str, duplicateIds: List[str], smart: bool = False):
+async def merge_facts(masterId: str, duplicateIds: List[str], mergedTitle: str, mergedText: str):
     """
-    Merge multiple duplicate facts into a single master fact.
+    Merge duplicate facts into a single master record.
 
-    smart=False (default): executes the graph merge immediately — moves all
-    relationships from duplicates to master and deletes the duplicate nodes.
+    The caller is responsible for consolidating content before calling this tool:
+    use suggest_merge to retrieve all records, write a comprehensive mergedTitle
+    and mergedText that preserves every detail from every record, then call this.
 
-    smart=True: fetches the full texts of all records and returns them to the
-    client for consolidation. The client should then:
-      1. Write a consolidated text that preserves ALL details from every record.
-      2. Call update_fact(memoryId=masterId, text=<consolidated>)
-      3. Call merge_facts(masterId=masterId, duplicateIds=duplicateIds, smart=False)
+    This tool:
+    1. Updates the master record with the provided mergedTitle and mergedText.
+    2. Moves all graph relationships from duplicates to the master.
+    3. Deletes the duplicate nodes.
     """
-    if smart:
-        records = await mem.db_get_texts_for_merge(masterId, duplicateIds, _current_user())
-        return {
-            "records": records,
-            "master_id": masterId,
-            "duplicate_ids": duplicateIds,
-            "consolidation_instructions": (
-                "Combine ALL records into one comprehensive text. Rules:\n"
-                "1. Preserve every unique fact, name, date, decision, and technical detail.\n"
-                "2. Do NOT generalize or drop granular specifics.\n"
-                "3. Use sections/bullets if the entity has multiple distinct topics.\n"
-                "4. Incorporate any listed relationships into the narrative.\n"
-                "Then call update_fact(memoryId=master_id, text=<result>) "
-                "followed by merge_facts(masterId=master_id, duplicateIds=duplicate_ids, smart=False)."
-            ),
-        }
-    await mem.db_merge_memories(masterId, duplicateIds, _current_user())
+    user = _current_user()
+    await mem.db_update_memory(masterId, mergedTitle, mergedText, None, user)
+    await mem.db_merge_memories(masterId, duplicateIds, user)
     return f"Successfully merged {len(duplicateIds)} facts into {masterId}"
 
 @mcp.tool()
