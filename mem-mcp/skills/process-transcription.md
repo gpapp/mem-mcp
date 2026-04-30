@@ -104,8 +104,11 @@ Use relative links between files, e.g.:
 - Use `search_facts` with the entity name or variations.
 - If a match is found:
     - Use `update_fact` to merge new information into the existing record.
+    - Only add genuinely new information — do NOT re-state what is already in the text.
     - Do NOT create a duplicate entry.
 - If no match is found, use `add_fact`.
+
+**Reprocessing / adding new information:** If this meeting or source has been processed before, the entities likely already exist. Search thoroughly before creating anything. Prefer `update_fact` over `add_fact` when in doubt.
 
 ### 7. Handling Ambiguity and Mispronunciations (Aliases)
 People are often referred to by first names or their names might be mispronounced in the transcription.
@@ -155,6 +158,11 @@ Immediately after creating related facts, use `link_facts` to connect them. This
 Log significant events in the diary system using markdown format. Use `diary_save_entry(content, date)`.
 
 **Important — append-only:** Every call to `diary_save_entry` creates a brand-new entry. It never updates or overwrites an existing entry for that date. Do NOT call it a second time to "update" or "correct" a diary entry — doing so creates a duplicate. Write the complete, final content in a single call per topic.
+
+**Before writing diary entries — check what already exists:**
+Use `diary_search_entries` with the meeting topic, date, or project name to find any entries already logged for this session.
+- If entries exist for this date/meeting: only write entries for topics NOT already covered. Do NOT re-log what is already recorded.
+- If no relevant entries exist: proceed normally.
 
 **Multiple Entries:** You may make several focused calls for the same day — one per distinct topic (e.g., one for decisions, one for action items). Each becomes its own independently searchable entry. Do NOT create overlapping entries about the same topic.
 
