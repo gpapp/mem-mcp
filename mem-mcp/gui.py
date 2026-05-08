@@ -360,15 +360,16 @@ SETUP_SECTION = """<div style="margin-top: 2rem;">
 async def get_landing(request: Request):
     creds = _check_session_auth(request)
     ctx = _get_auth_context(request)
+    base_url = mem.BASE_URL or "/"
     
     if creds:
         ctx["LOGIN_HTML"] = ""
-        ctx["SETUP_HTML"] = SETUP_SECTION
+        ctx["SETUP_HTML"] = SETUP_SECTION.replace("{{BASE_URL}}", base_url)
     else:
-        ctx["LOGIN_HTML"] = LOGIN_SECTION
+        ctx["LOGIN_HTML"] = LOGIN_SECTION.replace("{{BASE_URL}}", base_url)
         ctx["SETUP_HTML"] = ""
     
-    html = _render_template("landing", BASE_URL=mem.BASE_URL, **ctx)
+    html = _render_template("landing", BASE_URL=base_url, **ctx)
     return HTMLResponse(content=html)
 
 
