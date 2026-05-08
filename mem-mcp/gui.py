@@ -31,6 +31,7 @@ from pydantic import BaseModel
 from typing import Optional
 
 import memory as mem
+from fastapi.responses import Response
 
 SESSION_SECRET = os.getenv("MEM_SESSION_SECRET", secrets.token_hex(32))
 web_app = FastAPI(title="Memory Vault GUI")
@@ -305,6 +306,13 @@ def _get_auth_context(request: Request):
         "AUTH_BASE64": auth_b64,
         "MCP_URL": mcp_url
     }
+
+
+@web_app.get("/favicon.svg", response_class=Response)
+async def get_favicon():
+    path = os.path.join(os.path.dirname(__file__), "templates", "favicon.svg")
+    with open(path, "rb") as f:
+        return Response(content=f.read(), media_type="image/svg+xml")
 
 
 @web_app.get("/", response_class=HTMLResponse)
