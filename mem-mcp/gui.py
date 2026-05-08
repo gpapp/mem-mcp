@@ -23,6 +23,7 @@ import base64
 import logging
 import secrets
 from datetime import datetime, timedelta
+from typing import Optional
 
 import memory as mem
 from fastapi import Request, HTTPException, FastAPI
