@@ -47,7 +47,7 @@ async def add_fact(title: str, text: str, category: str):
     return f"Successfully added memory with ID: {memory_id}"
 
 @mcp.tool()
-async def search_facts(query: str, category: Optional[str] = None, limit: int = 10, top_p: float = 0.4):
+async def search_facts(query: str, category: Optional[str] = None, limit: int = 5, top_p: float = 0.7):
     """
     Search for facts matching query criteria.
     - query: semantic search string
