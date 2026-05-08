@@ -26,6 +26,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 import memory as mem
+from passlib.apache import HtpasswdFile
 from fastapi import Request, HTTPException, FastAPI
 from fastapi.responses import Response, JSONResponse, HTMLResponse, RedirectResponse
 from pydantic import BaseModel
@@ -35,6 +36,16 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 SESSION_SECRET = os.getenv("MEM_SESSION_SECRET", secrets.token_hex(32))
 web_app = FastAPI(title="Memory Vault GUI")
 web_app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET, session_cookie="mem_session")
+
+HTPASSWD_PATH = os.getenv("HTPASSWD_PATH", os.path.join(os.path.dirname(__file__), "htpasswd"))
+
+def _verify_htpasswd(username: str, password: str) -> bool:
+    try:
+        ht = HtpasswdFile(HTPASSWD_PATH)
+        return ht.verify(password, username)
+    except Exception as e:
+        logging.warning(f"htpasswd verification failed: {e}")
+        return False
 
 templates = Environment(
     loader=FileSystemLoader(os.path.join(os.path.dirname(__file__), "templates")),
@@ -163,6 +174,8 @@ async def _set_session(request: Request, user: str, password: str):
 
 @web_app.post("/api/auth/login")
 async def api_login(request: Request, response: Response, form: LoginForm):
+    if not _verify_htpasswd(form.username, form.password):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
     await _set_session(request, form.username, form.password)
     return {"status": "ok", "user": form.username}
 

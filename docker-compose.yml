@@ -84,6 +84,7 @@ services:
     volumes:
       - MEM_model_cache:/root/.cache/fastembed
       - ./mem-mcp/logs:/app/logs
+      - ./mem-mcp/htpasswd:/app/htpasswd:ro
       - ./mem-mcp/htpasswd:/etc/nginx/.htpasswd:ro
 
 volumes:
