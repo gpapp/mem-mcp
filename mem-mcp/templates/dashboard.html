@@ -1132,10 +1132,90 @@ npm install @modelcontextprotocol/sdk</code></pre>
     document.querySelectorAll('.context-menu').forEach(el => el.remove());
   }
 
-  async function addToBuildGraph(nodeId) {
+async function addToBuildGraph(nodeId) {
     hideContextMenu();
-    setGraphMode('build');
+    switchTab('graph');
+    if (!isBuildMode) {
+      setGraphMode('build');
+    }
     await showOnMap(nodeId);
+  }
+
+  async function showOnMap(id) {
+    if (!isBuildMode) {
+      switchTab('graph');
+      openInGraph(id);
+      return;
+    }
+    
+    if (!graphLoaded) {
+      await loadGraph();
+    }
+    
+    if (buildGraphNodes.has(id)) {
+      if (network) {
+        network.focus(id, { scale: 1.5, animation: { duration: 1000, easingFunction: 'easeInOutQuad' } });
+        network.selectNodes([id]);
+      }
+      toast('Node already on map');
+      return;
+    }
+    
+    try {
+      const focusData = await api.get('graph/focus/' + id);
+      
+      buildGraphNodes.add(focusData.center.id);
+      
+      const newNodes = [];
+      for (const node of focusData.nodes) {
+        if (!buildGraphNodes.has(node.id)) {
+          buildGraphNodes.add(node.id);
+          newNodes.push({
+            id: node.id,
+            label: truncateText(node.title, 20),
+            title: node.title,
+            group: node.category,
+            shape: 'dot',
+            size: 10,
+            font: { size: 12, face: 'Inter' }
+          });
+        }
+      }
+      
+      const connData = await api.get('graph/connections/' + id);
+      
+      for (const [relType, connections] of Object.entries(connData)) {
+        for (const conn of connections) {
+          if (!buildGraphNodes.has(conn.id)) {
+            buildGraphNodes.add(conn.id);
+            newNodes.push({
+              id: conn.id,
+              label: truncateText(conn.title, 20),
+              title: conn.title,
+              group: conn.category,
+              shape: 'dot',
+              size: 10,
+              font: { size: 12, face: 'Inter' }
+            });
+          }
+        }
+      }
+      
+      updateBuildStatus();
+      
+      rebuildNetwork();
+      
+      setTimeout(() => {
+        if (network) {
+          network.focus(id, { scale: 1.5, animation: { duration: 1000, easingFunction: 'easeInOutQuad' } });
+          network.selectNodes([id]);
+        }
+      }, 300);
+      
+      toast('📍 Added to map');
+    } catch(e) {
+      toast('⚠️ Error loading node: ' + e.message);
+    }
   }
 
   async function goToFact(nodeId) {
@@ -1149,43 +1229,26 @@ npm install @modelcontextprotocol/sdk</code></pre>
     try {
       const neighbors = await api.get('graph/neighbors/' + nodeId);
       
+      let addedCount = 0;
       for (const neighbor of neighbors) {
         if (!buildGraphNodes.has(neighbor.id)) {
           buildGraphNodes.add(neighbor.id);
-          
-          if (graphData.nodes) {
-            graphData.nodes.add({
-              id: neighbor.id,
-              label: truncateText(neighbor.text || neighbor.title || '', 20),
-              title: neighbor.text || neighbor.title || '',
-              group: neighbor.category || 'General',
-              shape: 'dot',
-              size: 10,
-              font: { size: 12, face: 'Inter' }
-            });
-          }
-          
-          const edgeKey = nodeId + '|' + neighbor.id + '|_';
-          if (!buildGraphEdges.has(edgeKey)) {
-            buildGraphEdges.add(edgeKey);
-            
-            if (graphData.edges) {
-              graphData.edges.add({
-                from: nodeId,
-                to: neighbor.id,
-                font: { size: 10, align: 'middle' },
-                arrows: 'to',
-                color: { color: '#e5e7eb', highlight: '#4f46e5' }
-              });
-            }
-          }
+          addedCount++;
         }
       }
       
       updateBuildStatus();
-      toast('🔗 Added ' + neighbors.length + ' connected node' + (neighbors.length !== 1 ? 's' : ''));
+      rebuildNetwork();
+      
+      setTimeout(() => {
+        if (network) {
+          network.focus(nodeId, { scale: 1.2, animation: { duration: 800, easingFunction: 'easeInOutQuad' } });
+        }
+      }, 300);
+      
+      toast('🔗 Added ' + addedCount + ' connected node' + (addedCount !== 1 ? 's' : ''));
     } catch(e) {
-      toast('⚠️ Error loading connections');
+      toast('⚠️ Error: ' + e.message);
     }
   }
 
@@ -1196,46 +1259,26 @@ npm install @modelcontextprotocol/sdk</code></pre>
       const connections = await api.get('graph/connections/' + nodeId);
       const connList = connections[relType] || [];
       
+      let addedCount = 0;
       for (const conn of connList) {
         if (!buildGraphNodes.has(conn.id)) {
           buildGraphNodes.add(conn.id);
-          
-          if (graphData.nodes) {
-            graphData.nodes.add({
-              id: conn.id,
-              label: truncateText(conn.title || '', 20),
-              title: conn.title || '',
-              group: conn.category || 'General',
-              shape: 'dot',
-              size: 10,
-              font: { size: 12, face: 'Inter' }
-            });
-          }
-        }
-        
-        const edgeKey = nodeId + '|' + conn.id + '|' + relType;
-        const reverseKey = conn.id + '|' + nodeId + '|' + relType;
-        
-        if (!buildGraphEdges.has(edgeKey) && !buildGraphEdges.has(reverseKey)) {
-          buildGraphEdges.add(edgeKey);
-          
-          if (graphData.edges) {
-            graphData.edges.add({
-              from: nodeId,
-              to: conn.id,
-              label: relType,
-              font: { size: 10, align: 'middle' },
-              arrows: 'to',
-              color: { color: '#e5e7eb', highlight: '#4f46e5' }
-            });
-          }
+          addedCount++;
         }
       }
       
       updateBuildStatus();
-      toast(`🔗 Added ${connList.length} node${connList.length !== 1 ? 's' : ''} via ${relType}`);
+      rebuildNetwork();
+      
+      setTimeout(() => {
+        if (network) {
+          network.focus(nodeId, { scale: 1.2, animation: { duration: 800, easingFunction: 'easeInOutQuad' } });
+        }
+      }, 300);
+      
+      toast(`🔗 Added ${addedCount} node${addedCount !== 1 ? 's' : ''} via ${relType}`);
     } catch(e) {
-      toast('⚠️ Error loading connections');
+      toast('⚠️ Error: ' + e.message);
     }
   }
 
