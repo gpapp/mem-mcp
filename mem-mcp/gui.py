@@ -63,7 +63,7 @@ def _verify_htpasswd(username: str, password: str) -> bool:
                 if user != username:
                     continue
                 if hash.startswith("$apr1$"):
-                    salt, expected = hash[5:12], hash[13:]
+                    salt, expected = hash[5:13], hash[13:]
                     if apr1_md5(password, salt) == expected:
                         return True
         logging.info(f"htpasswd verify: {username} -> False")
