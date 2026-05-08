@@ -22,20 +22,12 @@ import os
 import base64
 import logging
 import secrets
+import subprocess
 from datetime import datetime, timedelta
 from typing import Optional
 
 import memory as mem
-import hashlib
 from fastapi import Request, HTTPException, FastAPI
-
-def apr1_md5(password: str, salt: str) -> str:
-    import subprocess
-    result = subprocess.run(
-        ["htpasswd", "-nbm", password, salt],
-        capture_output=True, text=True
-    )
-    return result.stdout.strip().split("$")[-1]
 from fastapi.responses import Response, JSONResponse, HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 from starlette.middleware.sessions import SessionMiddleware
@@ -52,22 +44,13 @@ def _verify_htpasswd(username: str, password: str) -> bool:
         if not os.path.exists(HTPASSWD_PATH):
             logging.warning(f"htpasswd file not found: {HTPASSWD_PATH}")
             return False
-        with open(HTPASSWD_PATH) as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if ":" not in line:
-                    continue
-                user,hash = line.split(":", 1)
-                if user != username:
-                    continue
-                if hash.startswith("$apr1$"):
-                    salt, expected = hash[5:13], hash[13:]
-                    if apr1_md5(password, salt) == expected:
-                        return True
-        logging.info(f"htpasswd verify: {username} -> False")
-        return False
+        result = subprocess.run(
+            ["htpasswd", "-vb", HTPASSWD_PATH, username, password],
+            capture_output=True, text=True
+        )
+        result_code = result.returncode
+        logging.info(f"htpasswd verify: {username} -> {result_code == 0}")
+        return result_code == 0
     except Exception as e:
         logging.warning(f"htpasswd verification failed: {e}")
         return False
