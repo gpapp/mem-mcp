@@ -365,13 +365,18 @@ async def db_delete_memory(memory_id: str, user_id: str) -> bool:
 
 
 async def db_link_facts(source_id: str, target_id: str, rel_type: str, metadata: dict, user_id: str):
-    """Create a relationship between two facts in Neo4j."""
+    """Create a bidirectional relationship between two facts in Neo4j.
+    Creates forward link (source->target) and reverse link (target->source).
+    """
     neo4j_driver = get_neo4j()
     if not neo4j_driver:
         raise RuntimeError("Neo4j not connected.")
 
     rel_type = rel_type.upper().replace(" ", "_")
+    reverse_rel = rel_type  # Same verb works for reverse direction (e.g., "CONNECTED_TO" works both ways)
+    
     with neo4j_driver.session() as s:
+        # Create forward relationship (source -> target)
         s.run(
             f"""
             MATCH (a:Fact {{id: $sid, userId: $userId}})
@@ -381,6 +386,57 @@ async def db_link_facts(source_id: str, target_id: str, rel_type: str, metadata:
             """,
             sid=source_id, tid=target_id, userId=user_id, metadata=metadata
         )
+        # Create reverse relationship (target -> source) for two-way navigation
+        s.run(
+            f"""
+            MATCH (a:Fact {{id: $sid, userId: $userId}})
+            MATCH (b:Fact {{id: $tid, userId: $userId}})
+            MERGE (b)-[r:{reverse_rel}]->(a)
+            SET r += $metadata
+            """,
+            sid=source_id, tid=target_id, userId=user_id, metadata=metadata
+        )
+
+
+async def db_unlink_facts(source_id: str, target_id: str, rel_type: str, user_id: str):
+    """Remove a bidirectional relationship between two facts in Neo4j."""
+    neo4j_driver = get_neo4j()
+    if not neo4j_driver:
+        raise RuntimeError("Neo4j not connected.")
+
+    rel_type = rel_type.upper().replace(" ", "_") if rel_type else None
+    
+    with neo4j_driver.session() as s:
+        if rel_type:
+            s.run(
+                f"""
+                MATCH (a:Fact {{id: $sid, userId: $userId}})-[r:{rel_type}]->(b:Fact {{id: $tid, userId: $userId}})
+                DELETE r
+                """,
+                sid=source_id, tid=target_id, userId=user_id
+            )
+            s.run(
+                f"""
+                MATCH (a:Fact {{id: $sid, userId: $userId}})<-[r:{rel_type}]-(b:Fact {{id: $tid, userId: $userId}})
+                DELETE r
+                """,
+                sid=source_id, tid=target_id, userId=user_id
+            )
+        else:
+            s.run(
+                """
+                MATCH (a:Fact {id: $sid, userId: $userId})-[r]->(b:Fact {id: $tid, userId: $userId})
+                DELETE r
+                """,
+                sid=source_id, tid=target_id, userId=user_id
+            )
+            s.run(
+                """
+                MATCH (a:Fact {id: $sid, userId: $userId})<-[r]-(b:Fact {id: $tid, userId: $userId})
+                DELETE r
+                """,
+                sid=source_id, tid=target_id, userId=user_id
+            )
 
 
 def db_get_neighborhood(fact_id: str, depth: int, rel_types: List[str], user_id: str) -> list:

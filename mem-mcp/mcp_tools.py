@@ -64,9 +64,15 @@ async def list_categories():
 
 @mcp.tool()
 async def link_facts(sourceFactId: str, targetFactId: str, relationshipType: str, metadata: Optional[dict] = None):
-    """Create a relationship between two facts."""
+    """Create a bidirectional relationship between two facts (two-way link)."""
     await mem.db_link_facts(sourceFactId, targetFactId, relationshipType, metadata or {}, _current_user())
-    return f"Link created: {sourceFactId} -> {targetFactId}"
+    return f"Linked: {sourceFactId} <-> {targetFactId}"
+
+@mcp.tool()
+async def unlink_facts(sourceFactId: str, targetFactId: str, relationshipType: Optional[str] = None):
+    """Remove a bidirectional relationship between two facts."""
+    await mem.db_unlink_facts(sourceFactId, targetFactId, relationshipType, _current_user())
+    return f"Unlinked: {sourceFactId} <-> {targetFactId}"
 
 @mcp.tool()
 async def get_fact_neighborhood(factId: str, depth: int = 1, relationshipTypes: Optional[List[str]] = None):
