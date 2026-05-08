@@ -16,6 +16,12 @@ docker exec ollama ollama pull nomic-embed-text
 python mem-mcp\server.py
 ```
 
+## Code Quality
+
+After completing any code changes:
+1. Run `python -m py_compile <file.py>` to verify syntax
+2. If successful, commit and push to git
+
 ## Architecture
 
 | Component | Port | Notes |
