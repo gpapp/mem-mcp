@@ -278,11 +278,15 @@ async def db_update_memory(memory_id: str, title: Optional[str], text: Optional[
     if not qdrant or not neo4j_driver:
         raise RuntimeError("Database connections not established.")
 
+    logger.info(f"[db_update_memory] Updating {memory_id}: title={title}, text={'Yes' if text else 'No'}, category={category}")
+
     # Get current to see what's changing
     with neo4j_driver.session() as s:
         res = s.run("MATCH (f:Fact {id: $id, userId: $userId}) RETURN f", id=memory_id, userId=user_id)
         existing = res.single()
-        if not existing: return False
+        if not existing: 
+            logger.warning(f"[db_update_memory] Memory {memory_id} not found")
+            return False
         old_fact = existing["f"]
 
     new_text = text if text is not None else old_fact.get("text")
@@ -290,10 +294,19 @@ async def db_update_memory(memory_id: str, title: Optional[str], text: Optional[
     new_cat  = category.strip().capitalize() if category else old_fact.get("category")
     new_meta = metadata or {} 
     
+    logger.info(f"[db_update_memory] New values: title={new_title}, text_len={len(new_text) if new_text else 0}")
+    
     # Qdrant Update
     # Re-embed if text OR title changes
     embed_text = f"{new_title}: {new_text}" if new_title else new_text
-    vector = await get_embedding(embed_text) if (text is not None or title is not None) else None
+    needs_embed = text is not None or title is not None
+    
+    try:
+        vector = await get_embedding(embed_text) if needs_embed else None
+        logger.info(f"[db_update_memory] Embedding generated, vector_len={len(vector) if vector else 0}")
+    except Exception as e:
+        logger.error(f"[db_update_memory] Embedding failed: {e}")
+        raise RuntimeError(f"Embedding failed: {e}")
     
     # Prepare payload, converting Neo4j types to JSON-serializable ones
     payload = {}
@@ -315,6 +328,8 @@ async def db_update_memory(memory_id: str, title: Optional[str], text: Optional[
         current_meta.update(new_meta)
         payload["metadata"] = current_meta
 
+    logger.info(f"[db_update_memory] Upserting to Qdrant, payload keys: {list(payload.keys())}")
+    
     await qdrant.upsert(
         collection_name=COLLECTION_NAME,
         points=[PointStruct(
@@ -325,6 +340,7 @@ async def db_update_memory(memory_id: str, title: Optional[str], text: Optional[
     )
 
     # Neo4j Update
+    logger.info(f"[db_update_memory] Updating Neo4j")
     with neo4j_driver.session() as s:
         s.run(
             """
@@ -340,6 +356,7 @@ async def db_update_memory(memory_id: str, title: Optional[str], text: Optional[
             """,
             id=memory_id, userId=user_id, text=new_text, title=new_title, category=new_cat, metadata=new_meta
         )
+    logger.info(f"[db_update_memory] Update complete for {memory_id}")
     return True
 
 
