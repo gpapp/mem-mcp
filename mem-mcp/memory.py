@@ -680,7 +680,7 @@ def db_list_memories(user_id: str) -> list:
             WHERE type(r) <> 'IN_CATEGORY' AND type(r) <> 'KNOWS'
             RETURN f, c.name as category, 
                    collect({rel: type(r), target_id: target.id, target_text: target.text, target_title: target.title}) as links
-            ORDER BY c.name ASC, f.timestamp DESC
+            ORDER BY coalesce(f.title, f.text) ASC
             """,
             userId=user_id,
         )

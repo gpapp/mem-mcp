@@ -1112,6 +1112,10 @@ npm install @modelcontextprotocol/sdk</code></pre>
         </div>
         <div class="context-menu-separator"></div>
         ${submenuHTML}
+        <div class="context-menu-separator"></div>
+        <div class="context-menu-item" onclick="removeNodeFromBuild('${nodeId}')" style="color: var(--danger);">
+          🗑️ Remove from graph
+        </div>
       `;
     } else {
       menuHTML += `
@@ -1280,6 +1284,15 @@ async function addToBuildGraph(nodeId) {
     } catch(e) {
       toast('⚠️ Error: ' + e.message);
     }
+  }
+
+  function removeNodeFromBuild(nodeId) {
+    hideContextMenu();
+    buildGraphNodes.delete(nodeId);
+    buildGraphEdges.delete(nodeId);
+    updateBuildStatus();
+    rebuildNetwork();
+    toast('🗑️ Node removed from graph');
   }
 
   function truncateText(text, maxLen) {
