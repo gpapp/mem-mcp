@@ -23,28 +23,21 @@ import base64
 import logging
 import secrets
 from datetime import datetime, timedelta
-from fastapi import FastAPI, Request, HTTPException, Response
-from fastapi.responses import HTMLResponse, JSONResponse, Response
-from fastapi.security import HTTPBasicCredentials
-from starlette.middleware.sessions import SessionMiddleware
-from pydantic import BaseModel
-from typing import Optional
 
 import memory as mem
-from fastapi.responses import Response
+from fastapi import Request, HTTPException
+from fastapi.responses import Response, JSONResponse, HTMLResponse, RedirectResponse
+from starlette.middleware.sessions import SessionMiddleware
+from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 SESSION_SECRET = os.getenv("MEM_SESSION_SECRET", secrets.token_hex(32))
 web_app = FastAPI(title="Memory Vault GUI")
 web_app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET, session_cookie="mem_session")
 
-def _render_template(name: str, ext: str = "html", **context) -> str:
-    path = os.path.join(os.path.dirname(__file__), "templates", f"{name}.{ext}")
-    with open(path, "r", encoding="utf-8") as f:
-        html = f.read()
-    for k, v in context.items():
-        replacement = "1" if v is True else "0" if v is False else str(v)
-        html = html.replace(f"{{{{{k}}}}}", replacement)
-    return html
+templates = Environment(
+    loader=FileSystemLoader(os.path.join(os.path.dirname(__file__), "templates")),
+    autoescape=select_autoescape(["html", "xml"])
+)
 
 # Helper functions must be defined BEFORE middleware that uses them
 def _check_session_auth(request: Request) -> tuple[str, str] | None:
@@ -185,6 +178,13 @@ async def api_auth_check(request: Request):
 # REST API
 # ---------------------------------------------------------------------------
 
+def _require_auth(request: Request):
+    creds = _check_session_auth(request)
+    if not creds:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return creds[0]
+
+
 @web_app.get("/api/ping")
 async def api_ping():
     return {"status": "ok", "version": "1.3", "base_url": mem.BASE_URL}
@@ -323,37 +323,8 @@ async def get_favicon():
         return Response(content=f.read(), media_type="image/svg+xml")
 
 
-LOGIN_SECTION = """<div class="card">
-  <h2>🔐 Sign In</h2>
-  <form id="loginForm">
-    <input type="text" name="username" placeholder="Username" required autocomplete="username">
-    <input type="password" name="password" placeholder="Password" required autocomplete="current-password">
-    <button type="submit" class="btn">Sign In</button>
-  </form>
-</div>"""
-
-SETUP_SECTION = """<div style="margin-top: 2rem;">
-  <a href="{{BASE_URL}}/gui" class="btn">Enter Dashboard →</a>
-</div>
-
-<div class="card" style="margin-top: 2rem;">
-  <h2>🔌 MCP Setup Guide</h2>
-  <p>Connect your AI assistant to your Vault using the command below.</p>
-  
-  <div class="step">
-    <p><span class="step-num">1</span> <strong>Claude Desktop / Claude Code:</strong></p>
-    <p>Run this in your terminal:</p>
-    <pre><code>claude mcp add --transport http memory-vault {{MCP_URL}} --header "Authorization: Basic {{AUTH_BASE64}}"</code></pre>
-  </div>
-
-  <div class="step">
-    <p><span class="step-num">2</span> <strong>Active Credentials:</strong></p>
-    <div style="background: var(--bg); padding: 1rem; border-radius: 8px; border: 1px dashed var(--primary);">
-      <p style="margin:0;"><strong>User:</strong> <code>{{AUTH_USER}}</code></p>
-      <p style="margin:.5rem 0 0 0;"><strong>Pass:</strong> <code>{{AUTH_PASS}}</code></p>
-    </div>
-  </div>
-</div>"""
+def _render(name: str, **ctx):
+    return templates.get_template(f"{name}.html").render(**ctx)
 
 
 @web_app.get("/", response_class=HTMLResponse)
@@ -361,22 +332,17 @@ async def get_landing(request: Request):
     creds = _check_session_auth(request)
     ctx = _get_auth_context(request)
     base_url = mem.BASE_URL or "/"
-    
-    if creds:
-        ctx["LOGIN_HTML"] = ""
-        ctx["SETUP_HTML"] = SETUP_SECTION.replace("{{BASE_URL}}", base_url)
-    else:
-        ctx["LOGIN_HTML"] = LOGIN_SECTION.replace("{{BASE_URL}}", base_url)
-        ctx["SETUP_HTML"] = ""
-    
-    html = _render_template("landing", BASE_URL=base_url, **ctx)
+    ctx["BASE_URL"] = base_url
+    ctx["authenticated"] = bool(creds)
+    html = _render("landing", **ctx)
     return HTMLResponse(content=html)
 
 
 @web_app.get("/api/download/mcp-bridge.mjs", response_class=Response)
 async def download_mcp_bridge(request: Request):
     ctx = _get_auth_context(request)
-    js_content = _render_template("mcp-bridge", ext="mjs", BASE_URL=mem.BASE_URL, **ctx)
+    ctx["BASE_URL"] = mem.BASE_URL or "/"
+    js_content = templates.get_template("mcp-bridge.mjs").render(**ctx)
     return Response(
         content=js_content,
         media_type="application/javascript",
@@ -385,6 +351,10 @@ async def download_mcp_bridge(request: Request):
 
 @web_app.get("/gui", response_class=HTMLResponse)
 async def get_gui(request: Request):
+    creds = _check_session_auth(request)
+    if not creds:
+        return RedirectResponse(url=mem.BASE_URL or "/", status_code=302)
     ctx = _get_auth_context(request)
-    html = _render_template("dashboard", BASE_URL=mem.BASE_URL, **ctx)
+    ctx["BASE_URL"] = mem.BASE_URL or "/"
+    html = _render("dashboard", **ctx)
     return HTMLResponse(content=html)
