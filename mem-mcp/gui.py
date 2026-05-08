@@ -30,31 +30,12 @@ import hashlib
 from fastapi import Request, HTTPException, FastAPI
 
 def apr1_md5(password: str, salt: str) -> str:
-    password_b = password.encode()
-    apr1_salt = f"APR1{salt}".encode()
-    ctx = hashlib.md5(password_b + apr1_salt + password_b)
-    binary = ctx.digest()
-    for i in range(1000):
-        new = b''
-        if i % 2 == 0:
-            new = password_b
-        else:
-            new = binary
-        if i % 3 != 0:
-            new += apr1_salt
-        if i % 7 != 0:
-            new += password_b
-        if i % 2 == 0:
-            new += binary
-        else:
-            new += password_b
-        binary = hashlib.md5(new).digest()
-    import base64
-    b64 = base64.b64encode(binary)
-    arr = bytearray(b64[:22] + b'\x00\x00' + b64[22:23])
-    apr1_map = str.maketrans('./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz', './0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz')
-    result = arr.translate(apr1_map).decode()
-    return result
+    import subprocess
+    result = subprocess.run(
+        ["htpasswd", "-nbm", password, salt],
+        capture_output=True, text=True
+    )
+    return result.stdout.strip().split("$")[-1]
 from fastapi.responses import Response, JSONResponse, HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 from starlette.middleware.sessions import SessionMiddleware
