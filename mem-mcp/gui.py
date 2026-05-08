@@ -74,7 +74,7 @@ async def auth_guard(request: Request, call_next):
             elif request.url.path.startswith("/api/") and not request.url.path.startswith("/api/auth"):
                 return JSONResponse({"detail": "Not authenticated"}, status_code=401)
             else:
-                return HTMLResponse(content=_render_template("login", BASE_URL=mem.BASE_URL), status_code=200)
+                return RedirectResponse(url=mem.BASE_URL or "/", status_code=302)
     return await call_next(request)
 
 # Suppress noisy uvicorn access logs for the root path (MCP heartbeats)
@@ -286,16 +286,23 @@ async def api_whoami(request: Request):
 # ---------------------------------------------------------------------------
 
 def _get_auth_context(request: Request):
+    # Try session auth first, then Basic Auth header
     auth_user, auth_pass, auth_b64 = "unknown", "********", ""
-    auth_header = request.headers.get("Authorization")
-    if auth_header and auth_header.startswith("Basic "):
-        try:
-            encoded = auth_header.split(" ")[1]
-            auth_b64 = encoded
-            decoded = base64.b64decode(encoded).decode("utf-8")
-            if ":" in decoded:
-                auth_user, auth_pass = decoded.split(":", 1)
-        except Exception: pass
+    
+    session_user = request.session.get("user")
+    session_pass = request.session.get("pass")
+    if session_user and session_pass:
+        auth_user, auth_pass = session_user, session_pass
+    else:
+        auth_header = request.headers.get("Authorization")
+        if auth_header and auth_header.startswith("Basic "):
+            try:
+                encoded = auth_header.split(" ")[1]
+                auth_b64 = encoded
+                decoded = base64.b64decode(encoded).decode("utf-8")
+                if ":" in decoded:
+                    auth_user, auth_pass = decoded.split(":", 1)
+            except Exception: pass
     
     # Intelligently calculate MCP_URL
     # If BASE_URL is https://hass.securemail.hu/mcp, we want the mcp_url to be https://hass.securemail.hu/mcp/mcp
