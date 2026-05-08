@@ -5,6 +5,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y \
     build-essential \
     curl \
+    apache2-utils \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
