@@ -200,7 +200,7 @@ async def api_ping():
 @web_app.get("/api/memories", response_class=JSONResponse)
 async def api_list_memories(request: Request):
     try:
-        return mem.db_list_memories(_require_user(request)(request))
+        return mem.db_list_memories(_require_user(request))
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
