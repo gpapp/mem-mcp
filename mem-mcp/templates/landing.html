@@ -41,8 +41,23 @@
       <span class="badge">Connected</span>
       <h1>🧠 Memory Vault</h1>
       <p>Your personal knowledge graph and vector store, unified.</p>
-      <div style="margin-top: 2rem;">
+      <div style="margin-top: 2rem;" id="enterBtn">
         <a href="{{BASE_URL}}/gui" class="btn">Enter Dashboard →</a>
+      </div>
+
+      <div class="card" id="loginCard" style="display:none;">
+        <h2>🔐 Sign In</h2>
+        <form id="loginForm">
+          <div style="margin-bottom: 1rem;">
+            <label style="display:block;margin-bottom:.5rem;">Username</label>
+            <input type="text" name="username" required style="width:100%;padding:.5rem;border:1px solid var(--border);border-radius:8px;">
+          </div>
+          <div style="margin-bottom: 1rem;">
+            <label style="display:block;margin-bottom:.5rem;">Password</label>
+            <input type="password" name="password" required style="width:100%;padding:.5rem;border:1px solid var(--border);border-radius:8px;">
+          </div>
+          <button type="submit" class="btn">Sign In</button>
+        </form>
       </div>
     </header>
 
@@ -69,5 +84,38 @@
       Running at <span class="url-tag">{{BASE_URL}}</span>
     </footer>
   </div>
+  <script>
+    const apiBase = "{{BASE_URL}}/api";
+    const BASE_URL = "{{BASE_URL}}";
+
+    // Check auth and show appropriate UI
+    fetch(`${apiBase}/auth/check`).then(r => r.json()).then(d => {
+      if (d.authenticated) {
+        window.location.href = BASE_URL + "/gui";
+      } else {
+        document.getElementById('enterBtn').style.display = 'none';
+        document.getElementById('loginCard').style.display = 'block';
+      }
+    }).catch(() => {
+      document.getElementById('enterBtn').style.display = 'none';
+      document.getElementById('loginCard').style.display = 'block';
+    });
+
+    // Handle login
+    document.getElementById('loginForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const form = new FormData(e.target);
+      const res = await fetch(`${apiBase}/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: form.get('username'), password: form.get('password') })
+      });
+      if (res.ok) {
+        window.location.href = BASE_URL + '/gui';
+      } else {
+        alert('Invalid credentials');
+      }
+    });
+  </script>
 </body>
 </html>

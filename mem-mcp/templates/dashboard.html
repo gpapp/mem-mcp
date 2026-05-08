@@ -148,7 +148,7 @@
     pre { background: #1f2937; color: #f3f4f6; padding: 1rem; border-radius: 8px; overflow-x: auto; font-size: .85rem; }
   </style>
 </head>
-<body>
+<body onload="init()">
 
 <nav>
   <h1>🧠 Memory Vault</h1>
@@ -321,9 +321,32 @@ npm install @modelcontextprotocol/sdk</code></pre>
     delete: (url)       => fetch(`${apiBase}/${url}`, {method:'DELETE'}).then(r => r.ok ? r.json() : Promise.reject(r)),
   };
 
+  // Check auth on load
+  async function checkAuth() {
+    try {
+      const res = await fetch(`${apiBase}/auth/check`).then(r => r.json());
+      if (!res.authenticated) {
+        window.location.href = "{{BASE_URL}}";
+        return false;
+      }
+      return true;
+    } catch {
+      window.location.href = "{{BASE_URL}}";
+      return false;
+    }
+  }
+
   let memories = [], diaryEntries = [], activeDiaryDate = null;
   let insightsLoaded = false, graphLoaded = false;
   let activeCategory = null;
+
+  async function init() {
+    const ok = await checkAuth();
+    if (!ok) return;
+    loadMemories();
+    loadDiary();
+    loadWhoami();
+  }
 
   function toast(msg, ms=2500) {
     const el = document.getElementById('toast');
