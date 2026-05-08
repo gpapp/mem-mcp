@@ -44,8 +44,22 @@ def _render_template(name: str, ext: str = "html", **context) -> str:
         html = html.replace(f"{{{{{k}}}}}", str(v))
     return html
 
-web_app = FastAPI(title="Memory Vault GUI")
-web_app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET, session_cookie="mem_session")
+# Helper functions must be defined BEFORE middleware that uses them
+def _check_session_auth(request: Request) -> tuple[str, str] | None:
+    session_user = request.session.get("user")
+    session_pass = request.session.get("pass")
+    if session_user and session_pass:
+        return session_user, session_pass
+    
+    auth_header = request.headers.get("Authorization")
+    if auth_header and auth_header.startswith("Basic "):
+        try:
+            encoded = auth_header.split(" ")[1]
+            decoded = base64.b64decode(encoded).decode("utf-8")
+            if ":" in decoded:
+                return decoded.split(":", 1)
+        except Exception: pass
+    return None
 
 # Auth guard middleware - protect /gui routes
 @web_app.middleware("http")
@@ -53,8 +67,8 @@ async def auth_guard(request: Request, call_next):
     if request.url.path.startswith("/gui") or request.url.path.startswith("/api"):
         creds = _check_session_auth(request)
         if not creds:
-            if request.url.path.startswith("/api/auth") or request.url.path == "/api/ping":
-                pass  # Let auth endpoints and ping through
+            if request.url.path.startswith("/api/auth") or request.url.path in ["/api/ping", "/"]:
+                pass
             elif request.url.path.startswith("/api/") and not request.url.path.startswith("/api/auth"):
                 return JSONResponse({"detail": "Not authenticated"}, status_code=401)
             else:
@@ -128,22 +142,6 @@ def _user(request: Request) -> str:
     user = mem.extract_user_from_headers(dict(request.headers))
     print(f"[GUI] API Request path: {request.url.path} (User: {user})")
     return user
-
-def _check_session_auth(request: Request) -> tuple[str, str] | None:
-    session_user = request.session.get("user")
-    session_pass = request.session.get("pass")
-    if session_user and session_pass:
-        return session_user, session_pass
-    
-    auth_header = request.headers.get("Authorization")
-    if auth_header and auth_header.startswith("Basic "):
-        try:
-            encoded = auth_header.split(" ")[1]
-            decoded = base64.b64decode(encoded).decode("utf-8")
-            if ":" in decoded:
-                return decoded.split(":", 1)
-        except Exception: pass
-    return None
 
 # ---------------------------------------------------------------------------
 # Login / Logout Routes
