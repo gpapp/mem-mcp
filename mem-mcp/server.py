@@ -38,7 +38,7 @@ web_app.add_middleware(
 # Merge MCP into the Web GUI app
 # ---------------------------------------------------------------------------
 # SSE transport: GET /mcp opens the SSE stream, POST /messages/ receives client messages.
-mcp_app = mcp.http_app(transport="sse", path="/mcp", middleware=[mcp_cors])
+mcp_app = mcp.http_app(transport="http", path="/mcp", middleware=[mcp_cors])
 # We mount at / so that the proxy's /mcp hits the MCP server directly.
 # GUI and API routes will take precedence because they were defined first.
 web_app.mount("/", mcp_app)
