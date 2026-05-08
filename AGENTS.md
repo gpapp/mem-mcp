@@ -24,13 +24,14 @@ python mem-mcp\server.py
 | Qdrant | 6333 | Internal only, not exposed to host |
 | Neo4j | 7687 | Internal only |
 | Ollama | 11434 | Internal only |
-| nginx | /mcp | Proxy mount point (must include in all URL configs) |
+| nginx | /mem-mcp | Proxy mount point (must include in all URL configs) |
 
 ## Nginx Config
 
 **IMPORTANT**: Update `nginx_snippet.conf` before deploying. Two locations:
-- `/mcp/mcp/` → MCP (Basic Auth via nginx)
-- `/mcp/` → GUI/API (session auth via app, cookie passthrough)
+
+- `/mem-mcp/mcp/` → MCP (Basic Auth via nginx)
+- `/mem-mcp/` → GUI/API (session auth via app, cookie passthrough)
 
 ## Critical Config
 
