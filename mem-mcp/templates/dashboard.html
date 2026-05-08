@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Memory Vault</title>
+  <title>Memory Vault — Dashboard</title>
   <link rel="icon" type="image/svg+xml" href="{{BASE_URL}}/favicon.svg">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -29,6 +29,8 @@
       box-shadow: 0 2px 8px rgba(79,70,229,.35);
     }
     nav h1 { margin: 0; font-size: 1.15rem; font-weight: 700; letter-spacing: -.3px; }
+    nav h1 a { color: inherit; text-decoration: none; }
+    nav h1 a:hover { text-decoration: underline; }
     #user-badge { font-size: .82rem; opacity: .9; background: rgba(255,255,255,.15);
                   padding: .2rem .7rem; border-radius: 99px; }
 
@@ -152,7 +154,7 @@
 <body onload="init()">
 
 <nav>
-  <h1>🧠 Memory Vault</h1>
+  <h1><a href="{{BASE_URL}}/">🧠 Memory Vault</a></h1>
   <span id="user-badge">Loading…</span>
 </nav>
 

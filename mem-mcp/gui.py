@@ -317,7 +317,9 @@ async def get_favicon():
 
 @web_app.get("/", response_class=HTMLResponse)
 async def get_landing(request: Request):
+    creds = _check_session_auth(request)
     ctx = _get_auth_context(request)
+    ctx["SHOW_LOGIN"] = not bool(creds)
     html = _render_template("landing", BASE_URL=mem.BASE_URL, **ctx)
     return HTMLResponse(content=html)
 
