@@ -106,7 +106,7 @@ async def diary_search_entries(query: str, limit: int = 3, top_p: float = 0.4):
     return await mem.db_search_diary(query, _current_user(), limit, top_p)
     
 @mcp.tool()
-async def find_duplicates(category: str = "People", limit: int = 50, threshold: float = 0.75, group_by: Optional[str] = "first_name"):
+async def find_duplicates(category: str = "People", limit: int = 50, threshold: float = 0.85, group_by: Optional[str] = "first_name"):
     """
     Find potential duplicate entries in memory by comparing embeddings similarity ranking.
     Returns grouped clusters of similar items for manual deduplication.
