@@ -140,6 +140,12 @@ def _user(request: Request) -> str:
     print(f"[GUI] API Request path: {request.url.path} (User: {user})")
     return user
 
+def _require_user(request: Request) -> str:
+    user = _user(request)
+    if user == "anonymous" or not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return user
+
 # ---------------------------------------------------------------------------
 # Login / Logout Routes
 # ---------------------------------------------------------------------------
@@ -194,7 +200,7 @@ async def api_ping():
 @web_app.get("/api/memories", response_class=JSONResponse)
 async def api_list_memories(request: Request):
     try:
-        return mem.db_list_memories(_user(request))
+        return mem.db_list_memories(_require_user(request)(request))
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
@@ -203,7 +209,7 @@ async def api_list_memories(request: Request):
 async def api_create_memory(request: Request, body: MemoryCreate):
     try:
         metadata = {"tags": [t.strip() for t in body.tags.split(",") if t.strip()]} if body.tags else {}
-        doc_id = await mem.db_add_memory(body.text, body.category, _user(request), metadata, title=body.title)
+        doc_id = await mem.db_add_memory(body.text, body.category, _require_user(request), metadata, title=body.title)
         return {"id": doc_id, "text": body.text, "title": body.title, "category": body.category.strip().capitalize(), "metadata": metadata}
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
@@ -213,7 +219,7 @@ async def api_create_memory(request: Request, body: MemoryCreate):
 async def api_update_memory(memory_id: str, request: Request, body: MemoryUpdate):
     try:
         metadata = {"tags": [t.strip() for t in body.tags.split(",") if t.strip()]} if body.tags else {}
-        found = await mem.db_update_memory(memory_id, body.title, body.text, body.category, _user(request), metadata)
+        found = await mem.db_update_memory(memory_id, body.title, body.text, body.category, _require_user(request), metadata)
         if not found:
             raise HTTPException(status_code=404, detail="Memory not found or access denied.")
         return {"id": memory_id, "title": body.title, "text": body.text, "category": body.category.strip().capitalize(), "metadata": metadata}
@@ -223,7 +229,7 @@ async def api_update_memory(memory_id: str, request: Request, body: MemoryUpdate
 @web_app.post("/api/memories/link", response_class=JSONResponse, status_code=201)
 async def api_link_memory(request: Request, body: MemoryLink):
     try:
-        await mem.db_link_facts(body.sourceId, body.targetId, body.relType, {}, _user(request))
+        await mem.db_link_facts(body.sourceId, body.targetId, body.relType, {}, _require_user(request))
         return {"status": "linked"}
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
@@ -232,7 +238,7 @@ async def api_link_memory(request: Request, body: MemoryLink):
 @web_app.delete("/api/memories/{memory_id}", response_class=JSONResponse)
 async def api_delete_memory(memory_id: str, request: Request):
     try:
-        await mem.db_delete_memory(memory_id, _user(request))
+        await mem.db_delete_memory(memory_id, _require_user(request))
         return {"deleted": memory_id}
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
@@ -241,7 +247,7 @@ async def api_delete_memory(memory_id: str, request: Request):
 @web_app.get("/api/categories", response_class=JSONResponse)
 async def api_list_categories(request: Request):
     try:
-        return mem.db_list_categories(_user(request))
+        return mem.db_list_categories(_require_user(request))
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
@@ -249,7 +255,7 @@ async def api_list_categories(request: Request):
 @web_app.get("/api/diary", response_class=JSONResponse)
 async def api_list_diary(request: Request):
     try:
-        return mem.db_list_diary(_user(request))
+        return mem.db_list_diary(_require_user(request))
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
@@ -257,7 +263,7 @@ async def api_list_diary(request: Request):
 @web_app.get("/api/insights", response_class=JSONResponse)
 async def api_get_insights(request: Request):
     try:
-        return mem.db_find_patterns(_user(request))
+        return mem.db_find_patterns(_require_user(request))
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
@@ -265,7 +271,7 @@ async def api_get_insights(request: Request):
 @web_app.get("/api/graph", response_class=JSONResponse)
 async def api_get_graph(request: Request):
     try:
-        return mem.db_get_graph(_user(request))
+        return mem.db_get_graph(_require_user(request))
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
@@ -273,14 +279,14 @@ async def api_get_graph(request: Request):
 @web_app.post("/api/diary", response_class=JSONResponse, status_code=201)
 async def api_save_diary(request: Request, body: DiaryCreate):
     try:
-        entry_date = await mem.db_save_diary(body.content, _user(request), body.date)
+        entry_date = await mem.db_save_diary(body.content, _require_user(request), body.date)
         return {"date": entry_date, "content": body.content}
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
 @web_app.get("/api/whoami", response_class=JSONResponse)
 async def api_whoami(request: Request):
-    return {"user": _user(request)}
+    return {"user": _require_user(request)}
 
 
 # ---------------------------------------------------------------------------
