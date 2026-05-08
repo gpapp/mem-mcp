@@ -41,8 +41,13 @@ HTPASSWD_PATH = os.getenv("HTPASSWD_PATH", os.path.join(os.path.dirname(__file__
 
 def _verify_htpasswd(username: str, password: str) -> bool:
     try:
+        if not os.path.exists(HTPASSWD_PATH):
+            logging.warning(f"htpasswd file not found: {HTPASSWD_PATH}")
+            return False
         ht = HtpasswdFile(HTPASSWD_PATH)
-        return ht.verify(password, username)
+        result = ht.verify(password, username)
+        logging.info(f"htpasswd verify: {username} -> {result}")
+        return result
     except Exception as e:
         logging.warning(f"htpasswd verification failed: {e}")
         return False
