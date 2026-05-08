@@ -262,7 +262,7 @@ class MemoryUnlink(BaseModel):
     relType: Optional[str] = None
 
 
-@web_app.request("/api/memories/link", response_class=JSONResponse)
+@web_app.delete("/api/memories/link", response_class=JSONResponse)
 async def api_unlink_memory(request: Request, body: MemoryUnlink):
     try:
         await mem.db_unlink_facts(body.sourceId, body.targetId, body.relType or "", _require_user(request))
