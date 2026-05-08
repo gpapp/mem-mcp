@@ -316,11 +316,51 @@ async def get_favicon():
         return Response(content=f.read(), media_type="image/svg+xml")
 
 
+LOGIN_SECTION = """<div class="card">
+  <h2>🔐 Sign In</h2>
+  <form id="loginForm">
+    <input type="text" name="username" placeholder="Username" required autocomplete="username">
+    <input type="password" name="password" placeholder="Password" required autocomplete="current-password">
+    <button type="submit" class="btn">Sign In</button>
+  </form>
+</div>"""
+
+SETUP_SECTION = """<div style="margin-top: 2rem;">
+  <a href="{{BASE_URL}}/gui" class="btn">Enter Dashboard →</a>
+</div>
+
+<div class="card" style="margin-top: 2rem;">
+  <h2>🔌 MCP Setup Guide</h2>
+  <p>Connect your AI assistant to your Vault using the command below.</p>
+  
+  <div class="step">
+    <p><span class="step-num">1</span> <strong>Claude Desktop / Claude Code:</strong></p>
+    <p>Run this in your terminal:</p>
+    <pre><code>claude mcp add --transport http memory-vault {{MCP_URL}} --header "Authorization: Basic {{AUTH_BASE64}}"</code></pre>
+  </div>
+
+  <div class="step">
+    <p><span class="step-num">2</span> <strong>Active Credentials:</strong></p>
+    <div style="background: var(--bg); padding: 1rem; border-radius: 8px; border: 1px dashed var(--primary);">
+      <p style="margin:0;"><strong>User:</strong> <code>{{AUTH_USER}}</code></p>
+      <p style="margin:.5rem 0 0 0;"><strong>Pass:</strong> <code>{{AUTH_PASS}}</code></p>
+    </div>
+  </div>
+</div>"""
+
+
 @web_app.get("/", response_class=HTMLResponse)
 async def get_landing(request: Request):
     creds = _check_session_auth(request)
     ctx = _get_auth_context(request)
-    ctx["SHOW_LOGIN"] = not bool(creds)
+    
+    if creds:
+        ctx["LOGIN_HTML"] = ""
+        ctx["SETUP_HTML"] = SETUP_SECTION
+    else:
+        ctx["LOGIN_HTML"] = LOGIN_SECTION
+        ctx["SETUP_HTML"] = ""
+    
     html = _render_template("landing", BASE_URL=mem.BASE_URL, **ctx)
     return HTMLResponse(content=html)
 
