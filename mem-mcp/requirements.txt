@@ -10,3 +10,4 @@ uvicorn
 markdown2
 openai
 itsdangerous
+jinja2
