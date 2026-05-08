@@ -850,9 +850,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
         );
         const filteredEdges = new vis.DataSet(
           data.edges.filter(e => {
-            const edgeKey = e.from + '|' + e.to + '|' + e.label;
-            return buildGraphEdges.has(edgeKey) || 
-                   (buildGraphNodes.has(e.from) && buildGraphNodes.has(e.to) && buildGraphEdges.has('bidir|' + edgeKey));
+            return buildGraphNodes.has(e.from) && buildGraphNodes.has(e.to);
           }).map(e => ({
             from: e.from,
             to: e.to,
@@ -863,10 +861,14 @@ npm install @modelcontextprotocol/sdk</code></pre>
           }))
         );
         initNetwork({ nodes: filteredNodes, edges: filteredEdges });
+      } else if (isBuildMode && buildGraphNodes.size === 0) {
+        const container = document.getElementById('graph-container');
+        container.innerHTML = '<p class="empty" style="padding-top: 3rem;">Select a memory and click "📍 Show on map" to start building your graph.</p>';
       } else {
         initNetwork(graphData);
       }
     } catch(e) {
+      const container = document.getElementById('graph-container');
       container.innerHTML = '<p class="empty">⚠️ Error loading graph.</p>';
     }
   }
@@ -913,11 +915,53 @@ npm install @modelcontextprotocol/sdk</code></pre>
     document.getElementById('build-status').style.display = isBuildMode ? '' : 'none';
     document.getElementById('clear-build-btn').style.display = isBuildMode ? '' : 'none';
     
+    if (graphLoaded && graphData.nodes && graphData.edges) {
+      rebuildNetwork();
+    } else if (!graphLoaded) {
+      loadGraph();
+    }
+  }
+
+  function rebuildNetwork() {
+    if (network) {
+      network.destroy();
+      network = null;
+    }
+    
     if (isBuildMode && buildGraphNodes.size === 0) {
       const container = document.getElementById('graph-container');
       container.innerHTML = '<p class="empty" style="padding-top: 3rem;">Select a memory and click "📍 Show on map" to start building your graph.</p>';
+      return;
+    }
+    
+    if (isBuildMode && buildGraphNodes.size > 0) {
+      const fullData = { nodes: graphData.nodes, edges: graphData.edges };
+      const filteredNodes = new vis.DataSet(
+        fullData.nodes.get().filter(n => buildGraphNodes.has(n.id)).map(n => ({
+          id: n.id,
+          label: n.label,
+          title: n.title,
+          group: n.group,
+          shape: n.shape,
+          size: n.size,
+          font: n.font
+        }))
+      );
+      const filteredEdges = new vis.DataSet(
+        fullData.edges.get().filter(e => {
+          return buildGraphNodes.has(e.from) && buildGraphNodes.has(e.to);
+        }).map(e => ({
+          from: e.from,
+          to: e.to,
+          label: e.label,
+          font: e.font,
+          arrows: e.arrows,
+          color: e.color
+        }))
+      );
+      initNetwork({ nodes: filteredNodes, edges: filteredEdges });
     } else {
-      loadGraph();
+      initNetwork(graphData);
     }
   }
 
