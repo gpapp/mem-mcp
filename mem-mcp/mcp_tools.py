@@ -47,12 +47,13 @@ async def add_fact(title: str, text: str, category: str):
     return f"Successfully added memory with ID: {memory_id}"
 
 @mcp.tool()
-async def search_facts(query: str, category: Optional[str] = None, limit: int = 10, top_p: float = 0.4):
+async def search_facts(query: str, category: Optional[str] = None, limit: int = 5, top_p: float = 0.75):
     """
     Search for facts matching query criteria.
     - query: semantic search string
     - category: optional filter (e.g. 'People', 'Client', 'Preferences') to limit output
-    - limit: maximum number of results
+    - limit: maximum number of results (default 5)
+    - top_p: threshold to filter low-probability results (default 0.75, higher = more selective)
     """
     return await mem.db_search_memories(query, _current_user(), limit, category, top_p)
 
