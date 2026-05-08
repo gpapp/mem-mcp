@@ -26,8 +26,14 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 import memory as mem
-import pyapr1
+import hashlib
 from fastapi import Request, HTTPException, FastAPI
+
+def apr1_md5(password: str, salt: str) -> str:
+    ctx = hashlib.md5((password + f"APR1{salt}").encode())
+    for i in range(1000):
+        ctx = hashlib.md5((ctx.digest() + (password + f"APR1{salt}").encode()) if i % 2 == 0 else (ctx.digest() + password.encode())).encode()
+    return hashlib.md5(ctx.digest()).hexdigest()
 from fastapi.responses import Response, JSONResponse, HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 from starlette.middleware.sessions import SessionMiddleware
@@ -55,9 +61,8 @@ def _verify_htpasswd(username: str, password: str) -> bool:
                 if user != username:
                     continue
                 if hash.startswith("$apr1$"):
-                    salt = hash[5:12]
-                    expected = hash[13:]
-                    if pyapr1.apr1_md5(password, salt) == expected:
+                    salt, expected = hash[5:12], hash[13:]
+                    if apr1_md5(password, salt) == expected:
                         return True
         logging.info(f"htpasswd verify: {username} -> False")
         return False
