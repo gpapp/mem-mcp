@@ -131,6 +131,20 @@
     .search-input-wrapper i { position: absolute; left: .7rem; top: 50%; transform: translateY(-50%); color: var(--muted); }
     .search-input { padding-left: 1.2rem; }
     
+    .alphabet-filter {
+      display: flex; flex-wrap: wrap; gap: 4px; margin: 0.75rem 0;
+    }
+    .alpha-btn {
+      width: 28px; height: 28px; border: 1px solid var(--border);
+      border-radius: 4px; background: var(--bg); color: var(--muted);
+      font-size: 0.8rem; font-weight: 600; cursor: pointer;
+      transition: all .15s;
+    }
+    .alpha-btn:hover { background: var(--primary-light); color: var(--primary); }
+    .alpha-btn.active { background: var(--primary); color: #fff; border-color: var(--primary); }
+    .alpha-btn.disabled { opacity: 0.3; cursor: default; }
+    .alpha-btn.disabled:hover { background: var(--bg); color: var(--muted); }
+    
     .sort-select { width: auto; font-size: .85rem; padding: .4rem .6rem; }
 
     /* ── Toast ── */
@@ -295,6 +309,8 @@
         </select>
       </div>
 
+      <div id="alphabet-filter" class="alphabet-filter"></div>
+
       <div id="memories-list"></div>
     </div>
   </div>
@@ -414,6 +430,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
   let memories = [], diaryEntries = [], activeDiaryDate = null;
   let insightsLoaded = false, graphLoaded = false;
   let activeCategory = null;
+  let activeLetterFilter = null;
 
   function init() {
     loadMemories();
@@ -449,6 +466,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
       memories = await api.get('memories'); 
       renderMemories(); 
       renderCategorySidebar();
+      renderAlphabetFilter();
     }
     catch(e) { document.getElementById('memories-list').innerHTML = '<p class="empty">⚠️ Could not load memories.</p>'; }
   }
@@ -478,6 +496,36 @@ npm install @modelcontextprotocol/sdk</code></pre>
     renderMemories();
   }
 
+  function renderAlphabetFilter() {
+    const el = document.getElementById('alphabet-filter');
+    const letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('');
+    
+    const usedLetters = new Set();
+    memories.forEach(m => {
+      const title = m.title || m.text || '';
+      const first = title.trim()[0];
+      if (first) usedLetters.add(first.toUpperCase());
+    });
+    
+    el.innerHTML = letters.map(letter => {
+      const isUsed = usedLetters.has(letter);
+      const isActive = activeLetterFilter === letter;
+      const className = 'alpha-btn' + (isActive ? ' active' : '') + (!isUsed ? ' disabled' : '');
+      const onclick = isUsed ? `setLetterFilter('${letter}')` : '';
+      return `<button class="${className}" ${onclick ? 'onclick="' + onclick + '"' : ''}>${letter}</button>`;
+    }).join('');
+  }
+
+  function setLetterFilter(letter) {
+    if (activeLetterFilter === letter) {
+      activeLetterFilter = null;
+    } else {
+      activeLetterFilter = letter;
+    }
+    renderAlphabetFilter();
+    renderMemories();
+  }
+
   function toggleAddForm() {
     const form = document.getElementById('add-memory-form');
     form.style.display = form.style.display === 'none' ? 'flex' : 'none';
@@ -492,7 +540,9 @@ npm install @modelcontextprotocol/sdk</code></pre>
       const matchCat = activeCategory === null || m.category === activeCategory;
       const mTitle = m.title ? m.title.toLowerCase() : '';
       const matchQuery = !query || m.text.toLowerCase().includes(query) || mTitle.includes(query) || m.category.toLowerCase().includes(query);
-      return matchCat && matchQuery;
+      const firstChar = (m.title || m.text || '').trim()[0] || '';
+      const matchLetter = activeLetterFilter === null || firstChar.toUpperCase() === activeLetterFilter;
+      return matchCat && matchQuery && matchLetter;
     });
 
     // Sorting
