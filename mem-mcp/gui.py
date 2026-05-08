@@ -27,7 +27,7 @@ from datetime import datetime, timedelta
 import memory as mem
 from fastapi import Request, HTTPException, FastAPI
 from fastapi.responses import Response, JSONResponse, HTMLResponse, RedirectResponse
-from fastapi.security import BaseModel
+from pydantic import BaseModel
 from starlette.middleware.sessions import SessionMiddleware
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
