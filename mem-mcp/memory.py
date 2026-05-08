@@ -620,9 +620,10 @@ def db_list_categories(user_id: str) -> list:
         return [r["category"] for r in result]
 
 
-async def db_find_duplicates(user_id: str, category: str = "People", limit: int = 50, threshold: float = 0.85):
+async def db_find_duplicates(user_id: str, category: str = "People", limit: int = 50, threshold: float = 0.6, max_cluster: int = 4):
     """
     Find potential duplicates in a category using embedding similarity and clustering.
+    Iteratively increases threshold to keep clusters <= max_cluster.
     """
     qdrant = await get_qdrant()
     neo4j_driver = get_neo4j()
@@ -644,7 +645,6 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
         items = []
         for r in result:
             f_node = r["f"]
-            # Extract metadata (all properties except core ones)
             core_keys = {"id", "text", "category", "timestamp", "userId"}
             metadata = {}
             for k, v in f_node.items():
@@ -670,17 +670,14 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
         with_vectors=True
     )
     
-    # Map id to vector
     vectors = {p.id: p.vector for p in points if p.vector}
-    
-    # Filter items that have vectors
     items_with_vectors = [item for item in items if item["id"] in vectors]
     if not items_with_vectors:
         return []
 
-    # 3. Compute similarity and find pairs
-    candidate_pairs = []
+    # Compute all pairwise similarities once
     num_items = len(items_with_vectors)
+    all_pairs = []
     for i in range(num_items):
         for j in range(i + 1, num_items):
             id_i = items_with_vectors[i]["id"]
@@ -688,7 +685,6 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
             vec_i = np.array(vectors[id_i])
             vec_j = np.array(vectors[id_j])
             
-            # Cosine similarity
             norm_i = np.linalg.norm(vec_i)
             norm_j = np.linalg.norm(vec_j)
             if norm_i == 0 or norm_j == 0:
@@ -699,78 +695,105 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
             title_i = items_with_vectors[i].get("title")
             title_j = items_with_vectors[j].get("title")
 
-            # Boost similarity based on title matches
             if title_i and title_j:
                 ti, tj = title_i.strip().lower(), title_j.strip().lower()
                 if ti == tj:
                     similarity = max(similarity, 1.0)
                 else:
-                    # Tokenize to check for matching words (e.g. matching first names or last names)
                     ti_words = set(ti.split())
                     tj_words = set(tj.split())
                     common_words = ti_words.intersection(tj_words)
 
                     if common_words:
-                        # Filter out very short common words to avoid matching on 'the', 'a', etc. (unless it's a name)
                         valid_common = [w for w in common_words if len(w) > 2 or category.strip().capitalize() == "People"]
                         if valid_common:
-                            # Boost based on ratio of matched words to the shorter title
                             min_words = min(len(ti_words), len(tj_words))
                             match_ratio = len(valid_common) / min_words if min_words > 0 else 0
-
                             boost = 0.25 * match_ratio
                             similarity = max(similarity + boost, 0.86 if match_ratio >= 1.0 else similarity + boost)
 
-            if similarity >= threshold:
-                candidate_pairs.append((i, j, float(similarity)))
+            all_pairs.append((i, j, float(similarity)))
 
-    # 4. Cluster using Union-Find
-    parent = list(range(num_items))
-    def find(i):
-        if parent[i] == i:
-            return i
-        parent[i] = find(parent[i])
-        return parent[i]
+    # Helper function to cluster at given threshold
+    def cluster_at_threshold(thresh):
+        parent = list(range(num_items))
+        def find(x):
+            if parent[x] == x:
+                return x
+            parent[x] = find(parent[x])
+            return parent[x]
+        def union(x, y):
+            rx, ry = find(x), find(y)
+            if rx != ry:
+                parent[rx] = ry
 
-    def union(i, j):
-        root_i = find(i)
-        root_j = find(j)
-        if root_i != root_j:
-            parent[root_i] = root_j
+        for i, j, score in all_pairs:
+            if score >= thresh:
+                union(i, j)
 
-    for i, j, score in candidate_pairs:
-        union(i, j)
+        clusters_map = {}
+        for i in range(num_items):
+            root = find(i)
+            if root not in clusters_map:
+                clusters_map[root] = []
+            clusters_map[root].append(i)
 
-    # Group into clusters
-    clusters_map = {}
-    for i in range(num_items):
-        root = find(i)
-        if root not in clusters_map:
-            clusters_map[root] = []
-        clusters_map[root].append(i)
+        return [idxs for idxs in clusters_map.values() if len(idxs) >= 2]
 
-    # Format results
-    final_clusters = []
-    cluster_id_counter = 1
-    for root, member_indices in clusters_map.items():
-        if len(member_indices) < 2:
+    # Iteratively increase threshold for oversized clusters
+    current_threshold = threshold
+    max_threshold = 0.95
+    threshold_step = 0.05
+
+    # Track which items are already clustered
+    assigned = set()
+
+    while current_threshold <= max_threshold:
+        clusters = cluster_at_threshold(current_threshold)
+        
+        final_clusters = []
+        oversized_clusters = []
+
+        for member_indices in clusters:
+            # Already handled?
+            new_members = [i for i in member_indices if i not in assigned]
+            if not new_members:
+                continue
+
+            if len(new_members) <= max_cluster:
+                # Accept this cluster
+                for i in new_members:
+                    assigned.add(i)
+                final_clusters.append(sorted(new_members))
+            else:
+                # Too big - will split at higher threshold
+                oversized_clusters.append(new_members)
+
+        # If no oversized clusters, we're done
+        if not oversized_clusters:
+            break
+
+        # Increase threshold for next iteration
+        current_threshold += threshold_step
+
+    # Build final results from clusters
+    result_clusters = []
+    for cluster_indices in final_clusters:
+        if len(cluster_indices) < 2:
             continue
         
         members = []
         cluster_scores = []
-        for idx in member_indices:
+        for idx in cluster_indices:
             item = items_with_vectors[idx]
-            # Find similarity with other members in the cluster
-            # We use the average similarity of this item to other members
             item_scores = []
-            for i, j, score in candidate_pairs:
-                if (i == idx and j in member_indices) or (j == idx and i in member_indices):
+            for i, j, score in all_pairs:
+                if (i == idx and j in cluster_indices) or (j == idx and i in cluster_indices):
                     item_scores.append(score)
             
             avg_item_sim = sum(item_scores) / len(item_scores) if item_scores else 1.0
             cluster_scores.extend(item_scores)
             
-            # Merge metadata into top level for easier reading, like the user example
             member_info = {
                 "id": item["id"],
                 "text": item["text"],
@@ -781,21 +804,17 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
             members.append(member_info)
         
         avg_similarity = sum(cluster_scores) / len(cluster_scores) if cluster_scores else 0.0
-        
         recommendation = "MERGE - high overlap" if avg_similarity > 0.9 else "MERGE - verify and combine"
         
-        final_clusters.append({
-            "cluster_id": cluster_id_counter,
+        result_clusters.append({
+            "cluster_id": len(result_clusters) + 1,
             "members": members,
             "avg_similarity": round(avg_similarity, 4),
-            "recommendation": recommendation
+"recommendation": recommendation
         })
-        cluster_id_counter += 1
 
-    # Sort clusters by avg_similarity DESC
-    final_clusters.sort(key=lambda x: x["avg_similarity"], reverse=True)
-    
-    return final_clusters
+    result_clusters.sort(key=lambda x: x["avg_similarity"], reverse=True)
+    return result_clusters
 
 
 async def db_merge_memories(master_id: str, duplicate_ids: List[str], user_id: str):
