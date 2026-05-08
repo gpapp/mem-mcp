@@ -24,12 +24,20 @@ python mem-mcp\server.py
 | Qdrant | 6333 | Internal only, not exposed to host |
 | Neo4j | 7687 | Internal only |
 | Ollama | 11434 | Internal only |
+| nginx | /mcp | Proxy mount point (must include in all URL configs) |
+
+## Nginx Config
+
+**IMPORTANT**: Update `nginx_snippet.conf` before deploying. Two locations:
+- `/mcp/mcp/` → MCP (Basic Auth via nginx)
+- `/mcp/` → GUI/API (session auth via app, cookie passthrough)
 
 ## Critical Config
 
 - `MEM_NEO4J_PASSWORD` (also mapped to `NEO_PASS` in docker-compose)
 - Embedder: pull `nomic-embed-text` into Ollama container (docker-compose uses `nomic-ea` by default)
-- User vault resolved from `Authorization: Basic` header or `X-Remote-User` proxy headers
+- User vault resolved from `Authorization: Basic` header or session cookie
+- `BASE_URL` must include `/mcp` prefix when behind nginx
 
 ## Gotchas
 
