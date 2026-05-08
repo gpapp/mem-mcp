@@ -26,7 +26,6 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 import memory as mem
-from passlib.apache import HtpasswdFile
 from fastapi import Request, HTTPException, FastAPI
 from fastapi.responses import Response, JSONResponse, HTMLResponse, RedirectResponse
 from pydantic import BaseModel
@@ -44,10 +43,31 @@ def _verify_htpasswd(username: str, password: str) -> bool:
         if not os.path.exists(HTPASSWD_PATH):
             logging.warning(f"htpasswd file not found: {HTPASSWD_PATH}")
             return False
-        ht = HtpasswdFile(HTPASSWD_PATH)
-        result = ht.verify(password, username)
-        logging.info(f"htpasswd verify: {username} -> {result}")
-        return result
+        import hashlib
+        import hmac
+        def apr1_md5_verify(password: str, salt: str, expected_hash: str) -> bool:
+            ctx = hashlib.md5((password + f"APR1{salt}").encode())
+            for i in range(1000):
+                ctx = hashlib.md5((ctx.digest() + (password + f"APR1{salt}").encode()) if i % 2 == 0 else (ctx.digest() + password.encode())).encode()
+            computed = hashlib.md5(ctx.digest()).hexdigest()
+            return computed == expected_hash
+        with open(HTPASSWD_PATH) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if ":" not in line:
+                    continue
+                user,hash = line.split(":", 1)
+                if user != username:
+                    continue
+                if hash.startswith("$apr1$"):
+                    salt = hash[5:12]
+                    expected = hash[13:]
+                    if apr1_md5_verify(password, salt, expected):
+                        return True
+        logging.info(f"htpasswd verify: {username} -> False")
+        return False
     except Exception as e:
         logging.warning(f"htpasswd verification failed: {e}")
         return False
