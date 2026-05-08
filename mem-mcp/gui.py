@@ -32,10 +32,26 @@ from fastapi import Request, HTTPException, FastAPI
 def apr1_md5(password: str, salt: str) -> str:
     password_b = password.encode()
     apr1_salt = f"APR1{salt}".encode()
-    ctx = hashlib.md5(password_b + apr1_salt)
+    ctx = hashlib.md5()
+    ctx.update(password_b)
+    ctx.update(apr1_salt)
+    A = ctx.hexdigest()
     for i in range(1000):
-        ctx = hashlib.md5(ctx.digest() + apr1_salt if i % 2 == 0 else ctx.digest() + password_b)
-    return hashlib.md5(ctx.digest()).hexdigest()
+        ctx = hashlib.md5()
+        if i % 2 == 0:
+            ctx.update(password_b)
+        else:
+            ctx.update(A.encode())
+        if i % 3 != 0:
+            ctx.update(apr1_salt)
+        if i % 7 != 0:
+            ctx.update(password_b)
+        if i % 2 == 0:
+            ctx.update(password_b)
+        else:
+            ctx.update(A.encode())
+        A = ctx.hexdigest()
+    return A
 from fastapi.responses import Response, JSONResponse, HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 from starlette.middleware.sessions import SessionMiddleware
