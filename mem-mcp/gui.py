@@ -42,7 +42,8 @@ def _render_template(name: str, ext: str = "html", **context) -> str:
     with open(path, "r", encoding="utf-8") as f:
         html = f.read()
     for k, v in context.items():
-        html = html.replace(f"{{{{{k}}}}}", str(v))
+        replacement = "1" if v is True else "0" if v is False else str(v)
+        html = html.replace(f"{{{{{k}}}}}", replacement)
     return html
 
 # Helper functions must be defined BEFORE middleware that uses them
