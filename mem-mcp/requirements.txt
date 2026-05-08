@@ -9,3 +9,4 @@ httpx
 uvicorn
 markdown2
 openai
+itsdangerous

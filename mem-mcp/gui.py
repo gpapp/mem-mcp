@@ -21,12 +21,20 @@ or common proxy headers – identical logic to the MCP server.
 import os
 import base64
 import logging
-from fastapi import FastAPI, Request, HTTPException
+import secrets
+from datetime import datetime, timedelta
+from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.security import HTTPBasicCredentials
+from starlette.middleware.sessions import SessionMiddleware
 from pydantic import BaseModel
 from typing import Optional
 
 import memory as mem
+
+SESSION_SECRET = os.getenv("MEM_SESSION_SECRET", secrets.token_hex(32))
+web_app = FastAPI(title="Memory Vault GUI")
+web_app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET, session_cookie="mem_session")
 
 def _render_template(name: str, ext: str = "html", **context) -> str:
     path = os.path.join(os.path.dirname(__file__), "templates", f"{name}.{ext}")
@@ -37,6 +45,21 @@ def _render_template(name: str, ext: str = "html", **context) -> str:
     return html
 
 web_app = FastAPI(title="Memory Vault GUI")
+web_app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET, session_cookie="mem_session")
+
+# Auth guard middleware - protect /gui routes
+@web_app.middleware("http")
+async def auth_guard(request: Request, call_next):
+    if request.url.path.startswith("/gui") or request.url.path.startswith("/api"):
+        creds = _check_session_auth(request)
+        if not creds:
+            if request.url.path.startswith("/api/auth") or request.url.path == "/api/ping":
+                pass  # Let auth endpoints and ping through
+            elif request.url.path.startswith("/api/") and not request.url.path.startswith("/api/auth"):
+                return JSONResponse({"detail": "Not authenticated"}, status_code=401)
+            else:
+                return HTMLResponse(content=_render_template("login", BASE_URL=mem.BASE_URL), status_code=200)
+    return await call_next(request)
 
 # Suppress noisy uvicorn access logs for the root path (MCP heartbeats)
 class EndpointFilter(logging.Filter):
@@ -98,9 +121,64 @@ class DiaryCreate(BaseModel):
 # ---------------------------------------------------------------------------
 
 def _user(request: Request) -> str:
+    session_user = request.session.get("user")
+    if session_user:
+        print(f"[GUI] API Request path: {request.url.path} (User: {session_user} [session])")
+        return session_user
     user = mem.extract_user_from_headers(dict(request.headers))
     print(f"[GUI] API Request path: {request.url.path} (User: {user})")
     return user
+
+def _check_session_auth(request: Request) -> tuple[str, str] | None:
+    session_user = request.session.get("user")
+    session_pass = request.session.get("pass")
+    if session_user and session_pass:
+        return session_user, session_pass
+    
+    auth_header = request.headers.get("Authorization")
+    if auth_header and auth_header.startswith("Basic "):
+        try:
+            encoded = auth_header.split(" ")[1]
+            decoded = base64.b64decode(encoded).decode("utf-8")
+            if ":" in decoded:
+                return decoded.split(":", 1)
+        except Exception: pass
+    return None
+
+# ---------------------------------------------------------------------------
+# Login / Logout Routes
+# ---------------------------------------------------------------------------
+
+class LoginForm(BaseModel):
+    username: str
+    password: str
+
+
+async def _set_session(response: Response, user: str, password: str):
+    request.session["user"] = user
+    request.session["pass"] = password
+    request.session["expires"] = (datetime.now() + timedelta(hours=24)).isoformat()
+
+
+@web_app.post("/api/auth/login")
+async def api_login(request: Request, response: Response, form: LoginForm):
+    await _set_session(response, form.username, form.password)
+    return {"status": "ok", "user": form.username}
+
+
+@web_app.post("/api/auth/logout")
+async def api_logout(request: Request, response: Response):
+    request.session.clear()
+    return {"status": "ok"}
+
+
+@web_app.get("/api/auth/check")
+async def api_auth_check(request: Request):
+    creds = _check_session_auth(request)
+    if creds:
+        user, _pass = creds
+        return {"authenticated": True, "user": user}
+    return {"authenticated": False}
 
 
 # ---------------------------------------------------------------------------
