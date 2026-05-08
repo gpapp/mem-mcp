@@ -155,7 +155,7 @@
 
 <nav>
   <h1><a href="{{BASE_URL}}/">🧠 Memory Vault</a></h1>
-  <span id="user-badge">Loading…</span>
+  <span id="user-badge">Loading…</span> <button onclick="logout()" style="margin-left:.5rem;padding:.2rem .5rem;font-size:.75rem;">Logout</button>
 </nav>
 
 <div class="tabs">
@@ -323,6 +323,11 @@ npm install @modelcontextprotocol/sdk</code></pre>
     put:    (url, body) => fetch(`${apiBase}/${url}`, {method:'PUT',   headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}).then(r => r.ok ? r.json() : Promise.reject(r)),
     delete: (url)       => fetch(`${apiBase}/${url}`, {method:'DELETE'}).then(r => r.ok ? r.json() : Promise.reject(r)),
   };
+
+  function logout() {
+    if (!confirm('Logout?')) return;
+    fetch(`${apiBase}/auth/logout`, {method:'POST'}).then(() => window.location.href = "{{BASE_URL}}/");
+  }
 
   let memories = [], diaryEntries = [], activeDiaryDate = null;
   let insightsLoaded = false, graphLoaded = false;
