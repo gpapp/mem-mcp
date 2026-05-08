@@ -20,11 +20,14 @@ Use this skill when you have:
 - Apply stored corrections: `search_facts("correction")` → fix recurring misspellings of names and terms before proceeding.
 
 ### 2. Participant Extraction
-Scan for all speaker labels and name mentions. Build a raw list:
-```
-Raw participants: [Tim, Rafael, Kate, ...]
-```
-Do NOT resolve to memory yet — that happens in Phase 2.
+Scan for speaker labels and voice profile headers (e.g., "Speaker A: male, 40s"). Voice profiles are guidance only — use discussion content to verify speaker identity:
+- Topic expertise (who would discuss this subject)
+- Questions asked vs. answers given
+- Demonstrated knowledge/perspective
+
+**Speaker correction option:** If voice profile doesn't match context, offer to reassign the label (e.g., "Speaker B appears to be X based on context").
+
+Build raw list: `Raw participants: [Tim, Rafael, Kate, ...]`
 
 ### 3. Content Analysis
 Extract all entities from the transcription:
