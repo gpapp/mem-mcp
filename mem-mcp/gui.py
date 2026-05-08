@@ -295,6 +295,7 @@ def _get_auth_context(request: Request):
     session_pass = request.session.get("pass")
     if session_user and session_pass:
         auth_user, auth_pass = session_user, session_pass
+        auth_b64 = base64.b64encode(f"{auth_user}:{auth_pass}".encode()).decode()
     else:
         auth_header = request.headers.get("Authorization")
         if auth_header and auth_header.startswith("Basic "):
