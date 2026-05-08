@@ -154,7 +154,7 @@ class LoginForm(BaseModel):
     password: str
 
 
-async def _set_session(response: Response, user: str, password: str):
+async def _set_session(request: Request, user: str, password: str):
     request.session["user"] = user
     request.session["pass"] = password
     request.session["expires"] = (datetime.now() + timedelta(hours=24)).isoformat()
@@ -162,7 +162,7 @@ async def _set_session(response: Response, user: str, password: str):
 
 @web_app.post("/api/auth/login")
 async def api_login(request: Request, response: Response, form: LoginForm):
-    await _set_session(response, form.username, form.password)
+    await _set_session(request, form.username, form.password)
     return {"status": "ok", "user": form.username}
 
 
