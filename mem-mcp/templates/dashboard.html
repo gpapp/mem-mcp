@@ -353,6 +353,10 @@ npm install @modelcontextprotocol/sdk</code></pre>
     if (tab === 'graph' && !graphLoaded) loadGraph();
   }
 
+  async function loadWhoami() {
+    try { const info = await api.get('whoami'); document.getElementById('user-badge').textContent = '👤 ' + info.user; } catch(_) {}
+  }
+
   async function loadMemories() {
     try { 
       memories = await api.get('memories'); 
