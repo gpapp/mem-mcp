@@ -472,6 +472,57 @@ def db_get_neighborhood(fact_id: str, depth: int, rel_types: List[str], user_id:
         return nodes
 
 
+def db_get_fact_by_id(fact_id: str, user_id: str) -> Optional[dict]:
+    """Get a single fact by its ID."""
+    neo4j_driver = get_neo4j()
+    if not neo4j_driver:
+        raise RuntimeError("Neo4j not connected.")
+
+    with neo4j_driver.session() as s:
+        result = s.run(
+            """
+            MATCH (f:Fact {id: $id, userId: $userId})
+            RETURN f
+            """,
+            id=fact_id, userId=user_id
+        )
+        record = result.single()
+        if record:
+            return dict(record["f"])
+        return None
+
+
+def db_get_connections_by_type(fact_id: str, user_id: str) -> dict:
+    """Get all connections for a fact grouped by relationship type."""
+    neo4j_driver = get_neo4j()
+    if not neo4j_driver:
+        raise RuntimeError("Neo4j not connected.")
+
+    with neo4j_driver.session() as s:
+        result = s.run(
+            """
+            MATCH (f:Fact {id: $id, userId: $userId})
+            MATCH (f)-[r]-(neighbor:Fact)
+            WHERE neighbor.userId = $userId
+            RETURN type(r) as rel_type, collect({id: neighbor.id, title: neighbor.title, text: neighbor.text, category: neighbor.category}) as connections
+            """,
+            id=fact_id, userId=user_id
+        )
+        
+        connections = {}
+        for r in result:
+            rel_type = r["rel_type"]
+            connections[rel_type] = []
+            for conn in r["connections"]:
+                connections[rel_type].append({
+                    "id": conn["id"],
+                    "title": conn.get("title") or conn.get("text", "")[:50],
+                    "category": conn.get("category", "General")
+                })
+        
+        return connections
+
+
 async def db_search_memories(query: str, user_id: str, limit: int = 5, category: Optional[str] = None, top_p: float = 0.4) -> list:
     """Vector-similarity search with optional category filter. Also does a basic substring match on titles."""
     qdrant = await get_qdrant()

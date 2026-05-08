@@ -256,6 +256,21 @@ async def api_link_memory(request: Request, body: MemoryLink):
         raise HTTPException(status_code=503, detail=str(e))
 
 
+class MemoryUnlink(BaseModel):
+    sourceId: str
+    targetId: str
+    relType: Optional[str] = None
+
+
+@web_app.request("/api/memories/link", response_class=JSONResponse)
+async def api_unlink_memory(request: Request, body: MemoryUnlink):
+    try:
+        await mem.db_unlink_facts(body.sourceId, body.targetId, body.relType or "", _require_user(request))
+        return {"status": "unlinked"}
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
 @web_app.delete("/api/memories/{memory_id}", response_class=JSONResponse)
 async def api_delete_memory(memory_id: str, request: Request):
     try:
@@ -293,6 +308,70 @@ async def api_get_insights(request: Request):
 async def api_get_graph(request: Request):
     try:
         return mem.db_get_graph(_require_user(request))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@web_app.get("/api/graph/neighbors/{fact_id}", response_class=JSONResponse)
+async def api_get_neighbors(request: Request, fact_id: str):
+    try:
+        return mem.db_get_neighborhood(fact_id, depth=1, rel_types=None, user_id=_require_user(request))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@web_app.get("/api/graph/focus/{fact_id}", response_class=JSONResponse)
+async def api_focus_graph(request: Request, fact_id: str):
+    try:
+        user_id = _require_user(request)
+        fact = mem.db_get_fact_by_id(fact_id, user_id)
+        if not fact:
+            raise HTTPException(status_code=404, detail="Fact not found")
+        
+        neighbors = mem.db_get_neighborhood(fact_id, depth=1, rel_types=None, user_id=user_id)
+        
+        # Group connections by relationship type
+        connections_by_type = {}
+        edges = []
+        nodes = []
+        
+        # Add center node
+        center = {
+            "id": fact["id"],
+            "title": fact.get("title", fact["text"][:50]),
+            "text": fact["text"],
+            "category": fact.get("category", "General")
+        }
+        
+        # Track seen node IDs to avoid duplicates
+        seen_nodes = {fact["id"]}
+        
+        for neighbor in neighbors:
+            nid = neighbor["id"]
+            if nid not in seen_nodes:
+                seen_nodes.add(nid)
+                nodes.append({
+                    "id": neighbor["id"],
+                    "title": neighbor.get("text", "")[:50],
+                    "category": neighbor.get("category", "General")
+                })
+        
+        return {
+            "center": center,
+            "nodes": nodes,
+            "edges": edges,
+            "neighbors": [{"id": n["id"], "title": n.get("text", "")[:50], "category": n.get("category", "General")} for n in neighbors]
+        }
+    except HTTPException:
+        raise
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@web_app.get("/api/graph/connections/{fact_id}", response_class=JSONResponse)
+async def api_get_connections(request: Request, fact_id: str):
+    try:
+        return mem.db_get_connections_by_type(fact_id, _require_user(request))
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 

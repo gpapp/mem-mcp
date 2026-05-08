@@ -93,11 +93,31 @@
     .memory-item:hover { box-shadow: 0 2px 8px rgba(79,70,229,.1); }
     .memory-text { flex: 1; font-size: .9rem; line-height: 1.5; }
     .memory-meta { font-size: .75rem; color: var(--muted); margin-top: .2rem; }
-    .memory-actions { display: flex; gap: .4rem; flex-shrink: 0; }
+    .memory-actions {
+      display: flex; gap: .4rem; flex-shrink: 0;
+    }
+    .memory-actions .map-btn {
+      background: var(--success); color: #fff;
+    }
+    .memory-actions .map-btn:hover {
+      background: #059669;
+    }
+    .memory-actions .build-mode-btn {
+      background: #f59e0b; color: #fff;
+    }
+    .memory-actions .build-mode-btn:hover {
+      background: #d97706;
+    }
     .tag-badge { display: inline-block; background: var(--primary-light); color: var(--primary); font-size: .7rem; font-weight: 600;
                 padding: .1rem .4rem; border-radius: 4px; margin-right: .3rem; margin-top: .4rem; }
-    .link-badge { display: inline-block; background: #fffbeb; color: #b45309; border: 1px solid #fde68a; font-size: .7rem; font-weight: 600;
-                 padding: .1rem .4rem; border-radius: 4px; margin-right: .3rem; margin-top: .4rem; }
+.link-badge { display: inline-flex; align-items: center; gap: 2px; background: #fffbeb; color: #b45309; border: 1px solid #fde68a; font-size: .7rem; font-weight: 600;
+                  padding: .1rem .3rem; border-radius: 4px; margin-right: .3rem; margin-top: .4rem; }
+    .link-badge .link-content { margin-right: 2px; }
+    .link-action-btn { background: none; border: none; cursor: pointer; padding: 0; font-size: .7rem; opacity: 0.6; }
+    .link-action-btn:hover { opacity: 1; }
+    .link-edit-form { display: inline-flex; align-items: center; gap: 4px; background: #fffbeb; border: 1px solid #fde68a; padding: .2rem .4rem; border-radius: 4px; margin-right: .3rem; margin-top: .4rem; }
+    .link-edit-form input { padding: .15rem .3rem; border: 1px solid #fde68a; border-radius: 3px; font-size: .7rem; width: 100px; }
+    .link-edit-form button { background: none; border: none; cursor: pointer; padding: 0; font-size: .7rem; }
 
     .markdown-body { background: transparent !important; color: var(--text); }
     .markdown-body p:last-child { margin-bottom: 0; }
@@ -149,6 +169,70 @@
                                            padding: 1.5rem; box-shadow: var(--shadow); }
     
     pre { background: #1f2937; color: #f3f4f6; padding: 1rem; border-radius: 8px; overflow-x: auto; font-size: .85rem; }
+
+    /* ── Build Graph Mode ── */
+    .graph-controls {
+      display: flex; gap: .5rem; margin-bottom: 1rem; align-items: center;
+    }
+    .mode-toggle {
+      display: flex; background: var(--bg); border: 1px solid var(--border);
+      border-radius: 7px; overflow: hidden;
+    }
+    .mode-toggle button {
+      padding: .4rem .75rem; border: none; background: none; cursor: pointer;
+      font-size: .8rem; font-weight: 500; color: var(--muted); transition: all .15s;
+    }
+    .mode-toggle button.active {
+      background: var(--primary); color: #fff;
+    }
+    .mode-toggle button:not(.active):hover {
+      background: var(--border);
+    }
+    .build-status {
+      font-size: .8rem; color: var(--muted);
+    }
+    .build-status .count {
+      font-weight: 700; color: var(--primary);
+    }
+
+    /* ── Context Menu ── */
+    .context-menu {
+      position: fixed; z-index: 1000; background: var(--surface);
+      border: 1px solid var(--border); border-radius: 8px;
+      box-shadow: 0 4px 12px rgba(0,0,0,.15); padding: 4px 0; min-width: 180px;
+    }
+    .context-menu-item {
+      padding: 8px 14px; cursor: pointer; font-size: .85rem;
+      display: flex; align-items: center; gap: 8px;
+    }
+    .context-menu-item:hover { background: var(--primary-light); }
+    .context-menu-item.disabled { opacity: .5; cursor: not-allowed; }
+    .context-menu-item.disabled:hover { background: none; }
+    .context-menu-separator {
+      height: 1px; background: var(--border); margin: 4px 0;
+    }
+    .submenu {
+      position: relative;
+    }
+    .submenu-trigger::after {
+      content: '▸'; margin-left: auto; font-size: .7rem;
+    }
+    .submenu-items {
+      display: none; position: absolute; left: 100%; top: 0;
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,.15);
+      padding: 4px 0; min-width: 140px;
+    }
+    .submenu:hover .submenu-items { display: block; }
+    .submenu-item {
+      padding: 6px 12px; cursor: pointer; font-size: .82rem;
+      display: flex; align-items: center; gap: 6px;
+    }
+    .submenu-item:hover { background: var(--primary-light); }
+    .submenu-item .rel-badge {
+      background: var(--primary-light); color: var(--primary);
+      font-size: .7rem; padding: 1px 5px; border-radius: 3px;
+    }
   </style>
 </head>
 <body onload="init()">
@@ -265,6 +349,16 @@
 <div id="page-graph" class="page">
   <div class="card">
     <h2 style="margin-top:0;">🕸️ Knowledge Graph</h2>
+    <div class="graph-controls">
+      <div class="mode-toggle">
+        <button id="mode-full" class="active" onclick="setGraphMode('full')">Full Graph</button>
+        <button id="mode-build" onclick="setGraphMode('build')">Build Graph</button>
+      </div>
+      <span id="build-status" class="build-status" style="display:none;"></span>
+      <button id="clear-build-btn" class="btn btn-ghost btn-sm" onclick="clearBuildGraph()" style="display:none;">
+        🗑️ Clear
+      </button>
+    </div>
     <div id="graph-container" style="height: 70vh; min-height: 500px; border: 1px solid var(--border); border-radius: 8px; background: #fff;"></div>
   </div>
 </div>
@@ -321,7 +415,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     get:    (url)       => fetch(`${apiBase}/${url}`).then(r => r.ok ? r.json() : Promise.reject(r)),
     post:   (url, body) => fetch(`${apiBase}/${url}`, {method:'POST',  headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}).then(r => r.ok ? r.json() : Promise.reject(r)),
     put:    (url, body) => fetch(`${apiBase}/${url}`, {method:'PUT',   headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}).then(r => r.ok ? r.json() : Promise.reject(r)),
-    delete: (url)       => fetch(`${apiBase}/${url}`, {method:'DELETE'}).then(r => r.ok ? r.json() : Promise.reject(r)),
+    delete: (url, body) => fetch(`${apiBase}/${url}`, {method:'DELETE', headers:{'Content-Type':'application/json'}, body: body ? JSON.stringify(body) : undefined}).then(r => r.ok ? r.json() : Promise.reject(r)),
   };
 
   function logout() {
@@ -448,7 +542,13 @@ npm install @modelcontextprotocol/sdk</code></pre>
         <div id="mem-text-${m.id}" class="markdown-body">${marked.parse(m.text)}</div>
         <div class="memory-meta">
           ${tags.map(t => `<span class="tag-badge">#${t}</span>`).join('')}
-          ${(m.links || []).map(l => `<span class="link-badge" onclick="jumpToMemory('${l.target_id}')" style="cursor:pointer;" title="Click to view">🔗 ${l.rel} &rarr; ${escHtml(l.target_title || l.target_text.substring(0, 30))}</span>`).join('')}
+          ${(m.links || []).map(l => `
+            <span class="link-badge" id="link-badge-${m.id}-${l.target_id}">
+              <span class="link-content" onclick="jumpToMemory('${l.target_id}')" style="cursor:pointer;">🔗 ${l.rel} &rarr; ${escHtml(l.target_title || l.target_text.substring(0, 30))}</span>
+              <button class="link-action-btn" onclick="showLinkEdit('${m.id}', '${l.target_id}', '${escHtml(l.rel)}', '${escHtml(l.target_title || l.target_text.substring(0, 30))}')" title="Edit link">✏️</button>
+              <button class="link-action-btn" onclick="deleteLink('${m.id}', '${l.target_id}', '${l.rel}')" title="Delete link">🗑️</button>
+            </span>
+          `).join('')}
         </div>
         <div class="edit-form" id="edit-form-${m.id}" style="display:none; flex-direction:column; gap:0.5rem; width:100%;">
           <input id="edit-title-${m.id}" value="${escHtml(m.title || '')}" placeholder="Title...">
@@ -475,6 +575,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
         </div>
       </div>
       <div class="memory-actions">
+        <button class="btn map-btn btn-sm" id="map-btn-${m.id}" onclick="showOnMap('${m.id}')" title="Show on map">📍</button>
         <button class="btn btn-ghost btn-sm" onclick="openInGraph('${m.id}')" title="View in Graph">🕸️</button>
         <button class="btn btn-ghost btn-sm" id="link-btn-${m.id}" onclick="startLink('${m.id}')" title="Link Memory">🔗</button>
         <button class="btn btn-ghost btn-sm" id="edit-btn-${m.id}" onclick="startEdit('${m.id}')" title="Edit Memory">✏️</button>
@@ -499,6 +600,52 @@ npm install @modelcontextprotocol/sdk</code></pre>
       cancelLink(id);
       await loadMemories();
     } catch(e) { toast('❌ Error linking'); }
+  }
+
+  function showLinkEdit(sourceId, targetId, relType, targetLabel) {
+    const badge = document.getElementById('link-badge-' + sourceId + '-' + targetId);
+    if (!badge) return;
+    
+    badge.innerHTML = `
+      <form class="link-edit-form" onsubmit="event.preventDefault(); saveLinkEdit('${sourceId}', '${targetId}', '${relType}')">
+        <input id="edit-rel-${sourceId}-${targetId}" value="${escHtml(relType)}" placeholder="Relationship">
+        <button type="submit" title="Save" style="color: var(--success);">✓</button>
+        <button type="button" onclick="deleteLink('${sourceId}', '${targetId}', '${relType}')" title="Delete" style="color: var(--danger);">🗑️</button>
+        <button type="button" onclick="cancelLinkEdit('${sourceId}', '${targetId}', '${relType}', '${escHtml(targetLabel)}')" title="Cancel" style="color: var(--muted);">✕</button>
+      </form>
+    `;
+  }
+
+  async function saveLinkEdit(sourceId, targetId, oldRelType) {
+    const newRelType = document.getElementById('edit-rel-' + sourceId + '-' + targetId).value.trim();
+    if (!newRelType) { toast('⚠️ Relationship type required'); return; }
+    
+    try {
+      await api.delete('memories/link', {sourceId, targetId, relType: oldRelType});
+      await api.post('memories/link', {sourceId, targetId, relType: newRelType});
+      toast('✅ Link updated');
+      await loadMemories();
+    } catch(e) { toast('❌ Error updating link'); }
+  }
+
+  async function deleteLink(sourceId, targetId, relType) {
+    if (!confirm('Delete this link?')) return;
+    try {
+      await api.delete('memories/link', {sourceId, targetId, relType});
+      toast('🗑️ Link deleted');
+      await loadMemories();
+    } catch(e) { toast('❌ Error deleting link'); }
+  }
+
+  function cancelLinkEdit(sourceId, targetId, relType, targetLabel) {
+    const badge = document.getElementById('link-badge-' + sourceId + '-' + targetId);
+    if (!badge) return;
+    
+    badge.innerHTML = `
+      <span class="link-content" onclick="jumpToMemory('${targetId}')" style="cursor:pointer;">🔗 ${relType} &rarr; ${escHtml(targetLabel)}</span>
+      <button class="link-action-btn" onclick="showLinkEdit('${sourceId}', '${targetId}', '${escHtml(relType)}', '${escHtml(targetLabel)}')" title="Edit link">✏️</button>
+      <button class="link-action-btn" onclick="deleteLink('${sourceId}', '${targetId}', '${relType}')" title="Delete link">🗑️</button>
+    `;
   }
 
   function jumpToMemory(targetId) {
@@ -668,6 +815,12 @@ npm install @modelcontextprotocol/sdk</code></pre>
   }
 
   let network = null;
+  let graphData = { nodes: null, edges: null };
+  let isBuildMode = false;
+  let buildGraphNodes = new Set();
+  let buildGraphEdges = new Set();
+  let currentContextNode = null;
+
   async function loadGraph() {
     const container = document.getElementById('graph-container');
     container.innerHTML = '<p class="empty">Loading graph...</p>';
@@ -676,17 +829,17 @@ npm install @modelcontextprotocol/sdk</code></pre>
       graphLoaded = true;
       container.innerHTML = '';
       
-      const nodes = new vis.DataSet(data.nodes.map(n => ({
+      graphData.nodes = new vis.DataSet(data.nodes.map(n => ({
         id: n.id,
         label: n.label === 'Category' ? n.title : truncateText(n.title, 20),
-        title: n.title, // tooltip on hover
+        title: n.title,
         group: n.group,
         shape: n.label === 'Category' ? 'box' : 'dot',
         size: n.label === 'Category' ? 20 : 10,
         font: { size: 12, face: 'Inter' }
       })));
       
-      const edges = new vis.DataSet(data.edges.map(e => ({
+      graphData.edges = new vis.DataSet(data.edges.map(e => ({
         from: e.from,
         to: e.to,
         label: e.label,
@@ -695,32 +848,344 @@ npm install @modelcontextprotocol/sdk</code></pre>
         color: { color: '#e5e7eb', highlight: '#4f46e5' }
       })));
       
-      const networkData = { nodes: nodes, edges: edges };
-      const options = {
-        nodes: { borderWidth: 1, shadow: true },
-        edges: { width: 1, smooth: { type: 'continuous' } },
-        physics: {
-          barnesHut: { gravitationalConstant: -2000, centralGravity: 0.3, springLength: 95 },
-          stabilization: { iterations: 150 }
-        },
-        interaction: { hover: true, tooltipDelay: 200 }
-      };
-      
-      network = new vis.Network(container, networkData, options);
-
-      // Add double-click event to navigate to the memory
-      network.on("doubleClick", function (params) {
-        if (params.nodes.length > 0) {
-          const nodeId = params.nodes[0];
-          // Check if it's a memory (not a category node which might not be in the memories array directly)
-          const m = memories.find(x => x.id === nodeId);
-          if (m) {
-            jumpToMemory(nodeId);
-          }
-        }
-      });
+      if (isBuildMode && buildGraphNodes.size > 0) {
+        const filteredNodes = new vis.DataSet(
+          data.nodes.filter(n => buildGraphNodes.has(n.id)).map(n => ({
+            id: n.id,
+            label: n.label === 'Category' ? n.title : truncateText(n.title, 20),
+            title: n.title,
+            group: n.group,
+            shape: n.label === 'Category' ? 'box' : 'dot',
+            size: n.label === 'Category' ? 20 : 10,
+            font: { size: 12, face: 'Inter' }
+          }))
+        );
+        const filteredEdges = new vis.DataSet(
+          data.edges.filter(e => {
+            const edgeKey = e.from + '|' + e.to + '|' + e.label;
+            return buildGraphEdges.has(edgeKey) || 
+                   (buildGraphNodes.has(e.from) && buildGraphNodes.has(e.to) && buildGraphEdges.has('bidir|' + edgeKey));
+          }).map(e => ({
+            from: e.from,
+            to: e.to,
+            label: e.label,
+            font: { size: 10, align: 'middle' },
+            arrows: 'to',
+            color: { color: '#e5e7eb', highlight: '#4f46e5' }
+          }))
+        );
+        initNetwork({ nodes: filteredNodes, edges: filteredEdges });
+      } else {
+        initNetwork(graphData);
+      }
     } catch(e) {
       container.innerHTML = '<p class="empty">⚠️ Error loading graph.</p>';
+    }
+  }
+
+  function initNetwork(data) {
+    const container = document.getElementById('graph-container');
+    
+    const options = {
+      nodes: { borderWidth: 1, shadow: true },
+      edges: { width: 1, smooth: { type: 'continuous' } },
+      physics: {
+        barnesHut: { gravitationalConstant: -2000, centralGravity: 0.3, springLength: 95 },
+        stabilization: { iterations: 150 }
+      },
+      interaction: { hover: true, tooltipDelay: 200 }
+    };
+    
+    network = new vis.Network(container, data, options);
+
+    network.on("doubleClick", function (params) {
+      if (params.nodes.length > 0) {
+        const nodeId = params.nodes[0];
+        const m = memories.find(x => x.id === nodeId);
+        if (m) {
+          jumpToMemory(nodeId);
+        }
+      }
+    });
+
+    network.on("oncontext", function (params) {
+      params.event.preventDefault();
+      if (params.nodes.length === 0) return;
+      const nodeId = params.nodes[0];
+      currentContextNode = nodeId;
+      showContextMenu(params.event, nodeId);
+    });
+  }
+
+  function setGraphMode(mode) {
+    isBuildMode = (mode === 'build');
+    
+    document.getElementById('mode-full').classList.toggle('active', mode === 'full');
+    document.getElementById('mode-build').classList.toggle('active', mode === 'build');
+    document.getElementById('build-status').style.display = isBuildMode ? '' : 'none';
+    document.getElementById('clear-build-btn').style.display = isBuildMode ? '' : 'none';
+    
+    if (isBuildMode && buildGraphNodes.size === 0) {
+      const container = document.getElementById('graph-container');
+      container.innerHTML = '<p class="empty" style="padding-top: 3rem;">Select a memory and click "📍 Show on map" to start building your graph.</p>';
+    } else {
+      loadGraph();
+    }
+  }
+
+  function clearBuildGraph() {
+    if (!confirm('Clear all nodes from the build graph?')) return;
+    buildGraphNodes.clear();
+    buildGraphEdges.clear();
+    const container = document.getElementById('graph-container');
+    container.innerHTML = '<p class="empty" style="padding-top: 3rem;">Select a memory and click "📍 Show on map" to start building your graph.</p>';
+    updateBuildStatus();
+  }
+
+  function updateBuildStatus() {
+    const statusEl = document.getElementById('build-status');
+    if (buildGraphNodes.size > 0) {
+      statusEl.innerHTML = '<span class="count">' + buildGraphNodes.size + '</span> node' + (buildGraphNodes.size !== 1 ? 's' : '') + ' on map';
+    } else {
+      statusEl.innerHTML = '';
+    }
+  }
+
+  async function showOnMap(id) {
+    switchTab('graph');
+    
+    if (!isBuildMode) {
+      openInGraph(id);
+      return;
+    }
+    
+    if (!graphLoaded) {
+      await loadGraph();
+    }
+    
+    if (buildGraphNodes.has(id)) {
+      if (network) {
+        network.focus(id, { scale: 1.5, animation: { duration: 1000, easingFunction: 'easeInOutQuad' } });
+        network.selectNodes([id]);
+      }
+      toast('Node already on map');
+      return;
+    }
+    
+    try {
+      const focusData = await api.get('graph/focus/' + id);
+      
+      buildGraphNodes.add(focusData.center.id);
+      
+      const newNodes = [];
+      for (const node of focusData.nodes) {
+        if (!buildGraphNodes.has(node.id)) {
+          buildGraphNodes.add(node.id);
+          newNodes.push({
+            id: node.id,
+            label: truncateText(node.title, 20),
+            title: node.title,
+            group: node.category,
+            shape: 'dot',
+            size: 10,
+            font: { size: 12, face: 'Inter' }
+          });
+        }
+      }
+      
+      if (graphData.nodes && newNodes.length > 0) {
+        graphData.nodes.add(newNodes);
+      }
+      
+      const connData = await api.get('graph/connections/' + id);
+      
+      for (const [relType, connections] of Object.entries(connData)) {
+        for (const conn of connections) {
+          const edgeKey = id + '|' + conn.id + '|' + relType;
+          const reverseKey = conn.id + '|' + id + '|' + relType;
+          
+          if (!buildGraphEdges.has(edgeKey) && !buildGraphEdges.has(reverseKey)) {
+            buildGraphEdges.add(edgeKey);
+            
+            if (graphData.edges) {
+              graphData.edges.add({
+                from: id,
+                to: conn.id,
+                label: relType,
+                font: { size: 10, align: 'middle' },
+                arrows: 'to',
+                color: { color: '#e5e7eb', highlight: '#4f46e5' }
+              });
+            }
+          }
+        }
+      }
+      
+      updateBuildStatus();
+      
+      setTimeout(() => {
+        if (network) {
+          network.focus(id, { scale: 1.5, animation: { duration: 1000, easingFunction: 'easeInOutQuad' } });
+          network.selectNodes([id]);
+        }
+      }, 300);
+      
+      toast('📍 Added to map');
+    } catch(e) {
+      toast('⚠️ Error loading node');
+    }
+  }
+
+  async function showContextMenu(event, nodeId) {
+    document.querySelectorAll('.context-menu').forEach(el => el.remove());
+    
+    const connections = await api.get('graph/connections/' + nodeId);
+    const relTypes = Object.keys(connections);
+    
+    let submenuHTML = '';
+    if (relTypes.length > 0) {
+      submenuHTML = `
+        <div class="submenu">
+          <div class="context-menu-item submenu-trigger" onclick="event.stopPropagation()">
+            Show connection...
+          </div>
+          <div class="submenu-items">
+            ${relTypes.map(rel => `
+              <div class="submenu-item" onclick="showConnectionType('${nodeId}', '${rel}')">
+                <span class="rel-badge">${rel}</span>
+              </div>
+            `).join('')}
+          </div>
+        </div>
+      `;
+    } else {
+      submenuHTML = `
+        <div class="context-menu-item disabled">
+          Show connection... (none)
+        </div>
+      `;
+    }
+    
+    const menuHTML = `
+      <div class="context-menu" style="left: ${event.clientX}px; top: ${event.clientY}px;">
+        <div class="context-menu-item" onclick="goToFact('${nodeId}')">
+          📋 Go to fact
+        </div>
+        <div class="context-menu-item" onclick="showAllConnected('${nodeId}')">
+          🔗 Show all connected
+        </div>
+        <div class="context-menu-separator"></div>
+        ${submenuHTML}
+      </div>
+    `;
+    
+    document.body.insertAdjacentHTML('beforeend', menuHTML);
+    
+    document.addEventListener('click', hideContextMenu, { once: true });
+  }
+
+  function hideContextMenu() {
+    document.querySelectorAll('.context-menu').forEach(el => el.remove());
+  }
+
+  async function goToFact(nodeId) {
+    hideContextMenu();
+    jumpToMemory(nodeId);
+  }
+
+  async function showAllConnected(nodeId) {
+    hideContextMenu();
+    
+    try {
+      const neighbors = await api.get('graph/neighbors/' + nodeId);
+      
+      for (const neighbor of neighbors) {
+        if (!buildGraphNodes.has(neighbor.id)) {
+          buildGraphNodes.add(neighbor.id);
+          
+          if (graphData.nodes) {
+            graphData.nodes.add({
+              id: neighbor.id,
+              label: truncateText(neighbor.text || neighbor.title || '', 20),
+              title: neighbor.text || neighbor.title || '',
+              group: neighbor.category || 'General',
+              shape: 'dot',
+              size: 10,
+              font: { size: 12, face: 'Inter' }
+            });
+          }
+          
+          const edgeKey = nodeId + '|' + neighbor.id + '|_';
+          if (!buildGraphEdges.has(edgeKey)) {
+            buildGraphEdges.add(edgeKey);
+            
+            if (graphData.edges) {
+              graphData.edges.add({
+                from: nodeId,
+                to: neighbor.id,
+                font: { size: 10, align: 'middle' },
+                arrows: 'to',
+                color: { color: '#e5e7eb', highlight: '#4f46e5' }
+              });
+            }
+          }
+        }
+      }
+      
+      updateBuildStatus();
+      toast('🔗 Added ' + neighbors.length + ' connected node' + (neighbors.length !== 1 ? 's' : ''));
+    } catch(e) {
+      toast('⚠️ Error loading connections');
+    }
+  }
+
+  async function showConnectionType(nodeId, relType) {
+    hideContextMenu();
+    
+    try {
+      const connections = await api.get('graph/connections/' + nodeId);
+      const connList = connections[relType] || [];
+      
+      for (const conn of connList) {
+        if (!buildGraphNodes.has(conn.id)) {
+          buildGraphNodes.add(conn.id);
+          
+          if (graphData.nodes) {
+            graphData.nodes.add({
+              id: conn.id,
+              label: truncateText(conn.title || '', 20),
+              title: conn.title || '',
+              group: conn.category || 'General',
+              shape: 'dot',
+              size: 10,
+              font: { size: 12, face: 'Inter' }
+            });
+          }
+        }
+        
+        const edgeKey = nodeId + '|' + conn.id + '|' + relType;
+        const reverseKey = conn.id + '|' + nodeId + '|' + relType;
+        
+        if (!buildGraphEdges.has(edgeKey) && !buildGraphEdges.has(reverseKey)) {
+          buildGraphEdges.add(edgeKey);
+          
+          if (graphData.edges) {
+            graphData.edges.add({
+              from: nodeId,
+              to: conn.id,
+              label: relType,
+              font: { size: 10, align: 'middle' },
+              arrows: 'to',
+              color: { color: '#e5e7eb', highlight: '#4f46e5' }
+            });
+          }
+        }
+      }
+      
+      updateBuildStatus();
+      toast(`🔗 Added ${connList.length} node${connList.length !== 1 ? 's' : ''} via ${relType}`);
+    } catch(e) {
+      toast('⚠️ Error loading connections');
     }
   }
 
