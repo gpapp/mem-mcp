@@ -96,18 +96,6 @@
     .memory-actions {
       display: flex; gap: .4rem; flex-shrink: 0;
     }
-    .memory-actions .map-btn {
-      background: var(--success); color: #fff;
-    }
-    .memory-actions .map-btn:hover {
-      background: #059669;
-    }
-    .memory-actions .build-mode-btn {
-      background: #f59e0b; color: #fff;
-    }
-    .memory-actions .build-mode-btn:hover {
-      background: #d97706;
-    }
     .tag-badge { display: inline-block; background: var(--primary-light); color: var(--primary); font-size: .7rem; font-weight: 600;
                 padding: .1rem .4rem; border-radius: 4px; margin-right: .3rem; margin-top: .4rem; }
 .link-badge { display: inline-flex; align-items: center; gap: 2px; background: #fffbeb; color: #b45309; border: 1px solid #fde68a; font-size: .7rem; font-weight: 600;
@@ -1039,45 +1027,57 @@ npm install @modelcontextprotocol/sdk</code></pre>
   async function showContextMenu(event, nodeId) {
     document.querySelectorAll('.context-menu').forEach(el => el.remove());
     
-    const connections = await api.get('graph/connections/' + nodeId);
-    const relTypes = Object.keys(connections);
-    
-    let submenuHTML = '';
-    if (relTypes.length > 0) {
-      submenuHTML = `
-        <div class="submenu">
-          <div class="context-menu-item submenu-trigger" onclick="event.stopPropagation()">
-            Show connection...
-          </div>
-          <div class="submenu-items">
-            ${relTypes.map(rel => `
-              <div class="submenu-item" onclick="showConnectionType('${nodeId}', '${rel}')">
-                <span class="rel-badge">${rel}</span>
-              </div>
-            `).join('')}
-          </div>
-        </div>
-      `;
-    } else {
-      submenuHTML = `
-        <div class="context-menu-item disabled">
-          Show connection... (none)
-        </div>
-      `;
-    }
-    
-    const menuHTML = `
+    let menuHTML = `
       <div class="context-menu" style="left: ${event.clientX}px; top: ${event.clientY}px;">
         <div class="context-menu-item" onclick="goToFact('${nodeId}')">
           📋 Go to fact
         </div>
+    `;
+    
+    if (isBuildMode) {
+      const connections = await api.get('graph/connections/' + nodeId);
+      const relTypes = Object.keys(connections);
+      
+      let submenuHTML = '';
+      if (relTypes.length > 0) {
+        submenuHTML = `
+          <div class="submenu">
+            <div class="context-menu-item submenu-trigger" onclick="event.stopPropagation()">
+              Show connection...
+            </div>
+            <div class="submenu-items">
+              ${relTypes.map(rel => `
+                <div class="submenu-item" onclick="showConnectionType('${nodeId}', '${rel}')">
+                  <span class="rel-badge">${rel}</span>
+                </div>
+              `).join('')}
+            </div>
+          </div>
+        `;
+      } else {
+        submenuHTML = `
+          <div class="context-menu-item disabled">
+            Show connection... (none)
+          </div>
+        `;
+      }
+      
+      menuHTML += `
         <div class="context-menu-item" onclick="showAllConnected('${nodeId}')">
           🔗 Show all connected
         </div>
         <div class="context-menu-separator"></div>
         ${submenuHTML}
-      </div>
-    `;
+      `;
+    } else {
+      menuHTML += `
+        <div class="context-menu-item" onclick="addToBuildGraph('${nodeId}')">
+          🕸️ Build graph
+        </div>
+      `;
+    }
+    
+    menuHTML += '</div>';
     
     document.body.insertAdjacentHTML('beforeend', menuHTML);
     
@@ -1086,6 +1086,12 @@ npm install @modelcontextprotocol/sdk</code></pre>
 
   function hideContextMenu() {
     document.querySelectorAll('.context-menu').forEach(el => el.remove());
+  }
+
+  async function addToBuildGraph(nodeId) {
+    hideContextMenu();
+    setGraphMode('build');
+    await showOnMap(nodeId);
   }
 
   async function goToFact(nodeId) {
