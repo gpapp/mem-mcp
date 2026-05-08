@@ -30,9 +30,11 @@ import hashlib
 from fastapi import Request, HTTPException, FastAPI
 
 def apr1_md5(password: str, salt: str) -> str:
-    ctx = hashlib.md5((password + f"APR1{salt}").encode())
+    password_b = password.encode()
+    apr1_salt = f"APR1{salt}".encode()
+    ctx = hashlib.md5(password_b + apr1_salt)
     for i in range(1000):
-        ctx = hashlib.md5((ctx.digest() + (password + f"APR1{salt}").encode()) if i % 2 == 0 else (ctx.digest() + password.encode())).encode()
+        ctx = hashlib.md5(ctx.digest() + apr1_salt if i % 2 == 0 else ctx.digest() + password_b)
     return hashlib.md5(ctx.digest()).hexdigest()
 from fastapi.responses import Response, JSONResponse, HTMLResponse, RedirectResponse
 from pydantic import BaseModel
