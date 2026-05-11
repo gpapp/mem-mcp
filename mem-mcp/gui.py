@@ -230,6 +230,29 @@ async def api_list_memories(request: Request):
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
+@web_app.get("/api/memories/{memory_id}", response_class=JSONResponse)
+async def api_get_memory(memory_id: str, request: Request):
+    """Fetch a single memory enriched with links and metadata."""
+    user_id = _require_user(request)
+    # We use db_list_memories and filter to reuse the complex enrichment logic
+    # which handles Neo4j link aggregation and property cleaning.
+    all_m = mem.db_list_memories(user_id)
+    m = next((x for x in all_m if x["id"] == memory_id), None)
+    if not m:
+        raise HTTPException(status_code=404, detail="Memory not found or access denied.")
+    return m
+
+@web_app.get("/api/diary/{entry_id}", response_class=JSONResponse)
+async def api_get_diary_entry(entry_id: str, request: Request):
+    """Fetch a single diary entry by ID."""
+    user_id = _require_user(request)
+    # Reuse db_list_diary to ensure the structure (mentions, dates) is consistent.
+    all_e = mem.db_list_diary(user_id)
+    e = next((x for x in all_e if x["id"] == entry_id), None)
+    if not e:
+        raise HTTPException(status_code=404, detail="Diary entry not found or access denied.")
+    return e
+
 
 @web_app.post("/api/memories", response_class=JSONResponse, status_code=201)
 async def api_create_memory(request: Request, body: MemoryCreate):

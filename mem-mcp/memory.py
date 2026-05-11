@@ -1333,6 +1333,7 @@ def db_get_graph(user_id: str) -> dict:
                     edge_lookup[reverse_sig]["arrows"] = "to,from"
                 elif edge_sig not in edge_lookup:
                     new_edge = {
+                        "id": f"{f['id']}_{m_id}_{rel}",
                         "from": f["id"],
                         "to": m_id,
                         "label": rel,

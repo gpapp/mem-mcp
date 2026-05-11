@@ -449,24 +449,79 @@ npm install @modelcontextprotocol/sdk</code></pre>
     console.log("[SSE] Initializing real-time event listener...");
     const eventSource = new EventSource(`${apiBase}/events`);
 
-    eventSource.addEventListener('memory_changed', (e) => {
+    eventSource.addEventListener('memory_changed', async (e) => {
       const data = JSON.parse(e.data);
       console.log("[SSE] Memory change received:", data);
-      toast(`Vault Updated: ${data.action} ${data.title || ''}`);
-      loadMemories();
-      if (graphLoaded) loadGraph();
-      if (insightsLoaded) loadInsights();
+      
+      if (data.action === 'delete') {
+        memories = memories.filter(m => m.id !== data.id);
+        if (graphLoaded && network) graphData.nodes.remove(data.id);
+      } else {
+        // For add/update/merge, fetch the specific item to get full metadata and links
+        try {
+          const item = await api.get(`memories/${data.id || data.master_id}`);
+          const idx = memories.findIndex(m => m.id === item.id);
+          if (idx !== -1) memories[idx] = item;
+          else memories.push(item);
+          
+          if (graphLoaded && network) {
+            graphData.nodes.update({
+              id: item.id,
+              label: truncateText(item.title || item.text, 20),
+              title: item.title || item.text,
+              group: item.category
+            });
+          }
+        } catch(err) { console.error("Failed to fetch updated memory", err); }
+      }
+      
+      renderMemories();
+      renderCategorySidebar();
+      renderAlphabetFilter();
+      if (insightsLoaded) loadInsights(); // Insights are aggregate, still require reload
     });
 
-    eventSource.addEventListener('graph_changed', (e) => {
-      console.log("[SSE] Graph relationship changed");
-      loadMemories(); // Refresh to update link badges in list
-      if (graphLoaded) loadGraph();
+    eventSource.addEventListener('graph_changed', async (e) => {
+      const data = JSON.parse(e.data);
+      console.log("[SSE] Graph change received:", data);
+      
+      // Update local memory objects to refresh badges in the list
+      if (data.source_id) {
+        try {
+          const updatedSource = await api.get(`memories/${data.source_id}`);
+          const idx = memories.findIndex(m => m.id === data.source_id);
+          if (idx !== -1) { memories[idx] = updatedSource; renderMemories(); }
+        } catch(_) {}
+      }
+
+      if (graphLoaded && network) {
+        if (data.action === 'link') {
+          const edgeId = `${data.source_id}_${data.target_id}_${data.rel_type}`;
+          graphData.edges.update({
+            id: edgeId,
+            from: data.source_id,
+            to: data.target_id,
+            label: data.rel_type,
+            arrows: 'to'
+          });
+        } else if (data.action === 'unlink') {
+          // Remove any edges between these two nodes
+          const edges = graphData.edges.get({
+            filter: (item) => (item.from === data.source_id && item.to === data.target_id) || (item.from === data.target_id && item.to === data.source_id)
+          });
+          graphData.edges.remove(edges);
+        }
+      }
     });
 
-    eventSource.addEventListener('diary_changed', (e) => {
-      console.log("[SSE] Diary updated");
-      loadDiary();
+    eventSource.addEventListener('diary_changed', async (e) => {
+      const data = JSON.parse(e.data);
+      try {
+        const entry = await api.get(`diary/${data.id}`);
+        diaryEntries.unshift(entry);
+        renderDiarySidebar();
+        if (!activeDiaryDate) selectDiaryEntry(entry.date);
+      } catch(_) { loadDiary(); }
     });
 
     eventSource.onerror = (err) => {
