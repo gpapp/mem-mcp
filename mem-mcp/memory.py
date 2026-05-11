@@ -789,18 +789,29 @@ def db_list_categories(user_id: str) -> list:
 
 async def db_find_duplicates(user_id: str, category: str = "People", limit: int = 50, threshold: float = 0.6, max_cluster: int = 4):
     """
-    Find potential duplicates in a category using embedding similarity and clustering.
-    Iteratively increases threshold to keep clusters <= max_cluster.
+    Find potential duplicates in a category using multi-signal similarity and clustering.
+
+    Similarity is the MAX of independent signals:
+      - Vector cosine similarity (embedding distance)
+      - Exact normalized title match → 1.0
+      - Email match → 1.0
+      - first_name + last_name match → 1.0
+      - Alias match → 0.95
+      - Title word-overlap boost (additive on vector score)
+
+    Clustering:
+      1. Form initial clusters at `threshold`.
+      2. Any cluster > max_cluster is recursively split by re-clustering
+         only its members at a higher internal threshold.
     """
     qdrant = await get_qdrant()
     neo4j_driver = get_neo4j()
     if not qdrant or not neo4j_driver:
         raise RuntimeError("Database connections not established.")
 
-    # 1. Fetch items from Neo4j (fetch a larger pool to ensure we don't miss duplicates)
+    # ── 1. Fetch items from Neo4j ──────────────────────────────────────────
     fetch_limit = max(limit * 10, 1000)
     with neo4j_driver.session() as s:
-        # Use case-insensitive category matching and more robust lookup
         result = s.run(
             """
             MATCH (f:Fact {userId: $userId})
@@ -819,7 +830,7 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
             for k, v in f_node.items():
                 if k not in core_keys:
                     metadata[k] = v.iso_format() if hasattr(v, "iso_format") else v
-            
+
             items.append({
                 "id": f_node["id"],
                 "text": f_node["text"],
@@ -831,41 +842,47 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
     logger.info(f"[db_find_duplicates] Found {len(items)} items in Neo4j for category '{category}' (user: {user_id})")
 
     if not items:
-        # Check if category exists at all to help debug
         with neo4j_driver.session() as s:
             cats = s.run("MATCH (f:Fact {userId: $userId}) RETURN DISTINCT f.category as cat", userId=user_id)
             available = [str(c["cat"]) for c in cats]
             logger.info(f"[db_find_duplicates] Available categories: {available}")
         return []
 
-    # 2. Get vectors from Qdrant
+    # ── 2. Get vectors from Qdrant ─────────────────────────────────────────
     ids = [item["id"] for item in items]
     points = await qdrant.retrieve(
         collection_name=COLLECTION_NAME,
         ids=ids,
         with_vectors=True
     )
-    
+
     vectors = {str(p.id): p.vector for p in points if p.vector}
     items_with_vectors = [item for item in items if str(item["id"]) in vectors]
     if not items_with_vectors:
-        logger.warning(f"No vectors found for {len(items)} items in Qdrant. Check sync.")
+        logger.warning(f"[db_find_duplicates] No vectors found for {len(items)} items in Qdrant. Check sync.")
         return []
 
-    # Pre-calculate normalized names and metadata for all items to speed up N^2 loop
+    logger.info(f"[db_find_duplicates] {len(items_with_vectors)} items have vectors (of {len(items)} total)")
+
+    # ── 3. Prepare per-item data ───────────────────────────────────────────
     def normalize_name(name):
-        if not name: return ""
+        """Lower-case, strip, flip 'Last, First' → 'first last'."""
+        if not name:
+            return ""
         n = name.lower().strip()
         if "," in n:
-            parts = [p.strip() for p in n.split(",")]
-            if len(parts) == 2: return f"{parts[1]} {parts[0]}"
+            parts = [p.strip() for p in n.split(",", 1)]
+            if len(parts) == 2 and parts[0] and parts[1]:
+                return f"{parts[1]} {parts[0]}"
         return n
+
+    is_people = category.strip().lower() == "people"
 
     prepared = []
     for item in items_with_vectors:
         meta = item.get("metadata") or {}
-        
-        # Handle aliases in both list and dict formats
+
+        # Aliases can be list or dict
         aliases_raw = meta.get("aliases") or []
         if isinstance(aliases_raw, dict):
             aliases_list = list(aliases_raw.keys())
@@ -874,170 +891,192 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
         else:
             aliases_list = []
 
+        norm = normalize_name(item.get("title"))
+        norm_words = set(norm.split()) if norm else set()
+
         prepared.append({
             "id": item["id"],
-            "vec": np.array(vectors[item["id"]]),
-            "norm_name": normalize_name(item.get("title")),
+            "vec": np.array(vectors[str(item["id"])]),
+            "norm_name": norm,
+            "norm_words": norm_words,
             "email": str(meta.get("email", "")).lower().strip(),
             "first_name": str(meta.get("first_name", "")).lower().strip(),
             "last_name": str(meta.get("last_name", "")).lower().strip(),
             "aliases": [normalize_name(a) for a in aliases_list],
-            "title": item.get("title", ""),
-            "metadata": meta
+            "title": item.get("title") or "",
+            "metadata": meta,
         })
 
-    # Compute all pairwise similarities once
+    # ── 4. Compute pairwise similarity (multi-signal, take MAX) ────────────
     num_items = len(prepared)
-    all_pairs = []
+    # Store as dict for fast lookup: (i,j) → score
+    pair_scores: dict = {}
+
     for i in range(num_items):
         p_i = prepared[i]
         vec_i = p_i["vec"]
         norm_vec_i = np.linalg.norm(vec_i)
-        if norm_vec_i == 0: continue
+        if norm_vec_i == 0:
+            continue
 
         for j in range(i + 1, num_items):
             p_j = prepared[j]
             vec_j = p_j["vec"]
             norm_vec_j = np.linalg.norm(vec_j)
-            if norm_vec_j == 0: continue
+            if norm_vec_j == 0:
+                continue
 
-            # 1. Vector Similarity
-            similarity = np.dot(vec_i, vec_j) / (norm_vec_i * norm_vec_j)
+            signals = []
 
-            # 2. Metadata & Title Boosts
-            # Direct match
+            # Signal 1: Vector cosine similarity
+            vec_sim = float(np.dot(vec_i, vec_j) / (norm_vec_i * norm_vec_j))
+            signals.append(vec_sim)
+
+            # Signal 2: Exact normalized-title match
             if p_i["norm_name"] and p_j["norm_name"] and p_i["norm_name"] == p_j["norm_name"]:
-                similarity = 1.0
-            
-            # Email match
-            elif p_i["email"] and p_j["email"] and p_i["email"] == p_j["email"]:
-                similarity = 1.0
+                signals.append(1.0)
 
-            # First + Last name match
-            elif p_i["first_name"] and p_i["last_name"] and p_j["first_name"] and p_j["last_name"]:
-                if p_i["first_name"] == p_j["first_name"] and p_i["last_name"] == p_j["last_name"]:
-                    similarity = 1.0
+            # Signal 3: Email match
+            if p_i["email"] and p_j["email"] and p_i["email"] == p_j["email"]:
+                signals.append(1.0)
 
-            # Alias match
-            elif (p_j["norm_name"] in p_i["aliases"]) or (p_i["norm_name"] in p_j["aliases"]):
-                similarity = max(similarity, 0.95)
+            # Signal 4: first_name + last_name match
+            if (p_i["first_name"] and p_i["last_name"]
+                    and p_j["first_name"] and p_j["last_name"]
+                    and p_i["first_name"] == p_j["first_name"]
+                    and p_i["last_name"] == p_j["last_name"]):
+                signals.append(1.0)
 
-            # 3. Word overlap boost
-            if similarity < 0.9 and p_i["title"] and p_j["title"]:
-                ti_words = set(p_i["norm_name"].split())
-                tj_words = set(p_j["norm_name"].split())
-                common = ti_words.intersection(tj_words)
+            # Signal 5: Alias ↔ title match
+            if p_j["norm_name"] and p_j["norm_name"] in p_i["aliases"]:
+                signals.append(0.95)
+            if p_i["norm_name"] and p_i["norm_name"] in p_j["aliases"]:
+                signals.append(0.95)
+
+            # Signal 6: Title word-overlap boost (additive on vec_sim)
+            if p_i["norm_words"] and p_j["norm_words"]:
+                common = p_i["norm_words"] & p_j["norm_words"]
                 if common:
-                    valid = [w for w in common if len(w) > 2 or category.strip().capitalize() == "People"]
+                    valid = [w for w in common if len(w) > 2 or is_people]
                     if valid:
-                        match_ratio = len(valid) / min(len(ti_words), len(tj_words))
-                        boost = 0.3 * match_ratio
-                        similarity = min(1.0, similarity + boost)
-                        if match_ratio >= 1.0: similarity = max(similarity, 0.88)
+                        min_words = min(len(p_i["norm_words"]), len(p_j["norm_words"]))
+                        ratio = len(valid) / min_words if min_words else 0
+                        boosted = vec_sim + 0.3 * ratio
+                        if ratio >= 1.0:
+                            boosted = max(boosted, 0.88)
+                        signals.append(min(1.0, boosted))
 
-            all_pairs.append((i, j, float(similarity)))
+            similarity = max(signals)
+            pair_scores[(i, j)] = similarity
 
-    logger.info(f"[db_find_duplicates] Calculated {len(all_pairs)} pairwise similarities for {num_items} items.")
+    logger.info(f"[db_find_duplicates] Computed {len(pair_scores)} pairwise scores for {num_items} items")
 
-    # Helper function to cluster at given threshold
-    def cluster_at_threshold(thresh):
-        parent = list(range(num_items))
+    # Log top matches for debugging
+    top_pairs = sorted(pair_scores.items(), key=lambda x: x[1], reverse=True)[:10]
+    for (pi, pj), sc in top_pairs:
+        logger.info(f"  top pair: '{prepared[pi]['title']}' ↔ '{prepared[pj]['title']}' = {sc:.4f}")
+
+    # ── 5. Clustering with per-cluster splitting ───────────────────────────
+    def union_find_cluster(member_indices: list, thresh: float) -> list:
+        """Union-Find cluster a subset of items at a given threshold.
+        Returns list of clusters (each a list of global indices), size >= 2.
+        """
+        idx_set = set(member_indices)
+        parent = {x: x for x in member_indices}
+
         def find(x):
-            if parent[x] == x:
-                return x
-            parent[x] = find(parent[x])
-            return parent[x]
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
         def union(x, y):
             rx, ry = find(x), find(y)
             if rx != ry:
                 parent[rx] = ry
 
-        for i, j, score in all_pairs:
-            if score >= thresh:
-                union(i, j)
+        for (a, b), score in pair_scores.items():
+            if a in idx_set and b in idx_set and score >= thresh:
+                union(a, b)
 
-        clusters_map = {}
-        for i in range(num_items):
-            root = find(i)
-            if root not in clusters_map:
-                clusters_map[root] = []
-            clusters_map[root].append(i)
+        groups: dict = {}
+        for x in member_indices:
+            root = find(x)
+            groups.setdefault(root, []).append(x)
 
-        return [idxs for idxs in clusters_map.values() if len(idxs) >= 2]
+        return [sorted(g) for g in groups.values() if len(g) >= 2]
 
-    # Iteratively increase threshold for oversized clusters
-    current_threshold = threshold
-    max_threshold = 0.95
-    threshold_step = 0.05
+    def split_cluster(members: list, thresh: float, step: float = 0.05, ceiling: float = 0.98) -> list:
+        """Recursively split an oversized cluster by raising its internal threshold."""
+        if len(members) <= max_cluster:
+            return [members]
 
-    # Track which items are already clustered
-    assigned = set()
+        next_thresh = thresh + step
+        if next_thresh > ceiling:
+            # Can't split further – accept as-is
+            return [members]
 
-    while current_threshold <= max_threshold:
-        clusters = cluster_at_threshold(current_threshold)
-        
-        final_clusters = []
-        oversized_clusters = []
-
-        for member_indices in clusters:
-            # Already handled?
-            new_members = [i for i in member_indices if i not in assigned]
-            if not new_members:
-                continue
-
-            # If we've reached max_threshold, we must accept the cluster even if it's large,
-            # otherwise it just disappears from results.
-            if len(new_members) <= max_cluster or current_threshold >= max_threshold:
-                # Accept this cluster
-                for i in new_members:
-                    assigned.add(i)
-                final_clusters.append(sorted(new_members))
+        sub_clusters = union_find_cluster(members, next_thresh)
+        result = []
+        # Singletons (items not in any sub-cluster) are dropped
+        for sc in sub_clusters:
+            if len(sc) <= max_cluster:
+                result.append(sc)
             else:
-                # Too big - will split at higher threshold
-                oversized_clusters.append(new_members)
+                result.extend(split_cluster(sc, next_thresh, step, ceiling))
+        return result
 
-        # If no oversized clusters, we're done
-        if not oversized_clusters:
-            break
+    # Initial clustering at the user-supplied threshold
+    initial_clusters = union_find_cluster(list(range(num_items)), threshold)
+    logger.info(f"[db_find_duplicates] Initial clustering at {threshold}: {len(initial_clusters)} clusters")
 
-        # Increase threshold for next iteration
-        current_threshold += threshold_step
+    # Split oversized clusters
+    final_clusters = []
+    for cluster in initial_clusters:
+        if len(cluster) <= max_cluster:
+            final_clusters.append(cluster)
+        else:
+            final_clusters.extend(split_cluster(cluster, threshold))
 
-    # Build final results from clusters
+    logger.info(f"[db_find_duplicates] After splitting: {len(final_clusters)} clusters")
+
+    # ── 6. Build output ────────────────────────────────────────────────────
     result_clusters = []
     for cluster_indices in final_clusters:
         if len(cluster_indices) < 2:
             continue
-        
+
         members = []
         cluster_scores = []
+        ci_set = set(cluster_indices)
+
         for idx in cluster_indices:
             item = items_with_vectors[idx]
             item_scores = []
-            for i, j, score in all_pairs:
-                if (i == idx and j in cluster_indices) or (j == idx and i in cluster_indices):
+            for (a, b), score in pair_scores.items():
+                if (a == idx and b in ci_set) or (b == idx and a in ci_set):
                     item_scores.append(score)
-            
+
             avg_item_sim = sum(item_scores) / len(item_scores) if item_scores else 1.0
             cluster_scores.extend(item_scores)
-            
+
             member_info = {
                 "id": item["id"],
                 "text": item["text"],
                 "title": item["title"],
-                "similarity": round(avg_item_sim, 4)
+                "similarity": round(avg_item_sim, 4),
             }
-            member_info.update(item["metadata"])
+            member_info.update(item.get("metadata") or {})
             members.append(member_info)
-        
+
         avg_similarity = sum(cluster_scores) / len(cluster_scores) if cluster_scores else 0.0
         recommendation = "MERGE - high overlap" if avg_similarity > 0.9 else "MERGE - verify and combine"
-        
+
         result_clusters.append({
             "cluster_id": len(result_clusters) + 1,
             "members": members,
             "avg_similarity": round(avg_similarity, 4),
-"recommendation": recommendation
+            "recommendation": recommendation,
         })
 
     result_clusters.sort(key=lambda x: x["avg_similarity"], reverse=True)
