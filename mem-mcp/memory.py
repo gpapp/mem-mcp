@@ -609,12 +609,12 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
             WHERE toLower(f.title) CONTAINS toLower($query_str)
             """
         if category:
-            cypher += " AND f.category = $category"
+            cypher += " AND toLower(f.category) = toLower($category)"
         cypher += " RETURN f LIMIT $limit"
 
         params = {"userId": user_id, "query_str": query, "limit": limit}
         if category:
-            params["category"] = category.strip().capitalize()
+            params["category"] = category.strip()
 
         neo_result = s.run(cypher, **params)
         for r in neo_result:
@@ -798,16 +798,18 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
         raise RuntimeError("Database connections not established.")
 
     # 1. Fetch items from Neo4j (fetch a larger pool to ensure we don't miss duplicates)
-    fetch_limit = max(limit * 5, 500)
+    fetch_limit = max(limit * 10, 1000)
     with neo4j_driver.session() as s:
+        # Use case-insensitive category matching and more robust lookup
         result = s.run(
             """
-            MATCH (f:Fact {userId: $userId, category: $category})
+            MATCH (f:Fact {userId: $userId})
+            WHERE toLower(f.category) = toLower($category)
             RETURN f
             ORDER BY f.timestamp DESC
             LIMIT $limit
             """,
-            userId=user_id, category=category.strip().capitalize(), limit=fetch_limit
+            userId=user_id, category=category.strip(), limit=fetch_limit
         )
         items = []
         for r in result:
@@ -826,7 +828,14 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
                 "metadata": metadata
             })
 
+    logger.info(f"[db_find_duplicates] Found {len(items)} items in Neo4j for category '{category}' (user: {user_id})")
+
     if not items:
+        # Check if category exists at all to help debug
+        with neo4j_driver.session() as s:
+            cats = s.run("MATCH (f:Fact {userId: $userId}) RETURN DISTINCT f.category as cat", userId=user_id)
+            available = [str(c["cat"]) for c in cats]
+            logger.info(f"[db_find_duplicates] Available categories: {available}")
         return []
 
     # 2. Get vectors from Qdrant
@@ -855,6 +864,16 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
     prepared = []
     for item in items_with_vectors:
         meta = item.get("metadata") or {}
+        
+        # Handle aliases in both list and dict formats
+        aliases_raw = meta.get("aliases") or []
+        if isinstance(aliases_raw, dict):
+            aliases_list = list(aliases_raw.keys())
+        elif isinstance(aliases_raw, list):
+            aliases_list = aliases_raw
+        else:
+            aliases_list = []
+
         prepared.append({
             "id": item["id"],
             "vec": np.array(vectors[item["id"]]),
@@ -862,7 +881,7 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
             "email": str(meta.get("email", "")).lower().strip(),
             "first_name": str(meta.get("first_name", "")).lower().strip(),
             "last_name": str(meta.get("last_name", "")).lower().strip(),
-            "aliases": [normalize_name(a) for a in meta.get("aliases", [])] if isinstance(meta.get("aliases"), list) else [],
+            "aliases": [normalize_name(a) for a in aliases_list],
             "title": item.get("title", ""),
             "metadata": meta
         })
