@@ -436,12 +436,42 @@ npm install @modelcontextprotocol/sdk</code></pre>
     loadMemories();
     loadDiary();
     loadWhoami();
+    initSSE();
   }
 
   function toast(msg, ms=2500) {
     const el = document.getElementById('toast');
     el.textContent = msg; el.classList.add('show');
     setTimeout(() => el.classList.remove('show'), ms);
+  }
+
+  function initSSE() {
+    console.log("[SSE] Initializing real-time event listener...");
+    const eventSource = new EventSource(`${apiBase}/events`);
+
+    eventSource.addEventListener('memory_changed', (e) => {
+      const data = JSON.parse(e.data);
+      console.log("[SSE] Memory change received:", data);
+      toast(`Vault Updated: ${data.action} ${data.title || ''}`);
+      loadMemories();
+      if (graphLoaded) loadGraph();
+      if (insightsLoaded) loadInsights();
+    });
+
+    eventSource.addEventListener('graph_changed', (e) => {
+      console.log("[SSE] Graph relationship changed");
+      loadMemories(); // Refresh to update link badges in list
+      if (graphLoaded) loadGraph();
+    });
+
+    eventSource.addEventListener('diary_changed', (e) => {
+      console.log("[SSE] Diary updated");
+      loadDiary();
+    });
+
+    eventSource.onerror = (err) => {
+      console.warn("[SSE] Connection lost. EventSource will automatically reconnect.");
+    };
   }
 
   function switchTab(tab) {

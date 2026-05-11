@@ -22,6 +22,8 @@ import os
 import base64
 import logging
 import secrets
+import json
+import asyncio # Added for asyncio.wait_for
 import subprocess
 from datetime import datetime, timedelta
 from typing import Optional
@@ -32,6 +34,7 @@ from fastapi.responses import Response, JSONResponse, HTMLResponse, RedirectResp
 from pydantic import BaseModel
 from starlette.middleware.sessions import SessionMiddleware
 from jinja2 import Environment, FileSystemLoader, select_autoescape
+from sse_starlette.sse import EventSourceResponse
 
 SESSION_SECRET = os.getenv("MEM_SESSION_SECRET", secrets.token_hex(32))
 web_app = FastAPI(title="Memory Vault GUI")
@@ -61,11 +64,12 @@ templates = Environment(
 )
 
 # Helper functions must be defined BEFORE middleware that uses them
-def _check_session_auth(request: Request) -> tuple[str, str] | None:
+def _check_session_auth(request: Request) -> str | None:
+    """Returns username if authenticated, else None."""
     session_user = request.session.get("user")
     session_pass = request.session.get("pass")
     if session_user and session_pass:
-        return session_user, session_pass
+        return session_user
     
     auth_header = request.headers.get("Authorization")
     if auth_header and auth_header.startswith("Basic "):
@@ -73,7 +77,7 @@ def _check_session_auth(request: Request) -> tuple[str, str] | None:
             encoded = auth_header.split(" ")[1]
             decoded = base64.b64decode(encoded).decode("utf-8")
             if ":" in decoded:
-                return decoded.split(":", 1)
+                return decoded.split(":", 1)[0]
         except Exception: pass
     return None
 
@@ -81,9 +85,12 @@ def _check_session_auth(request: Request) -> tuple[str, str] | None:
 @web_app.middleware("http")
 async def auth_guard(request: Request, call_next):
     if request.url.path.startswith("/gui") or request.url.path.startswith("/api"):
-        creds = _check_session_auth(request)
-        if not creds:
-            if request.url.path.startswith("/api/auth") or request.url.path in ["/api/ping", "/"]:
+        user = _check_session_auth(request)
+        if user:
+            request.state.user = user # Set user in request state
+        else:
+            # Allow specific unauthenticated paths
+            if request.url.path.startswith("/api/auth") or request.url.path in ["/api/ping", "/"] or request.url.path == "/api/events":
                 pass
             elif request.url.path.startswith("/api/") and not request.url.path.startswith("/api/auth"):
                 return JSONResponse({"detail": "Not authenticated"}, status_code=401)
@@ -155,6 +162,12 @@ def _user(request: Request) -> str:
     if session_user:
         print(f"[GUI] API Request path: {request.url.path} (User: {session_user} [session])")
         return session_user
+    # Try request.state.user first, then fall back to headers
+    if hasattr(request.state, "user") and request.state.user:
+        print(f"[GUI] API Request path: {request.url.path} (User: {request.state.user} [state])")
+        return request.state.user
+    # Fallback to extracting from headers if not set by middleware (e.g., for non-API routes)
+    # This might be redundant if auth_guard always sets request.state.user for relevant paths
     user = mem.extract_user_from_headers(dict(request.headers))
     print(f"[GUI] API Request path: {request.url.path} (User: {user})")
     return user
@@ -206,14 +219,6 @@ async def api_auth_check(request: Request):
 # ---------------------------------------------------------------------------
 # REST API
 # ---------------------------------------------------------------------------
-
-def _require_auth(request: Request):
-    creds = _check_session_auth(request)
-    if not creds:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    return creds[0]
-
-
 @web_app.get("/api/ping")
 async def api_ping():
     return {"status": "ok", "version": "1.3", "base_url": mem.BASE_URL}
@@ -388,6 +393,39 @@ async def api_save_diary(request: Request, body: DiaryCreate):
 async def api_whoami(request: Request):
     return {"user": _require_user(request)}
 
+
+@web_app.get("/api/events")
+async def sse_events(request: Request):
+    user_id = _require_user(request) # Ensure user is authenticated for SSE stream
+    # Create a private queue for this specific connection
+    queue = asyncio.Queue()
+    mem.db_subscribers.append(queue)
+
+    async def event_generator():
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    # Wait for an event with a timeout to periodically check for disconnects
+                    event = await asyncio.wait_for(queue.get(), timeout=5.0)
+                    # Only send events belonging to this specific user
+                    if event["user_id"] == user_id:
+                        yield {
+                            "event": event["event_type"],
+                            "data": json.dumps(event["payload"])
+                        }
+                except asyncio.TimeoutError:
+                    continue
+                except Exception as e:
+                    mem.logger.error(f"Error in SSE generator: {e}")
+                    await asyncio.sleep(1)
+        finally:
+            if queue in mem.db_subscribers:
+                mem.db_subscribers.remove(queue)
+            mem.logger.info(f"SSE stream for user {user_id} closed.")
+
+    return EventSourceResponse(event_generator())
 
 # ---------------------------------------------------------------------------
 # HTML Routes

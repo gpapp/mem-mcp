@@ -60,6 +60,20 @@ _neo4j_driver = None
 _db_initialized = False
 _db_lock = asyncio.Lock()
 
+# Global event queue for database changes
+db_subscribers: List[asyncio.Queue] = []
+
+async def publish_db_event(user_id: str, event_type: str, payload: Optional[dict] = None):
+    """Publishes a database change event to the global queue."""
+    event = {
+        "user_id": user_id,
+        "event_type": event_type,
+        "payload": payload or {},
+        "timestamp": datetime.now().isoformat()
+    }
+    for queue in db_subscribers:
+        await queue.put(event)
+
 async def get_qdrant() -> AsyncQdrantClient:
     global _qdrant, _db_initialized
     async with _db_lock:
@@ -265,6 +279,12 @@ async def db_add_memory(text: str, category: str, user_id: str, metadata: Option
             metadata=meta
         )
 
+    await publish_db_event(user_id, "memory_changed", {
+        "action": "add",
+        "id": doc_id,
+        "category": category,
+        "title": title
+    })
     return doc_id
 
 
@@ -357,6 +377,12 @@ async def db_update_memory(memory_id: str, title: Optional[str], text: Optional[
             id=memory_id, userId=user_id, text=new_text, title=new_title, category=new_cat, metadata=new_meta
         )
     logger.info(f"[db_update_memory] Update complete for {memory_id}")
+    await publish_db_event(user_id, "memory_changed", {
+        "action": "update",
+        "id": memory_id,
+        "category": new_cat,
+        "title": new_title
+    })
     return True
 
 
@@ -378,7 +404,13 @@ async def db_delete_memory(memory_id: str, user_id: str) -> bool:
             id=memory_id, userId=user_id,
         )
         rec = result.single()
-        return (rec and rec["n"] > 0) or True  # qdrant already done
+        if (rec and rec["n"] > 0):
+            await publish_db_event(user_id, "memory_changed", {
+                "action": "delete",
+                "id": memory_id
+            })
+            return True
+        return True # Qdrant already done
 
 
 async def db_link_facts(source_id: str, target_id: str, rel_type: str, metadata: dict, user_id: str):
@@ -414,6 +446,12 @@ async def db_link_facts(source_id: str, target_id: str, rel_type: str, metadata:
             sid=source_id, tid=target_id, userId=user_id, metadata=metadata
         )
 
+    await publish_db_event(user_id, "graph_changed", {
+        "action": "link",
+        "source_id": source_id,
+        "target_id": target_id,
+        "rel_type": rel_type
+    })
 
 async def db_unlink_facts(source_id: str, target_id: str, rel_type: str, user_id: str):
     """Remove a bidirectional relationship between two facts in Neo4j."""
@@ -455,6 +493,11 @@ async def db_unlink_facts(source_id: str, target_id: str, rel_type: str, user_id
                 sid=source_id, tid=target_id, userId=user_id
             )
 
+    await publish_db_event(user_id, "graph_changed", {
+        "action": "unlink",
+        "source_id": source_id,
+        "target_id": target_id
+    })
 
 def db_get_neighborhood(fact_id: str, depth: int, rel_types: List[str], user_id: str) -> list:
     """Explore context around a fact in the graph."""
@@ -1058,6 +1101,12 @@ async def db_merge_memories(master_id: str, duplicate_ids: List[str], user_id: s
         collection_name=COLLECTION_NAME,
         points_selector=duplicate_ids,
     )
+    await publish_db_event(user_id, "memory_changed", {
+        "action": "merge",
+        "master_id": master_id,
+        "duplicate_ids": duplicate_ids
+    })
+
 
 
 
@@ -1143,6 +1192,11 @@ async def db_save_diary(content: str, user_id: str, date: Optional[str] = None) 
                 id=doc_id, userId=user_id, factIds=mentioned_ids
             )
 
+    await publish_db_event(user_id, "diary_changed", {
+        "action": "add",
+        "id": doc_id,
+        "date": entry_date
+    })
     return entry_date
 
 
@@ -1236,7 +1290,7 @@ def db_get_graph(user_id: str) -> dict:
         
         node_map = {}
         edges = []
-        seen_edges = set()
+        edge_lookup = {}  # sig -> edge_dict for collapsing bidirectional links
         
         for r in result:
             f = r["f"]
@@ -1272,16 +1326,22 @@ def db_get_graph(user_id: str) -> dict:
                         }
                 
                 edge_sig = (f["id"], m_id, rel)
-                if edge_sig not in seen_edges:
-                    seen_edges.add(edge_sig)
-                    edges.append({
+                reverse_sig = (m_id, f["id"], rel)
+
+                if reverse_sig in edge_lookup:
+                    # Collapse bidirectional arrows with same label
+                    edge_lookup[reverse_sig]["arrows"] = "to,from"
+                elif edge_sig not in edge_lookup:
+                    new_edge = {
                         "from": f["id"],
                         "to": m_id,
-                        "label": rel
-                    })
+                        "label": rel,
+                        "arrows": "to"
+                    }
+                    edge_lookup[edge_sig] = new_edge
+                    edges.append(new_edge)
                 
         return {
             "nodes": list(node_map.values()),
             "edges": edges
         }
-
