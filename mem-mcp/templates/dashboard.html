@@ -631,11 +631,12 @@ npm install @modelcontextprotocol/sdk</code></pre>
     });
 
     // Sorting
+    const sortKey = m => (m.title || m.text || '').toLowerCase();
     filtered.sort((a, b) => {
       if (sort === 'newest') return (b.id || "").localeCompare(a.id || "");
       if (sort === 'oldest') return (a.id || "").localeCompare(b.id || "");
-      if (sort === 'alphabetical') return a.text.localeCompare(b.text);
-      if (sort === 'category') return a.category.localeCompare(b.category) || a.text.localeCompare(b.text);
+      if (sort === 'alphabetical') return sortKey(a).localeCompare(sortKey(b));
+      if (sort === 'category') return a.category.localeCompare(b.category) || sortKey(a).localeCompare(sortKey(b));
       return 0;
     });
 
