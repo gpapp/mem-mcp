@@ -172,6 +172,10 @@ async def suggest_merge(cluster_json: str):
     Analyze a cluster of potential duplicates and return a structured comparison
     for the client to evaluate. The client decides which record is the master
     and what to merge, then calls merge_facts to execute.
+
+    cluster_json may be:
+      - A JSON array of full record dicts (from find_duplicates output), OR
+      - A JSON array of string IDs — records will be fetched automatically.
     """
     import json
 
@@ -183,8 +187,28 @@ async def suggest_merge(cluster_json: str):
     if not isinstance(records, list) or not records:
         return "Empty or invalid cluster data."
 
+    # If items are plain strings, treat them as IDs and fetch full records.
+    if records and isinstance(records[0], str):
+        user = _current_user()
+        fetched = []
+        for rid in records:
+            result = await mem.db_search_memories(rid, user, limit=1, top_p=0.0)
+            # db_search_memories returns a list; try to match by id
+            if isinstance(result, list):
+                match = next((m for m in result if isinstance(m, dict) and m.get("id") == rid), None)
+                if match:
+                    fetched.append(match)
+                elif result:
+                    fetched.append(result[0])
+            elif isinstance(result, dict):
+                fetched.append(result)
+        records = fetched
+
     analyzed = []
     for r in records:
+        if not isinstance(r, dict):
+            logger.warning(f"suggest_merge: skipping non-dict record: {r!r}")
+            continue
         text = r.get("text") or ""
         non_empty = sum(1 for v in r.values() if v not in (None, "", []))
         analyzed.append({
