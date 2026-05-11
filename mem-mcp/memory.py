@@ -837,9 +837,10 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
         with_vectors=True
     )
     
-    vectors = {p.id: p.vector for p in points if p.vector}
-    items_with_vectors = [item for item in items if item["id"] in vectors]
+    vectors = {str(p.id): p.vector for p in points if p.vector}
+    items_with_vectors = [item for item in items if str(item["id"]) in vectors]
     if not items_with_vectors:
+        logger.warning(f"No vectors found for {len(items)} items in Qdrant. Check sync.")
         return []
 
     # Compute all pairwise similarities once
@@ -927,7 +928,9 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
             if not new_members:
                 continue
 
-            if len(new_members) <= max_cluster:
+            # If we've reached max_threshold, we must accept the cluster even if it's large,
+            # otherwise it just disappears from results.
+            if len(new_members) <= max_cluster or current_threshold >= max_threshold:
                 # Accept this cluster
                 for i in new_members:
                     assigned.add(i)

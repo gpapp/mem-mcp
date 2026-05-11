@@ -7,33 +7,73 @@ import memory as mem
 
 logger = logging.getLogger("memory-vault")
 
-def get_sampling_handler():
-    try:
-        from fastmcp.client.sampling.handlers.openai import OpenAISamplingHandler
-        from openai import AsyncOpenAI
-
-        ollama_url = os.getenv("MEM_LLM_URL", "http://ollama:11434")
-        llm_model = os.getenv("MEM_LLM_MODEL", "llama3")
-
-        return OpenAISamplingHandler(
-            client=AsyncOpenAI(base_url=f"{ollama_url}/v1", api_key="ollama"),
-            default_model=llm_model
-        )
-    except Exception as e:
-        logger.warning(f"Could not load OpenAISamplingHandler: {e}")
-        return None
 
 # Initialize FastMCP with the built-in sampling fallback behavior
 mcp = FastMCP(
     "MemoryVault",
-    sampling_handler=get_sampling_handler(),
-    sampling_handler_behavior="fallback"
 )
 
 def _current_user() -> str:
     headers = get_http_headers()
     user = mem.extract_user_from_headers(headers)
     return user
+
+
+def _format_fact_md(fact: dict) -> str:
+    """
+    Render a fact dict as a Markdown block suitable for LLM display.
+
+    Expected keys: id, title, text, category, score (optional), metadata (optional).
+    """
+    title    = fact.get("title") or ""
+    text     = fact.get("text") or ""
+    category = fact.get("category") or ""
+    fact_id  = fact.get("id") or ""
+    score    = fact.get("score")
+    metadata = fact.get("metadata") or {}
+
+    lines = []
+
+    # Heading
+    if title:
+        lines.append(f"### {title}")
+    else:
+        lines.append(f"### (untitled)")
+
+    # Body
+    if text:
+        lines.append("")
+        lines.append(text)
+
+    # Meta row
+    meta_parts = []
+    if category:
+        meta_parts.append(f"📂 **{category}**")
+    if score is not None:
+        meta_parts.append(f"🎯 score: `{score:.3f}`")
+    if fact_id:
+        meta_parts.append(f"🔑 `{fact_id}`")
+    if meta_parts:
+        lines.append("")
+        lines.append(" · ".join(meta_parts))
+
+    # Optional metadata fields (skip noisy internal keys)
+    _skip = {"userId", "updatedAt", "timestamp"}
+    extra = {k: v for k, v in metadata.items() if k not in _skip and v not in (None, "", {}, [])}
+    if extra:
+        lines.append("")
+        for k, v in extra.items():
+            lines.append(f"- **{k}**: {v}")
+
+    return "\n".join(lines)
+
+
+def _format_facts_md(facts: list) -> str:
+    """Render a list of fact dicts as a combined Markdown document."""
+    if not facts:
+        return "_No facts found._"
+    blocks = [_format_fact_md(f) for f in facts]
+    return "\n\n---\n\n".join(blocks)
 
 @mcp.tool()
 async def add_fact(title: str, text: str, category: str):
@@ -50,12 +90,14 @@ async def add_fact(title: str, text: str, category: str):
 async def search_facts(query: str, category: Optional[str] = None, limit: int = 5, top_p: float = 0.7):
     """
     Search for facts matching query criteria.
+    Returns results formatted as Markdown for easy reading.
     - query: semantic search string
     - category: optional filter (e.g. 'People', 'Client', 'Preferences') to limit output
     - limit: maximum number of results (default 5)
     - top_p: threshold to filter low-probability results (default 0.75, higher = more selective)
     """
-    return await mem.db_search_memories(query, _current_user(), limit, category, top_p)
+    facts = await mem.db_search_memories(query, _current_user(), limit, category, top_p)
+    return _format_facts_md(facts)
 
 @mcp.tool()
 async def list_categories():
@@ -76,8 +118,14 @@ async def unlink_facts(sourceFactId: str, targetFactId: str, relationshipType: O
 
 @mcp.tool()
 async def get_fact_neighborhood(factId: str, depth: int = 1, relationshipTypes: Optional[List[str]] = None):
-    """Explore context around a fact."""
-    return mem.db_get_neighborhood(factId, depth, relationshipTypes or [], _current_user())
+    """
+    Explore context around a fact.
+    Returns neighboring facts formatted as Markdown.
+    """
+    neighbors = mem.db_get_neighborhood(factId, depth, relationshipTypes or [], _current_user())
+    if not neighbors:
+        return "_No connected facts found._"
+    return _format_facts_md(neighbors)
 
 @mcp.tool()
 async def update_fact(memoryId: str, title: Optional[str] = None, text: Optional[str] = None, category: Optional[str] = None):
@@ -97,8 +145,17 @@ async def delete_fact(factId: str):
 
 @mcp.tool()
 async def find_patterns():
-    """Discover recurring themes."""
-    return mem.db_find_patterns(_current_user())
+    """
+    Discover recurring themes across the knowledge graph.
+    Returns a Markdown-formatted list of patterns.
+    """
+    patterns = mem.db_find_patterns(_current_user())
+    if not patterns:
+        return "_No patterns found yet._"
+    lines = ["## Recurring Themes\n"]
+    for p in patterns:
+        lines.append(f"- **{p['pattern']}** — strength: `{p['strength']}`")
+    return "\n".join(lines)
 
 @mcp.tool()
 async def diary_save_entry(content: str, date: Optional[str] = None):
@@ -192,16 +249,14 @@ async def suggest_merge(cluster_json: str):
         user = _current_user()
         fetched = []
         for rid in records:
-            result = await mem.db_search_memories(rid, user, limit=1, top_p=0.0)
-            # db_search_memories returns a list; try to match by id
-            if isinstance(result, list):
-                match = next((m for m in result if isinstance(m, dict) and m.get("id") == rid), None)
-                if match:
-                    fetched.append(match)
-                elif result:
-                    fetched.append(result[0])
-            elif isinstance(result, dict):
+            result = mem.db_get_fact_by_id(rid, user)
+            if result:
                 fetched.append(result)
+            else:
+                # Fallback to search if not found by direct ID (might be in Qdrant but not Neo4j)
+                search_res = await mem.db_search_memories(rid, user, limit=1, top_p=0.0)
+                if search_res and isinstance(search_res, list):
+                    fetched.append(search_res[0])
         records = fetched
 
     analyzed = []
