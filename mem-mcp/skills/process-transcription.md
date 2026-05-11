@@ -1,6 +1,7 @@
 ---
 name: process-transcription
 description: Structured workflow for processing meeting transcriptions into the knowledge graph. Includes interactive human checkpoints for people resolution and fact-person assignment before writing anything to memory.
+context: fork
 ---
 
 ## When to Use This Skill
@@ -20,7 +21,8 @@ Use this skill when you have:
 - Apply stored corrections: `search_facts("correction")` → fix recurring misspellings of names and terms before proceeding.
 
 ### 2. Participant Extraction
-Scan for speaker labels and voice profile headers (e.g., "Speaker A: male, 40s"). Voice profiles are guidance only — use discussion content to verify speaker identity:
+Scan for speaker labels and voice profile headers (e.g., "[00:00:20] Shreekes Srinivas:"):
+- Voice profiles are guidance only — use discussion content to verify speaker identity:
 - Topic expertise (who would discuss this subject)
 - Questions asked vs. answers given
 - Demonstrated knowledge/perspective
