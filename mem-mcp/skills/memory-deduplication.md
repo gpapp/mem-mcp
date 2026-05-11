@@ -46,14 +46,40 @@ After a merge, verify the results:
 - Use `get_fact_neighborhood` on the Master ID to confirm the consolidated graph.
 - If the text needs further refinement, use `update_fact`.
 
-## Efficiency: Multi-Tool Execution
-Call `find_duplicates` first, then process all clusters: call `suggest_merge` for each cluster in the same response, read all results, write consolidated content for each, then execute all `merge_facts` calls together.
+## Troubleshooting: If No Duplicates are Found
 
-## Examples of "Duplicate" Patterns
-- **People**: "Kate" vs "Katarina" (same role/company).
-- **Projects**: "Project Phoenix" vs "Phoenix AGI Research".
-- **Concepts**: "Vector DB" vs "Vector Databases".
+If `find_duplicates` returns no clusters but you suspect there are duplicates:
 
-## Tips
-- **Human-in-the-Loop**: If a merge seems risky or data might be lost, STOP and ask the user for confirmation.
-- **Relationship Safety**: `merge_facts` automatically prevents duplicate edges. Do NOT manually re-link after a merge.
+### 1. Lower the Threshold
+Try a lower threshold (e.g., `0.5` or even `0.4`). This increases the sensitivity of the algorithm.
+```
+find_duplicates(category="People", threshold=0.5)
+```
+
+### 2. Perform Manual "Suspect" Searches
+If broad detection fails, search for specific names or terms that you suspect are duplicated.
+- **Tip**: Do NOT search for the category name (e.g., "people") as a query. Search for specific names or partial strings.
+- **Tool**: Use `search_facts(query="Matthias", category="People")`.
+- **Action**: If you find two items that look identical, manually create a cluster by taking their IDs and passing them to `suggest_merge(["id1", "id2"])`.
+
+### 3. Check Related Categories
+Sometimes facts are miscategorized. If you can't find a person in "People", check "General" or "Client".
+```
+find_duplicates(category="General", threshold=0.6)
+```
+
+## Advanced: Manual Clustering
+The `suggest_merge` tool can accept a JSON array of raw IDs. If you manually identify duplicates through search:
+1. Collect the IDs of the duplicates.
+2. Call `suggest_merge(cluster_json='["id1", "id2", "id3"]')`.
+3. Follow the normal merge workflow.
+
+## Verification: Post-Merge Cleanup
+1. **Check Relationships**: Use `get_fact_neighborhood` on the Master ID.
+2. **Delete Residuals**: If a merge left behind a redundant fact that wasn't part of the cluster, delete it manually.
+3. **Update Text**: Use `update_fact` to polish the final consolidated text if the LLM's merge was too verbose.
+
+## Tips for High-Quality Merges
+- **Preserve Aliases**: If one record uses a nickname and another a full name, add the nickname to the `aliases` metadata of the Master record.
+- **Date Check**: Look at `updatedAt` or `timestamp` to identify which record is the most recent (though "completeness" is usually a better guide for the Master).
+- **Confirm with User**: Always show the consolidated text to the user before calling `merge_facts` if there's any ambiguity.

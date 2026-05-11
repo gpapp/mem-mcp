@@ -843,44 +843,82 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
         logger.warning(f"No vectors found for {len(items)} items in Qdrant. Check sync.")
         return []
 
+    # Pre-calculate normalized names and metadata for all items to speed up N^2 loop
+    def normalize_name(name):
+        if not name: return ""
+        n = name.lower().strip()
+        if "," in n:
+            parts = [p.strip() for p in n.split(",")]
+            if len(parts) == 2: return f"{parts[1]} {parts[0]}"
+        return n
+
+    prepared = []
+    for item in items_with_vectors:
+        meta = item.get("metadata") or {}
+        prepared.append({
+            "id": item["id"],
+            "vec": np.array(vectors[item["id"]]),
+            "norm_name": normalize_name(item.get("title")),
+            "email": str(meta.get("email", "")).lower().strip(),
+            "first_name": str(meta.get("first_name", "")).lower().strip(),
+            "last_name": str(meta.get("last_name", "")).lower().strip(),
+            "aliases": [normalize_name(a) for a in meta.get("aliases", [])] if isinstance(meta.get("aliases"), list) else [],
+            "title": item.get("title", ""),
+            "metadata": meta
+        })
+
     # Compute all pairwise similarities once
-    num_items = len(items_with_vectors)
+    num_items = len(prepared)
     all_pairs = []
     for i in range(num_items):
+        p_i = prepared[i]
+        vec_i = p_i["vec"]
+        norm_vec_i = np.linalg.norm(vec_i)
+        if norm_vec_i == 0: continue
+
         for j in range(i + 1, num_items):
-            id_i = items_with_vectors[i]["id"]
-            id_j = items_with_vectors[j]["id"]
-            vec_i = np.array(vectors[id_i])
-            vec_j = np.array(vectors[id_j])
+            p_j = prepared[j]
+            vec_j = p_j["vec"]
+            norm_vec_j = np.linalg.norm(vec_j)
+            if norm_vec_j == 0: continue
+
+            # 1. Vector Similarity
+            similarity = np.dot(vec_i, vec_j) / (norm_vec_i * norm_vec_j)
+
+            # 2. Metadata & Title Boosts
+            # Direct match
+            if p_i["norm_name"] and p_j["norm_name"] and p_i["norm_name"] == p_j["norm_name"]:
+                similarity = 1.0
             
-            norm_i = np.linalg.norm(vec_i)
-            norm_j = np.linalg.norm(vec_j)
-            if norm_i == 0 or norm_j == 0:
-                continue
+            # Email match
+            elif p_i["email"] and p_j["email"] and p_i["email"] == p_j["email"]:
+                similarity = 1.0
 
-            similarity = np.dot(vec_i, vec_j) / (norm_i * norm_j)
+            # First + Last name match
+            elif p_i["first_name"] and p_i["last_name"] and p_j["first_name"] and p_j["last_name"]:
+                if p_i["first_name"] == p_j["first_name"] and p_i["last_name"] == p_j["last_name"]:
+                    similarity = 1.0
 
-            title_i = items_with_vectors[i].get("title")
-            title_j = items_with_vectors[j].get("title")
+            # Alias match
+            elif (p_j["norm_name"] in p_i["aliases"]) or (p_i["norm_name"] in p_j["aliases"]):
+                similarity = max(similarity, 0.95)
 
-            if title_i and title_j:
-                ti, tj = title_i.strip().lower(), title_j.strip().lower()
-                if ti == tj:
-                    similarity = max(similarity, 1.0)
-                else:
-                    ti_words = set(ti.split())
-                    tj_words = set(tj.split())
-                    common_words = ti_words.intersection(tj_words)
-
-                    if common_words:
-                        valid_common = [w for w in common_words if len(w) > 2 or category.strip().capitalize() == "People"]
-                        if valid_common:
-                            min_words = min(len(ti_words), len(tj_words))
-                            match_ratio = len(valid_common) / min_words if min_words > 0 else 0
-                            boost = 0.25 * match_ratio
-                            similarity = max(similarity + boost, 0.86 if match_ratio >= 1.0 else similarity + boost)
+            # 3. Word overlap boost
+            if similarity < 0.9 and p_i["title"] and p_j["title"]:
+                ti_words = set(p_i["norm_name"].split())
+                tj_words = set(p_j["norm_name"].split())
+                common = ti_words.intersection(tj_words)
+                if common:
+                    valid = [w for w in common if len(w) > 2 or category.strip().capitalize() == "People"]
+                    if valid:
+                        match_ratio = len(valid) / min(len(ti_words), len(tj_words))
+                        boost = 0.3 * match_ratio
+                        similarity = min(1.0, similarity + boost)
+                        if match_ratio >= 1.0: similarity = max(similarity, 0.88)
 
             all_pairs.append((i, j, float(similarity)))
+
+    logger.info(f"[db_find_duplicates] Calculated {len(all_pairs)} pairwise similarities for {num_items} items.")
 
     # Helper function to cluster at given threshold
     def cluster_at_threshold(thresh):
