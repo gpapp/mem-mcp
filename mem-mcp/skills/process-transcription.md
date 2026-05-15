@@ -220,11 +220,11 @@ Text:
 ```
 diary_search_entries("<meeting topic> <date>")
 ```
-- **New topic:** write a fresh entry.
-- **Existing entry, new info:** write a new entry labelled `[Updated] <topic>`.
-- **Unchanged:** skip entirely.
+- **No match:** write a fresh entry with `diary_save_entry(content, date)`.
+- **Match found, new info:** call `diary_save_entry` again with the **same `date`** and the **full updated content** (merge old + new — do not reference the old entry). The server overwrites the entry for that date.
+- **Match found, nothing new:** skip entirely.
 
-Each entry covers one meeting. Append-only — never overwrite.
+Each entry covers one meeting and one date. Re-saving with the same date replaces the existing entry.
 
 Content focus: **what the user did** — outcomes, decisions made, tasks assigned to the user. Not a processing log.
 
