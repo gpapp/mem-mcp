@@ -47,6 +47,7 @@
     /* ── Layout ── */
     .page { display: none; padding: 1.5rem; max-width: 1100px; margin: 0 auto; }
     .page.active { display: block; }
+    #page-memories { max-width: none; padding: .75rem 1rem; }
 
     /* ── Cards & forms ── */
     .card { background: var(--surface); border: 1px solid var(--border);
@@ -84,18 +85,51 @@
       margin-bottom: .5rem;
     }
     .memory-item {
-      display: flex; align-items: flex-start; gap: .75rem;
+      display: flex; align-items: center; gap: .5rem;
       background: var(--surface); border: 1px solid var(--border);
-      border-left: 3px solid var(--primary); border-radius: var(--radius);
-      padding: .75rem 1rem; margin-bottom: .5rem;
-      transition: box-shadow .15s;
+      border-left: 3px solid transparent; border-radius: 6px;
+      padding: .5rem .75rem; margin-bottom: .3rem;
+      cursor: pointer; transition: all .15s;
     }
-    .memory-item:hover { box-shadow: 0 2px 8px rgba(79,70,229,.1); }
+    .memory-item:hover { border-left-color: var(--primary); background: var(--primary-light); }
+    .memory-item.selected { border-left-color: var(--primary); background: var(--primary-light); }
+    .memory-item-title { flex: 1; font-size: .88rem; font-weight: 500; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .memory-item-cat { font-size: .7rem; color: var(--muted); background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: .1rem .35rem; flex-shrink: 0; }
     .memory-text { flex: 1; font-size: .9rem; line-height: 1.5; }
     .memory-meta { font-size: .75rem; color: var(--muted); margin-top: .2rem; }
     .memory-actions {
       display: flex; gap: .4rem; flex-shrink: 0;
     }
+
+    /* ── Fact Detail Pane ── */
+    .fact-pane {
+      display: flex; flex-direction: column; gap: 1rem;
+      overflow-y: auto;
+    }
+    .fact-pane-empty {
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      height: 100%; color: var(--muted); text-align: center; gap: .75rem;
+      padding: 2rem;
+    }
+    .fact-pane-empty h3 { margin: 0; font-size: 1rem; font-weight: 600; color: var(--text); }
+    .fact-pane-empty p { margin: 0; font-size: .85rem; }
+    .fact-detail-header {
+      display: flex; align-items: flex-start; justify-content: space-between; gap: .75rem;
+      padding-bottom: .75rem; border-bottom: 1px solid var(--border);
+    }
+    .fact-detail-title { font-size: 1.1rem; font-weight: 700; color: var(--primary); flex: 1; word-break: break-word; }
+    .fact-detail-cat { font-size: .75rem; color: var(--muted); background: var(--bg); border: 1px solid var(--border); border-radius: 5px; padding: .2rem .55rem; flex-shrink: 0; margin-top: .15rem; }
+    .fact-detail-body { font-size: .9rem; line-height: 1.6; }
+    .fact-detail-actions { display: flex; gap: .5rem; flex-wrap: wrap; }
+
+    /* in-place edit mode inside the fact pane */
+    .fact-edit-field { margin-bottom: .5rem; }
+    .fact-edit-field label { display: block; font-size: .75rem; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; margin-bottom: .2rem; }
+    .fact-edit-row { display: flex; gap: .5rem; }
+    .fact-edit-row > * { flex: 1; }
+
+    /* add-fact form inside the pane */
+    .add-fact-form { display: flex; flex-direction: column; gap: .65rem; }
     .tag-badge { display: inline-block; background: var(--primary-light); color: var(--primary); font-size: .7rem; font-weight: 600;
                 padding: .1rem .4rem; border-radius: 4px; margin-right: .3rem; margin-top: .4rem; }
 .link-badge { display: inline-flex; align-items: center; gap: 2px; background: #fffbeb; color: #b45309; border: 1px solid #fde68a; font-size: .7rem; font-weight: 600;
@@ -112,9 +146,11 @@
     .empty { color: var(--muted); font-size: .9rem; padding: 2rem 0; text-align: center; }
 
     /* ── Memories Page Layout ── */
-    .memories-layout { display: flex; gap: 1.5rem; }
-    .memories-sidebar { width: 220px; flex-shrink: 0; }
-    .memories-main { flex: 1; min-width: 0; }
+    .memories-layout { display: flex; gap: 1rem; height: calc(100vh - 140px); min-height: 500px; }
+    .memories-sidebar { width: 180px; flex-shrink: 0; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow-y: auto; }
+    .memories-list-col { width: 280px; flex-shrink: 0; display: flex; flex-direction: column; gap: .5rem; min-width: 0; }
+    .memories-list-scroll { flex: 1; overflow-y: auto; }
+    .memories-main { flex: 1; min-width: 0; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 1.25rem; overflow-y: auto; }
     
     .sidebar-list { list-style: none; padding: 0; margin: 0; }
     .sidebar-item { 
@@ -266,64 +302,67 @@
 <!-- ═══ MEMORIES PAGE ═══ -->
 <div id="page-memories" class="page active">
   <div class="memories-layout">
-    <!-- Sidebar -->
-    <div class="memories-sidebar">
-      <div class="card" style="padding: 1rem;">
-        <label>Categories</label>
-        <ul id="categories-sidebar" class="sidebar-list">
-          <li class="sidebar-item active" onclick="setCategory(null)">All Memories</li>
-        </ul>
-      </div>
+
+    <!-- Col 1: Categories -->
+    <div class="memories-sidebar" style="padding: .75rem .5rem;">
+      <div style="font-size:.7rem; font-weight:700; text-transform:uppercase; letter-spacing:.5px; color:var(--muted); padding:.25rem .5rem .6rem;">Categories</div>
+      <ul id="categories-sidebar" class="sidebar-list">
+        <li class="sidebar-item active" onclick="setCategory(null)">All <span class="count"></span></li>
+      </ul>
     </div>
 
-    <!-- Main Content -->
-    <div class="memories-main">
-      <div class="card" style="margin-bottom:1.25rem;">
-        <div style="display:flex; justify-content: space-between; align-items: center; margin-bottom:.75rem;">
-          <strong style="font-size:.95rem;">Add a new memory</strong>
-          <button class="btn btn-ghost btn-sm" onclick="toggleAddForm()">Toggle Form</button>
-        </div>
-        <div id="add-memory-form" class="form-row">
-          <div style="flex: 1.5;">
-            <label for="new-title">Title</label>
-            <input id="new-title" placeholder="Short title...">
-          </div>
-          <div style="flex: 2;">
-            <label for="new-text">Fact / Memory</label>
-            <textarea id="new-text" placeholder="e.g. I prefer dark mode editors" style="min-height:60px;"></textarea>
-          </div>
-          <div style="flex: 1;">
-            <label for="new-category">Category</label>
-            <input id="new-category" list="category-datalist" placeholder="e.g. Preferences" value="General">
-            <datalist id="category-datalist"></datalist>
-          </div>
-          <div style="flex: 1;">
-            <label for="new-tags">Tags (comma separated)</label>
-            <input id="new-tags" placeholder="tag1, tag2">
-          </div>
-          <div style="flex: 0;">
-            <label>&nbsp;</label>
-            <button class="btn btn-primary" onclick="addMemory()">＋ Add</button>
-          </div>
-        </div>
-      </div>
-
-      <div class="search-row">
-        <div class="search-input-wrapper">
-          <input type="text" id="search-query" class="search-input" placeholder="Search memories..." oninput="renderMemories()">
+    <!-- Col 2: Fact list -->
+    <div class="memories-list-col">
+      <div class="search-row" style="margin-bottom:0;">
+        <div class="search-input-wrapper" style="flex:1;">
+          <input type="text" id="search-query" class="search-input" placeholder="Search…" oninput="renderMemories()">
         </div>
         <select id="sort-order" class="sort-select" onchange="renderMemories()">
-          <option value="newest">Newest First</option>
-          <option value="oldest">Oldest First</option>
-          <option value="alphabetical">Alphabetical</option>
-          <option value="category">By Category</option>
+          <option value="newest">Newest</option>
+          <option value="oldest">Oldest</option>
+          <option value="alphabetical">A–Z</option>
+          <option value="category">Category</option>
         </select>
       </div>
-
-      <div id="alphabet-filter" class="alphabet-filter"></div>
-
-      <div id="memories-list"></div>
+      <div id="alphabet-filter" class="alphabet-filter" style="margin:.4rem 0;"></div>
+      <div id="memories-list" class="memories-list-scroll"></div>
     </div>
+
+    <!-- Col 3: Fact detail / add-fact pane -->
+    <div id="fact-pane" class="memories-main fact-pane">
+      <!-- Rendered by renderFactPane() -->
+      <div class="fact-pane-empty">
+        <h3>No fact selected</h3>
+        <p>Pick a fact from the list, or add a new one below.</p>
+        <div style="width:100%; margin-top:1rem;">
+          <div id="add-fact-inline" class="add-fact-form">
+            <div class="fact-edit-field">
+              <label for="new-title">Title</label>
+              <input id="new-title" placeholder="Short title…">
+            </div>
+            <div class="fact-edit-field">
+              <label for="new-text">Fact / Memory</label>
+              <textarea id="new-text" placeholder="e.g. I prefer dark mode editors" style="min-height:80px;"></textarea>
+            </div>
+            <div class="fact-edit-row">
+              <div class="fact-edit-field">
+                <label for="new-category">Category</label>
+                <input id="new-category" list="category-datalist" placeholder="General" value="General">
+                <datalist id="category-datalist"></datalist>
+              </div>
+              <div class="fact-edit-field">
+                <label for="new-tags">Tags</label>
+                <input id="new-tags" placeholder="tag1, tag2">
+              </div>
+            </div>
+            <div style="display:flex; justify-content:flex-end;">
+              <button class="btn btn-primary" onclick="addMemory()">＋ Add Fact</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
   </div>
 </div>
 
@@ -470,6 +509,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
       if (data.action === 'delete') {
         memories = memories.filter(m => m.id !== data.id);
         if (graphLoaded && network) graphData.nodes.remove(data.id);
+        if (selectedFactId === data.id) clearFactPane();
       } else {
         // For add/update/merge, fetch the specific item to get full metadata and links
         try {
@@ -486,6 +526,8 @@ npm install @modelcontextprotocol/sdk</code></pre>
               group: item.category
             });
           }
+          // Refresh detail pane if this fact is selected
+          if (selectedFactId === item.id) renderFactPane(item);
         } catch(err) { console.error("Failed to fetch updated memory", err); }
       }
       
@@ -505,6 +547,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
           const updatedSource = await api.get(`memories/${data.source_id}`);
           const idx = memories.findIndex(m => m.id === data.source_id);
           if (idx !== -1) { memories[idx] = updatedSource; renderMemories(); }
+          if (selectedFactId === data.source_id) renderFactPane(updatedSource);
         } catch(_) {}
       }
 
@@ -577,16 +620,16 @@ npm install @modelcontextprotocol/sdk</code></pre>
     const categories = Object.keys(counts).sort();
     
     el.innerHTML = `<li class="sidebar-item ${activeCategory === null ? 'active' : ''}" onclick="setCategory(null)">
-      All Memories <span class="count">${memories.length}</span>
+      All <span class="count">${memories.length}</span>
     </li>` + categories.map(cat => `
-      <li class="sidebar-item ${activeCategory === cat ? 'active' : ''}" onclick="setCategory('${cat}')">
-        ${cat} <span class="count">${counts[cat]}</span>
+      <li class="sidebar-item ${activeCategory === cat ? 'active' : ''}" onclick="setCategory('${escHtml(cat)}')">
+        ${escHtml(cat)} <span class="count">${counts[cat]}</span>
       </li>
     `).join('');
     
     // Also update datalist for add form
     const datalist = document.getElementById('category-datalist');
-    datalist.innerHTML = categories.map(cat => `<option value="${cat}">`).join('');
+    if (datalist) datalist.innerHTML = categories.map(cat => `<option value="${escHtml(cat)}">`).join('');
   }
 
   function setCategory(cat) {
@@ -625,11 +668,6 @@ npm install @modelcontextprotocol/sdk</code></pre>
     renderMemories();
   }
 
-  function toggleAddForm() {
-    const form = document.getElementById('add-memory-form');
-    form.style.display = form.style.display === 'none' ? 'flex' : 'none';
-  }
-
   function renderMemories() {
     const el = document.getElementById('memories-list');
     const query = document.getElementById('search-query').value.toLowerCase();
@@ -644,7 +682,6 @@ npm install @modelcontextprotocol/sdk</code></pre>
       return matchCat && matchQuery && matchLetter;
     });
 
-    // Sorting
     const sortKey = m => (m.title || m.text || '').toLowerCase();
     filtered.sort((a, b) => {
       if (sort === 'newest') return (b.id || "").localeCompare(a.id || "");
@@ -654,89 +691,212 @@ npm install @modelcontextprotocol/sdk</code></pre>
       return 0;
     });
 
-    if (!filtered.length) { el.innerHTML = '<p class="empty">No matching memories found.</p>'; return; }
-    
-    const groups = {};
-    // Only group by category if sorting by category
+    if (!filtered.length) { el.innerHTML = '<p class="empty">No matching memories.</p>'; return; }
+
     if (sort === 'category') {
+      const groups = {};
       filtered.forEach(m => { (groups[m.category] = groups[m.category] || []).push(m); });
       el.innerHTML = Object.keys(groups).sort().map(cat => `
-        <div class="category-header">${cat}</div>
-        ${groups[cat].map(m => renderMemoryItem(m)).join('')}
+        <div class="category-header">${escHtml(cat)}</div>
+        ${groups[cat].map(m => renderMemoryListItem(m)).join('')}
       `).join('');
     } else {
-      el.innerHTML = filtered.map(m => renderMemoryItem(m)).join('');
+      el.innerHTML = filtered.map(m => renderMemoryListItem(m)).join('');
     }
   }
 
-  function renderMemoryItem(m) {
+  /* Compact list row — clicking selects the fact into the detail pane */
+  function renderMemoryListItem(m) {
+    const selected = selectedFactId === m.id ? ' selected' : '';
+    return `<div class="memory-item${selected}" id="mem-${m.id}" onclick="selectFact('${m.id}')">
+      <span class="memory-item-title">${escHtml(m.title || m.text || 'Untitled')}</span>
+      <span class="memory-item-cat">${escHtml(m.category)}</span>
+    </div>`;
+  }
+
+  /* ── Fact Detail Pane ── */
+  let selectedFactId = null;
+
+  function selectFact(id) {
+    selectedFactId = id;
+    // Update selected highlight in list
+    document.querySelectorAll('#memories-list .memory-item').forEach(el => {
+      el.classList.toggle('selected', el.id === 'mem-' + id);
+    });
+    const m = memories.find(x => x.id === id);
+    if (m) renderFactPane(m);
+  }
+
+  function clearFactPane() {
+    selectedFactId = null;
+    document.querySelectorAll('#memories-list .memory-item').forEach(el => el.classList.remove('selected'));
+    const pane = document.getElementById('fact-pane');
+    pane.innerHTML = `
+      <div class="fact-pane-empty">
+        <h3>No fact selected</h3>
+        <p>Pick a fact from the list, or add a new one below.</p>
+        <div style="width:100%; margin-top:1rem;">
+          <div id="add-fact-inline" class="add-fact-form">
+            <div class="fact-edit-field">
+              <label for="new-title">Title</label>
+              <input id="new-title" placeholder="Short title…">
+            </div>
+            <div class="fact-edit-field">
+              <label for="new-text">Fact / Memory</label>
+              <textarea id="new-text" placeholder="e.g. I prefer dark mode editors" style="min-height:80px;"></textarea>
+            </div>
+            <div class="fact-edit-row">
+              <div class="fact-edit-field">
+                <label for="new-category">Category</label>
+                <input id="new-category" list="category-datalist" placeholder="General" value="General">
+                <datalist id="category-datalist"></datalist>
+              </div>
+              <div class="fact-edit-field">
+                <label for="new-tags">Tags</label>
+                <input id="new-tags" placeholder="tag1, tag2">
+              </div>
+            </div>
+            <div style="display:flex; justify-content:flex-end;">
+              <button class="btn btn-primary" onclick="addMemory()">＋ Add Fact</button>
+            </div>
+          </div>
+        </div>
+      </div>`;
+    // Repopulate datalist
+    renderCategorySidebar();
+  }
+
+  function renderFactPane(m, editMode = false) {
     const tags = (m.metadata && m.metadata.tags) || [];
-    return `
-    <div class="memory-item" id="mem-${m.id}">
-      <div class="memory-text">
-        <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom: 0.5rem;">
-          <strong style="color:var(--primary);">${escHtml(m.title || 'Fact')}</strong>
-        </div>
-        <div id="mem-text-${m.id}" class="markdown-body">${marked.parse(m.text)}</div>
-        <div class="memory-meta">
-          ${tags.map(t => `<span class="tag-badge">#${t}</span>`).join('')}
-          ${(m.links || []).map(l => `
-            <span class="link-badge" id="link-badge-${m.id}-${l.target_id}">
-              <span class="link-content" onclick="jumpToMemory('${l.target_id}')" style="cursor:pointer;">🔗 ${l.rel} &rarr; ${escHtml(l.target_title || l.target_text.substring(0, 30))}</span>
-              <button class="link-action-btn" onclick="showLinkEdit('${m.id}', '${l.target_id}', '${escHtml(l.rel)}', '${escHtml(l.target_title || l.target_text.substring(0, 30))}')" title="Edit link">✏️</button>
-              <button class="link-action-btn" onclick="deleteLink('${m.id}', '${l.target_id}', '${l.rel}')" title="Delete link">🗑️</button>
-            </span>
-          `).join('')}
-        </div>
-        <div class="edit-form" id="edit-form-${m.id}" style="display:none; flex-direction:column; gap:0.5rem; width:100%;">
-          <input id="edit-title-${m.id}" value="${escHtml(m.title || '')}" placeholder="Title...">
-          <textarea id="edit-text-${m.id}" style="min-height:80px;">${escHtml(m.text)}</textarea>
-          <div style="display:flex; gap:0.5rem;">
-            <input id="edit-cat-${m.id}" value="${escHtml(m.category)}" style="flex:1;">
-            <input id="edit-tags-${m.id}" value="${escHtml(tags.join(', '))}" placeholder="tags…" style="flex:1;">
+    const pane = document.getElementById('fact-pane');
+
+    if (editMode) {
+      pane.innerHTML = `
+        <div>
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1rem; padding-bottom:.75rem; border-bottom:1px solid var(--border);">
+            <span style="font-size:.8rem; font-weight:700; text-transform:uppercase; color:var(--muted); letter-spacing:.5px;">Editing Fact</span>
+            <button class="btn btn-ghost btn-sm" onclick="clearFactPane()">✕ Close</button>
           </div>
-          <div style="display:flex; gap:0.5rem; justify-content:flex-end;">
-            <button class="btn btn-ghost btn-sm" onclick="cancelEdit('${m.id}')">Cancel</button>
-            <button class="btn btn-primary btn-sm" onclick="saveEdit('${m.id}')">Save</button>
+          <div class="add-fact-form">
+            <div class="fact-edit-field">
+              <label for="ep-title">Title</label>
+              <input id="ep-title" value="${escHtml(m.title || '')}">
+            </div>
+            <div class="fact-edit-field">
+              <label for="ep-text">Fact / Memory</label>
+              <textarea id="ep-text" style="min-height:120px;">${escHtml(m.text)}</textarea>
+            </div>
+            <div class="fact-edit-row">
+              <div class="fact-edit-field">
+                <label for="ep-cat">Category</label>
+                <input id="ep-cat" value="${escHtml(m.category)}">
+              </div>
+              <div class="fact-edit-field">
+                <label for="ep-tags">Tags</label>
+                <input id="ep-tags" value="${escHtml(tags.join(', '))}">
+              </div>
+            </div>
+            <div style="display:flex; gap:.5rem; justify-content:flex-end;">
+              <button class="btn btn-ghost btn-sm" onclick="renderFactPane(memories.find(x=>x.id==='${m.id}'))">Cancel</button>
+              <button class="btn btn-primary btn-sm" onclick="saveFactEdit('${m.id}')">Save</button>
+            </div>
           </div>
         </div>
-        <div class="link-form" id="link-form-${m.id}" style="display:none; flex-direction:column; gap:0.5rem; width:100%; margin-top:0.5rem; padding: 0.5rem; background: var(--bg); border-radius: 4px; border: 1px solid var(--border);">
-          <div style="font-size: 0.8rem; font-weight: 600;">Link to another memory</div>
-          <select id="link-target-${m.id}" style="width: 100%; padding: 0.4rem; border: 1px solid var(--border); border-radius: 4px;">
-             ${memories.filter(x => x.id !== m.id).map(x => `<option value="${x.id}">${escHtml(x.title || (x.text ? x.text.substring(0, 40) : 'Unnamed'))}</option>`).join('')}
+        <div id="ep-link-section">
+          ${renderLinkSection(m)}
+        </div>`;
+    } else {
+      pane.innerHTML = `
+        <div>
+          <div class="fact-detail-header">
+            <div>
+              <div class="fact-detail-title">${escHtml(m.title || 'Untitled')}</div>
+              <span class="fact-detail-cat">${escHtml(m.category)}</span>
+            </div>
+            <button class="btn btn-ghost btn-sm" onclick="clearFactPane()" style="flex-shrink:0;" title="Close">✕</button>
+          </div>
+          <div class="fact-detail-body markdown-body" style="margin:.75rem 0;">${marked.parse(m.text)}</div>
+          <div class="memory-meta" style="margin-bottom:.75rem;">
+            ${tags.map(t => `<span class="tag-badge">#${escHtml(t)}</span>`).join('')}
+          </div>
+          <div class="fact-detail-actions">
+            <button class="btn btn-ghost btn-sm" onclick="startFactEdit('${m.id}')">✏️ Edit</button>
+            <button class="btn btn-ghost btn-sm" onclick="openInGraph('${m.id}')">🕸️ Graph</button>
+            <button class="btn btn-ghost btn-sm" onclick="showOnMap('${m.id}')">📍 Map</button>
+            <button class="btn btn-ghost btn-sm" onclick="togglePaneLinkForm('${m.id}')">🔗 Link</button>
+            <button class="btn btn-danger btn-sm" onclick="deleteMemory('${m.id}')">🗑️ Delete</button>
+          </div>
+        </div>
+        <div id="ep-link-section">
+          ${renderLinkSection(m)}
+        </div>
+        <div id="pane-link-form-${m.id}" style="display:none; flex-direction:column; gap:.5rem; padding:.75rem; background:var(--bg); border-radius:6px; border:1px solid var(--border);">
+          <div style="font-size:.8rem; font-weight:600; color:var(--muted);">Link to another memory</div>
+          <select id="pane-link-target-${m.id}" style="width:100%;">
+            ${memories.filter(x => x.id !== m.id).map(x => `<option value="${x.id}">${escHtml(x.title || x.text.substring(0,50))}</option>`).join('')}
           </select>
-          <input id="link-rel-${m.id}" placeholder="Relationship type (e.g. KNOWS, WORKS_ON)" style="width: 100%; padding: 0.4rem; border: 1px solid var(--border); border-radius: 4px;">
-          <div style="display:flex; gap:0.5rem; justify-content:flex-end;">
-            <button class="btn btn-ghost btn-sm" onclick="cancelLink('${m.id}')">Cancel</button>
-            <button class="btn btn-primary btn-sm" onclick="saveLink('${m.id}')">Link</button>
+          <input id="pane-link-rel-${m.id}" placeholder="Relationship type (e.g. KNOWS)">
+          <div style="display:flex; gap:.5rem; justify-content:flex-end;">
+            <button class="btn btn-ghost btn-sm" onclick="document.getElementById('pane-link-form-${m.id}').style.display='none'">Cancel</button>
+            <button class="btn btn-primary btn-sm" onclick="savePaneLink('${m.id}')">Link</button>
           </div>
-        </div>
-      </div>
-      <div class="memory-actions">
-        <button class="btn map-btn btn-sm" id="map-btn-${m.id}" onclick="showOnMap('${m.id}')" title="Show on map">📍</button>
-        <button class="btn btn-ghost btn-sm" onclick="openInGraph('${m.id}')" title="View in Graph">🕸️</button>
-        <button class="btn btn-ghost btn-sm" id="link-btn-${m.id}" onclick="startLink('${m.id}')" title="Link Memory">🔗</button>
-        <button class="btn btn-ghost btn-sm" id="edit-btn-${m.id}" onclick="startEdit('${m.id}')" title="Edit Memory">✏️</button>
-        <button class="btn btn-danger btn-sm" onclick="deleteMemory('${m.id}')" title="Delete Memory">🗑️</button>
+        </div>`;
+    }
+  }
+
+  function renderLinkSection(m) {
+    if (!m.links || !m.links.length) return '';
+    return `<div style="margin-top:.5rem;">
+      <div style="font-size:.75rem; font-weight:700; text-transform:uppercase; color:var(--muted); letter-spacing:.5px; margin-bottom:.4rem;">Links</div>
+      <div>
+        ${m.links.map(l => `
+          <span class="link-badge" id="link-badge-${m.id}-${l.target_id}">
+            <span class="link-content" onclick="selectFact('${l.target_id}')" style="cursor:pointer;">🔗 ${escHtml(l.rel)} → ${escHtml(l.target_title || l.target_text.substring(0,30))}</span>
+            <button class="link-action-btn" onclick="showLinkEdit('${m.id}','${l.target_id}','${escHtml(l.rel)}','${escHtml(l.target_title||l.target_text.substring(0,30))}')" title="Edit">✏️</button>
+            <button class="link-action-btn" onclick="deleteLink('${m.id}','${l.target_id}','${l.rel}')" title="Delete">🗑️</button>
+          </span>
+        `).join('')}
       </div>
     </div>`;
   }
 
-  function startEdit(id) { document.getElementById('edit-form-' + id).style.display = 'flex'; document.getElementById('edit-btn-' + id).style.display = 'none'; cancelLink(id); }
-  function cancelEdit(id) { document.getElementById('edit-form-' + id).style.display = 'none'; document.getElementById('edit-btn-' + id).style.display = ''; }
+  function startFactEdit(id) {
+    const m = memories.find(x => x.id === id);
+    if (m) renderFactPane(m, true);
+  }
 
-  function startLink(id) { document.getElementById('link-form-' + id).style.display = 'flex'; document.getElementById('link-btn-' + id).style.display = 'none'; cancelEdit(id); }
-  function cancelLink(id) { document.getElementById('link-form-' + id).style.display = 'none'; document.getElementById('link-btn-' + id).style.display = ''; }
+  async function saveFactEdit(id) {
+    const title = document.getElementById('ep-title').value.trim();
+    const text  = document.getElementById('ep-text').value.trim();
+    const cat   = document.getElementById('ep-cat').value.trim() || 'General';
+    const tags  = document.getElementById('ep-tags').value.trim();
+    if (!text) return;
+    try {
+      const updated = await api.put('memories/' + id, {title, text, category: cat, tags});
+      const m = memories.find(x => x.id === id);
+      if (m) { m.title = updated.title; m.text = updated.text; m.category = updated.category; m.metadata = updated.metadata; }
+      renderMemories();
+      renderCategorySidebar();
+      renderFactPane(memories.find(x => x.id === id));
+      toast('✅ Updated');
+    } catch(e) { toast('❌ Failed'); }
+  }
 
-  async function saveLink(id) {
-    const targetId = document.getElementById('link-target-' + id).value;
-    const relType = document.getElementById('link-rel-' + id).value.trim();
+  function togglePaneLinkForm(id) {
+    const el = document.getElementById('pane-link-form-' + id);
+    if (el) el.style.display = el.style.display === 'none' ? 'flex' : 'none';
+  }
+
+  async function savePaneLink(id) {
+    const targetId = document.getElementById('pane-link-target-' + id).value;
+    const relType  = document.getElementById('pane-link-rel-' + id).value.trim();
     if (!targetId || !relType) { toast('⚠️ Relationship type required'); return; }
     try {
-      await api.post('memories/link', {sourceId: id, targetId: targetId, relType: relType});
+      await api.post('memories/link', {sourceId: id, targetId, relType});
       toast('🔗 Linked');
-      cancelLink(id);
       await loadMemories();
+      const m = memories.find(x => x.id === id);
+      if (m) renderFactPane(m);
     } catch(e) { toast('❌ Error linking'); }
   }
 
@@ -745,11 +905,11 @@ npm install @modelcontextprotocol/sdk</code></pre>
     if (!badge) return;
     
     badge.innerHTML = `
-      <form class="link-edit-form" onsubmit="event.preventDefault(); saveLinkEdit('${sourceId}', '${targetId}', '${relType}')">
+      <form class="link-edit-form" onsubmit="event.preventDefault(); saveLinkEdit('${sourceId}', '${targetId}', '${escHtml(relType)}')">
         <input id="edit-rel-${sourceId}-${targetId}" value="${escHtml(relType)}" placeholder="Relationship">
         <button type="submit" title="Save" style="color: var(--success);">✓</button>
-        <button type="button" onclick="deleteLink('${sourceId}', '${targetId}', '${relType}')" title="Delete" style="color: var(--danger);">🗑️</button>
-        <button type="button" onclick="cancelLinkEdit('${sourceId}', '${targetId}', '${relType}', '${escHtml(targetLabel)}')" title="Cancel" style="color: var(--muted);">✕</button>
+        <button type="button" onclick="deleteLink('${sourceId}', '${targetId}', '${escHtml(relType)}')" title="Delete" style="color: var(--danger);">🗑️</button>
+        <button type="button" onclick="cancelLinkEdit('${sourceId}', '${targetId}', '${escHtml(relType)}', '${escHtml(targetLabel)}')" title="Cancel" style="color: var(--muted);">✕</button>
       </form>
     `;
   }
@@ -763,6 +923,8 @@ npm install @modelcontextprotocol/sdk</code></pre>
       await api.post('memories/link', {sourceId, targetId, relType: newRelType});
       toast('✅ Link updated');
       await loadMemories();
+      const m = memories.find(x => x.id === sourceId);
+      if (m && selectedFactId === sourceId) renderFactPane(m);
     } catch(e) { toast('❌ Error updating link'); }
   }
 
@@ -772,38 +934,30 @@ npm install @modelcontextprotocol/sdk</code></pre>
       await api.delete('memories/link', {sourceId, targetId, relType});
       toast('🗑️ Link deleted');
       await loadMemories();
+      const m = memories.find(x => x.id === sourceId);
+      if (m && selectedFactId === sourceId) renderFactPane(m);
     } catch(e) { toast('❌ Error deleting link'); }
   }
 
   function cancelLinkEdit(sourceId, targetId, relType, targetLabel) {
     const badge = document.getElementById('link-badge-' + sourceId + '-' + targetId);
     if (!badge) return;
-    
     badge.innerHTML = `
-      <span class="link-content" onclick="jumpToMemory('${targetId}')" style="cursor:pointer;">🔗 ${relType} &rarr; ${escHtml(targetLabel)}</span>
+      <span class="link-content" onclick="selectFact('${targetId}')" style="cursor:pointer;">🔗 ${escHtml(relType)} → ${escHtml(targetLabel)}</span>
       <button class="link-action-btn" onclick="showLinkEdit('${sourceId}', '${targetId}', '${escHtml(relType)}', '${escHtml(targetLabel)}')" title="Edit link">✏️</button>
-      <button class="link-action-btn" onclick="deleteLink('${sourceId}', '${targetId}', '${relType}')" title="Delete link">🗑️</button>
+      <button class="link-action-btn" onclick="deleteLink('${sourceId}', '${targetId}', '${escHtml(relType)}')" title="Delete link">🗑️</button>
     `;
   }
 
   function jumpToMemory(targetId) {
     switchTab('memories');
     const m = memories.find(x => x.id === targetId);
-    if (m && activeCategory !== null && activeCategory !== m.category) {
-      setCategory(null);
-    }
+    if (m && activeCategory !== null && activeCategory !== m.category) setCategory(null);
     document.getElementById('search-query').value = '';
+    activeLetterFilter = null;
     renderMemories();
-
-    setTimeout(() => {
-      const el = document.getElementById('mem-' + targetId);
-      if (el) {
-        el.scrollIntoView({behavior: 'smooth', block: 'center'});
-        el.style.transition = 'box-shadow 0.3s ease';
-        el.style.boxShadow = '0 0 0 3px var(--primary)';
-        setTimeout(() => el.style.boxShadow = 'none', 2000);
-      }
-    }, 150);
+    renderAlphabetFilter();
+    setTimeout(() => selectFact(targetId), 100);
   }
 
   async function openInGraph(id) {
@@ -811,32 +965,15 @@ npm install @modelcontextprotocol/sdk</code></pre>
     if (!graphLoaded) await loadGraph();
     if (network) {
       setTimeout(() => {
-        network.focus(id, {
-          scale: 1.5,
-          animation: { duration: 1000, easingFunction: 'easeInOutQuad' }
-        });
+        network.focus(id, { scale: 1.5, animation: { duration: 1000, easingFunction: 'easeInOutQuad' } });
         network.selectNodes([id]);
       }, 500);
     }
   }
 
   async function saveEdit(id) {
-    const title = document.getElementById('edit-title-' + id).value.trim();
-    const text = document.getElementById('edit-text-' + id).value.trim();
-    const cat  = document.getElementById('edit-cat-' + id).value.trim() || 'General';
-    const tags = document.getElementById('edit-tags-' + id).value.trim();
-    if (!text) return;
-    try {
-      const updated = await api.put('memories/' + id, {title, text, category: cat, tags});
-      const m = memories.find(x => x.id === id);
-      if (m) { 
-        m.title = updated.title;
-        m.text = updated.text; 
-        m.category = updated.category; 
-        m.metadata = updated.metadata; 
-      }
-      renderMemories(); toast('✅ Updated');
-    } catch(e) { toast('❌ Failed'); }
+    // Legacy shim — now handled by saveFactEdit
+    await saveFactEdit(id);
   }
 
   async function addMemory() {
@@ -847,20 +984,26 @@ npm install @modelcontextprotocol/sdk</code></pre>
     if (!text) return;
     try {
       const m = await api.post('memories', {title, text, category: cat, tags});
-      memories.push(m); 
+      memories.push(m);
       renderCategorySidebar();
       renderMemories();
-      document.getElementById('new-title').value = ''; 
-      document.getElementById('new-text').value = ''; 
-      document.getElementById('new-tags').value = '';
+      renderAlphabetFilter();
+      // Select the newly created fact in the detail pane
+      setTimeout(() => selectFact(m.id), 50);
       toast('✅ Saved');
     } catch(e) { toast('❌ Error'); }
   }
 
   async function deleteMemory(id) {
     if (!confirm('Delete?')) return;
-    try { await api.delete('memories/' + id); memories = memories.filter(m => m.id !== id); renderMemories(); toast('🗑️ Deleted'); }
-    catch(e) { toast('❌ Error'); }
+    try {
+      await api.delete('memories/' + id);
+      memories = memories.filter(m => m.id !== id);
+      if (selectedFactId === id) clearFactPane();
+      renderMemories();
+      renderCategorySidebar();
+      toast('🗑️ Deleted');
+    } catch(e) { toast('❌ Error'); }
   }
 
   async function loadDiary() {
@@ -1164,159 +1307,6 @@ npm install @modelcontextprotocol/sdk</code></pre>
     } else {
       statusEl.innerHTML = '';
     }
-  }
-
-  async function showOnMap(id) {
-    switchTab('graph');
-    
-    if (!isBuildMode) {
-      openInGraph(id);
-      return;
-    }
-    
-    if (!graphLoaded) {
-      await loadGraph();
-    }
-    
-    if (buildGraphNodes.has(id)) {
-      if (network) {
-        network.focus(id, { scale: 1.5, animation: { duration: 1000, easingFunction: 'easeInOutQuad' } });
-        network.selectNodes([id]);
-      }
-      toast('Node already on map');
-      return;
-    }
-    
-    try {
-      const focusData = await api.get('graph/focus/' + id);
-      
-      buildGraphNodes.add(focusData.center.id);
-      
-      const newNodes = [];
-      for (const node of focusData.nodes) {
-        if (!buildGraphNodes.has(node.id)) {
-          buildGraphNodes.add(node.id);
-          newNodes.push({
-            id: node.id,
-            label: truncateText(node.title, 20),
-            title: node.title,
-            group: node.category,
-            shape: 'dot',
-            size: 10,
-            font: { size: 12, face: 'Inter' }
-          });
-        }
-      }
-      
-      if (graphData.nodes && newNodes.length > 0) {
-        graphData.nodes.add(newNodes);
-      }
-      
-      const connData = await api.get('graph/connections/' + id);
-      
-      for (const [relType, connections] of Object.entries(connData)) {
-        for (const conn of connections) {
-          const edgeKey = id + '|' + conn.id + '|' + relType;
-          const reverseKey = conn.id + '|' + id + '|' + relType;
-          
-          if (!buildGraphEdges.has(edgeKey) && !buildGraphEdges.has(reverseKey)) {
-            buildGraphEdges.add(edgeKey);
-            
-            if (graphData.edges) {
-              graphData.edges.add({
-                from: id,
-                to: conn.id,
-                label: relType,
-                font: { size: 10, align: 'middle' },
-                arrows: 'to',
-                color: { color: '#e5e7eb', highlight: '#4f46e5' }
-              });
-            }
-          }
-        }
-      }
-      
-      updateBuildStatus();
-      
-      setTimeout(() => {
-        if (network) {
-          network.focus(id, { scale: 1.5, animation: { duration: 1000, easingFunction: 'easeInOutQuad' } });
-          network.selectNodes([id]);
-        }
-      }, 300);
-      
-      toast('📍 Added to map');
-    } catch(e) {
-      toast('⚠️ Error loading node');
-    }
-  }
-
-  async function showContextMenu(event, nodeId) {
-    document.querySelectorAll('.context-menu').forEach(el => el.remove());
-    
-    let menuHTML = `
-      <div class="context-menu" style="left: ${event.clientX}px; top: ${event.clientY}px;">
-        <div class="context-menu-item" onclick="goToFact('${nodeId}')">
-          📋 Go to fact
-        </div>
-    `;
-    
-    if (isBuildMode) {
-      const connections = await api.get('graph/connections/' + nodeId);
-      const relTypes = Object.keys(connections);
-      
-      let submenuHTML = '';
-      if (relTypes.length > 0) {
-        submenuHTML = `
-          <div class="submenu">
-            <div class="context-menu-item submenu-trigger" onclick="event.stopPropagation()">
-              Show connection...
-            </div>
-            <div class="submenu-items">
-              ${relTypes.map(rel => `
-                <div class="submenu-item" onclick="showConnectionType('${nodeId}', '${rel}')">
-                  <span class="rel-badge">${rel}</span>
-                </div>
-              `).join('')}
-            </div>
-          </div>
-        `;
-      } else {
-        submenuHTML = `
-          <div class="context-menu-item disabled">
-            Show connection... (none)
-          </div>
-        `;
-      }
-      
-      menuHTML += `
-        <div class="context-menu-item" onclick="showAllConnected('${nodeId}')">
-          🔗 Show all connected
-        </div>
-        <div class="context-menu-separator"></div>
-        ${submenuHTML}
-        <div class="context-menu-separator"></div>
-        <div class="context-menu-item" onclick="removeNodeFromBuild('${nodeId}')" style="color: var(--danger);">
-          🗑️ Remove from graph
-        </div>
-      `;
-    } else {
-      menuHTML += `
-        <div class="context-menu-item" onclick="addToBuildGraph('${nodeId}')">
-          🕸️ Build graph
-        </div>
-      `;
-    }
-    
-    menuHTML += '</div>';
-    
-    document.body.insertAdjacentHTML('beforeend', menuHTML);
-    
-    document.addEventListener('click', hideContextMenu, { once: true });
-  }
-
-  function hideContextMenu() {
-    document.querySelectorAll('.context-menu').forEach(el => el.remove());
   }
 
 async function addToBuildGraph(nodeId) {
