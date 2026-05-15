@@ -220,11 +220,12 @@ Text:
 ```
 diary_search_entries("<meeting topic> <date>")
 ```
-- **No match:** write a fresh entry with `diary_save_entry(content, date)`.
-- **Match found, new info:** call `diary_save_entry` again with the **same `date`** and the **full updated content** (merge old + new — do not reference the old entry). The server overwrites the entry for that date.
+- **No match:** write a fresh entry with `diary_save_entry(content, timestamp="YYYY-MM-DDTHH:MM:SS")`.
+  Use the meeting's start time as the timestamp (ISO-8601, e.g. `2026-05-15T10:00:00`).
+- **Match found, new info:** call `diary_save_entry` again with the **same `timestamp`** and the **full updated content** (merge old + new). The server replaces the existing entry for that timestamp.
 - **Match found, nothing new:** skip entirely.
 
-Each entry covers one meeting and one date. Re-saving with the same date replaces the existing entry.
+Each entry covers one meeting. Re-saving with the same timestamp replaces the existing entry — there is always exactly one entry per meeting.
 
 Content focus: **what the user did** — outcomes, decisions made, tasks assigned to the user. Not a processing log.
 

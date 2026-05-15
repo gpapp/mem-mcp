@@ -40,7 +40,7 @@ CORE TASKS:
 5. Deduplication: Merge new information into existing facts using 'update_fact' instead of creating duplicates.
 6. Ambiguity & Aliases: If a name is ambiguous or confidence is low, STOP and ask the user for clarification. Create an 'aliases' dictionary with confidences for mispronunciations or first names, and add it to the metadata and markdown text.
 7. Save key facts and links.
-8. Log the summary in the diary using 'diary_save_entry'.
+8. Log the summary in the diary using 'diary_save_entry' with the meeting's start time as the timestamp (ISO-8601, e.g. '2026-05-15T10:00:00'). Re-saving with the same timestamp replaces the existing entry, so use the original timestamp to update rather than duplicate.
 9. PERFORMANCE: Batch multiple 'create_fact' and 'link_facts' calls into a single response for maximum efficiency.
 TRANSCRIPTION CONTENT:
 {transcription_text}

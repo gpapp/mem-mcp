@@ -1214,41 +1214,48 @@ async def db_merge_memories(master_id: str, duplicate_ids: List[str], user_id: s
 # Diary helpers
 # ---------------------------------------------------------------------------
 
-def _diary_id(user_id: str, entry_date: str) -> str:
-    return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"diary_{user_id}_{entry_date}"))
+def _diary_id(user_id: str, timestamp: str) -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"diary_{user_id}_{timestamp}"))
 
 
-async def db_save_diary(content: str, user_id: str, date: Optional[str] = None) -> str:
-    """Save a diary entry (allows multiple entries per day). Returns the entry date string."""
+async def db_save_diary(content: str, user_id: str, timestamp: Optional[str] = None) -> str:
+    """Upsert a diary entry keyed by user + timestamp. Returns the ISO timestamp string.
+
+    Passing the same timestamp a second time replaces the existing entry (content + vector),
+    so callers can update an entry by re-saving with the original timestamp.
+    """
     qdrant = await get_qdrant()
     neo4j_driver = get_neo4j()
     if not qdrant or not neo4j_driver:
         raise RuntimeError("Database connections not established.")
 
-    entry_date = date if date else datetime.now().strftime("%Y-%m-%d")
-    doc_id     = str(uuid.uuid4())
-    vector     = await get_embedding(content)
+    entry_ts = timestamp if timestamp else datetime.now().isoformat(timespec="seconds")
+    # Derive a stable ID from user + timestamp so the same timestamp always maps to the same node
+    doc_id   = _diary_id(user_id, entry_ts)
+    # Keep a plain date string for display / grouping purposes
+    entry_date = entry_ts[:10]
+    vector   = await get_embedding(content)
 
-    # Qdrant
+    # Qdrant — upsert by the stable doc_id so re-saving replaces the vector
     await qdrant.upsert(
         collection_name=DIARY_COLLECTION,
         points=[PointStruct(
             id=doc_id,
             vector=vector,
-            payload={"content": content, "date": entry_date, "userId": user_id},
+            payload={"content": content, "date": entry_date, "timestamp": entry_ts, "userId": user_id},
         )],
     )
 
-    # Neo4j
+    # Neo4j — MERGE on id so re-saving the same timestamp updates content in-place
     with neo4j_driver.session() as s:
         s.run(
             """
             MERGE (u:User {id: $userId})
-            CREATE (d:DiaryEntry {id: $id, date: $date, content: $content, 
-                                 userId: $userId, timestamp: datetime()})
+            MERGE (d:DiaryEntry {id: $id, userId: $userId})
+            SET d.date = $date, d.timestamp = $timestamp, d.content = $content
             MERGE (u)-[:WROTE_DIARY]->(d)
             """,
-            userId=user_id, date=entry_date, content=content, id=doc_id
+            userId=user_id, id=doc_id, date=entry_date, timestamp=entry_ts, content=content
         )
 
         # Automatic linking to People and Client facts
@@ -1294,9 +1301,10 @@ async def db_save_diary(content: str, user_id: str, date: Optional[str] = None) 
     await publish_db_event(user_id, "diary_changed", {
         "action": "add",
         "id": doc_id,
-        "date": entry_date
+        "date": entry_date,
+        "timestamp": entry_ts
     })
-    return entry_date
+    return entry_ts
 
 
 async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float = 0.4) -> list:
@@ -1320,23 +1328,24 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
     entries = []
     for r in result.points:
         date = r.payload.get("date")
+        entry_ts = r.payload.get("timestamp", date)
         content = r.payload.get("content")
         
-        # Enrich with mentions from Neo4j
+        # Enrich with mentions from Neo4j — match by stable entry id
         mentions = []
         with neo4j_driver.session() as s:
             m_res = s.run(
-                "MATCH (d:DiaryEntry {date: $date, userId: $userId})-[:MENTIONS]->(f:Fact) RETURN f.id as id, f.text as text",
-                date=date, userId=user_id
+                "MATCH (d:DiaryEntry {id: $id, userId: $userId})-[:MENTIONS]->(f:Fact) RETURN f.id as id, f.text as text",
+                id=str(r.id), userId=user_id
             )
             mentions = [{"id": mr["id"], "text": mr["text"]} for mr in m_res]
             
         entries.append({
             "id": r.id,
             "date": date,
+            "timestamp": entry_ts,
             "content": content,
             "score": r.score,
-            "timestamp": None, # Qdrant payload doesn't have it yet, we could fetch from Neo4j if needed
             "mentions": mentions
         })
     return entries

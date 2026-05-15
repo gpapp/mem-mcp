@@ -150,7 +150,7 @@ class MemoryLink(BaseModel):
 
 class DiaryCreate(BaseModel):
     content: str
-    date: Optional[str] = None
+    timestamp: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -419,8 +419,8 @@ async def api_get_connections(request: Request, fact_id: str):
 @web_app.post("/api/diary", response_class=JSONResponse, status_code=201)
 async def api_save_diary(request: Request, body: DiaryCreate):
     try:
-        entry_date = await mem.db_save_diary(body.content, _require_user(request), body.date)
-        return {"date": entry_date, "content": body.content}
+        entry_ts = await mem.db_save_diary(body.content, _require_user(request), body.timestamp)
+        return {"timestamp": entry_ts, "content": body.content}
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 

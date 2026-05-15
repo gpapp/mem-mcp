@@ -158,10 +158,16 @@ async def find_patterns():
     return "\n".join(lines)
 
 @mcp.tool()
-async def diary_save_entry(content: str, date: Optional[str] = None):
-    """Save a diary entry."""
-    entry_date = await mem.db_save_diary(content, _current_user(), date)
-    return f"Saved for {entry_date}"
+async def diary_save_entry(content: str, timestamp: Optional[str] = None):
+    """Save or update a diary entry.
+
+    - timestamp: ISO-8601 datetime string (e.g. '2026-05-15T14:30:00'). Defaults to now.
+      Passing the same timestamp a second time **replaces** the existing entry, so you
+      can update an entry by re-saving with its original timestamp.
+    - Returns the timestamp string that identifies the entry.
+    """
+    entry_ts = await mem.db_save_diary(content, _current_user(), timestamp)
+    return f"Saved for {entry_ts}"
 
 @mcp.tool()
 async def diary_search_entries(query: str, limit: int = 3, top_p: float = 0.4):
