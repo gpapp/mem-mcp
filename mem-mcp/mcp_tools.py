@@ -234,26 +234,6 @@ async def merge_facts(masterId: str, duplicateIds: List[str], mergedTitle: str, 
     return f"Successfully merged {len(duplicateIds)} facts into {masterId}"
 
 @mcp.tool()
-async def transcription_cleanup(text: str, participants: Optional[List[str]] = None):
-    """
-    Prepare a raw transcription for cleanup by the client.
-    Returns the text with metadata and instructions — the client performs the actual cleanup.
-    """
-    return {
-        "raw_transcription": text,
-        "known_participants": participants or [],
-        "word_count": len(text.split()),
-        "char_count": len(text),
-        "instructions": (
-            "Clean up this transcription:\n"
-            "1. Assign '[Speaker Name]:' labels — use known_participants or infer from context\n"
-            "2. Remove filler words: um, uh, like, you know, sort of\n"
-            "3. Fix obvious transcription errors and incomplete sentences\n"
-            "4. Preserve all meaningful content verbatim"
-        ),
-    }
-
-@mcp.tool()
 async def suggest_merge(cluster_json: str):
     """
     Analyze a cluster of potential duplicates and return a structured comparison
@@ -343,32 +323,6 @@ async def get_skill_workflow(skillName: str):
         return f"Skill '{skillName}' not found."
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
-
-@mcp.tool()
-async def debug_client_capabilities(ctx: Context):
-    """
-    Log and return the client capabilities announced by the MCP client.
-    Use this to debug if sampling or other features are supported by the client.
-    """
-    try:
-        # Access client information from the context
-        if hasattr(ctx, "request_context"):
-            client_info = getattr(ctx.request_context, "client_capabilities", None)
-            info_name = getattr(ctx.request_context.session.client_params, "client_info", "Unknown") if hasattr(ctx.request_context, "session") else "Unknown"
-        else:
-            session = getattr(ctx, "session", None)
-            client_params = getattr(session, "client_params", None)
-            client_info = getattr(client_params, "capabilities", None)
-            info_name = getattr(client_params, "client_info", "Unknown")
-
-        return {
-            "client_name": str(info_name),
-            "supports_sampling": hasattr(client_info, "sampling") and getattr(client_info, "sampling") is not None,
-            "supports_roots": hasattr(client_info, "roots") and getattr(client_info, "roots") is not None,
-            "raw_capabilities": str(client_info)
-        }
-    except Exception as e:
-        return {"error": f"Error extracting capabilities: {e}"}
 
 
 # ---------------------------------------------------------------------------

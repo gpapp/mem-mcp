@@ -17,7 +17,7 @@ Use this skill when you have:
 
 ### 1. File and Metadata
 
-- Extract date/time from filename (pattern: `YYYY-MM-DD HH-MM-SS`)
+- Extract date/time from filename (pattern: `YYYY-MM-DD hh-mm-ss`) round it to the nearest 15 minutes.
 - Identify meeting title, topic, and context (internal/client/etc.)
 - Apply stored corrections: `search_facts("correction")` → fix recurring misspellings of names and terms before proceeding.
 
@@ -221,20 +221,21 @@ Text:
 diary_search_entries("<meeting topic> <date>")
 ```
 - **No match:** write a fresh entry with `diary_save_entry(content, timestamp="YYYY-MM-DDTHH:MM:SS")`.
-  Use the meeting's start time as the timestamp (ISO-8601, e.g. `2026-05-15T10:00:00`).
+  Use the meeting's start time as the timestamp rounded to the nearest 15 minutes.
+-(ISO-8601, e.g. `2026-05-15T10:00:00`).
 - **Match found, new info:** call `diary_save_entry` again with the **same `timestamp`** and the **full updated content** (merge old + new). The server replaces the existing entry for that timestamp.
 - **Match found, nothing new:** skip entirely.
 
 Each entry covers one meeting. Re-saving with the same timestamp replaces the existing entry — there is always exactly one entry per meeting.
 
-Content focus: **what the user did** — outcomes, decisions made, tasks assigned to the user. Not a processing log.
+Content focus: **what the user did** — outcomes, decisions made, tasks assigned to the user. Not a processing log, no smalltalk.
 
+Use the d
 **Uniform diary entry format** (always use this exact structure):
 
 ```markdown
-## [Meeting Title] — YYYY-MM-DD
-
 **Participants:** [Name (Role), Name (Role), ...]
+
 **Context:** [one-line summary of what this meeting was about]
 
 ### Decisions

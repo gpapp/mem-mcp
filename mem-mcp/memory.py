@@ -110,6 +110,7 @@ def get_neo4j():
                     s.run("CREATE INDEX fact_user_id_index IF NOT EXISTS FOR (f:Fact) ON (f.userId)")
                     s.run("CREATE INDEX fact_category_index IF NOT EXISTS FOR (f:Fact) ON (f.category)")
                     s.run("CREATE INDEX diary_date_index IF NOT EXISTS FOR (d:DiaryEntry) ON (d.date)")
+                    s.run("OPTIONAL MATCH (a)-[:MENTIONS]->(b) RETURN 1 LIMIT 0")
             except Exception as e:
                 logger.error(f"Neo4j init error: {e}")
     return _neo4j_driver
@@ -602,11 +603,13 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
             MATCH (f:Fact {userId: $userId})
             WHERE toLower(f.title) CONTAINS toLower($query_str)
                OR toLower(f.text) CONTAINS toLower($query_str)
+               OR any(alias IN keys(f.metadata.aliases) WHERE toLower(alias) CONTAINS toLower($query_str))
             """
         else:
             cypher = """
             MATCH (f:Fact {userId: $userId})
             WHERE toLower(f.title) CONTAINS toLower($query_str)
+               OR any(alias IN keys(f.metadata.aliases) WHERE toLower(alias) CONTAINS toLower($query_str))
             """
         if category:
             cypher += " AND toLower(f.category) = toLower($category)"
