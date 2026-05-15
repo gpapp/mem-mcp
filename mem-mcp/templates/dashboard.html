@@ -143,6 +143,9 @@
 
     .markdown-body { background: transparent !important; color: var(--text); }
     .markdown-body p:last-child { margin-bottom: 0; }
+    .markdown-body ul.task-list { list-style: none; padding-left: 0.25rem; }
+    .markdown-body ul.task-list li { display: flex; align-items: flex-start; gap: 0.4rem; margin: 0.25rem 0; }
+    .markdown-body ul.task-list li input[type="checkbox"] { margin-top: 0.2rem; flex-shrink: 0; accent-color: var(--primary); cursor: default; }
     .empty { color: var(--muted); font-size: .9rem; padding: 2rem 0; text-align: center; }
 
     /* ── Memories Page Layout ── */
@@ -467,6 +470,28 @@ npm install @modelcontextprotocol/sdk</code></pre>
 <div id="toast"></div>
 
 <script>
+  // Configure marked: GFM task-list items rendered as real checkboxes (marked v5+/v18 API)
+  marked.use({
+    gfm: true,
+    renderer: {
+      listitem(token) {
+        const body = this.parser.parseInline(token.tokens);
+        if (token.task) {
+          const checked = token.checked ? ' checked' : '';
+          return `<li><input type="checkbox"${checked} disabled> ${body}</li>\n`;
+        }
+        return `<li>${body}</li>\n`;
+      },
+      list(token) {
+        const tag = token.ordered ? 'ol' : 'ul';
+        const hasTask = token.items.some(i => i.task);
+        const cls = hasTask ? ' class="task-list"' : '';
+        const body = token.items.map(item => this.listitem(item)).join('');
+        return `<${tag}${cls}>\n${body}</${tag}>\n`;
+      }
+    }
+  });
+
   const apiBase = "{{BASE_URL}}/api";
   const api = {
     get:    (url)       => fetch(`${apiBase}/${url}`).then(r => r.ok ? r.json() : Promise.reject(r)),
