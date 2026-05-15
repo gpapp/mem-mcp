@@ -200,6 +200,12 @@
     .diary-search-box input { width: 100%; padding: .4rem .6rem; border: 1px solid var(--border); border-radius: 6px;
                               background: var(--bg); color: var(--text); font-size: .85rem; box-sizing: border-box; outline: none; }
     .diary-search-box input:focus { border-color: var(--primary); }
+    .diary-calendar-box { padding: .5rem .75rem; border-bottom: 1px solid var(--border); }
+    .diary-calendar-box input { width: 100%; padding: .35rem .5rem; border: 1px solid var(--border); border-radius: 6px;
+                               background: var(--bg); color: var(--text); font-size: .8rem; box-sizing: border-box; outline: none; }
+    .diary-calendar-box input:focus { border-color: var(--primary); }
+    .diary-date-group { padding: .5rem .75rem; background: var(--bg); border-bottom: 1px solid var(--border); }
+    .diary-date-group-label { font-size: .7rem; font-weight: 700; color: var(--primary); text-transform: uppercase; letter-spacing: .5px; }
     .diary-search-result { padding: .6rem 1rem; cursor: pointer; border-bottom: 1px solid var(--bg); transition: all .15s;
                            font-size: .85rem; color: var(--text); }
     .diary-search-result:hover { background: var(--bg); color: var(--primary); }
@@ -380,6 +386,10 @@
         <span>History</span>
         <button class="btn btn-primary btn-sm" onclick="showDiaryEditor()">＋ New</button>
       </div>
+      <div class="diary-calendar-box">
+        <input type="date" id="diary-calendar" onchange="onDiaryCalendarChange(this.value)">
+        <span id="diary-calendar-clear" style="display:none; cursor:pointer; color:var(--primary); font-size:.75rem; margin-left:.5rem;" onclick="clearDiaryDateFilter()">✕ Clear</span>
+      </div>
       <div class="diary-search-box">
         <input type="search" id="diary-search-input" placeholder="Search entries…" oninput="onDiarySearch(this.value)" autocomplete="off">
       </div>
@@ -498,7 +508,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     fetch(`${apiBase}/auth/logout`, {method:'POST'}).then(() => window.location.href = "{{BASE_URL}}/");
   }
 
-  let memories = [], diaryEntries = [], activeDiaryId = null;
+  let memories = [], diaryEntries = [], activeDiaryId = null, selectedDiaryDate = null;
   let insightsLoaded = false, graphLoaded = false;
   let activeCategory = null;
   let activeLetterFilter = null;
@@ -1082,29 +1092,88 @@ npm install @modelcontextprotocol/sdk</code></pre>
     const el = document.getElementById('diary-dates-list');
     if (!diaryEntries.length) { el.innerHTML = '<p class="empty">No entries.</p>'; return; }
 
-    const sorted = [...diaryEntries].sort((a, b) => (b.timestamp || b.date || '').localeCompare(a.timestamp || a.date || ''));
-    el.innerHTML = sorted.map(entry => {
-      const title = diaryEntryTitle(entry);
-      const time = entry.timestamp && entry.timestamp.includes('T') ? entry.timestamp.split('T')[1].substring(0, 5) : '';
-      const dateLabel = entry.date + (time ? ' · ' + time : '');
-      return `<div class="diary-date-item ${entry.id === activeDiaryId ? 'active' : ''}" onclick="selectDiaryEntry('${entry.id}')">
-        <div class="diary-item-date">📅 ${dateLabel}</div>
-        <div class="diary-item-title">${escHtml(title)}</div>
-      </div>`;
-    }).join('');
+    let filtered = diaryEntries;
+    if (selectedDiaryDate) {
+      filtered = diaryEntries.filter(e => e.date === selectedDiaryDate);
+    }
+
+    const sorted = [...filtered].sort((a, b) => (b.timestamp || b.date || '').localeCompare(a.timestamp || a.date || ''));
+
+    const grouped = {};
+    sorted.forEach(entry => {
+      const dateKey = entry.date || 'Unknown';
+      if (!grouped[dateKey]) grouped[dateKey] = [];
+      grouped[dateKey].push(entry);
+    });
+
+    const sortedDates = Object.keys(grouped).sort((a, b) => b.localeCompare(a));
+
+    el.innerHTML = sortedDates.map(date => `
+      <div class="diary-date-group">
+        <div class="diary-date-group-label">📅 ${formatDateDisplay(date)}</div>
+      </div>
+      ${grouped[date].map(entry => {
+        const title = diaryEntryTitle(entry);
+        const time = entry.timestamp && entry.timestamp.includes('T') ? entry.timestamp.split('T')[1].substring(0, 5) : '';
+        return `<div class="diary-date-item ${entry.id === activeDiaryId ? 'active' : ''}" onclick="selectDiaryEntry('${entry.id}')">
+          <div class="diary-item-date">${time ? '🕐 ' + time : ''}</div>
+          <div class="diary-item-title">${escHtml(title)}</div>
+        </div>`;
+      }).join('')}
+    `).join('');
+  }
+
+  function formatDateDisplay(dateStr) {
+    const d = new Date(dateStr);
+    if (isNaN(d.getTime())) return dateStr;
+    const today = new Date();
+    const yesterday = new Date(today);
+    yesterday.setDate(yesterday.getDate() - 1);
+    if (dateStr === today.toISOString().split('T')[0]) return 'Today';
+    if (dateStr === yesterday.toISOString().split('T')[0]) return 'Yesterday';
+    return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' });
+  }
+
+  function onDiaryCalendarChange(value) {
+    selectedDiaryDate = value || null;
+    document.getElementById('diary-calendar-clear').style.display = selectedDiaryDate ? 'inline' : 'none';
+    renderDiarySidebar();
+  }
+
+  function clearDiaryDateFilter() {
+    selectedDiaryDate = null;
+    document.getElementById('diary-calendar').value = '';
+    document.getElementById('diary-calendar-clear').style.display = 'none';
+    renderDiarySidebar();
   }
 
   function selectDiaryEntry(id) {
     activeDiaryId = id;
-    const entry = diaryEntries.find(e => e.id === id);
+    let entry = diaryEntries.find(e => e.id === id);
     renderDiarySidebar();
 
     document.getElementById('diary-editor').style.display = 'none';
     document.getElementById('diary-viewer').style.display = 'block';
 
     const viewEl = document.getElementById('diary-view-content');
-    if (!entry) { viewEl.innerHTML = '<p class="empty">Entry not found.</p>'; return; }
+    if (!entry) {
+      viewEl.innerHTML = '<p class="empty">Entry not found. Reloading...</p>';
+      loadDiary().then(() => {
+        entry = diaryEntries.find(e => e.id === id);
+        if (entry) {
+          renderDiaryEntryView(entry);
+        } else {
+          viewEl.innerHTML = '<p class="empty">Entry not found. It may have been deleted.</p>';
+        }
+      });
+      return;
+    }
 
+    renderDiaryEntryView(entry);
+  }
+
+  function renderDiaryEntryView(entry) {
+    const viewEl = document.getElementById('diary-view-content');
     viewEl.classList.remove('empty');
     const time = entry.timestamp && entry.timestamp.includes('T') ? entry.timestamp.split('T')[1].substring(0, 5) : '';
     const mentions = (entry.mentions || []).map(m => `<span class="link-badge" onclick="jumpToMemory('${m.id}')" style="cursor:pointer;" title="Click to view">👤 ${escHtml(m.title || m.text.substring(0,20))}</span>`).join('');
@@ -1145,6 +1214,8 @@ npm install @modelcontextprotocol/sdk</code></pre>
 
   function showDiaryEditor() { 
     activeDiaryId = null; 
+    selectedDiaryDate = null;
+    document.getElementById('diary-calendar').value = '';
     renderDiarySidebar(); 
     document.getElementById('diary-viewer').style.display = 'none'; 
     const ed = document.getElementById('diary-editor');
