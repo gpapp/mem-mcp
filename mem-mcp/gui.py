@@ -37,8 +37,9 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 from sse_starlette.sse import EventSourceResponse
 
 SESSION_SECRET = os.getenv("MEM_SESSION_SECRET", secrets.token_hex(32))
+SESSION_MAX_AGE = 30 * 24 * 60 * 60  # 30 days in seconds
 web_app = FastAPI(title="Memory Vault GUI")
-web_app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET, session_cookie="mem_session")
+web_app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET, session_cookie="mem_session", max_age=SESSION_MAX_AGE, same_site="lax", https_only=False)
 
 HTPASSWD_PATH = os.getenv("HTPASSWD_PATH", os.path.join(os.path.dirname(__file__), "htpasswd"))
 
@@ -190,7 +191,7 @@ class LoginForm(BaseModel):
 async def _set_session(request: Request, user: str, password: str):
     request.session["user"] = user
     request.session["pass"] = password
-    request.session["expires"] = (datetime.now() + timedelta(hours=24)).isoformat()
+    request.session["expires"] = (datetime.now() + timedelta(days=30)).isoformat()
 
 
 @web_app.post("/api/auth/login")
