@@ -1044,16 +1044,70 @@ npm install @modelcontextprotocol/sdk</code></pre>
   function onDiarySearch(q) {
     clearTimeout(diarySearchTimer);
     if (!q.trim()) { renderDiarySidebar(); return; }
-    // Instant client-side filter while waiting for server response
+
+    const datePattern = parseDateQuery(q);
     const lower = q.toLowerCase();
+
     const matched = diaryEntries.filter(e => {
       const title = (e.title || '').toLowerCase();
       const content = (e.content || '').toLowerCase();
-      return title.includes(lower) || content.includes(lower) || e.date.includes(lower);
+      const matchesText = title.includes(lower) || content.includes(lower) || e.date.includes(lower);
+      const matchesDate = datePattern && matchesDatePattern(e.date, datePattern);
+      return matchesText || matchesDate;
     });
     renderDiarySearchResults(matched, q);
-    // Debounce server-side vector search
     diarySearchTimer = setTimeout(() => runDiaryVectorSearch(q), 400);
+  }
+
+  function parseDateQuery(q) {
+    const trimmed = q.trim().toLowerCase();
+    const months = ['january','february','march','april','may','june','july','august','september','october','november','december'];
+    const monthsShort = ['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'];
+
+    // Pattern: Year-MM (e.g., "2026-05", "2026-5")
+    const ymMatch = trimmed.match(/^(\d{4})-(\d{1,2})$/);
+    if (ymMatch) {
+      return { year: ymMatch[1], month: parseInt(ymMatch[2]) };
+    }
+
+    // Pattern: Year only (e.g., "2026")
+    if (/^\d{4}$/.test(trimmed)) {
+      return { year: trimmed };
+    }
+
+    // Pattern: "Month Year" (e.g., "May 2026", "May 2026")
+    for (let i = 0; i < months.length; i++) {
+      const monthRe = new RegExp('^' + months[i] + '\\s+(\\d{4})$', 'i');
+      const m = trimmed.match(monthRe);
+      if (m) return { year: m[1], month: i + 1 };
+    }
+    for (let i = 0; i < monthsShort.length; i++) {
+      const monthRe = new RegExp('^' + monthsShort[i] + '\\s+(\\d{4})$', 'i');
+      const m = trimmed.match(monthRe);
+      if (m) return { year: m[1], month: i + 1 };
+    }
+
+    // Pattern: "Month" (current year, e.g., "May")
+    const currentYear = new Date().getFullYear().toString();
+    for (let i = 0; i < months.length; i++) {
+      if (trimmed === months[i]) return { year: currentYear, month: i + 1 };
+    }
+    for (let i = 0; i < monthsShort.length; i++) {
+      if (trimmed === monthsShort[i]) return { year: currentYear, month: i + 1 };
+    }
+
+    return null;
+  }
+
+  function matchesDatePattern(dateStr, pattern) {
+    if (!dateStr) return false;
+    const d = new Date(dateStr);
+    if (isNaN(d.getTime())) return false;
+    const year = d.getFullYear().toString();
+    const month = (d.getMonth() + 1).toString();
+    if (pattern.year && year !== pattern.year) return false;
+    if (pattern.month && month !== pattern.month.toString()) return false;
+    return true;
   }
 
   async function runDiaryVectorSearch(q) {
