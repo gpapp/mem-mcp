@@ -212,10 +212,12 @@
                      border-radius: var(--radius); overflow-y: auto; display: flex; flex-direction: column; }
     .diary-sidebar-header { padding: 1rem; border-bottom: 1px solid var(--border); font-weight: 700; font-size: .85rem; 
                             text-transform: uppercase; color: var(--muted); display: flex; justify-content: space-between; align-items: center; }
-    .diary-date-item { padding: .75rem 1rem; cursor: pointer; border-bottom: 1px solid var(--bg); transition: all .15s; 
-                       font-size: .9rem; color: var(--text); font-weight: 500; }
+    .diary-date-item { padding: .6rem 1rem; cursor: pointer; border-bottom: 1px solid var(--bg); transition: all .15s; }
     .diary-date-item:hover { background: var(--bg); color: var(--primary); }
-    .diary-date-item.active { background: var(--primary-light); color: var(--primary); border-right: 3px solid var(--primary); }
+    .diary-date-item.active { background: var(--primary-light); border-right: 3px solid var(--primary); }
+    .diary-date-item .diary-item-date { font-size: .72rem; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .03em; }
+    .diary-date-item .diary-item-title { font-size: .85rem; font-weight: 500; color: var(--text); margin-top: .15rem; line-height: 1.3; }
+    .diary-date-item.active .diary-item-title { color: var(--primary); }
     .diary-main { flex: 1; display: flex; flex-direction: column; gap: 1rem; overflow-y: auto; text-align: left; }
     .diary-view-card, .diary-editor-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); 
                                            padding: 1.5rem; box-shadow: var(--shadow); }
@@ -486,7 +488,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     fetch(`${apiBase}/auth/logout`, {method:'POST'}).then(() => window.location.href = "{{BASE_URL}}/");
   }
 
-  let memories = [], diaryEntries = [], activeDiaryDate = null;
+  let memories = [], diaryEntries = [], activeDiaryId = null;
   let insightsLoaded = false, graphLoaded = false;
   let activeCategory = null;
   let activeLetterFilter = null;
@@ -583,7 +585,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
         const entry = await api.get(`diary/${data.id}`);
         diaryEntries.unshift(entry);
         renderDiarySidebar();
-        if (!activeDiaryDate) selectDiaryEntry(entry.date);
+        if (!activeDiaryId) selectDiaryEntry(entry.id);
       } catch(_) { loadDiary(); }
     });
 
@@ -1013,7 +1015,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
   }
 
   async function loadDiary() {
-    try { diaryEntries = await api.get('diary'); renderDiarySidebar(); if (diaryEntries.length && !activeDiaryDate) selectDiaryEntry(diaryEntries[0].date); }
+    try { diaryEntries = await api.get('diary'); renderDiarySidebar(); if (diaryEntries.length && !activeDiaryId) selectDiaryEntry(diaryEntries[0].id); }
     catch(e) { document.getElementById('diary-dates-list').innerHTML = '<p class="empty">⚠️ Error</p>'; }
   }
 
@@ -1042,89 +1044,90 @@ npm install @modelcontextprotocol/sdk</code></pre>
     const el = document.getElementById('diary-dates-list');
     if (!results.length) { el.innerHTML = '<p class="empty" style="padding:.75rem 1rem; font-size:.85rem;">No results.</p>'; return; }
     el.innerHTML = results.map(entry => {
-      const snippet = (entry.content || '').replace(/\s+/g, ' ').substring(0, 80);
-      return `<div class="diary-search-result" onclick="selectDiaryEntry('${entry.date}')">
-        <div class="result-date">📅 ${entry.date}</div>
-        <div class="result-snippet">${escHtml(snippet)}…</div>
+      const title = diaryEntryTitle(entry);
+      const snippet = (entry.content || '').replace(/#+\s[^\n]*/g, '').replace(/\s+/g, ' ').trim().substring(0, 60);
+      return `<div class="diary-date-item" onclick="selectDiaryEntry('${entry.id}')">
+        <div class="diary-item-date">📅 ${entry.date}</div>
+        <div class="diary-item-title">${escHtml(title)}</div>
+        ${snippet ? `<div style="font-size:.75rem;color:var(--muted);margin-top:.2rem;">${escHtml(snippet)}…</div>` : ''}
       </div>`;
     }).join('');
+  }
+
+  // Extract the first ## heading from entry content as a display title
+  function diaryEntryTitle(entry) {
+    const m = (entry.content || '').match(/^##\s+(.+)/m);
+    if (m) return m[1].replace(/\s*—\s*\d{4}-\d{2}-\d{2}.*$/, '').trim();
+    // fallback: first non-empty line stripped of markdown
+    const first = (entry.content || '').split('\n').find(l => l.trim());
+    return first ? first.replace(/^#+\s*/, '').trim().substring(0, 50) : '(no title)';
   }
 
   function renderDiarySidebar() {
     const el = document.getElementById('diary-dates-list');
     if (!diaryEntries.length) { el.innerHTML = '<p class="empty">No entries.</p>'; return; }
-    
-    // Group unique dates
-    const dates = [...new Set(diaryEntries.map(d => d.date))].sort((a,b) => b.localeCompare(a));
-    
-    el.innerHTML = dates.map(date => {
-      const dayEntries = diaryEntries.filter(d => d.date === date);
-      const times = dayEntries
-        .map(e => e.timestamp && e.timestamp.includes('T') ? e.timestamp.split('T')[1].substring(0, 5) : null)
-        .filter(Boolean).sort();
-      const timeHint = times.length === 1 ? times[0]
-        : times.length > 1 ? `${times[0]}–${times[times.length-1]}` : '';
-      return `<div class="diary-date-item ${date === activeDiaryDate ? 'active' : ''}" onclick="selectDiaryEntry('${date}')">
-        <span>📅 ${date}</span>
-        ${timeHint ? `<span style="font-size:0.7rem; color:var(--muted); display:block; margin-top:0.1rem;">${timeHint}${dayEntries.length > 1 ? ' · ' + dayEntries.length + ' entries' : ''}</span>` : ''}
+
+    const sorted = [...diaryEntries].sort((a, b) => (b.timestamp || b.date || '').localeCompare(a.timestamp || a.date || ''));
+    el.innerHTML = sorted.map(entry => {
+      const title = diaryEntryTitle(entry);
+      const time = entry.timestamp && entry.timestamp.includes('T') ? entry.timestamp.split('T')[1].substring(0, 5) : '';
+      const dateLabel = entry.date + (time ? ' · ' + time : '');
+      return `<div class="diary-date-item ${entry.id === activeDiaryId ? 'active' : ''}" onclick="selectDiaryEntry('${entry.id}')">
+        <div class="diary-item-date">📅 ${dateLabel}</div>
+        <div class="diary-item-title">${escHtml(title)}</div>
       </div>`;
     }).join('');
   }
 
-  function selectDiaryEntry(date) {
-    activeDiaryDate = date;
-    const dayEntries = diaryEntries.filter(d => d.date === date).sort((a, b) => (b.timestamp || "").localeCompare(a.timestamp || ""));
+  function selectDiaryEntry(id) {
+    activeDiaryId = id;
+    const entry = diaryEntries.find(e => e.id === id);
     renderDiarySidebar();
-    
+
     document.getElementById('diary-editor').style.display = 'none';
     document.getElementById('diary-viewer').style.display = 'block';
-    
+
     const viewEl = document.getElementById('diary-view-content');
-    if (dayEntries.length) {
-      viewEl.classList.remove('empty');
-      
-      viewEl.innerHTML = `
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1.5rem; border-bottom: 2px solid var(--primary-light); padding-bottom: 0.5rem;">
-          <h2 style="margin:0; font-size:1.25rem;">📅 ${date}</h2>
-          <span style="font-size:0.8rem; color:var(--muted);">${dayEntries.length} entries today</span>
+    if (!entry) { viewEl.innerHTML = '<p class="empty">Entry not found.</p>'; return; }
+
+    viewEl.classList.remove('empty');
+    const time = entry.timestamp && entry.timestamp.includes('T') ? entry.timestamp.split('T')[1].substring(0, 5) : '';
+    const mentions = (entry.mentions || []).map(m => `<span class="link-badge" onclick="jumpToMemory('${m.id}')" style="cursor:pointer;" title="Click to view">👤 ${escHtml(m.title || m.text.substring(0,20))}</span>`).join('');
+
+    viewEl.innerHTML = `
+      <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:1.5rem; border-bottom: 2px solid var(--primary-light); padding-bottom: 0.75rem;">
+        <div>
+          <div style="font-size:.75rem; font-weight:600; color:var(--muted); text-transform:uppercase; letter-spacing:.03em; margin-bottom:.25rem;">
+            📅 ${entry.date}${time ? ' · ' + time : ''}
+          </div>
+          <h2 style="margin:0; font-size:1.15rem;">${escHtml(diaryEntryTitle(entry))}</h2>
         </div>
-        ${dayEntries.map((entry, idx) => {
-          const mentions = (entry.mentions || []).map(m => `<span class="link-badge" onclick="jumpToMemory('${m.id}')" style="cursor:pointer;" title="Click to view">👤 ${escHtml(m.title || m.text.substring(0,20))}</span>`).join('');
-          // Parse time directly from ISO string to avoid UTC→local conversion
-          const time = entry.timestamp && entry.timestamp.includes('T') ? entry.timestamp.split('T')[1].substring(0, 5) : '';
-          
-          return `
-            <div class="diary-entry-segment" style="${idx > 0 ? 'margin-top:2rem; border-top:1px dashed var(--border); padding-top:1.5rem;' : ''}">
-              <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:0.75rem;">
-                <span style="font-size:0.75rem; font-weight:700; color:var(--primary); text-transform:uppercase;">Entry ${dayEntries.length - idx} ${time ? '• ' + time : ''}</span>
-                <div style="display:flex; gap:0.5rem; align-items:center; flex-wrap:wrap; justify-content:flex-end;">
-                  ${mentions}
-                  <button class="btn btn-danger btn-sm" onclick="deleteDiaryEntry('${entry.id}')" title="Delete entry" style="padding:0.15rem 0.5rem; font-size:0.75rem;">🗑️</button>
-                </div>
-              </div>
-              <div class="markdown-body">${marked.parse(entry.content || '')}</div>
-            </div>
-          `;
-        }).join('')}
-        <div style="margin-top:2rem; padding-top:1rem; border-top:1px solid var(--border); text-align:right;">
-          <button class="btn btn-ghost btn-sm" onclick="editLastEntry('${date}')">✏️ Edit Latest</button>
-        </div>`;
-    }
+        <div style="display:flex; gap:0.5rem; align-items:center; flex-shrink:0; margin-left:1rem;">
+          ${mentions}
+          <button class="btn btn-ghost btn-sm" onclick="editEntry('${entry.id}')" style="padding:0.15rem 0.5rem; font-size:0.75rem;">✏️</button>
+          <button class="btn btn-danger btn-sm" onclick="deleteDiaryEntry('${entry.id}')" title="Delete entry" style="padding:0.15rem 0.5rem; font-size:0.75rem;">🗑️</button>
+        </div>
+      </div>
+      <div class="markdown-body">${marked.parse(entry.content || '')}</div>`;
+  }
+
+  function editEntry(id) {
+    const entry = diaryEntries.find(e => e.id === id);
+    if (!entry) return;
+    document.getElementById('diary-viewer').style.display = 'none';
+    document.getElementById('diary-editor').style.display = 'block';
+    document.getElementById('diary-content').value = entry.content;
+    document.getElementById('diary-editor').dataset.editTimestamp = entry.timestamp || '';
   }
 
   function editLastEntry(date) {
     const dayEntries = diaryEntries.filter(d => d.date === date).sort((a, b) => (b.timestamp || "").localeCompare(a.timestamp || ""));
     if (!dayEntries.length) return;
-    const entry = dayEntries[0];
-    document.getElementById('diary-viewer').style.display = 'none';
-    document.getElementById('diary-editor').style.display = 'block';
-    document.getElementById('diary-content').value = entry.content;
-    // Store the original timestamp so saving re-uses it (upsert = replace in-place)
-    document.getElementById('diary-editor').dataset.editTimestamp = entry.timestamp || '';
+    editEntry(dayEntries[0].id);
   }
 
-  function showDiaryEditor() { activeDiaryDate = null; renderDiarySidebar(); const ed = document.getElementById('diary-editor'); ed.dataset.editTimestamp = ''; document.getElementById('diary-viewer').style.display = 'none'; ed.style.display = 'block'; document.getElementById('diary-content').value = ''; }
-  function cancelDiaryEdit() { if (diaryEntries.length) selectDiaryEntry(diaryEntries[0].date); else document.getElementById('diary-editor').style.display = 'none'; }
+  function showDiaryEditor() { activeDiaryId = null; renderDiarySidebar(); const ed = document.getElementById('diary-editor'); ed.dataset.editTimestamp = ''; document.getElementById('diary-viewer').style.display = 'none'; ed.style.display = 'block'; document.getElementById('diary-content').value = ''; }
+  function cancelDiaryEdit() { if (activeDiaryId) selectDiaryEntry(activeDiaryId); else if (diaryEntries.length) selectDiaryEntry(diaryEntries[0].id); else document.getElementById('diary-editor').style.display = 'none'; }
 
   async function deleteDiaryEntry(id) {
     if (!confirm('Delete this diary entry? This cannot be undone.')) return;
@@ -1132,14 +1135,14 @@ npm install @modelcontextprotocol/sdk</code></pre>
       await api.delete('diary/' + id);
       diaryEntries = diaryEntries.filter(e => e.id !== id);
       renderDiarySidebar();
-      if (diaryEntries.length) selectDiaryEntry(diaryEntries[0].date);
-      else { document.getElementById('diary-viewer').style.display = 'block'; document.getElementById('diary-view-content').innerHTML = '<p class="empty">No entries.</p>'; }
+      if (activeDiaryId === id) { activeDiaryId = null; document.getElementById('diary-viewer').style.display = 'block'; document.getElementById('diary-view-content').innerHTML = '<p class="empty">Entry deleted.</p>'; }
+      else if (diaryEntries.length && !activeDiaryId) selectDiaryEntry(diaryEntries[0].id);
       toast('🗑️ Entry deleted');
     } catch(e) { toast('❌ Error deleting entry'); }
   }
   function editCurrentEntry() {
-    const entry = diaryEntries.find(d => d.date === activeDiaryDate); if (!entry) return;
-    document.getElementById('diary-viewer').style.display = 'none'; document.getElementById('diary-editor').style.display = 'block'; document.getElementById('diary-content').value = entry.content;
+    if (!activeDiaryId) return;
+    editEntry(activeDiaryId);
   }
 
   async function saveDiary() {
