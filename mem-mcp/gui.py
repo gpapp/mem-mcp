@@ -149,7 +149,9 @@ class MemoryLink(BaseModel):
 
 class DiaryCreate(BaseModel):
     content: str
-    timestamp: Optional[str] = None
+    title: str
+    timestamp: str
+    id: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -430,8 +432,17 @@ async def api_get_connections(request: Request, fact_id: str):
 @web_app.post("/api/diary", response_class=JSONResponse, status_code=201)
 async def api_save_diary(request: Request, body: DiaryCreate):
     try:
-        entry_ts = await mem.db_save_diary(body.content, _require_user(request), body.timestamp)
-        return {"timestamp": entry_ts, "content": body.content}
+        user_id = _require_user(request)
+
+        # If the entry exists (id provided) but the timestamp was changed,
+        # we must delete the old entry because the ID is derived from the timestamp.
+        if body.id:
+            new_id = mem._diary_id(user_id, body.timestamp)
+            if body.id != new_id:
+                await mem.db_delete_diary(body.id, user_id)
+
+        entry_ts = await mem.db_save_diary(body.content, user_id, body.timestamp, body.title)
+        return {"timestamp": entry_ts, "content": body.content, "title": body.title}
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 

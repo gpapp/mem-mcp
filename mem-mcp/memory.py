@@ -1225,22 +1225,18 @@ def _diary_id(user_id: str, timestamp: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"diary_{user_id}_{timestamp}"))
 
 
-async def db_save_diary(content: str, user_id: str, timestamp: Optional[str] = None) -> str:
+async def db_save_diary(content: str, user_id: str, timestamp: str, title: str) -> str:
     """Upsert a diary entry keyed by user + timestamp. Returns the ISO timestamp string.
-
-    Passing the same timestamp a second time replaces the existing entry (content + vector),
-    so callers can update an entry by re-saving with the original timestamp.
     """
     qdrant = await get_qdrant()
     neo4j_driver = get_neo4j()
     if not qdrant or not neo4j_driver:
         raise RuntimeError("Database connections not established.")
 
-    entry_ts = timestamp if timestamp else datetime.now().isoformat(timespec="seconds")
     # Derive a stable ID from user + timestamp so the same timestamp always maps to the same node
-    doc_id   = _diary_id(user_id, entry_ts)
+    doc_id   = _diary_id(user_id, timestamp)
     # Keep a plain date string for display / grouping purposes
-    entry_date = entry_ts[:10]
+    entry_date = timestamp[:10]
     vector   = await get_embedding(content)
 
     # Qdrant — upsert by the stable doc_id so re-saving replaces the vector
@@ -1249,7 +1245,7 @@ async def db_save_diary(content: str, user_id: str, timestamp: Optional[str] = N
         points=[PointStruct(
             id=doc_id,
             vector=vector,
-            payload={"content": content, "date": entry_date, "timestamp": entry_ts, "userId": user_id},
+            payload={"content": content, "title": title, "date": entry_date, "timestamp": timestamp, "userId": user_id},
         )],
     )
 
@@ -1259,10 +1255,10 @@ async def db_save_diary(content: str, user_id: str, timestamp: Optional[str] = N
             """
             MERGE (u:User {id: $userId})
             MERGE (d:DiaryEntry {id: $id, userId: $userId})
-            SET d.date = $date, d.timestamp = $timestamp, d.content = $content
+            SET d.date = $date, d.timestamp = $timestamp, d.content = $content, d.title = $title
             MERGE (u)-[:WROTE_DIARY]->(d)
             """,
-            userId=user_id, id=doc_id, date=entry_date, timestamp=entry_ts, content=content
+            userId=user_id, id=doc_id, date=entry_date, timestamp=timestamp, content=content, title=title
         )
 
         # Automatic linking to People and Client facts
@@ -1309,9 +1305,9 @@ async def db_save_diary(content: str, user_id: str, timestamp: Optional[str] = N
         "action": "add",
         "id": doc_id,
         "date": entry_date,
-        "timestamp": entry_ts
+        "timestamp": timestamp
     })
-    return entry_ts
+    return timestamp
 
 
 async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float = 0.4) -> list:
@@ -1337,6 +1333,7 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
         date = r.payload.get("date")
         entry_ts = r.payload.get("timestamp", date)
         content = r.payload.get("content")
+        title = r.payload.get("title")
         
         # Enrich with mentions from Neo4j — match by stable entry id
         mentions = []
@@ -1352,6 +1349,7 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
             "date": date,
             "timestamp": entry_ts,
             "content": content,
+            "title": title,
             "score": r.score,
             "mentions": mentions
         })
@@ -1401,7 +1399,7 @@ def db_list_diary(user_id: str) -> list:
             """
             MATCH (d:DiaryEntry {userId: $userId})
             OPTIONAL MATCH (d)-[:MENTIONS]->(f:Fact)
-            RETURN d.id as id, d.date as date, d.content as content, d.timestamp as timestamp,
+            RETURN d.id as id, d.date as date, d.content as content, d.timestamp as timestamp, d.title as title,
                    collect({id: f.id, text: f.text, title: f.title}) as mentions
             ORDER BY d.date DESC, d.timestamp DESC
             """,
@@ -1412,6 +1410,7 @@ def db_list_diary(user_id: str) -> list:
                 "id": r["id"],
                 "date": r["date"], 
                 "content": r["content"], 
+                "title": r.get("title"),
                 "timestamp": r["timestamp"].iso_format() if r.get("timestamp") and hasattr(r["timestamp"], "iso_format") else (str(r["timestamp"]) if r.get("timestamp") else None),
                 "mentions": [m for m in r["mentions"] if m.get("id")]
             } for r in result
