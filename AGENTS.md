@@ -72,3 +72,13 @@ Modify or delete links between memories directly from the UI.
 - Each link badge shows ✏️ (edit) and 🗑️ (delete) buttons
 - Click ✏️ to change the relationship type inline
 - Click 🗑️ to delete the link (with confirmation)
+
+### Diary Search
+Search diary entries from the sidebar.
+
+- Type in the **Search entries…** box at the top of the diary sidebar
+- Instant client-side substring filter runs as you type
+- After 400 ms a server-side **vector similarity search** (`GET /api/diary/search?q=`) fires and updates results
+- Clicking a result navigates to that date's entries
+- Clearing the input restores the full date history list
+- API endpoint: `GET /api/diary/search?q=<text>&limit=10&top_p=0.4`

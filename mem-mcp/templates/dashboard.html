@@ -156,6 +156,17 @@
     }
     #toast.show { opacity: 1; transform: translateY(0); }
 
+    .diary-search-box { padding: .5rem .75rem; border-bottom: 1px solid var(--border); }
+    .diary-search-box input { width: 100%; padding: .4rem .6rem; border: 1px solid var(--border); border-radius: 6px;
+                              background: var(--bg); color: var(--text); font-size: .85rem; box-sizing: border-box; outline: none; }
+    .diary-search-box input:focus { border-color: var(--primary); }
+    .diary-search-result { padding: .6rem 1rem; cursor: pointer; border-bottom: 1px solid var(--bg); transition: all .15s;
+                           font-size: .85rem; color: var(--text); }
+    .diary-search-result:hover { background: var(--bg); color: var(--primary); }
+    .diary-search-result .result-date { font-size: .75rem; color: var(--muted); font-weight: 600; }
+    .diary-search-result .result-snippet { margin-top: .2rem; font-size: .8rem; color: var(--muted);
+                                           white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
     /* ── Diary Layout ── */
     .diary-layout { display: flex; gap: 1.5rem; height: calc(100vh - 180px); min-height: 500px; }
     .diary-sidebar { width: 220px; flex-shrink: 0; background: var(--surface); border: 1px solid var(--border); 
@@ -323,6 +334,9 @@
       <div class="diary-sidebar-header">
         <span>History</span>
         <button class="btn btn-primary btn-sm" onclick="showDiaryEditor()">＋ New</button>
+      </div>
+      <div class="diary-search-box">
+        <input type="search" id="diary-search-input" placeholder="Search entries…" oninput="onDiarySearch(this.value)" autocomplete="off">
       </div>
       <div id="diary-dates-list"></div>
     </div>
@@ -852,6 +866,39 @@ npm install @modelcontextprotocol/sdk</code></pre>
   async function loadDiary() {
     try { diaryEntries = await api.get('diary'); renderDiarySidebar(); if (diaryEntries.length && !activeDiaryDate) selectDiaryEntry(diaryEntries[0].date); }
     catch(e) { document.getElementById('diary-dates-list').innerHTML = '<p class="empty">⚠️ Error</p>'; }
+  }
+
+  let diarySearchTimer = null;
+
+  function onDiarySearch(q) {
+    clearTimeout(diarySearchTimer);
+    if (!q.trim()) { renderDiarySidebar(); return; }
+    // Instant client-side filter while waiting for server response
+    const lower = q.toLowerCase();
+    const matched = diaryEntries.filter(e => e.content.toLowerCase().includes(lower) || e.date.includes(lower));
+    renderDiarySearchResults(matched, q);
+    // Debounce server-side vector search
+    diarySearchTimer = setTimeout(() => runDiaryVectorSearch(q), 400);
+  }
+
+  async function runDiaryVectorSearch(q) {
+    if (!q.trim()) return;
+    try {
+      const results = await api.get('diary/search?q=' + encodeURIComponent(q) + '&limit=20');
+      renderDiarySearchResults(results, q);
+    } catch(e) { /* keep showing client-side results */ }
+  }
+
+  function renderDiarySearchResults(results, q) {
+    const el = document.getElementById('diary-dates-list');
+    if (!results.length) { el.innerHTML = '<p class="empty" style="padding:.75rem 1rem; font-size:.85rem;">No results.</p>'; return; }
+    el.innerHTML = results.map(entry => {
+      const snippet = (entry.content || '').replace(/\s+/g, ' ').substring(0, 80);
+      return `<div class="diary-search-result" onclick="selectDiaryEntry('${entry.date}')">
+        <div class="result-date">📅 ${entry.date}</div>
+        <div class="result-snippet">${escHtml(snippet)}…</div>
+      </div>`;
+    }).join('');
   }
 
   function renderDiarySidebar() {
