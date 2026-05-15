@@ -161,24 +161,36 @@ async def find_patterns():
 async def diary_save_entry(content: str, timestamp: Optional[str] = None):
     """Save or update a diary entry.
 
-    - timestamp: ISO-8601 datetime string (e.g. '2026-05-15T14:30:00'). Defaults to now.
+    - timestamp: ISO-8601 datetime string including time (e.g. '2026-05-15T14:30:00').
+      Defaults to the current date and time if omitted.
       Passing the same timestamp a second time **replaces** the existing entry, so you
       can update an entry by re-saving with its original timestamp.
-    - Returns the timestamp string that identifies the entry.
+    - Returns a dict with 'id' (use this to update or delete the entry later) and
+      'timestamp' (the ISO string that keys the entry).
     """
     entry_ts = await mem.db_save_diary(content, _current_user(), timestamp)
-    return f"Saved for {entry_ts}"
+    entry_id = mem._diary_id(_current_user(), entry_ts)
+    return {"id": entry_id, "timestamp": entry_ts}
 
 @mcp.tool()
 async def diary_search_entries(query: str, limit: int = 3, top_p: float = 0.4):
-    """Search diary entries."""
+    """Search diary entries using vector similarity.
+
+    Returns a list of matching entries. Each entry contains:
+    - id: use this with diary_delete_entry or diary_save_entry (as timestamp key) to update/delete
+    - timestamp: ISO-8601 datetime string (e.g. '2026-05-15T14:30:00') — the time the entry was saved
+    - date: YYYY-MM-DD portion of the timestamp
+    - content: the full Markdown text of the entry
+    - score: similarity score (higher = more relevant)
+    - mentions: list of facts linked to this entry
+    """
     return await mem.db_search_diary(query, _current_user(), limit, top_p)
 
 @mcp.tool()
 async def diary_delete_entry(entryId: str):
     """Delete a diary entry by its ID.
 
-    - entryId: the id returned by diary_save_entry or diary_search_entries.
+    - entryId: the 'id' field returned by diary_save_entry or diary_search_entries.
     - Returns a confirmation message, or an error if the entry was not found.
     """
     deleted = await mem.db_delete_diary(entryId, _current_user())

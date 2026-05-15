@@ -1051,8 +1051,18 @@ npm install @modelcontextprotocol/sdk</code></pre>
     // Group unique dates
     const dates = [...new Set(diaryEntries.map(d => d.date))].sort((a,b) => b.localeCompare(a));
     
-    el.innerHTML = dates.map(date => `
-      <div class="diary-date-item ${date === activeDiaryDate ? 'active' : ''}" onclick="selectDiaryEntry('${date}')">📅 ${date}</div>`).join('');
+    el.innerHTML = dates.map(date => {
+      const dayEntries = diaryEntries.filter(d => d.date === date);
+      const times = dayEntries
+        .map(e => e.timestamp && e.timestamp.includes('T') ? e.timestamp.split('T')[1].substring(0, 5) : null)
+        .filter(Boolean).sort();
+      const timeHint = times.length === 1 ? times[0]
+        : times.length > 1 ? `${times[0]}–${times[times.length-1]}` : '';
+      return `<div class="diary-date-item ${date === activeDiaryDate ? 'active' : ''}" onclick="selectDiaryEntry('${date}')">
+        <span>📅 ${date}</span>
+        ${timeHint ? `<span style="font-size:0.7rem; color:var(--muted); display:block; margin-top:0.1rem;">${timeHint}${dayEntries.length > 1 ? ' · ' + dayEntries.length + ' entries' : ''}</span>` : ''}
+      </div>`;
+    }).join('');
   }
 
   function selectDiaryEntry(date) {
@@ -1074,7 +1084,8 @@ npm install @modelcontextprotocol/sdk</code></pre>
         </div>
         ${dayEntries.map((entry, idx) => {
           const mentions = (entry.mentions || []).map(m => `<span class="link-badge" onclick="jumpToMemory('${m.id}')" style="cursor:pointer;" title="Click to view">👤 ${escHtml(m.title || m.text.substring(0,20))}</span>`).join('');
-          const time = entry.timestamp ? new Date(entry.timestamp).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}) : '';
+          // Parse time directly from ISO string to avoid UTC→local conversion
+          const time = entry.timestamp && entry.timestamp.includes('T') ? entry.timestamp.split('T')[1].substring(0, 5) : '';
           
           return `
             <div class="diary-entry-segment" style="${idx > 0 ? 'margin-top:2rem; border-top:1px dashed var(--border); padding-top:1.5rem;' : ''}">
@@ -1102,12 +1113,11 @@ npm install @modelcontextprotocol/sdk</code></pre>
     document.getElementById('diary-viewer').style.display = 'none';
     document.getElementById('diary-editor').style.display = 'block';
     document.getElementById('diary-content').value = entry.content;
-    // We don't have a specific update tool by ID yet, so this will just save a NEW entry with same content
-    // Actually, we should probably update db_save_diary to support update by ID if we wanted, 
-    // but the user's request emphasized adding/updating without overwriting.
+    // Store the original timestamp so saving re-uses it (upsert = replace in-place)
+    document.getElementById('diary-editor').dataset.editTimestamp = entry.timestamp || '';
   }
 
-  function showDiaryEditor() { activeDiaryDate = null; renderDiarySidebar(); document.getElementById('diary-viewer').style.display = 'none'; document.getElementById('diary-editor').style.display = 'block'; document.getElementById('diary-content').value = ''; }
+  function showDiaryEditor() { activeDiaryDate = null; renderDiarySidebar(); const ed = document.getElementById('diary-editor'); ed.dataset.editTimestamp = ''; document.getElementById('diary-viewer').style.display = 'none'; ed.style.display = 'block'; document.getElementById('diary-content').value = ''; }
   function cancelDiaryEdit() { if (diaryEntries.length) selectDiaryEntry(diaryEntries[0].date); else document.getElementById('diary-editor').style.display = 'none'; }
 
   async function deleteDiaryEntry(id) {
