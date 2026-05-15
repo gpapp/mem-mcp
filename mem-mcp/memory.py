@@ -1405,7 +1405,7 @@ def db_list_diary(user_id: str) -> list:
                 "id": r["id"],
                 "date": r["date"], 
                 "content": r["content"], 
-                "timestamp": r["timestamp"].iso_format() if r.get("timestamp") and hasattr(r["timestamp"], "iso_format") else None,
+                "timestamp": r["timestamp"].iso_format() if r.get("timestamp") and hasattr(r["timestamp"], "iso_format") else (str(r["timestamp"]) if r.get("timestamp") else None),
                 "mentions": [m for m in r["mentions"] if m.get("id")]
             } for r in result
         ]
