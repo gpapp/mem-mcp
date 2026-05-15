@@ -1329,11 +1329,20 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
     )
     
     entries = []
+    query_lower = query.lower()
     for r in result.points:
         date = r.payload.get("date")
         entry_ts = r.payload.get("timestamp", date)
         content = r.payload.get("content")
         title = r.payload.get("title")
+        score = r.score
+
+        # Boost score if query matches the title
+        if title:
+            if query_lower == title.lower():
+                score += 0.5
+            elif query_lower in title.lower() or title.lower() in query_lower:
+                score += 0.2
         
         # Enrich with mentions from Neo4j — match by stable entry id
         mentions = []
@@ -1350,9 +1359,12 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
             "timestamp": entry_ts,
             "content": content,
             "title": title,
-            "score": r.score,
+            "score": score,
             "mentions": mentions
         })
+
+    # Re-sort based on boosted scores
+    entries.sort(key=lambda x: x["score"], reverse=True)
     return entries
 
 

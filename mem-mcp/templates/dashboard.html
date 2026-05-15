@@ -1036,7 +1036,11 @@ npm install @modelcontextprotocol/sdk</code></pre>
     if (!q.trim()) { renderDiarySidebar(); return; }
     // Instant client-side filter while waiting for server response
     const lower = q.toLowerCase();
-    const matched = diaryEntries.filter(e => e.content.toLowerCase().includes(lower) || e.date.includes(lower));
+    const matched = diaryEntries.filter(e => {
+      const title = (e.title || '').toLowerCase();
+      const content = (e.content || '').toLowerCase();
+      return title.includes(lower) || content.includes(lower) || e.date.includes(lower);
+    });
     renderDiarySearchResults(matched, q);
     // Debounce server-side vector search
     diarySearchTimer = setTimeout(() => runDiaryVectorSearch(q), 400);
