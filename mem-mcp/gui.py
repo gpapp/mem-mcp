@@ -33,11 +33,9 @@ from fastapi import Request, HTTPException, FastAPI
 from fastapi.responses import Response, JSONResponse, HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 from starlette.middleware.sessions import SessionMiddleware
+from memory import SESSION_SECRET, SESSION_MAX_AGE # Import from memory.py
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from sse_starlette.sse import EventSourceResponse
-
-SESSION_SECRET = os.getenv("MEM_SESSION_SECRET", secrets.token_hex(32))
-SESSION_MAX_AGE = 30 * 24 * 60 * 60  # 30 days in seconds
 web_app = FastAPI(title="Memory Vault GUI")
 web_app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET, session_cookie="mem_session", max_age=SESSION_MAX_AGE, same_site="lax", https_only=False)
 

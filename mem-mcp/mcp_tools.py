@@ -1,12 +1,10 @@
-import os
 import logging
-from fastmcp import FastMCP, Context
+from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_http_headers
-from typing import Optional, List, Any
+from typing import Optional, List
 import memory as mem
 
 logger = logging.getLogger("memory-vault")
-
 
 # Initialize FastMCP with the built-in sampling fallback behavior
 mcp = FastMCP(
@@ -14,10 +12,12 @@ mcp = FastMCP(
 )
 
 def _current_user() -> str:
+    """
+    Internal helper to extract the user from the current request headers.
+    Used to identify the user vault without exposing user_id to the LLM.
+    """
     headers = get_http_headers()
-    user = mem.extract_user_from_headers(headers)
-    return user
-
+    return mem.extract_user_from_headers(headers)
 
 def _format_fact_md(fact: dict) -> str:
     """
@@ -165,11 +165,12 @@ async def diary_save_entry(content: str, timestamp: Optional[str] = None):
       Defaults to the current date and time if omitted.
       Passing the same timestamp a second time **replaces** the existing entry, so you
       can update an entry by re-saving with its original timestamp.
-    - Returns a dict with 'id' (use this to update or delete the entry later) and
+    - Returns a dict with 'id' (use this to update or delete the entry later) and 
       'timestamp' (the ISO string that keys the entry).
     """
-    entry_ts = await mem.db_save_diary(content, _current_user(), timestamp)
-    entry_id = mem._diary_id(_current_user(), entry_ts)
+    user = _current_user()
+    entry_ts = await mem.db_save_diary(content, user, timestamp)
+    entry_id = mem._diary_id(user, entry_ts)
     return {"id": entry_id, "timestamp": entry_ts}
 
 @mcp.tool()

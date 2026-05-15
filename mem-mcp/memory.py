@@ -16,6 +16,7 @@ import os
 import uuid
 import time
 import socket
+import secrets
 import logging
 import base64
 import httpx
@@ -51,6 +52,9 @@ BASE_URL       = os.getenv("BASE_URL",            "").rstrip("/")
 
 COLLECTION_NAME  = "ea_memories"
 DIARY_COLLECTION = "ea_diary"
+
+SESSION_SECRET = os.getenv("MEM_SESSION_SECRET", secrets.token_hex(32))
+SESSION_MAX_AGE = 30 * 24 * 60 * 60  # 30 days in seconds
 
 # ---------------------------------------------------------------------------
 # Global DB client references (lazily populated)

@@ -16,7 +16,8 @@ import memory as mem
 from mcp_tools import mcp
 from gui import web_app
 from fastapi.middleware.cors import CORSMiddleware
-
+from starlette.middleware.sessions import SessionMiddleware
+from memory import SESSION_SECRET, SESSION_MAX_AGE
 from starlette.middleware import Middleware as StarletteMiddleware
 mcp_cors = StarletteMiddleware(
     CORSMiddleware, 
@@ -37,8 +38,17 @@ web_app.add_middleware(
 # ---------------------------------------------------------------------------
 # Merge MCP into the Web GUI app
 # ---------------------------------------------------------------------------
-# SSE transport: GET /mcp opens the SSE stream, POST /messages/ receives client messages.
-mcp_app = mcp.http_app(transport="http", path="/mcp", middleware=[mcp_cors])
+
+# Session middleware for MCP app to ensure session is available for MCP calls
+mcp_session_middleware = StarletteMiddleware(
+    SessionMiddleware,
+    secret_key=SESSION_SECRET,
+    session_cookie="mem_session",
+    max_age=SESSION_MAX_AGE,
+    same_site="lax",
+    https_only=False
+)
+mcp_app = mcp.http_app(transport="http", path="/mcp", middleware=[mcp_cors, mcp_session_middleware])
 # We mount at / so that the proxy's /mcp hits the MCP server directly.
 # GUI and API routes will take precedence because they were defined first.
 web_app.mount("/", mcp_app)
