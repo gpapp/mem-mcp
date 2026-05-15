@@ -77,6 +77,7 @@ services:
       - MEM_NEO4J_URL=bolt://neo4j:7687
       - MEM_NEO4J_USER=neo4j
       - MEM_NEO4J_PASSWORD=${NEO_PASS}
+      - MEM_SESSION_SECRET=${MEM_SESSION_SECRET}
       - BASE_URL=${BASE_URL}
       - HTPASSWD_PATH=/app/htpasswd
 
