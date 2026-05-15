@@ -180,7 +180,13 @@ async def diary_save_entry(content: str, title: str, timestamp: str, entryId: Op
 
 @mcp.tool()
 async def diary_search_entries(query: str, limit: int = 3, top_p: float = 0.4):
-    """Search diary entries using vector similarity.
+    """Search diary entries using vector similarity or date/time filters.
+
+    Query supports:
+    - Natural language: "May 2026", "May 15 2026", "15 May 2026"
+    - ISO formats: "2026-05", "2026-05-15", "2026-05-15 14:30"
+    - Month names: "May", "May 2026", "May 15"
+    - Year only: "2026"
 
     Returns a list of matching entries. Each entry contains:
     - id: use this with diary_delete_entry or diary_save_entry (as timestamp key) to update/delete

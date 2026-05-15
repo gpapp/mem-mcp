@@ -1064,10 +1064,22 @@ npm install @modelcontextprotocol/sdk</code></pre>
     const months = ['january','february','march','april','may','june','july','august','september','october','november','december'];
     const monthsShort = ['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'];
 
-    // Pattern: Year-MM (e.g., "2026-05", "2026-5")
+    // Pattern: YYYY-MM-DD (e.g., "2026-05-15")
+    const ymdMatch = trimmed.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+    if (ymdMatch) {
+      return { year: ymdMatch[1], month: parseInt(ymdMatch[2]), day: parseInt(ymdMatch[3]) };
+    }
+
+    // Pattern: YYYY-MM-DD HH:MM (e.g., "2026-05-15 14:30")
+    const ymdTimeMatch = trimmed.match(/^(\d{4})-(\d{1,2})-(\d{1,2})\s+(\d{1,2}):(\d{2})$/);
+    if (ymdTimeMatch) {
+      return { year: ymdTimeMatch[1], month: parseInt(ymdTimeMatch[2]), day: parseInt(ymdTimeMatch[3]), hour: parseInt(ymdTimeMatch[4]), minute: parseInt(ymdTimeMatch[5]) };
+    }
+
+    // Pattern: YYYY-MM (e.g., "2026-05", "2026-5")
     const ymMatch = trimmed.match(/^(\d{4})-(\d{1,2})$/);
     if (ymMatch) {
-      return { year: ymMatch[1], month: parseInt(ymMatch[2]) };
+      return { year: ymMatch[1], month: parseInt(ymdMatch[2]) };
     }
 
     // Pattern: Year only (e.g., "2026")
@@ -1075,7 +1087,31 @@ npm install @modelcontextprotocol/sdk</code></pre>
       return { year: trimmed };
     }
 
-    // Pattern: "Month Year" (e.g., "May 2026", "May 2026")
+    // Pattern: "Month Day, Year" (e.g., "May 15, 2026", "May 15 2026")
+    for (let i = 0; i < months.length; i++) {
+      const mdRe = new RegExp('^' + months[i] + '\\s+(\\d{1,2}),?\\s+(\\d{4})$', 'i');
+      const m = trimmed.match(mdRe);
+      if (m) return { year: m[2], month: i + 1, day: parseInt(m[1]) };
+    }
+    for (let i = 0; i < monthsShort.length; i++) {
+      const mdRe = new RegExp('^' + monthsShort[i] + '\\s+(\\d{1,2}),?\\s+(\\d{4})$', 'i');
+      const m = trimmed.match(mdRe);
+      if (m) return { year: m[2], month: i + 1, day: parseInt(m[1]) };
+    }
+
+    // Pattern: "Day Month Year" (e.g., "15 May 2026", "15th May 2026")
+    for (let i = 0; i < months.length; i++) {
+      const dmRe = new RegExp('^(\\d{1,2})(?:st|nd|rd|th)?\\s+' + months[i] + '\\s+(\\d{4})$', 'i');
+      const m = trimmed.match(dmRe);
+      if (m) return { year: m[2], month: i + 1, day: parseInt(m[1]) };
+    }
+    for (let i = 0; i < monthsShort.length; i++) {
+      const dmRe = new RegExp('^(\\d{1,2})(?:st|nd|rd|th)?\\s+' + monthsShort[i] + '\\s+(\\d{4})$', 'i');
+      const m = trimmed.match(dmRe);
+      if (m) return { year: m[2], month: i + 1, day: parseInt(m[1]) };
+    }
+
+    // Pattern: "Month Year" (e.g., "May 2026")
     for (let i = 0; i < months.length; i++) {
       const monthRe = new RegExp('^' + months[i] + '\\s+(\\d{4})$', 'i');
       const m = trimmed.match(monthRe);
@@ -1105,8 +1141,14 @@ npm install @modelcontextprotocol/sdk</code></pre>
     if (isNaN(d.getTime())) return false;
     const year = d.getFullYear().toString();
     const month = (d.getMonth() + 1).toString();
+    const day = d.getDate().toString();
+    const hour = d.getHours().toString();
+    const minute = d.getMinutes().toString();
     if (pattern.year && year !== pattern.year) return false;
     if (pattern.month && month !== pattern.month.toString()) return false;
+    if (pattern.day && day !== pattern.day.toString()) return false;
+    if (pattern.hour !== undefined && hour !== pattern.hour.toString()) return false;
+    if (pattern.minute !== undefined && minute !== pattern.minute.toString()) return false;
     return true;
   }
 
