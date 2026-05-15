@@ -1080,7 +1080,10 @@ npm install @modelcontextprotocol/sdk</code></pre>
             <div class="diary-entry-segment" style="${idx > 0 ? 'margin-top:2rem; border-top:1px dashed var(--border); padding-top:1.5rem;' : ''}">
               <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:0.75rem;">
                 <span style="font-size:0.75rem; font-weight:700; color:var(--primary); text-transform:uppercase;">Entry ${dayEntries.length - idx} ${time ? '• ' + time : ''}</span>
-                <div style="display:flex; gap:0.25rem; flex-wrap:wrap; justify-content:flex-end;">${mentions}</div>
+                <div style="display:flex; gap:0.5rem; align-items:center; flex-wrap:wrap; justify-content:flex-end;">
+                  ${mentions}
+                  <button class="btn btn-danger btn-sm" onclick="deleteDiaryEntry('${entry.id}')" title="Delete entry" style="padding:0.15rem 0.5rem; font-size:0.75rem;">🗑️</button>
+                </div>
               </div>
               <div class="markdown-body">${marked.parse(entry.content || '')}</div>
             </div>
@@ -1106,6 +1109,18 @@ npm install @modelcontextprotocol/sdk</code></pre>
 
   function showDiaryEditor() { activeDiaryDate = null; renderDiarySidebar(); document.getElementById('diary-viewer').style.display = 'none'; document.getElementById('diary-editor').style.display = 'block'; document.getElementById('diary-content').value = ''; }
   function cancelDiaryEdit() { if (diaryEntries.length) selectDiaryEntry(diaryEntries[0].date); else document.getElementById('diary-editor').style.display = 'none'; }
+
+  async function deleteDiaryEntry(id) {
+    if (!confirm('Delete this diary entry? This cannot be undone.')) return;
+    try {
+      await api.delete('diary/' + id);
+      diaryEntries = diaryEntries.filter(e => e.id !== id);
+      renderDiarySidebar();
+      if (diaryEntries.length) selectDiaryEntry(diaryEntries[0].date);
+      else { document.getElementById('diary-viewer').style.display = 'block'; document.getElementById('diary-view-content').innerHTML = '<p class="empty">No entries.</p>'; }
+      toast('🗑️ Entry deleted');
+    } catch(e) { toast('❌ Error deleting entry'); }
+  }
   function editCurrentEntry() {
     const entry = diaryEntries.find(d => d.date === activeDiaryDate); if (!entry) return;
     document.getElementById('diary-viewer').style.display = 'none'; document.getElementById('diary-editor').style.display = 'block'; document.getElementById('diary-content').value = entry.content;

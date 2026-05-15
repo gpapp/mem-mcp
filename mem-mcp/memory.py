@@ -26,7 +26,7 @@ from datetime import datetime
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import (
     Distance, VectorParams, PointStruct,
-    Filter, FieldCondition, MatchValue,
+    Filter, FieldCondition, MatchValue, PointIdsList,
 )
 from neo4j import GraphDatabase
 # ---------------------------------------------------------------------------
@@ -1349,6 +1349,38 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
             "mentions": mentions
         })
     return entries
+
+
+async def db_delete_diary(entry_id: str, user_id: str) -> bool:
+    """Delete a single diary entry by id. Returns True if the entry existed and was deleted."""
+    qdrant = await get_qdrant()
+    neo4j_driver = get_neo4j()
+    if not qdrant or not neo4j_driver:
+        raise RuntimeError("Database connections not established.")
+
+    # Verify ownership before deleting
+    with neo4j_driver.session() as s:
+        result = s.run(
+            "MATCH (d:DiaryEntry {id: $id, userId: $userId}) RETURN d.id as id",
+            id=entry_id, userId=user_id
+        )
+        if not result.single():
+            return False
+
+        # Delete from Neo4j (detach removes all relationships)
+        s.run(
+            "MATCH (d:DiaryEntry {id: $id, userId: $userId}) DETACH DELETE d",
+            id=entry_id, userId=user_id
+        )
+
+    # Delete from Qdrant
+    await qdrant.delete(
+        collection_name=DIARY_COLLECTION,
+        points_selector=PointIdsList(points=[entry_id]),
+    )
+
+    await publish_db_event(user_id, "diary_changed", {"action": "delete", "id": entry_id})
+    return True
 
 
 def db_list_diary(user_id: str) -> list:

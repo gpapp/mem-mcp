@@ -173,6 +173,18 @@ async def diary_save_entry(content: str, timestamp: Optional[str] = None):
 async def diary_search_entries(query: str, limit: int = 3, top_p: float = 0.4):
     """Search diary entries."""
     return await mem.db_search_diary(query, _current_user(), limit, top_p)
+
+@mcp.tool()
+async def diary_delete_entry(entryId: str):
+    """Delete a diary entry by its ID.
+
+    - entryId: the id returned by diary_save_entry or diary_search_entries.
+    - Returns a confirmation message, or an error if the entry was not found.
+    """
+    deleted = await mem.db_delete_diary(entryId, _current_user())
+    if not deleted:
+        return f"Entry '{entryId}' not found or does not belong to the current user."
+    return f"Deleted diary entry {entryId}"
     
 @mcp.tool()
 async def find_duplicates(category: str = "People", limit: int = 50, threshold: float = 0.6, max_cluster: int = 4, group_by: Optional[str] = "first_name"):

@@ -266,6 +266,18 @@ async def api_get_diary_entry(entry_id: str, request: Request):
     return e
 
 
+@web_app.delete("/api/diary/{entry_id}", response_class=JSONResponse)
+async def api_delete_diary_entry(entry_id: str, request: Request):
+    """Delete a single diary entry by ID."""
+    try:
+        deleted = await mem.db_delete_diary(entry_id, _require_user(request))
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Diary entry not found or access denied.")
+        return {"deleted": entry_id}
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
 @web_app.post("/api/memories", response_class=JSONResponse, status_code=201)
 async def api_create_memory(request: Request, body: MemoryCreate):
     try:
