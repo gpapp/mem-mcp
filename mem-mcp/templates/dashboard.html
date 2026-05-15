@@ -144,8 +144,9 @@
     .markdown-body { background: transparent !important; color: var(--text); }
     .markdown-body p:last-child { margin-bottom: 0; }
     /* Task-list items: remove bullet, align checkbox with text */
-    .markdown-body ul li:has(> input[type="checkbox"]) { list-style: none; margin-left: -1.4rem; display: flex; align-items: flex-start; gap: 0.4rem; margin-bottom: 0.2rem; }
-    .markdown-body ul li > input[type="checkbox"] { margin-top: 0.25rem; flex-shrink: 0; accent-color: var(--primary); }
+    .markdown-body ul li:has(> input[type="checkbox"]) { list-style: none; margin-left: -1.4rem; display: flex; align-items: flex-start; gap: 0.6rem; margin-bottom: 0.4rem; width: 100%; }
+    .markdown-body ul li > input[type="checkbox"] { margin-top: 0.3rem; flex-shrink: 0; accent-color: var(--primary); width: 1.1rem; height: 1.1rem; cursor: pointer; }
+    .markdown-body ul li > span, .markdown-body ul li > div { flex-grow: 1; word-break: break-word; line-height: 1.5; }
     .empty { color: var(--muted); font-size: .9rem; padding: 2rem 0; text-align: center; }
 
     /* ── Memories Page Layout ── */
@@ -386,7 +387,16 @@
     </div>
     <div class="diary-main">
       <div id="diary-editor" class="diary-editor-card" style="display:none;">
-        <textarea id="diary-content" placeholder="Today I…"></textarea>
+        <input type="hidden" id="diary-id">
+        <div style="margin-bottom: 1rem;">
+          <label for="diary-title">Title</label>
+          <input type="text" id="diary-title" placeholder="Meeting with...">
+        </div>
+        <div style="margin-bottom: 1rem;">
+          <label for="diary-timestamp">Date & Time</label>
+          <input type="datetime-local" id="diary-timestamp">
+        </div>
+        <textarea id="diary-content" placeholder="Today I…" style="min-height: 250px;"></textarea>
         <div style="margin-top:.75rem; display: flex; justify-content: space-between;">
           <button class="btn btn-ghost" onclick="cancelDiaryEdit()">Cancel</button>
           <button class="btn btn-primary" onclick="saveDiary()">💾 Save Entry</button>
@@ -1056,6 +1066,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
 
   // Extract the first ## heading from entry content as a display title
   function diaryEntryTitle(entry) {
+    if (entry.title && entry.title !== "Untitled Entry") return entry.title;
     const m = (entry.content || '').match(/^##\s+(.+)/m);
     if (m) return m[1].replace(/\s*—\s*\d{4}-\d{2}-\d{2}.*$/, '').trim();
     // fallback: first non-empty line stripped of markdown
@@ -1116,8 +1127,10 @@ npm install @modelcontextprotocol/sdk</code></pre>
     if (!entry) return;
     document.getElementById('diary-viewer').style.display = 'none';
     document.getElementById('diary-editor').style.display = 'block';
+    document.getElementById('diary-id').value = entry.id;
+    document.getElementById('diary-title').value = entry.title || '';
+    document.getElementById('diary-timestamp').value = entry.timestamp || '';
     document.getElementById('diary-content').value = entry.content;
-    document.getElementById('diary-editor').dataset.editTimestamp = entry.timestamp || '';
   }
 
   function editLastEntry(date) {
@@ -1126,7 +1139,17 @@ npm install @modelcontextprotocol/sdk</code></pre>
     editEntry(dayEntries[0].id);
   }
 
-  function showDiaryEditor() { activeDiaryId = null; renderDiarySidebar(); const ed = document.getElementById('diary-editor'); ed.dataset.editTimestamp = ''; document.getElementById('diary-viewer').style.display = 'none'; ed.style.display = 'block'; document.getElementById('diary-content').value = ''; }
+  function showDiaryEditor() { 
+    activeDiaryId = null; 
+    renderDiarySidebar(); 
+    document.getElementById('diary-viewer').style.display = 'none'; 
+    const ed = document.getElementById('diary-editor');
+    ed.style.display = 'block'; 
+    document.getElementById('diary-id').value = '';
+    document.getElementById('diary-title').value = '';
+    document.getElementById('diary-timestamp').value = new Date().toISOString().slice(0, 16);
+    document.getElementById('diary-content').value = ''; 
+  }
   function cancelDiaryEdit() { if (activeDiaryId) selectDiaryEntry(activeDiaryId); else if (diaryEntries.length) selectDiaryEntry(diaryEntries[0].id); else document.getElementById('diary-editor').style.display = 'none'; }
 
   async function deleteDiaryEntry(id) {
@@ -1146,8 +1169,21 @@ npm install @modelcontextprotocol/sdk</code></pre>
   }
 
   async function saveDiary() {
-    const content = document.getElementById('diary-content').value.trim(); if (!content) return;
-    try { await api.post('diary', {content}); toast('📖 Saved'); await loadDiary(); } catch(e) { toast('❌ Error'); }
+    const id = document.getElementById('diary-id').value;
+    const title = document.getElementById('diary-title').value.trim();
+    const timestamp = document.getElementById('diary-timestamp').value;
+    const content = document.getElementById('diary-content').value.trim();
+
+    if (!title || !timestamp || !content) {
+      toast('⚠️ Title, Date, and Content are required');
+      return;
+    }
+
+    try { 
+      await api.post('diary', {id, title, timestamp, content}); 
+      toast('📖 Saved'); 
+      await loadDiary(); 
+    } catch(e) { toast('❌ Error saving entry'); }
   }
 
   async function loadInsights() {

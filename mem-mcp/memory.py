@@ -1237,7 +1237,7 @@ async def db_save_diary(content: str, user_id: str, timestamp: str, title: str) 
     doc_id   = _diary_id(user_id, timestamp)
     # Keep a plain date string for display / grouping purposes
     entry_date = timestamp[:10]
-    vector   = await get_embedding(content)
+    vector   = await get_embedding(f"{title}: {content}" if title else content)
 
     # Qdrant — upsert by the stable doc_id so re-saving replaces the vector
     await qdrant.upsert(
@@ -1394,6 +1394,14 @@ def db_list_diary(user_id: str) -> list:
     if not neo4j_driver:
         raise RuntimeError("Neo4j not connected.")
 
+    def format_ts_for_picker(ts):
+        """Format timestamp to YYYY-MM-DDTHH:MM for browser date picker compatibility."""
+        if not ts: return None
+        # Handle Neo4j datetime or strings
+        s_ts = ts.iso_format() if hasattr(ts, "iso_format") else str(ts)
+        # Return YYYY-MM-DDTHH:MM (first 16 characters)
+        return s_ts[:16]
+
     with neo4j_driver.session() as s:
         result = s.run(
             """
@@ -1410,8 +1418,8 @@ def db_list_diary(user_id: str) -> list:
                 "id": r["id"],
                 "date": r["date"], 
                 "content": r["content"], 
-                "title": r.get("title"),
-                "timestamp": r["timestamp"].iso_format() if r.get("timestamp") and hasattr(r["timestamp"], "iso_format") else (str(r["timestamp"]) if r.get("timestamp") else None),
+                "title": r.get("title") or "Untitled Entry",
+                "timestamp": format_ts_for_picker(r.get("timestamp")),
                 "mentions": [m for m in r["mentions"] if m.get("id")]
             } for r in result
         ]
