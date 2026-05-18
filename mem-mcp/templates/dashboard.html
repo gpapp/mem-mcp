@@ -1489,7 +1489,6 @@ npm install @modelcontextprotocol/sdk</code></pre>
       params.event.preventDefault();
       if (params.nodes.length === 0) return;
       const nodeId = params.nodes[0];
-      currentContextNode = nodeId;
       showContextMenu(params.event, nodeId);
     });
   }
@@ -1571,20 +1570,27 @@ npm install @modelcontextprotocol/sdk</code></pre>
   }
 
 let contextMenu = null;
+  let currentContextNodeData = null;
 
   function showContextMenu(event, nodeId) {
     hideContextMenu();
     
-    const node = memories.find(m => m.id === nodeId);
-    if (!node) return;
+    // Find node data from graphData first, then memories as fallback
+    let nodeData = graphData.nodes.get(nodeId);
+    if (!nodeData) {
+      nodeData = memories.find(m => m.id === nodeId);
+    }
+    if (!nodeData) return;
+    
+    const nodeName = nodeData.name || nodeData.label || 'Unknown';
     
     contextMenu = document.createElement('div');
     contextMenu.className = 'context-menu';
-    contextMenu.style.left = event.pageX + 'px';
-    contextMenu.style.top = event.pageY + 'px';
+    contextMenu.style.left = Math.min(event.pageX, window.innerWidth - 200) + 'px';
+    contextMenu.style.top = Math.min(event.pageY, window.innerHeight - 200) + 'px';
     
     contextMenu.innerHTML = `
-      <div class="context-menu-item" onclick="jumpToMemory('${nodeId}')">📖 Go to fact</div>
+      <div class="context-menu-item" onclick="goToFact('${nodeId}')">📖 Go to fact</div>
       <div class="context-menu-separator"></div>
       <div class="context-menu-item" onclick="addToBuildGraph('${nodeId}')">📍 Show on map</div>
       <div class="context-menu-item" onclick="showAllConnected('${nodeId}')">🔗 Show all connected</div>
@@ -1593,6 +1599,7 @@ let contextMenu = null;
     `;
     
     document.body.appendChild(contextMenu);
+    currentContextNodeData = nodeData;
     
     document.addEventListener('click', hideContextMenu);
     document.addEventListener('contextmenu', hideContextMenu);
@@ -1602,17 +1609,26 @@ let contextMenu = null;
     if (contextMenu) {
       contextMenu.remove();
       contextMenu = null;
+      currentContextNodeData = null;
     }
     document.removeEventListener('click', hideContextMenu);
     document.removeEventListener('contextmenu', hideContextMenu);
   }
 
+  async function goToFact(nodeId) {
+    hideContextMenu();
+    jumpToMemory(nodeId);
+  }
+
   async function addToBuildGraph(nodeId) {
     hideContextMenu();
     switchTab('graph');
+    
+    // Force build mode if not already
     if (!isBuildMode) {
       setGraphMode('build');
     }
+    
     await showOnMap(nodeId);
   }
 
@@ -1702,11 +1718,6 @@ let contextMenu = null;
     } catch(e) {
       toast('⚠️ Error loading node: ' + e.message);
     }
-  }
-
-  async function goToFact(nodeId) {
-    hideContextMenu();
-    jumpToMemory(nodeId);
   }
 
   async function showAllConnected(nodeId) {
