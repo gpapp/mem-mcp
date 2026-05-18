@@ -841,7 +841,9 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
       - Email match → 1.0
       - first_name + last_name match → 1.0
       - Alias match → 0.95
+      - Fuzzy alias ↔ title match (difflib ≥0.75) → 0.88
       - Title word-overlap boost (additive on vector score)
+      - Fuzzy title word match (difflib ≥0.75) → 0.7–0.95
 
     Clustering:
       1. Form initial clusters at `threshold`.
@@ -997,6 +999,14 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
             if p_i["norm_name"] and p_i["norm_name"] in p_j["aliases"]:
                 signals.append(0.95)
 
+            # Signal 5b: Fuzzy alias ↔ title match
+            for ali in p_i["aliases"]:
+                ali_words = ali.split()
+                for tw in p_j["norm_name"].split():
+                    if difflib.SequenceMatcher(None, ali, tw).ratio() >= 0.75:
+                        signals.append(0.88)
+                        break
+
             # Signal 6: Title word-overlap boost (additive on vec_sim)
             if p_i["norm_words"] and p_j["norm_words"]:
                 common = p_i["norm_words"] & p_j["norm_words"]
@@ -1009,6 +1019,15 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
                         if ratio >= 1.0:
                             boosted = max(boosted, 0.88)
                         signals.append(min(1.0, boosted))
+
+            # Signal 7: Fuzzy title word match
+            import difflib
+            for wi in p_i["norm_words"]:
+                for wj in p_j["norm_words"]:
+                    s = difflib.SequenceMatcher(None, wi, wj).ratio()
+                    if s >= 0.75:
+                        signals.append(min(0.95, 0.7 + 0.25 * s))
+                        break
 
             similarity = max(signals)
             pair_scores[(i, j)] = similarity
