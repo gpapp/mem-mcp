@@ -631,10 +631,17 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
 
             score = 1.0
             title = f.get("title", "")
-            if title and query_lower == title.lower():
-                score = 2.0
-            elif title and query_lower in title.lower():
-                score = 1.5
+            if title:
+                title_lower = title.lower()
+                query_words = query_lower.split()
+                if query_lower == title_lower:
+                    score = 2.5
+                elif title_lower in query_lower:
+                    score = 2.0
+                elif all(w in title_lower for w in query_words):
+                    score = 1.7
+                elif query_lower in title_lower:
+                    score = 1.5
 
             exact_matches.append({
                 "id": f["id"],
@@ -671,9 +678,15 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
 
         # Boost score if query matches the title
         if title:
-            if query_lower == title.lower():
+            title_lower = title.lower()
+            query_words = query_lower.split()
+            if query_lower == title_lower:
+                score += 1.0
+            elif title_lower in query_lower:
                 score += 0.5
-            elif query_lower in title.lower() or title.lower() in query_lower:
+            elif all(w in title_lower for w in query_words):
+                score += 0.4
+            elif query_lower in title_lower:
                 score += 0.2
 
         # Boost score if query matches an alias
