@@ -258,15 +258,15 @@
 
     /* ── Context Menu ── */
     .context-menu {
-      position: fixed; z-index: 1000; background: var(--surface);
+      position: fixed; z-index: 9999; background: var(--surface);
       border: 1px solid var(--border); border-radius: 8px;
       box-shadow: 0 4px 12px rgba(0,0,0,.15); padding: 4px 0; min-width: 180px;
     }
     .context-menu-item {
       padding: 8px 14px; cursor: pointer; font-size: .85rem;
-      display: flex; align-items: center; gap: 8px;
+      display: flex; align-items: center; gap: 8px; color: var(--text);
     }
-    .context-menu-item:hover { background: var(--primary-light); }
+    .context-menu-item:hover { background: var(--primary-light); color: var(--primary); }
     .context-menu-item.disabled { opacity: .5; cursor: not-allowed; }
     .context-menu-item.disabled:hover { background: none; }
     .context-menu-separator {
@@ -1487,9 +1487,13 @@ npm install @modelcontextprotocol/sdk</code></pre>
 
     network.on("oncontext", function (params) {
       params.event.preventDefault();
+      params.event.stopPropagation();
       if (params.nodes.length === 0) return;
       const nodeId = params.nodes[0];
-      showContextMenu(params.event, nodeId);
+      
+      // Use native event for positioning
+      const nativeEvent = params.event.originalEvent || params.event;
+      showContextMenu(nativeEvent, nodeId);
     });
   }
 
@@ -1575,19 +1579,26 @@ let contextMenu = null;
   function showContextMenu(event, nodeId) {
     hideContextMenu();
     
+    const x = event.clientX || event.pageX || 100;
+    const y = event.clientY || event.pageY || 100;
+    
     // Find node data from graphData first, then memories as fallback
-    let nodeData = graphData.nodes.get(nodeId);
+    let nodeData = null;
+    if (graphData && graphData.nodes) {
+      try { nodeData = graphData.nodes.get(nodeId); } catch(e) {}
+    }
     if (!nodeData) {
       nodeData = memories.find(m => m.id === nodeId);
     }
-    if (!nodeData) return;
-    
-    const nodeName = nodeData.name || nodeData.label || 'Unknown';
+    if (!nodeData) {
+      console.warn('[ContextMenu] Node not found:', nodeId);
+      return;
+    }
     
     contextMenu = document.createElement('div');
     contextMenu.className = 'context-menu';
-    contextMenu.style.left = Math.min(event.pageX, window.innerWidth - 200) + 'px';
-    contextMenu.style.top = Math.min(event.pageY, window.innerHeight - 200) + 'px';
+    contextMenu.style.left = Math.min(x, window.innerWidth - 200) + 'px';
+    contextMenu.style.top = Math.min(y, window.innerHeight - 200) + 'px';
     
     contextMenu.innerHTML = `
       <div class="context-menu-item" onclick="goToFact('${nodeId}')">📖 Go to fact</div>
@@ -1601,8 +1612,11 @@ let contextMenu = null;
     document.body.appendChild(contextMenu);
     currentContextNodeData = nodeData;
     
-    document.addEventListener('click', hideContextMenu);
-    document.addEventListener('contextmenu', hideContextMenu);
+    // Use capture to catch clicks outside the menu
+    setTimeout(() => {
+      document.addEventListener('click', hideContextMenu, { capture: true });
+      document.addEventListener('contextmenu', hideContextMenu, { capture: true });
+    }, 0);
   }
 
   function hideContextMenu() {
@@ -1611,8 +1625,8 @@ let contextMenu = null;
       contextMenu = null;
       currentContextNodeData = null;
     }
-    document.removeEventListener('click', hideContextMenu);
-    document.removeEventListener('contextmenu', hideContextMenu);
+    document.removeEventListener('click', hideContextMenu, { capture: true });
+    document.removeEventListener('contextmenu', hideContextMenu, { capture: true });
   }
 
   async function goToFact(nodeId) {
