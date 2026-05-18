@@ -8,11 +8,22 @@ Usage:
     python migrate_title_to_name.py [--dry-run]
 
 The --dry-run flag shows what would be changed without making modifications.
+
+Environment variables (use docker .env or host values):
+    MEM_NEO4J_URL          - Neo4j bolt URL (default: bolt://localhost:7687)
+    MEM_NEO4J_USER         - Neo4j user (default: neo4j)
+    MEM_NEO4J_PASSWORD     - Neo4j password
+    MEM_QDRANT_URL         - Qdrant URL (default: http://localhost:6333)
+    MEM_QDRANT_COLLECTION  - Qdrant collection name (default: ea_memories)
 """
 
 import asyncio
 import argparse
 import logging
+import os
+
+from dotenv import load_dotenv
+load_dotenv()
 
 from neo4j import AsyncGraphDatabase
 from qdrant_client import AsyncQdrantClient
@@ -21,20 +32,17 @@ from qdrant_client.models import Record, ScrollResponse
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("migration")
 
-NEO4J_URI = "bolt://localhost:7687"
-NEO4J_USER = "neo4j"
-QDRANT_URL = "http://localhost:6333"
-COLLECTION_NAME = "ea_memories"
+NEO4J_URL = os.getenv("MEM_NEO4J_URL", "bolt://localhost:7687")
+NEO4J_USER = os.getenv("MEM_NEO4J_USER", "neo4j")
+NEO4J_PASS = os.getenv("MEM_NEO4J_PASSWORD") or os.getenv("NEO4J_PASSWORD")
+QDRANT_URL = os.getenv("MEM_QDRANT_URL", "http://localhost:6333")
+COLLECTION_NAME = os.getenv("MEM_QDRANT_COLLECTION", "ea_memories")
 
 
 async def get_neo4j_driver():
-    from dotenv import load_dotenv
-    import os
-    load_dotenv()
-    password = os.getenv("NEO4J_PASSWORD") or os.getenv("MEM_NEO4J_PASSWORD")
-    if not password:
-        raise RuntimeError("NEO4J_PASSWORD not set in environment")
-    return AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, password))
+    if not NEO4J_PASS:
+        raise RuntimeError("MEM_NEO4J_PASSWORD not set in environment")
+    return AsyncGraphDatabase.driver(NEO4J_URL, auth=(NEO4J_USER, NEO4J_PASS))
 
 
 async def migrate_neo4j_facts(dry_run: bool = False):
@@ -42,7 +50,6 @@ async def migrate_neo4j_facts(dry_run: bool = False):
     migrated = 0
 
     async with driver.session() as s:
-        # Migrate Fact nodes
         result = await s.run("""
             MATCH (f:Fact)
             WHERE f.title IS NOT NULL AND f.name IS NULL
@@ -63,7 +70,6 @@ async def migrate_neo4j_facts(dry_run: bool = False):
                 logger.info(f"  Renamed Fact {rec['id']}: '{rec['old_title']}'")
             migrated += 1
 
-        # Migrate DiaryEntry nodes
         result = await s.run("""
             MATCH (d:DiaryEntry)
             WHERE d.title IS NOT NULL AND d.name IS NULL
@@ -95,22 +101,13 @@ async def migrate_qdrant(dry_run: bool = False):
 
     while True:
         try:
-            if offset:
-                result: ScrollResponse = await client.scroll(
-                    collection_name=COLLECTION_NAME,
-                    scroll_filter=None,
-                    limit=100,
-                    offset=offset,
-                    with_vectors=False,
-                )
-            else:
-                result: ScrollResponse = await client.scroll(
-                    collection_name=COLLECTION_NAME,
-                    scroll_filter=None,
-                    limit=100,
-                    offset=None,
-                    with_vectors=False,
-                )
+            result: ScrollResponse = await client.scroll(
+                collection_name=COLLECTION_NAME,
+                scroll_filter=None,
+                limit=100,
+                offset=offset,
+                with_vectors=False,
+            )
         except Exception as e:
             logger.error(f"Qdrant scroll failed: {e}")
             break
@@ -151,6 +148,8 @@ async def main():
 
     mode = "[DRY-RUN] " if args.dry_run else ""
     logger.info(f"{mode}Starting migration: title -> name")
+    logger.info(f"Neo4j: {NEO4J_URL}")
+    logger.info(f"Qdrant: {QDRANT_URL}/{COLLECTION_NAME}")
 
     neo4j_count = await migrate_neo4j_facts(dry_run=args.dry_run)
     qdrant_count = await migrate_qdrant(dry_run=args.dry_run)
