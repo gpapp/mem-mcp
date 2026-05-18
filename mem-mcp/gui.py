@@ -130,16 +130,17 @@ async def startup_event():
 
 class MemoryCreate(BaseModel):
     text: str
-    title: Optional[str] = None
+    name: Optional[str] = None
     category: str = "General"
     tags: Optional[str] = ""
 
 
 class MemoryUpdate(BaseModel):
     text: str
-    title: Optional[str] = None
+    name: Optional[str] = None
     category: str = "General"
     tags: Optional[str] = ""
+
 
 class MemoryLink(BaseModel):
     sourceId: str
@@ -149,7 +150,7 @@ class MemoryLink(BaseModel):
 
 class DiaryCreate(BaseModel):
     content: str
-    title: str
+    name: str
     timestamp: str
     id: Optional[str] = None
 
@@ -283,8 +284,8 @@ async def api_delete_diary_entry(entry_id: str, request: Request):
 async def api_create_memory(request: Request, body: MemoryCreate):
     try:
         metadata = {"tags": [t.strip() for t in body.tags.split(",") if t.strip()]} if body.tags else {}
-        doc_id = await mem.db_add_memory(body.text, body.category, _require_user(request), metadata, title=body.title)
-        return {"id": doc_id, "text": body.text, "title": body.title, "category": body.category.strip().capitalize(), "metadata": metadata}
+        doc_id = await mem.db_add_memory(body.text, body.category, _require_user(request), metadata, name=body.name)
+        return {"id": doc_id, "text": body.text, "name": body.name, "category": body.category.strip().capitalize(), "metadata": metadata}
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
@@ -293,10 +294,10 @@ async def api_create_memory(request: Request, body: MemoryCreate):
 async def api_update_memory(memory_id: str, request: Request, body: MemoryUpdate):
     try:
         metadata = {"tags": [t.strip() for t in body.tags.split(",") if t.strip()]} if body.tags else {}
-        found = await mem.db_update_memory(memory_id, body.title, body.text, body.category, _require_user(request), metadata)
+        found = await mem.db_update_memory(memory_id, body.name, body.text, body.category, _require_user(request), metadata)
         if not found:
             raise HTTPException(status_code=404, detail="Memory not found or access denied.")
-        return {"id": memory_id, "title": body.title, "text": body.text, "category": body.category.strip().capitalize(), "metadata": metadata}
+        return {"id": memory_id, "name": body.name, "text": body.text, "category": body.category.strip().capitalize(), "metadata": metadata}
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
@@ -391,7 +392,7 @@ async def api_focus_graph(request: Request, fact_id: str):
         # Add center node
         center = {
             "id": fact["id"],
-            "title": fact.get("title", fact["text"][:50]),
+            "name": fact.get("name", fact["text"][:50]),
             "text": fact["text"],
             "category": fact.get("category", "General")
         }
@@ -405,7 +406,7 @@ async def api_focus_graph(request: Request, fact_id: str):
                 seen_nodes.add(nid)
                 nodes.append({
                     "id": neighbor["id"],
-                    "title": neighbor.get("text", "")[:50],
+                    "name": neighbor.get("name", "")[:50] or neighbor.get("text", "")[:50],
                     "category": neighbor.get("category", "General")
                 })
         
@@ -413,7 +414,7 @@ async def api_focus_graph(request: Request, fact_id: str):
             "center": center,
             "nodes": nodes,
             "edges": edges,
-            "neighbors": [{"id": n["id"], "title": n.get("text", "")[:50], "category": n.get("category", "General")} for n in neighbors]
+            "neighbors": [{"id": n["id"], "name": n.get("name", "")[:50] or n.get("text", "")[:50], "category": n.get("category", "General")} for n in neighbors]
         }
     except HTTPException:
         raise
@@ -441,8 +442,8 @@ async def api_save_diary(request: Request, body: DiaryCreate):
             if body.id != new_id:
                 await mem.db_delete_diary(body.id, user_id)
 
-        entry_ts = await mem.db_save_diary(body.content, user_id, body.timestamp, body.title)
-        return {"timestamp": entry_ts, "content": body.content, "title": body.title}
+        entry_ts = await mem.db_save_diary(body.content, user_id, body.timestamp, body.name)
+        return {"timestamp": entry_ts, "content": body.content, "name": body.name}
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 

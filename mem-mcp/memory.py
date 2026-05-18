@@ -243,7 +243,7 @@ def extract_user_from_headers(headers: dict) -> str:
 # CRUD helpers – single source of truth for Qdrant + Neo4j consistency
 # ---------------------------------------------------------------------------
 
-async def db_add_memory(text: str, category: str, user_id: str, metadata: Optional[dict] = None, title: Optional[str] = None) -> str:
+async def db_add_memory(text: str, category: str, user_id: str, metadata: Optional[dict] = None, name: Optional[str] = None) -> str:
     """Insert a fact into Qdrant (vector) and Neo4j (graph). Returns the new ID."""
     qdrant = await get_qdrant()
     neo4j_driver = get_neo4j()
@@ -253,12 +253,11 @@ async def db_add_memory(text: str, category: str, user_id: str, metadata: Option
     doc_id   = str(uuid.uuid4())
     category = category.strip().capitalize()
     meta     = metadata or {}
-    # Use title + text for embedding for better context if title exists
-    embed_text = f"{title}: {text}" if title else text
+    embed_text = f"{name}: {text}" if name else text
     vector   = await get_embedding(embed_text)
 
     # Qdrant
-    payload = {"text": text, "title": title, "category": category, "userId": user_id, "metadata": meta}
+    payload = {"text": text, "name": name, "category": category, "userId": user_id, "metadata": meta}
     await qdrant.upsert(
         collection_name=COLLECTION_NAME,
         points=[PointStruct(
@@ -274,13 +273,13 @@ async def db_add_memory(text: str, category: str, user_id: str, metadata: Option
             """
             MERGE (u:User {id: $userId})
             MERGE (c:Category {name: $category})
-            CREATE (f:Fact {id: $id, text: $text, title: $title, category: $category,
+            CREATE (f:Fact {id: $id, text: $text, name: $name, category: $category,
                             timestamp: datetime(), userId: $userId})
             SET f += $metadata
             CREATE (u)-[:KNOWS]->(f)
             CREATE (f)-[:IN_CATEGORY]->(c)
             """,
-            userId=user_id, category=category, id=doc_id, text=text, title=title,
+            userId=user_id, category=category, id=doc_id, text=text, name=name,
             metadata=meta
         )
 
@@ -288,14 +287,14 @@ async def db_add_memory(text: str, category: str, user_id: str, metadata: Option
         "action": "add",
         "id": doc_id,
         "category": category,
-        "title": title
+        "name": name
     })
     return doc_id
 
 
-async def db_update_memory(memory_id: str, title: Optional[str], text: Optional[str], category: Optional[str], user_id: str, metadata: Optional[dict] = None) -> bool:
+async def db_update_memory(memory_id: str, name: Optional[str], text: Optional[str], category: Optional[str], user_id: str, metadata: Optional[dict] = None) -> bool:
     """
-    Update title, text, category, or metadata of an existing fact.
+    Update name, text, category, or metadata of an existing fact.
     Re-embeds if text changes. Returns True if the record was found.
     """
     qdrant = await get_qdrant()
@@ -303,7 +302,7 @@ async def db_update_memory(memory_id: str, title: Optional[str], text: Optional[
     if not qdrant or not neo4j_driver:
         raise RuntimeError("Database connections not established.")
 
-    logger.info(f"[db_update_memory] Updating {memory_id}: title={title}, text={'Yes' if text else 'No'}, category={category}")
+    logger.info(f"[db_update_memory] Updating {memory_id}: name={name}, text={'Yes' if text else 'No'}, category={category}")
 
     # Get current to see what's changing
     with neo4j_driver.session() as s:
@@ -315,16 +314,16 @@ async def db_update_memory(memory_id: str, title: Optional[str], text: Optional[
         old_fact = existing["f"]
 
     new_text = text if text is not None else old_fact.get("text")
-    new_title = title if title is not None else old_fact.get("title")
+    new_name = name if name is not None else old_fact.get("name")
     new_cat  = category.strip().capitalize() if category else old_fact.get("category")
     new_meta = metadata or {} 
     
-    logger.info(f"[db_update_memory] New values: title={new_title}, text_len={len(new_text) if new_text else 0}")
+    logger.info(f"[db_update_memory] New values: name={new_name}, text_len={len(new_text) if new_text else 0}")
     
     # Qdrant Update
-    # Re-embed if text OR title changes
-    embed_text = f"{new_title}: {new_text}" if new_title else new_text
-    needs_embed = text is not None or title is not None
+    # Re-embed if text OR name changes
+    embed_text = f"{new_name}: {new_text}" if new_name else new_text
+    needs_embed = text is not None or name is not None
     
     try:
         vector = await get_embedding(embed_text) if needs_embed else None
@@ -342,7 +341,7 @@ async def db_update_memory(memory_id: str, title: Optional[str], text: Optional[
             payload[k] = v
 
     if text is not None: payload["text"] = new_text
-    if title is not None: payload["title"] = new_title
+    if name is not None: payload["name"] = new_name
     if category is not None: payload["category"] = new_cat
     if metadata:
         current_meta = payload.get("metadata", {})
@@ -370,7 +369,7 @@ async def db_update_memory(memory_id: str, title: Optional[str], text: Optional[
         s.run(
             """
             MATCH (f:Fact {id: $id, userId: $userId})
-            SET f.text = $text, f.title = $title, f.category = $category, f.updatedAt = datetime()
+            SET f.text = $text, f.name = $name, f.category = $category, f.updatedAt = datetime()
             SET f += $metadata
             WITH f
             OPTIONAL MATCH (f)-[r:IN_CATEGORY]->(:Category)
@@ -379,14 +378,14 @@ async def db_update_memory(memory_id: str, title: Optional[str], text: Optional[
             MERGE (c:Category {name: $category})
             CREATE (f)-[:IN_CATEGORY]->(c)
             """,
-            id=memory_id, userId=user_id, text=new_text, title=new_title, category=new_cat, metadata=new_meta
+            id=memory_id, userId=user_id, text=new_text, name=new_name, category=new_cat, metadata=new_meta
         )
     logger.info(f"[db_update_memory] Update complete for {memory_id}")
     await publish_db_event(user_id, "memory_changed", {
         "action": "update",
         "id": memory_id,
         "category": new_cat,
-        "title": new_title
+        "name": new_name
     })
     return True
 
@@ -569,7 +568,7 @@ def db_get_connections_by_type(fact_id: str, user_id: str) -> dict:
             MATCH (f:Fact {id: $id, userId: $userId})
             MATCH (f)-[r]-(neighbor:Fact)
             WHERE neighbor.userId = $userId
-            RETURN type(r) as rel_type, collect({id: neighbor.id, title: neighbor.title, text: neighbor.text, category: neighbor.category}) as connections
+            RETURN type(r) as rel_type, collect({id: neighbor.id, name: neighbor.name, text: neighbor.text, category: neighbor.category}) as connections
             """,
             id=fact_id, userId=user_id
         )
@@ -581,7 +580,7 @@ def db_get_connections_by_type(fact_id: str, user_id: str) -> dict:
             for conn in r["connections"]:
                 connections[rel_type].append({
                     "id": conn["id"],
-                    "title": conn.get("title") or conn.get("text", "")[:50],
+                    "name": conn.get("name") or conn.get("text", "")[:50],
                     "category": conn.get("category", "General")
                 })
         
@@ -589,13 +588,13 @@ def db_get_connections_by_type(fact_id: str, user_id: str) -> dict:
 
 
 async def db_search_memories(query: str, user_id: str, limit: int = 5, category: Optional[str] = None, top_p: float = 0.4) -> list:
-    """Vector-similarity search with optional category filter. Also does a basic substring match on titles."""
+    """Vector-similarity search with optional category filter. Also does a basic substring match on names."""
     qdrant = await get_qdrant()
     neo4j_driver = get_neo4j()
     if not qdrant or not neo4j_driver:
         raise RuntimeError("Databases not connected.")
 
-    # 1. Neo4j exact/substring match on title or aliases
+    # 1. Neo4j exact/substring match on name or aliases
     # We do a quick lookup for nodes containing the query
     exact_matches = []
     query_lower = query.lower()
@@ -605,14 +604,14 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
         if len(query) > 3:
             cypher = """
             MATCH (f:Fact {userId: $userId})
-            WHERE toLower(f.title) CONTAINS toLower($query_str)
+            WHERE toLower(f.name) CONTAINS toLower($query_str)
                OR toLower(f.text) CONTAINS toLower($query_str)
                OR any(alias IN keys(f.metadata.aliases) WHERE toLower(alias) CONTAINS toLower($query_str))
             """
         else:
             cypher = """
             MATCH (f:Fact {userId: $userId})
-            WHERE toLower(f.title) CONTAINS toLower($query_str)
+            WHERE toLower(f.name) CONTAINS toLower($query_str)
                OR any(alias IN keys(f.metadata.aliases) WHERE toLower(alias) CONTAINS toLower($query_str))
             """
         if category:
@@ -627,26 +626,26 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
         for r in neo_result:
             f = r["f"]
             # Construct a result matching Qdrant format
-            meta = {k: v for k, v in f.items() if k not in {"id", "text", "title", "category", "timestamp", "userId"}}
+            meta = {k: v for k, v in f.items() if k not in {"id", "text", "name", "category", "timestamp", "userId"}}
 
             score = 1.0
-            title = f.get("title", "")
-            if title:
-                title_lower = title.lower()
+            name = f.get("name", "")
+            if name:
+                name_lower = name.lower()
                 query_words = query_lower.split()
-                if query_lower == title_lower:
+                if query_lower == name_lower:
                     score = 2.5
-                elif title_lower in query_lower:
+                elif name_lower in query_lower:
                     score = 2.0
-                elif all(w in title_lower for w in query_words):
+                elif all(w in name_lower for w in query_words):
                     score = 1.7
-                elif query_lower in title_lower:
+                elif query_lower in name_lower:
                     score = 1.5
                 else:
                     import difflib
-                    title_words = title_lower.split()
-                    if len(query_words) == 1 and len(title_words) >= 1:
-                        for tw in title_words:
+                    name_words = name_lower.split()
+                    if len(query_words) == 1 and len(name_words) >= 1:
+                        for tw in name_words:
                             s = difflib.SequenceMatcher(None, query_lower, tw).ratio()
                             if s >= 0.7:
                                 score = 1.4 * s
@@ -655,7 +654,7 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
             exact_matches.append({
                 "id": f["id"],
                 "text": f["text"],
-                "title": f.get("title"),
+                "name": f.get("name"),
                 "category": f.get("category"),
                 "score": score,
                 "metadata": meta
@@ -683,25 +682,25 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
         score = r.score
         metadata = r.payload.get("metadata", {})
         aliases = metadata.get("aliases", {})
-        title = r.payload.get("title")
+        name = r.payload.get("name")
 
-        # Boost score if query matches the title
-        if title:
-            title_lower = title.lower()
+        # Boost score if query matches the name
+        if name:
+            name_lower = name.lower()
             query_words = query_lower.split()
-            if query_lower == title_lower:
+            if query_lower == name_lower:
                 score += 1.0
-            elif title_lower in query_lower:
+            elif name_lower in query_lower:
                 score += 0.5
-            elif all(w in title_lower for w in query_words):
+            elif all(w in name_lower for w in query_words):
                 score += 0.4
-            elif query_lower in title_lower:
+            elif query_lower in name_lower:
                 score += 0.2
             else:
                 import difflib
-                title_words = title_lower.split()
-                if len(query_words) == 1 and len(title_words) >= 1:
-                    for tw in title_words:
+                name_words = name_lower.split()
+                if len(query_words) == 1 and len(name_words) >= 1:
+                    for tw in name_words:
                         s = difflib.SequenceMatcher(None, query_lower, tw).ratio()
                         if s >= 0.7:
                             score += 0.35 * s
@@ -728,7 +727,7 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
         results.append({
             "id": r.id,
             "text": r.payload.get("text"),
-            "title": r.payload.get("title"),
+            "name": r.payload.get("name"),
             "category": r.payload.get("category"),
             "score": score,
             "metadata": metadata
@@ -783,8 +782,8 @@ def db_list_memories(user_id: str) -> list:
             OPTIONAL MATCH (f)-[r]->(target:Fact {userId: $userId})
             WHERE type(r) <> 'IN_CATEGORY' AND type(r) <> 'KNOWS'
             RETURN f, c.name as category, 
-                   collect({rel: type(r), target_id: target.id, target_text: target.text, target_title: target.title}) as links
-            ORDER BY coalesce(f.title, f.text) ASC
+                   collect({rel: type(r), target_id: target.id, target_text: target.text, target_name: target.name}) as links
+            ORDER BY coalesce(f.name, f.text) ASC
             """,
             userId=user_id,
         )
@@ -792,7 +791,7 @@ def db_list_memories(user_id: str) -> list:
         for r in result:
             f_node = r["f"]
             # Extract metadata (all properties except core ones)
-            core_keys = {"id", "text", "title", "category", "timestamp", "userId"}
+            core_keys = {"id", "text", "name", "category", "timestamp", "userId"}
             metadata = {}
             for k, v in f_node.items():
                 if k not in core_keys:
@@ -804,7 +803,7 @@ def db_list_memories(user_id: str) -> list:
             memories.append({
                 "id":        f_node["id"],
                 "text":      f_node["text"],
-                "title":     f_node.get("title"),
+                "name":     f_node.get("name"),
                 "category":  r["category"],
                 "timestamp": f_node["timestamp"].iso_format() if f_node.get("timestamp") else None,
                 "metadata":  metadata,
@@ -837,13 +836,13 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
 
     Similarity is the MAX of independent signals:
       - Vector cosine similarity (embedding distance)
-      - Exact normalized title match → 1.0
+      - Exact normalized name match → 1.0
       - Email match → 1.0
       - first_name + last_name match → 1.0
       - Alias match → 0.95
-      - Fuzzy alias ↔ title match (difflib ≥0.75) → 0.88
+      - Fuzzy alias ↔ name match (difflib ≥0.75) → 0.88
       - Title word-overlap boost (additive on vector score)
-      - Fuzzy title word match (difflib ≥0.75) → 0.7–0.95
+      - Fuzzy name word match (difflib ≥0.75) → 0.7–0.95
 
     Clustering:
       1. Form initial clusters at `threshold`.
@@ -880,7 +879,7 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
             items.append({
                 "id": f_node["id"],
                 "text": f_node["text"],
-                "title": f_node.get("title"),
+                "name": f_node.get("name"),
                 "category": f_node.get("category"),
                 "metadata": metadata
             })
@@ -937,7 +936,7 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
         else:
             aliases_list = []
 
-        norm = normalize_name(item.get("title"))
+        norm = normalize_name(item.get("name"))
         norm_words = set(norm.split()) if norm else set()
 
         prepared.append({
@@ -949,7 +948,7 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
             "first_name": str(meta.get("first_name", "")).lower().strip(),
             "last_name": str(meta.get("last_name", "")).lower().strip(),
             "aliases": [normalize_name(a) for a in aliases_list],
-            "title": item.get("title") or "",
+            "name": item.get("name") or "",
             "metadata": meta,
         })
 
@@ -978,7 +977,7 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
             vec_sim = float(np.dot(vec_i, vec_j) / (norm_vec_i * norm_vec_j))
             signals.append(vec_sim)
 
-            # Signal 2: Exact normalized-title match
+            # Signal 2: Exact normalized-name match
             if p_i["norm_name"] and p_j["norm_name"] and p_i["norm_name"] == p_j["norm_name"]:
                 signals.append(1.0)
 
@@ -993,13 +992,13 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
                     and p_i["last_name"] == p_j["last_name"]):
                 signals.append(1.0)
 
-            # Signal 5: Alias ↔ title match
+            # Signal 5: Alias ↔ name match
             if p_j["norm_name"] and p_j["norm_name"] in p_i["aliases"]:
                 signals.append(0.95)
             if p_i["norm_name"] and p_i["norm_name"] in p_j["aliases"]:
                 signals.append(0.95)
 
-            # Signal 5b: Fuzzy alias ↔ title match
+            # Signal 5b: Fuzzy alias ↔ name match
             for ali in p_i["aliases"]:
                 ali_words = ali.split()
                 for tw in p_j["norm_name"].split():
@@ -1020,7 +1019,7 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
                             boosted = max(boosted, 0.88)
                         signals.append(min(1.0, boosted))
 
-            # Signal 7: Fuzzy title word match
+            # Signal 7: Fuzzy name word match
             import difflib
             for wi in p_i["norm_words"]:
                 for wj in p_j["norm_words"]:
@@ -1037,7 +1036,7 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
     # Log top matches for debugging
     top_pairs = sorted(pair_scores.items(), key=lambda x: x[1], reverse=True)[:10]
     for (pi, pj), sc in top_pairs:
-        logger.info(f"  top pair: '{prepared[pi]['title']}' ↔ '{prepared[pj]['title']}' = {sc:.4f}")
+        logger.info(f"  top pair: '{prepared[pi]['name']}' ↔ '{prepared[pj]['name']}' = {sc:.4f}")
 
     # ── 5. Clustering with per-cluster splitting ───────────────────────────
     def union_find_cluster(member_indices: list, thresh: float) -> list:
@@ -1126,7 +1125,7 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
             member_info = {
                 "id": item["id"],
                 "text": item["text"],
-                "title": item["title"],
+                "name": item["name"],
                 "similarity": round(avg_item_sim, 4),
             }
             member_info.update(item.get("metadata") or {})
@@ -1246,7 +1245,7 @@ async def db_merge_memories(master_id: str, duplicate_ids: List[str], user_id: s
                 properties: {
                     id: 'discard',
                     text: 'discard',
-                    title: 'discard',
+                    name: 'discard',
                     userId: 'discard',
                     timestamp: 'discard',
                     category: 'discard',
@@ -1281,7 +1280,7 @@ def _diary_id(user_id: str, timestamp: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"diary_{user_id}_{timestamp}"))
 
 
-async def db_save_diary(content: str, user_id: str, timestamp: str, title: str) -> str:
+async def db_save_diary(content: str, user_id: str, timestamp: str, name: str) -> str:
     """Upsert a diary entry keyed by user + timestamp. Returns the ISO timestamp string.
     """
     qdrant = await get_qdrant()
@@ -1293,7 +1292,7 @@ async def db_save_diary(content: str, user_id: str, timestamp: str, title: str) 
     doc_id   = _diary_id(user_id, timestamp)
     # Keep a plain date string for display / grouping purposes
     entry_date = timestamp[:10]
-    vector   = await get_embedding(f"{title}: {content}" if title else content)
+    vector   = await get_embedding(f"{name}: {content}" if name else content)
 
     # Qdrant — upsert by the stable doc_id so re-saving replaces the vector
     await qdrant.upsert(
@@ -1301,7 +1300,7 @@ async def db_save_diary(content: str, user_id: str, timestamp: str, title: str) 
         points=[PointStruct(
             id=doc_id,
             vector=vector,
-            payload={"content": content, "title": title, "date": entry_date, "timestamp": timestamp, "userId": user_id},
+            payload={"content": content, "name": name, "date": entry_date, "timestamp": timestamp, "userId": user_id},
         )],
     )
 
@@ -1311,10 +1310,10 @@ async def db_save_diary(content: str, user_id: str, timestamp: str, title: str) 
             """
             MERGE (u:User {id: $userId})
             MERGE (d:DiaryEntry {id: $id, userId: $userId})
-            SET d.date = $date, d.timestamp = $timestamp, d.content = $content, d.title = $title
+            SET d.date = $date, d.timestamp = $timestamp, d.content = $content, d.name = $name
             MERGE (u)-[:WROTE_DIARY]->(d)
             """,
-            userId=user_id, id=doc_id, date=entry_date, timestamp=timestamp, content=content, title=title
+            userId=user_id, id=doc_id, date=entry_date, timestamp=timestamp, content=content, name=name
         )
 
         # Automatic linking to People and Client facts
@@ -1390,14 +1389,14 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
         date = r.payload.get("date")
         entry_ts = r.payload.get("timestamp", date)
         content = r.payload.get("content")
-        title = r.payload.get("title")
+        name = r.payload.get("name")
         score = r.score
 
-        # Boost score if query matches the title
-        if title:
-            if query_lower == title.lower():
+        # Boost score if query matches the name
+        if name:
+            if query_lower == name.lower():
                 score += 0.5
-            elif query_lower in title.lower() or title.lower() in query_lower:
+            elif query_lower in name.lower() or name.lower() in query_lower:
                 score += 0.2
         
         # Enrich with mentions from Neo4j — match by stable entry id
@@ -1414,7 +1413,7 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
             "date": date,
             "timestamp": entry_ts,
             "content": content,
-            "title": title,
+            "name": name,
             "score": score,
             "mentions": mentions
         })
@@ -1457,7 +1456,7 @@ async def db_delete_diary(entry_id: str, user_id: str) -> bool:
 
 
 def db_list_diary_entries(user_id: str, from_ts: Optional[str] = None, to_ts: Optional[str] = None) -> list:
-    """Return diary entries as (id, timestamp, title) tuples within optional time range.
+    """Return diary entries as (id, timestamp, name) tuples within optional time range.
     Defaults to last month if timestamps not provided."""
     neo4j_driver = get_neo4j()
     if not neo4j_driver:
@@ -1474,14 +1473,14 @@ def db_list_diary_entries(user_id: str, from_ts: Optional[str] = None, to_ts: Op
             """
             MATCH (d:DiaryEntry {userId: $userId})
             WHERE d.timestamp >= $fromTs AND d.timestamp <= $toTs
-            RETURN d.id as id, d.timestamp as timestamp, d.title as title
+            RETURN d.id as id, d.timestamp as timestamp, d.name as name
             ORDER BY d.timestamp DESC
             """,
             userId=user_id,
             fromTs=from_clause,
             toTs=to_clause,
         )
-        return [(r["id"], str(r["timestamp"]) if r["timestamp"] else None, r.get("title") or "Untitled")
+        return [(r["id"], str(r["timestamp"]) if r["timestamp"] else None, r.get("name") or "Unnamed")
                 for r in result]
 
 
@@ -1504,8 +1503,8 @@ def db_list_diary(user_id: str) -> list:
             """
             MATCH (d:DiaryEntry {userId: $userId})
             OPTIONAL MATCH (d)-[:MENTIONS]->(f:Fact)
-            RETURN d.id as id, d.date as date, d.content as content, d.timestamp as timestamp, d.title as title,
-                   collect({id: f.id, text: f.text, title: f.title}) as mentions
+            RETURN d.id as id, d.date as date, d.content as content, d.timestamp as timestamp, d.name as name,
+                   collect({id: f.id, text: f.text, name: f.name}) as mentions
             ORDER BY d.date DESC, d.timestamp DESC
             """,
             userId=user_id,
@@ -1515,7 +1514,7 @@ def db_list_diary(user_id: str) -> list:
                 "id": r["id"],
                 "date": r["date"], 
                 "content": r["content"], 
-                "title": r.get("title") or "Untitled Entry",
+                "name": r.get("name") or "Unnamed Entry",
                 "timestamp": format_ts_for_picker(r.get("timestamp")),
                 "mentions": [m for m in r["mentions"] if m.get("id")]
             } for r in result
@@ -1549,7 +1548,7 @@ def db_get_graph(user_id: str) -> dict:
                 node_map[f["id"]] = {
                     "id": f["id"],
                     "label": "Fact",
-                    "title": f.get("title") or f["text"],
+                    "name": f.get("name") or f["text"],
                     "group": f.get("category", "General")
                 }
             
@@ -1565,14 +1564,14 @@ def db_get_graph(user_id: str) -> dict:
                         node_map[m_id] = {
                             "id": m_id,
                             "label": "Category",
-                            "title": m["name"],
+                            "name": m["name"],
                             "group": "CategoryNode"
                         }
                     else:
                         node_map[m_id] = {
                             "id": m["id"],
                             "label": "Fact",
-                            "title": m["text"],
+                            "name": m["text"],
                             "group": m.get("category", "General")
                         }
                 

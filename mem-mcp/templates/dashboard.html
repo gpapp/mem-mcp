@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Memory Vault — Dashboard</title>
+  <name>Memory Vault — Dashboard</name>
   <link rel="icon" type="image/svg+xml" href="{{BASE_URL}}/favicon.svg">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -93,7 +93,7 @@
     }
     .memory-item:hover { border-left-color: var(--primary); background: var(--primary-light); }
     .memory-item.selected { border-left-color: var(--primary); background: var(--primary-light); }
-    .memory-item-title { flex: 1; font-size: .88rem; font-weight: 500; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .memory-item-name { flex: 1; font-size: .88rem; font-weight: 500; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .memory-item-cat { font-size: .7rem; color: var(--muted); background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: .1rem .35rem; flex-shrink: 0; }
     .memory-text { flex: 1; font-size: .9rem; line-height: 1.5; }
     .memory-meta { font-size: .75rem; color: var(--muted); margin-top: .2rem; }
@@ -117,7 +117,7 @@
       display: flex; align-items: flex-start; justify-content: space-between; gap: .75rem;
       padding-bottom: .75rem; border-bottom: 1px solid var(--border);
     }
-    .fact-detail-title { font-size: 1.1rem; font-weight: 700; color: var(--primary); flex: 1; word-break: break-word; }
+    .fact-detail-name { font-size: 1.1rem; font-weight: 700; color: var(--primary); flex: 1; word-break: break-word; }
     .fact-detail-cat { font-size: .75rem; color: var(--muted); background: var(--bg); border: 1px solid var(--border); border-radius: 5px; padding: .2rem .55rem; flex-shrink: 0; margin-top: .15rem; }
     .fact-detail-body { font-size: .9rem; line-height: 1.6; }
     .fact-detail-actions { display: flex; gap: .5rem; flex-wrap: wrap; }
@@ -223,8 +223,8 @@
     .diary-date-item:hover { background: var(--bg); color: var(--primary); }
     .diary-date-item.active { background: var(--primary-light); border-right: 3px solid var(--primary); }
     .diary-date-item .diary-item-date { font-size: .72rem; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .03em; }
-    .diary-date-item .diary-item-title { font-size: .85rem; font-weight: 500; color: var(--text); margin-top: .15rem; line-height: 1.3; }
-    .diary-date-item.active .diary-item-title { color: var(--primary); }
+    .diary-date-item .diary-item-name { font-size: .85rem; font-weight: 500; color: var(--text); margin-top: .15rem; line-height: 1.3; }
+    .diary-date-item.active .diary-item-name { color: var(--primary); }
     .diary-main { flex: 1; display: flex; flex-direction: column; gap: 1rem; overflow-y: auto; text-align: left; }
     .diary-view-card, .diary-editor-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); 
                                            padding: 1.5rem; box-shadow: var(--shadow); }
@@ -349,8 +349,8 @@
         <div style="width:100%; margin-top:1rem;">
           <div id="add-fact-inline" class="add-fact-form">
             <div class="fact-edit-field">
-              <label for="new-title">Title</label>
-              <input id="new-title" placeholder="Short title…">
+              <label for="new-name">Title</label>
+              <input id="new-name" placeholder="Short name…">
             </div>
             <div class="fact-edit-field">
               <label for="new-text">Fact / Memory</label>
@@ -399,8 +399,8 @@
       <div id="diary-editor" class="diary-editor-card" style="display:none;">
         <input type="hidden" id="diary-id">
         <div style="margin-bottom: 1rem;">
-          <label for="diary-title">Title</label>
-          <input type="text" id="diary-title" placeholder="Meeting with...">
+          <label for="diary-name">Title</label>
+          <input type="text" id="diary-name" placeholder="Meeting with...">
         </div>
         <div style="margin-bottom: 1rem;">
           <label for="diary-timestamp">Date & Time</label>
@@ -549,8 +549,8 @@ npm install @modelcontextprotocol/sdk</code></pre>
           if (graphLoaded && network) {
             graphData.nodes.update({
               id: item.id,
-              label: truncateText(item.title || item.text, 20),
-              title: item.title || item.text,
+              label: truncateText(item.name || item.text, 20),
+              name: item.name || item.text,
               group: item.category
             });
           }
@@ -672,8 +672,8 @@ npm install @modelcontextprotocol/sdk</code></pre>
     
     const usedLetters = new Set();
     memories.forEach(m => {
-      const title = m.title || m.text || '';
-      const first = title.trim()[0];
+      const name = m.name || m.text || '';
+      const first = name.trim()[0];
       if (first) usedLetters.add(first.toUpperCase());
     });
     
@@ -703,14 +703,14 @@ npm install @modelcontextprotocol/sdk</code></pre>
 
     let filtered = memories.filter(m => {
       const matchCat = activeCategory === null || m.category === activeCategory;
-      const mTitle = m.title ? m.title.toLowerCase() : '';
-      const matchQuery = !query || m.text.toLowerCase().includes(query) || mTitle.includes(query) || m.category.toLowerCase().includes(query);
-      const firstChar = (m.title || m.text || '').trim()[0] || '';
+      const mName = m.name ? m.name.toLowerCase() : '';
+      const matchQuery = !query || m.text.toLowerCase().includes(query) || mName.includes(query) || m.category.toLowerCase().includes(query);
+      const firstChar = (m.name || m.text || '').trim()[0] || '';
       const matchLetter = activeLetterFilter === null || firstChar.toUpperCase() === activeLetterFilter;
       return matchCat && matchQuery && matchLetter;
     });
 
-    const sortKey = m => (m.title || m.text || '').toLowerCase();
+    const sortKey = m => (m.name || m.text || '').toLowerCase();
     filtered.sort((a, b) => {
       if (sort === 'newest') return (b.id || "").localeCompare(a.id || "");
       if (sort === 'oldest') return (a.id || "").localeCompare(b.id || "");
@@ -737,7 +737,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
   function renderMemoryListItem(m) {
     const selected = selectedFactId === m.id ? ' selected' : '';
     return `<div class="memory-item${selected}" id="mem-${m.id}" onclick="selectFact('${m.id}')">
-      <span class="memory-item-title">${escHtml(m.title || m.text || 'Untitled')}</span>
+      <span class="memory-item-name">${escHtml(m.name || m.text || 'Unnamed')}</span>
       <span class="memory-item-cat">${escHtml(m.category)}</span>
     </div>`;
   }
@@ -766,8 +766,8 @@ npm install @modelcontextprotocol/sdk</code></pre>
         <div style="width:100%; margin-top:1rem;">
           <div id="add-fact-inline" class="add-fact-form">
             <div class="fact-edit-field">
-              <label for="new-title">Title</label>
-              <input id="new-title" placeholder="Short title…">
+              <label for="new-name">Title</label>
+              <input id="new-name" placeholder="Short name…">
             </div>
             <div class="fact-edit-field">
               <label for="new-text">Fact / Memory</label>
@@ -807,8 +807,8 @@ npm install @modelcontextprotocol/sdk</code></pre>
           </div>
           <div class="add-fact-form">
             <div class="fact-edit-field">
-              <label for="ep-title">Title</label>
-              <input id="ep-title" value="${escHtml(m.title || '')}">
+              <label for="ep-name">Title</label>
+              <input id="ep-name" value="${escHtml(m.name || '')}">
             </div>
             <div class="fact-edit-field">
               <label for="ep-text">Fact / Memory</label>
@@ -838,10 +838,10 @@ npm install @modelcontextprotocol/sdk</code></pre>
         <div>
           <div class="fact-detail-header">
             <div>
-              <div class="fact-detail-title">${escHtml(m.title || 'Untitled')}</div>
+              <div class="fact-detail-name">${escHtml(m.name || 'Unnamed')}</div>
               <span class="fact-detail-cat">${escHtml(m.category)}</span>
             </div>
-            <button class="btn btn-ghost btn-sm" onclick="clearFactPane()" style="flex-shrink:0;" title="Close">✕</button>
+            <button class="btn btn-ghost btn-sm" onclick="clearFactPane()" style="flex-shrink:0;" name="Close">✕</button>
           </div>
           <div class="fact-detail-body markdown-body" style="margin:.75rem 0;">${marked.parse(m.text)}</div>
           <div class="memory-meta" style="margin-bottom:.75rem;">
@@ -861,7 +861,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
         <div id="pane-link-form-${m.id}" style="display:none; flex-direction:column; gap:.5rem; padding:.75rem; background:var(--bg); border-radius:6px; border:1px solid var(--border);">
           <div style="font-size:.8rem; font-weight:600; color:var(--muted);">Link to another memory</div>
           <select id="pane-link-target-${m.id}" style="width:100%;">
-            ${memories.filter(x => x.id !== m.id).map(x => `<option value="${x.id}">${escHtml(x.title || x.text.substring(0,50))}</option>`).join('')}
+            ${memories.filter(x => x.id !== m.id).map(x => `<option value="${x.id}">${escHtml(x.name || x.text.substring(0,50))}</option>`).join('')}
           </select>
           <input id="pane-link-rel-${m.id}" placeholder="Relationship type (e.g. KNOWS)">
           <div style="display:flex; gap:.5rem; justify-content:flex-end;">
@@ -879,9 +879,9 @@ npm install @modelcontextprotocol/sdk</code></pre>
       <div>
         ${m.links.map(l => `
           <span class="link-badge" id="link-badge-${m.id}-${l.target_id}">
-            <span class="link-content" onclick="selectFact('${l.target_id}')" style="cursor:pointer;">🔗 ${escHtml(l.rel)} → ${escHtml(l.target_title || l.target_text.substring(0,30))}</span>
-            <button class="link-action-btn" onclick="showLinkEdit('${m.id}','${l.target_id}','${escHtml(l.rel)}','${escHtml(l.target_title||l.target_text.substring(0,30))}')" title="Edit">✏️</button>
-            <button class="link-action-btn" onclick="deleteLink('${m.id}','${l.target_id}','${l.rel}')" title="Delete">🗑️</button>
+            <span class="link-content" onclick="selectFact('${l.target_id}')" style="cursor:pointer;">🔗 ${escHtml(l.rel)} → ${escHtml(l.target_name || l.target_text.substring(0,30))}</span>
+            <button class="link-action-btn" onclick="showLinkEdit('${m.id}','${l.target_id}','${escHtml(l.rel)}','${escHtml(l.target_name||l.target_text.substring(0,30))}')" name="Edit">✏️</button>
+            <button class="link-action-btn" onclick="deleteLink('${m.id}','${l.target_id}','${l.rel}')" name="Delete">🗑️</button>
           </span>
         `).join('')}
       </div>
@@ -894,15 +894,15 @@ npm install @modelcontextprotocol/sdk</code></pre>
   }
 
   async function saveFactEdit(id) {
-    const title = document.getElementById('ep-title').value.trim();
+    const name = document.getElementById('ep-name').value.trim();
     const text  = document.getElementById('ep-text').value.trim();
     const cat   = document.getElementById('ep-cat').value.trim() || 'General';
     const tags  = document.getElementById('ep-tags').value.trim();
     if (!text) return;
     try {
-      const updated = await api.put('memories/' + id, {title, text, category: cat, tags});
+      const updated = await api.put('memories/' + id, {name, text, category: cat, tags});
       const m = memories.find(x => x.id === id);
-      if (m) { m.title = updated.title; m.text = updated.text; m.category = updated.category; m.metadata = updated.metadata; }
+      if (m) { m.name = updated.name; m.text = updated.text; m.category = updated.category; m.metadata = updated.metadata; }
       renderMemories();
       renderCategorySidebar();
       renderFactPane(memories.find(x => x.id === id));
@@ -935,9 +935,9 @@ npm install @modelcontextprotocol/sdk</code></pre>
     badge.innerHTML = `
       <form class="link-edit-form" onsubmit="event.preventDefault(); saveLinkEdit('${sourceId}', '${targetId}', '${escHtml(relType)}')">
         <input id="edit-rel-${sourceId}-${targetId}" value="${escHtml(relType)}" placeholder="Relationship">
-        <button type="submit" title="Save" style="color: var(--success);">✓</button>
-        <button type="button" onclick="deleteLink('${sourceId}', '${targetId}', '${escHtml(relType)}')" title="Delete" style="color: var(--danger);">🗑️</button>
-        <button type="button" onclick="cancelLinkEdit('${sourceId}', '${targetId}', '${escHtml(relType)}', '${escHtml(targetLabel)}')" title="Cancel" style="color: var(--muted);">✕</button>
+        <button type="submit" name="Save" style="color: var(--success);">✓</button>
+        <button type="button" onclick="deleteLink('${sourceId}', '${targetId}', '${escHtml(relType)}')" name="Delete" style="color: var(--danger);">🗑️</button>
+        <button type="button" onclick="cancelLinkEdit('${sourceId}', '${targetId}', '${escHtml(relType)}', '${escHtml(targetLabel)}')" name="Cancel" style="color: var(--muted);">✕</button>
       </form>
     `;
   }
@@ -972,8 +972,8 @@ npm install @modelcontextprotocol/sdk</code></pre>
     if (!badge) return;
     badge.innerHTML = `
       <span class="link-content" onclick="selectFact('${targetId}')" style="cursor:pointer;">🔗 ${escHtml(relType)} → ${escHtml(targetLabel)}</span>
-      <button class="link-action-btn" onclick="showLinkEdit('${sourceId}', '${targetId}', '${escHtml(relType)}', '${escHtml(targetLabel)}')" title="Edit link">✏️</button>
-      <button class="link-action-btn" onclick="deleteLink('${sourceId}', '${targetId}', '${escHtml(relType)}')" title="Delete link">🗑️</button>
+      <button class="link-action-btn" onclick="showLinkEdit('${sourceId}', '${targetId}', '${escHtml(relType)}', '${escHtml(targetLabel)}')" name="Edit link">✏️</button>
+      <button class="link-action-btn" onclick="deleteLink('${sourceId}', '${targetId}', '${escHtml(relType)}')" name="Delete link">🗑️</button>
     `;
   }
 
@@ -1005,13 +1005,13 @@ npm install @modelcontextprotocol/sdk</code></pre>
   }
 
   async function addMemory() {
-    const title = document.getElementById('new-title').value.trim();
+    const name = document.getElementById('new-name').value.trim();
     const text = document.getElementById('new-text').value.trim();
     const cat  = document.getElementById('new-category').value.trim() || 'General';
     const tags = document.getElementById('new-tags').value.trim();
     if (!text) return;
     try {
-      const m = await api.post('memories', {title, text, category: cat, tags});
+      const m = await api.post('memories', {name, text, category: cat, tags});
       memories.push(m);
       renderCategorySidebar();
       renderMemories();
@@ -1049,9 +1049,9 @@ npm install @modelcontextprotocol/sdk</code></pre>
     const lower = q.toLowerCase();
 
     const matched = diaryEntries.filter(e => {
-      const title = (e.title || '').toLowerCase();
+      const name = (e.name || '').toLowerCase();
       const content = (e.content || '').toLowerCase();
-      const matchesText = title.includes(lower) || content.includes(lower) || e.date.includes(lower);
+      const matchesText = name.includes(lower) || content.includes(lower) || e.date.includes(lower);
       const matchesDate = datePattern && matchesDatePattern(e.date, datePattern);
       return matchesText || matchesDate;
     });
@@ -1164,24 +1164,24 @@ npm install @modelcontextprotocol/sdk</code></pre>
     const el = document.getElementById('diary-dates-list');
     if (!results.length) { el.innerHTML = '<p class="empty" style="padding:.75rem 1rem; font-size:.85rem;">No results.</p>'; return; }
     el.innerHTML = results.map(entry => {
-      const title = diaryEntryTitle(entry);
+      const name = diaryEntryTitle(entry);
       const snippet = (entry.content || '').replace(/#+\s[^\n]*/g, '').replace(/\s+/g, ' ').trim().substring(0, 60);
       return `<div class="diary-date-item" onclick="selectDiaryEntry('${entry.id}')">
         <div class="diary-item-date">📅 ${entry.date}</div>
-        <div class="diary-item-title">${escHtml(title)}</div>
+        <div class="diary-item-name">${escHtml(name)}</div>
         ${snippet ? `<div style="font-size:.75rem;color:var(--muted);margin-top:.2rem;">${escHtml(snippet)}…</div>` : ''}
       </div>`;
     }).join('');
   }
 
-  // Extract the first ## heading from entry content as a display title
+  // Extract the first ## heading from entry content as a display name
   function diaryEntryTitle(entry) {
-    if (entry.title && entry.title !== "Untitled Entry") return entry.title;
+    if (entry.name && entry.name !== "Unnamed Entry") return entry.name;
     const m = (entry.content || '').match(/^##\s+(.+)/m);
     if (m) return m[1].replace(/\s*—\s*\d{4}-\d{2}-\d{2}.*$/, '').trim();
     // fallback: first non-empty line stripped of markdown
     const first = (entry.content || '').split('\n').find(l => l.trim());
-    return first ? first.replace(/^#+\s*/, '').trim().substring(0, 50) : '(no title)';
+    return first ? first.replace(/^#+\s*/, '').trim().substring(0, 50) : '(no name)';
   }
 
   function renderDiarySidebar() {
@@ -1209,11 +1209,11 @@ npm install @modelcontextprotocol/sdk</code></pre>
         <div class="diary-date-group-label">📅 ${formatDateDisplay(date)}</div>
       </div>
       ${grouped[date].map(entry => {
-        const title = diaryEntryTitle(entry);
+        const name = diaryEntryTitle(entry);
         const time = entry.timestamp && entry.timestamp.includes('T') ? entry.timestamp.split('T')[1].substring(0, 5) : '';
         return `<div class="diary-date-item ${entry.id === activeDiaryId ? 'active' : ''}" onclick="selectDiaryEntry('${entry.id}')">
           <div class="diary-item-date">${time ? '🕐 ' + time : ''}</div>
-          <div class="diary-item-title">${escHtml(title)}</div>
+          <div class="diary-item-name">${escHtml(name)}</div>
         </div>`;
       }).join('')}
     `).join('');
@@ -1272,7 +1272,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     const viewEl = document.getElementById('diary-view-content');
     viewEl.classList.remove('empty');
     const time = entry.timestamp && entry.timestamp.includes('T') ? entry.timestamp.split('T')[1].substring(0, 5) : '';
-    const mentions = (entry.mentions || []).map(m => `<span class="link-badge" onclick="jumpToMemory('${m.id}')" style="cursor:pointer;" title="Click to view">👤 ${escHtml(m.title || m.text.substring(0,20))}</span>`).join('');
+    const mentions = (entry.mentions || []).map(m => `<span class="link-badge" onclick="jumpToMemory('${m.id}')" style="cursor:pointer;" name="Click to view">👤 ${escHtml(m.name || m.text.substring(0,20))}</span>`).join('');
 
     viewEl.innerHTML = `
       <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:1.5rem; border-bottom: 2px solid var(--primary-light); padding-bottom: 0.75rem;">
@@ -1285,7 +1285,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
         <div style="display:flex; gap:0.5rem; align-items:center; flex-shrink:0; margin-left:1rem;">
           ${mentions}
           <button class="btn btn-ghost btn-sm" onclick="editEntry('${entry.id}')" style="padding:0.15rem 0.5rem; font-size:0.75rem;">✏️</button>
-          <button class="btn btn-danger btn-sm" onclick="deleteDiaryEntry('${entry.id}')" title="Delete entry" style="padding:0.15rem 0.5rem; font-size:0.75rem;">🗑️</button>
+          <button class="btn btn-danger btn-sm" onclick="deleteDiaryEntry('${entry.id}')" name="Delete entry" style="padding:0.15rem 0.5rem; font-size:0.75rem;">🗑️</button>
         </div>
       </div>
       <div class="markdown-body">${marked.parse(entry.content || '')}</div>`;
@@ -1297,7 +1297,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     document.getElementById('diary-viewer').style.display = 'none';
     document.getElementById('diary-editor').style.display = 'block';
     document.getElementById('diary-id').value = entry.id;
-    document.getElementById('diary-title').value = entry.title || '';
+    document.getElementById('diary-name').value = entry.name || '';
     document.getElementById('diary-timestamp').value = entry.timestamp || '';
     document.getElementById('diary-content').value = entry.content;
   }
@@ -1317,7 +1317,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     const ed = document.getElementById('diary-editor');
     ed.style.display = 'block'; 
     document.getElementById('diary-id').value = '';
-    document.getElementById('diary-title').value = '';
+    document.getElementById('diary-name').value = '';
     document.getElementById('diary-timestamp').value = new Date().toISOString().slice(0, 16);
     document.getElementById('diary-content').value = ''; 
   }
@@ -1341,17 +1341,17 @@ npm install @modelcontextprotocol/sdk</code></pre>
 
   async function saveDiary() {
     const id = document.getElementById('diary-id').value;
-    const title = document.getElementById('diary-title').value.trim();
+    const name = document.getElementById('diary-name').value.trim();
     const timestamp = document.getElementById('diary-timestamp').value;
     const content = document.getElementById('diary-content').value.trim();
 
-    if (!title || !timestamp || !content) {
+    if (!name || !timestamp || !content) {
       toast('⚠️ Title, Date, and Content are required');
       return;
     }
 
     try { 
-      await api.post('diary', {id, title, timestamp, content}); 
+      await api.post('diary', {id, name, timestamp, content}); 
       toast('📖 Saved'); 
       await loadDiary(); 
     } catch(e) { toast('❌ Error saving entry'); }
@@ -1386,8 +1386,8 @@ npm install @modelcontextprotocol/sdk</code></pre>
       
       graphData.nodes = new vis.DataSet(data.nodes.map(n => ({
         id: n.id,
-        label: n.label === 'Category' ? n.title : truncateText(n.title, 20),
-        title: n.title,
+        label: n.label === 'Category' ? n.name : truncateText(n.name, 20),
+        name: n.name,
         group: n.group,
         shape: n.label === 'Category' ? 'box' : 'dot',
         size: n.label === 'Category' ? 20 : 10,
@@ -1407,8 +1407,8 @@ npm install @modelcontextprotocol/sdk</code></pre>
         const filteredNodes = new vis.DataSet(
           data.nodes.filter(n => buildGraphNodes.has(n.id)).map(n => ({
             id: n.id,
-            label: n.label === 'Category' ? n.title : truncateText(n.title, 20),
-            title: n.title,
+            label: n.label === 'Category' ? n.name : truncateText(n.name, 20),
+            name: n.name,
             group: n.group,
             shape: n.label === 'Category' ? 'box' : 'dot',
             size: n.label === 'Category' ? 20 : 10,
@@ -1507,7 +1507,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
         fullData.nodes.get().filter(n => buildGraphNodes.has(n.id)).map(n => ({
           id: n.id,
           label: n.label,
-          title: n.title,
+          name: n.name,
           group: n.group,
           shape: n.shape,
           size: n.size,
@@ -1590,8 +1590,8 @@ async function addToBuildGraph(nodeId) {
           buildGraphNodes.add(node.id);
           newNodes.push({
             id: node.id,
-            label: truncateText(node.title, 20),
-            title: node.title,
+            label: truncateText(node.name, 20),
+            name: node.name,
             group: node.category,
             shape: 'dot',
             size: 10,
@@ -1608,8 +1608,8 @@ async function addToBuildGraph(nodeId) {
             buildGraphNodes.add(conn.id);
             newNodes.push({
               id: conn.id,
-              label: truncateText(conn.title, 20),
-              title: conn.title,
+              label: truncateText(conn.name, 20),
+              name: conn.name,
               group: conn.category,
               shape: 'dot',
               size: 10,

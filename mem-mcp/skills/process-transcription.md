@@ -19,7 +19,7 @@ Use this skill when you have:
 ### 1. File and Metadata
 
 - Extract date/time from filename (pattern: `YYYY-MM-DD hh-mm-ss`) round it to the nearest 15 minutes.
-- Identify meeting title, topic, and context (internal/client/etc.)
+- Identify meeting name, topic, and context (internal/client/etc.)
 - Apply stored corrections: `search_facts("correction")` → fix recurring misspellings of names and terms before proceeding.
 
 ### 2. Participant List
@@ -150,10 +150,10 @@ metadata: {"tags": ["person"], "aliases": {"Tim Lohman": 1.0, "Tim Loman": 0.9, 
 Title = name only. Role and company go in the description body.
 
 Examples of correct vs incorrect:
-- ✅ Correct: title="Gergely Papp" (People)
-- ❌ Incorrect: title="Gergely Papp - Enterprise Architect"
-- ✅ Correct: title="LeanIX" (Technology)
-- ❌ Incorrect: title="LeanIX — EA Tool"
+- ✅ Correct: name="Gergely Papp" (People)
+- ❌ Incorrect: name="Gergely Papp - Enterprise Architect"
+- ✅ Correct: name="LeanIX" (Technology)
+- ❌ Incorrect: name="LeanIX — EA Tool"
 
 General work-related: use `People` (for personnel), `Project`/`Projects` (for initiatives), `Technology` (for tools), `Concepts` (for principles), `Event`/`Events` (for events with specific timestamps)
 
@@ -164,11 +164,11 @@ Use mem0_add_fact for storing facts and mem0_link_facts for creating relationshi
 Store all other extracted entities with rich Markdown context. Use confirmed ownership from Phase 2.
 
 **Tools:**
-- `add_fact(title, text, category)` — new facts
+- `add_fact(name, text, category)` — new facts
 - `update_fact(memoryId, text, category)` — update existing (new info only)
 - `link_facts(sourceFactId, targetFactId, relationshipType)` — build the graph
 
-**Reprocessing guard:** before creating any fact, run `search_facts` on its title. If it already exists, update instead of creating a duplicate.
+**Reprocessing guard:** before creating any fact, run `search_facts` on its name. If it already exists, update instead of creating a duplicate.
 
 **Content separation rules by category:**
 
@@ -189,7 +189,7 @@ Do not add: who attended a meeting about it, what was decided in a meeting. Link
 Title: Decision: Proceed with Concur LEC on SAP ISP — YYYY-MM-DD
 Category: Decision
 Text:
-  **Decided:** YYYY-MM-DD  **Meeting:** [title]
+  **Decided:** YYYY-MM-DD  **Meeting:** [name]
   **Owner:** [confirmed person]
   **Decision:** [what was decided]
   **Rationale:** [why]
@@ -203,7 +203,7 @@ Category: Action
 Text:
   **Assigned to:** [confirmed person]
   **Due:** [date]
-  **From meeting:** [title] — YYYY-MM-DD
+  **From meeting:** [name] — YYYY-MM-DD
   **Task:** [full description]
   **Linked project:** [project name]
 ```
@@ -231,7 +231,7 @@ Text:
 ```
 list_diary_entries(fromTs="YYYY-MM-DDT00:00:00", toTs="YYYY-MM-DDT23:59:59")
 ```
-Returns `[(id, timestamp, title), ...]` for entries on that date.
+Returns `[(id, timestamp, name), ...]` for entries on that date.
 
 **Then search for related content:**
 ```
@@ -295,7 +295,7 @@ Text:
   - [ ] Task — Owner: Name — Due: date
 
   ## Links
-  - [Fact title] (created/updated)
+  - [Fact name] (created/updated)
 ```
 
 Link the summary fact to each participant: `summary → person: ATTENDED_BY`.

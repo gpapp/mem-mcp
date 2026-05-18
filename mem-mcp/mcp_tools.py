@@ -23,9 +23,9 @@ def _format_fact_md(fact: dict) -> str:
     """
     Render a fact dict as a Markdown block suitable for LLM display.
 
-    Expected keys: id, title, text, category, score (optional), metadata (optional).
+    Expected keys: id, name, text, category, score (optional), metadata (optional).
     """
-    title    = fact.get("title") or ""
+    name    = fact.get("name") or ""
     text     = fact.get("text") or ""
     category = fact.get("category") or ""
     fact_id  = fact.get("id") or ""
@@ -35,10 +35,10 @@ def _format_fact_md(fact: dict) -> str:
     lines = []
 
     # Heading
-    if title:
-        lines.append(f"### {title}")
+    if name:
+        lines.append(f"### {name}")
     else:
-        lines.append(f"### (untitled)")
+        lines.append(f"### (unnamed)")
 
     # Body
     if text:
@@ -76,14 +76,14 @@ def _format_facts_md(facts: list) -> str:
     return "\n\n---\n\n".join(blocks)
 
 @mcp.tool()
-async def add_fact(title: str, text: str, category: str):
+async def add_fact(name: str, text: str, category: str):
     """
     Save a new fact or memory to the knowledge graph.
-    'title' should be a concise header for the fact.
+    'name' should be a concise header for the fact.
     'text' should be the detailed content of the fact.
     'category' should be one of: People, Technology, Client, Project, Event, Tool.
     """
-    memory_id = await mem.db_add_memory(text, category, _current_user(), title=title)
+    memory_id = await mem.db_add_memory(text, category, _current_user(), name=name)
     return f"Successfully added memory with ID: {memory_id}"
 
 @mcp.tool()
@@ -128,11 +128,11 @@ async def get_fact_neighborhood(factId: str, depth: int = 1, relationshipTypes: 
     return _format_facts_md(neighbors)
 
 @mcp.tool()
-async def update_fact(memoryId: str, title: Optional[str] = None, text: Optional[str] = None, category: Optional[str] = None):
+async def update_fact(memoryId: str, name: Optional[str] = None, text: Optional[str] = None, category: Optional[str] = None):
     """
     Update an existing memory by ID. Provide only the fields that need updating.
     """
-    success = await mem.db_update_memory(memoryId, title, text, category, _current_user())
+    success = await mem.db_update_memory(memoryId, name, text, category, _current_user())
     if success:
         return f"Successfully updated memory {memoryId}"
     return f"Error: Memory {memoryId} not found or unauthorized."
@@ -158,10 +158,10 @@ async def find_patterns():
     return "\n".join(lines)
 
 @mcp.tool()
-async def diary_save_entry(content: str, title: str, timestamp: str, entryId: Optional[str] = None):
+async def diary_save_entry(content: str, name: str, timestamp: str, entryId: Optional[str] = None):
     """Save or update a diary entry.
 
-    - title: Concise title for the entry.
+    - name: Concise name for the entry.
     - timestamp: ISO-8601 datetime string including time (e.g. '2026-05-15T14:30:00').
       Passing the same timestamp a second time **replaces** the existing entry.
     - entryId: Optional ID of an existing entry. Use this if you are changing the 
@@ -174,7 +174,7 @@ async def diary_save_entry(content: str, title: str, timestamp: str, entryId: Op
         new_id = mem._diary_id(user, timestamp)
         if entryId != new_id:
             await mem.db_delete_diary(entryId, user)
-    entry_ts = await mem.db_save_diary(content, user, timestamp, title)
+    entry_ts = await mem.db_save_diary(content, user, timestamp, name)
     entry_id = mem._diary_id(user, entry_ts)
     return {"id": entry_id, "timestamp": entry_ts}
 
@@ -201,10 +201,10 @@ async def diary_search_entries(query: str, limit: int = 3, top_p: float = 0.4):
 @mcp.tool()
 async def list_diary_entries(fromTs: Optional[str] = None, toTs: Optional[str] = None):
     """
-    List diary entry titles with timestamps within a time range.
+    List diary entry names with timestamps within a time range.
     - fromTs: Start timestamp (ISO-8601). Defaults to 30 days ago.
     - toTs: End timestamp (ISO-8601). Defaults to now.
-    Returns a list of (id, timestamp, title) tuples.
+    Returns a list of (id, timestamp, name) tuples.
     """
     return mem.db_list_diary_entries(_current_user(), fromTs, toTs)
 
@@ -237,21 +237,21 @@ async def find_duplicates(category: str = "People", limit: int = 50, threshold: 
         return f"Error: {str(e)}"
 
 @mcp.tool()
-async def merge_facts(masterId: str, duplicateIds: List[str], mergedTitle: str, mergedText: str):
+async def merge_facts(masterId: str, duplicateIds: List[str], mergedName: str, mergedText: str):
     """
     Merge duplicate facts into a single master record.
 
     The caller is responsible for consolidating content before calling this tool:
-    use suggest_merge to retrieve all records, write a comprehensive mergedTitle
+    use suggest_merge to retrieve all records, write a comprehensive mergedName
     and mergedText that preserves every detail from every record, then call this.
 
     This tool:
-    1. Updates the master record with the provided mergedTitle and mergedText.
+    1. Updates the master record with the provided mergedName and mergedText.
     2. Moves all graph relationships from duplicates to the master.
     3. Deletes the duplicate nodes.
     """
     user = _current_user()
-    await mem.db_update_memory(masterId, mergedTitle, mergedText, None, user)
+    await mem.db_update_memory(masterId, mergedName, mergedText, None, user)
     await mem.db_merge_memories(masterId, duplicateIds, user)
     return f"Successfully merged {len(duplicateIds)} facts into {masterId}"
 
@@ -300,10 +300,10 @@ async def suggest_merge(cluster_json: str):
         non_empty = sum(1 for v in r.values() if v not in (None, "", []))
         analyzed.append({
             "id": r.get("id"),
-            "title": r.get("title", ""),
+            "name": r.get("name", ""),
             "text": text,
             "date": r.get("date") or r.get("updatedAt") or "",
-            "extra_fields": {k: v for k, v in r.items() if k not in ("id", "title", "text", "date", "updatedAt", "similarity")},
+            "extra_fields": {k: v for k, v in r.items() if k not in ("id", "name", "text", "date", "updatedAt", "similarity")},
             "_completeness": {"text_length": len(text), "non_empty_fields": non_empty},
         })
 
@@ -314,7 +314,7 @@ async def suggest_merge(cluster_json: str):
         "record_count": len(analyzed),
         "records_by_completeness": analyzed,
         "suggested_master_id": top["id"],
-        "suggested_master_title": top["title"],
+        "suggested_master_name": top["name"],
         "note": (
             "Records are sorted by completeness (field count, then text length). "
             "Review all records, confirm or override the suggested master, then call merge_facts."
