@@ -113,7 +113,8 @@ async def migrate_qdrant(dry_run: bool = False):
             break
 
         points_to_update = []
-        for point in result.points:
+        points, next_page = result
+        for point in points:
             payload = point.payload
             if "title" in payload and "name" not in payload:
                 new_payload = dict(payload)
@@ -133,7 +134,7 @@ async def migrate_qdrant(dry_run: bool = False):
             )
 
         migrated += len(points_to_update)
-        offset = result.next_page_offset
+        offset = next_page
         if offset is None:
             break
 
