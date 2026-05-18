@@ -1550,7 +1550,44 @@ npm install @modelcontextprotocol/sdk</code></pre>
     }
   }
 
-async function addToBuildGraph(nodeId) {
+let contextMenu = null;
+
+  function showContextMenu(event, nodeId) {
+    hideContextMenu();
+    
+    const node = memories.find(m => m.id === nodeId);
+    if (!node) return;
+    
+    contextMenu = document.createElement('div');
+    contextMenu.className = 'context-menu';
+    contextMenu.style.left = event.pageX + 'px';
+    contextMenu.style.top = event.pageY + 'px';
+    
+    contextMenu.innerHTML = `
+      <div class="context-menu-item" onclick="jumpToMemory('${nodeId}')">📖 Go to fact</div>
+      <div class="context-menu-separator"></div>
+      <div class="context-menu-item" onclick="addToBuildGraph('${nodeId}')">📍 Show on map</div>
+      <div class="context-menu-item" onclick="showAllConnected('${nodeId}')">🔗 Show all connected</div>
+      <div class="context-menu-separator"></div>
+      <div class="context-menu-item" onclick="removeNodeFromBuild('${nodeId}')">🗑️ Remove from map</div>
+    `;
+    
+    document.body.appendChild(contextMenu);
+    
+    document.addEventListener('click', hideContextMenu);
+    document.addEventListener('contextmenu', hideContextMenu);
+  }
+
+  function hideContextMenu() {
+    if (contextMenu) {
+      contextMenu.remove();
+      contextMenu = null;
+    }
+    document.removeEventListener('click', hideContextMenu);
+    document.removeEventListener('contextmenu', hideContextMenu);
+  }
+
+  async function addToBuildGraph(nodeId) {
     hideContextMenu();
     switchTab('graph');
     if (!isBuildMode) {
