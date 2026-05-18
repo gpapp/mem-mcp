@@ -991,11 +991,25 @@ npm install @modelcontextprotocol/sdk</code></pre>
   async function openInGraph(id) {
     switchTab('graph');
     if (!graphLoaded) await loadGraph();
+    
+    // Wait for network to initialize and stabilize
+    const waitForNetwork = () => {
+      return new Promise(resolve => {
+        const check = () => {
+          if (network && network._stabilized) {
+            resolve();
+          } else {
+            setTimeout(check, 200);
+          }
+        };
+        check();
+      });
+    };
+    
+    await waitForNetwork();
     if (network) {
-      setTimeout(() => {
-        network.focus(id, { scale: 1.5, animation: { duration: 1000, easingFunction: 'easeInOutQuad' } });
-        network.selectNodes([id]);
-      }, 500);
+      network.focus(id, { scale: 1.5, animation: { duration: 1000, easingFunction: 'easeInOutQuad' } });
+      network.selectNodes([id]);
     }
   }
 
@@ -1447,6 +1461,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
       nodes: { borderWidth: 1, shadow: true },
       edges: { width: 1, smooth: { type: 'continuous' } },
       physics: {
+        enabled: true,
         barnesHut: { gravitationalConstant: -2000, centralGravity: 0.3, springLength: 95 },
         stabilization: { iterations: 150 }
       },
@@ -1454,6 +1469,11 @@ npm install @modelcontextprotocol/sdk</code></pre>
     };
     
     network = new vis.Network(container, data, options);
+
+    // Wait for physics to stabilize before allowing focus operations
+    network.once('stabilizationIterationsDone', function() {
+      network._stabilized = true;
+    });
 
     network.on("doubleClick", function (params) {
       if (params.nodes.length > 0) {
@@ -1603,8 +1623,19 @@ let contextMenu = null;
       return;
     }
     
-    if (!graphLoaded) {
+    if (!graphLoaded || !network) {
       await loadGraph();
+    }
+    
+    // Wait for network to be ready
+    if (network && !network._stabilized) {
+      await new Promise(resolve => {
+        const check = () => {
+          if (network._stabilized) resolve();
+          else setTimeout(check, 200);
+        };
+        check();
+      });
     }
     
     if (buildGraphNodes.has(id)) {
@@ -1681,6 +1712,18 @@ let contextMenu = null;
   async function showAllConnected(nodeId) {
     hideContextMenu();
     
+    // Ensure network is ready
+    if (!graphLoaded || !network) await loadGraph();
+    if (network && !network._stabilized) {
+      await new Promise(resolve => {
+        const check = () => {
+          if (network._stabilized) resolve();
+          else setTimeout(check, 200);
+        };
+        check();
+      });
+    }
+    
     try {
       const neighbors = await api.get('graph/neighbors/' + nodeId);
       
@@ -1699,7 +1742,7 @@ let contextMenu = null;
         if (network) {
           network.focus(nodeId, { scale: 1.2, animation: { duration: 800, easingFunction: 'easeInOutQuad' } });
         }
-      }, 300);
+      }, 500);
       
       toast('🔗 Added ' + addedCount + ' connected node' + (addedCount !== 1 ? 's' : ''));
     } catch(e) {
