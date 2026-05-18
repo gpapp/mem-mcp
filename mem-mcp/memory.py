@@ -642,6 +642,15 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
                     score = 1.7
                 elif query_lower in title_lower:
                     score = 1.5
+                else:
+                    import difflib
+                    title_words = title_lower.split()
+                    if len(query_words) == 1 and len(title_words) >= 1:
+                        for tw in title_words:
+                            s = difflib.SequenceMatcher(None, query_lower, tw).ratio()
+                            if s >= 0.7:
+                                score = 1.4 * s
+                                break
 
             exact_matches.append({
                 "id": f["id"],
@@ -688,18 +697,33 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
                 score += 0.4
             elif query_lower in title_lower:
                 score += 0.2
+            else:
+                import difflib
+                title_words = title_lower.split()
+                if len(query_words) == 1 and len(title_words) >= 1:
+                    for tw in title_words:
+                        s = difflib.SequenceMatcher(None, query_lower, tw).ratio()
+                        if s >= 0.7:
+                            score += 0.35 * s
+                            break
 
         # Boost score if query matches an alias
         if aliases and isinstance(aliases, dict):
+            import difflib
             for alias, confidence in aliases.items():
                 if query_lower == alias.lower():
-                    # Exact alias match. Boost based on confidence.
                     try: score += (float(confidence) * 0.2)
                     except: pass
                 elif query_lower in alias.lower() or alias.lower() in query_lower:
-                    # Partial match
                     try: score += (float(confidence) * 0.05)
                     except: pass
+                elif len(query_words) == 1 and len(alias.split()) >= 1:
+                    for aw in alias.lower().split():
+                        s = difflib.SequenceMatcher(None, query_lower, aw).ratio()
+                        if s >= 0.7:
+                            try: score += (float(confidence) * 0.15 * s)
+                            except: pass
+                            break
         
         results.append({
             "id": r.id,
