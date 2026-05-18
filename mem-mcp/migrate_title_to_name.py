@@ -27,7 +27,7 @@ load_dotenv()
 
 from neo4j import AsyncGraphDatabase
 from qdrant_client import AsyncQdrantClient
-from qdrant_client.models import Record
+from qdrant_client.models import PointStruct
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("migration")
@@ -120,7 +120,7 @@ async def migrate_qdrant(dry_run: bool = False):
                 new_payload = dict(payload)
                 new_payload["name"] = new_payload.pop("title")
                 points_to_update.append(
-                    Record(id=point.id, payload=new_payload, vector=payload.get("vector"))
+                    PointStruct(id=point.id, payload=new_payload)
                 )
                 if dry_run:
                     logger.info(f"  [DRY-RUN] Would rename Qdrant point {point.id}: title -> name")
