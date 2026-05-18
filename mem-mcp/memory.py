@@ -1571,7 +1571,7 @@ def db_get_graph(user_id: str) -> dict:
                         node_map[m_id] = {
                             "id": m["id"],
                             "label": "Fact",
-                            "name": m["text"],
+                            "name": m.get("name") or m["text"],
                             "group": m.get("category", "General")
                         }
                 
