@@ -27,7 +27,7 @@ load_dotenv()
 
 from neo4j import AsyncGraphDatabase
 from qdrant_client import AsyncQdrantClient
-from qdrant_client.models import Record, ScrollResponse
+from qdrant_client.models import Record
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("migration")
@@ -101,7 +101,7 @@ async def migrate_qdrant(dry_run: bool = False):
 
     while True:
         try:
-            result: ScrollResponse = await client.scroll(
+            result = await client.scroll(
                 collection_name=COLLECTION_NAME,
                 scroll_filter=None,
                 limit=100,
