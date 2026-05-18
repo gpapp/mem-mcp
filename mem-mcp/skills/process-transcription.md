@@ -10,6 +10,7 @@ Use this skill when you have:
 - Meeting transcription files (typically .txt files with timestamps)
 - Need to extract structured information (people, projects, decisions, action items)
 - Want to build or update a knowledge graph with the transcription content
+- Need to store extracted information in memory systems for future reference
 
 ---
 
@@ -147,6 +148,16 @@ metadata: {"tags": ["person"], "aliases": {"Tim Lohman": 1.0, "Tim Loman": 0.9, 
 **Do not include:** meeting dates, what they said, decisions they made, tasks assigned to them. Those go in Decision/Action Item facts and the Diary, linked to the person.
 
 Title = name only. Role and company go in the description body.
+
+Examples of correct vs incorrect:
+- ✅ Correct: title="Gergely Papp" (People)
+- ❌ Incorrect: title="Gergely Papp - Enterprise Architect"
+- ✅ Correct: title="LeanIX" (Technology)
+- ❌ Incorrect: title="LeanIX — EA Tool"
+
+General work-related: use `People` (for personnel), `Project`/`Projects` (for initiatives), `Technology` (for tools), `Concepts` (for principles), `Event`/`Events` (for events with specific timestamps)
+
+Use mem0_add_fact for storing facts and mem0_link_facts for creating relationships between facts.
 
 ### 7. Facts, Decisions, Action Items
 
