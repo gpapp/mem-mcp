@@ -199,6 +199,16 @@ async def diary_search_entries(query: str, limit: int = 3, top_p: float = 0.4):
     return await mem.db_search_diary(query, _current_user(), limit, top_p)
 
 @mcp.tool()
+async def list_diary_entries(fromTs: Optional[str] = None, toTs: Optional[str] = None):
+    """
+    List diary entry titles with timestamps within a time range.
+    - fromTs: Start timestamp (ISO-8601). Defaults to 30 days ago.
+    - toTs: End timestamp (ISO-8601). Defaults to now.
+    Returns a list of (id, timestamp, title) tuples.
+    """
+    return mem.db_list_diary_entries(_current_user(), fromTs, toTs)
+
+@mcp.tool()
 async def diary_delete_entry(entryId: str):
     """Delete a diary entry by its ID.
 

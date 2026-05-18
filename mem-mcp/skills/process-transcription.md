@@ -216,7 +216,13 @@ Text:
 
 ### 8. Diary Logging
 
-**Before writing, search first:**
+**Before writing, find existing entries for the meeting timeframe:**
+```
+list_diary_entries(fromTs="YYYY-MM-DDT00:00:00", toTs="YYYY-MM-DDT23:59:59")
+```
+Returns `[(id, timestamp, title), ...]` for entries on that date.
+
+**Then search for related content:**
 ```
 diary_search_entries("<meeting topic> <date>")
 ```

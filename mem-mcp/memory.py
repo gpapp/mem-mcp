@@ -22,7 +22,7 @@ import base64
 import httpx
 import numpy as np
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import (
@@ -1398,6 +1398,35 @@ async def db_delete_diary(entry_id: str, user_id: str) -> bool:
 
     await publish_db_event(user_id, "diary_changed", {"action": "delete", "id": entry_id})
     return True
+
+
+def db_list_diary_entries(user_id: str, from_ts: Optional[str] = None, to_ts: Optional[str] = None) -> list:
+    """Return diary entries as (id, timestamp, title) tuples within optional time range.
+    Defaults to last month if timestamps not provided."""
+    neo4j_driver = get_neo4j()
+    if not neo4j_driver:
+        raise RuntimeError("Neo4j not connected.")
+
+    now = datetime.now(timezone.utc)
+    default_from = (now - timedelta(days=30)).isoformat()
+    default_to = now.isoformat()
+    from_clause = from_ts or default_from
+    to_clause = to_ts or default_to
+
+    with neo4j_driver.session() as s:
+        result = s.run(
+            """
+            MATCH (d:DiaryEntry {userId: $userId})
+            WHERE d.timestamp >= $fromTs AND d.timestamp <= $toTs
+            RETURN d.id as id, d.timestamp as timestamp, d.title as title
+            ORDER BY d.timestamp DESC
+            """,
+            userId=user_id,
+            fromTs=from_clause,
+            toTs=to_clause,
+        )
+        return [(r["id"], str(r["timestamp"]) if r["timestamp"] else None, r.get("title") or "Untitled")
+                for r in result]
 
 
 def db_list_diary(user_id: str) -> list:
