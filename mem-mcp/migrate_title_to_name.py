@@ -106,7 +106,7 @@ async def migrate_qdrant(dry_run: bool = False):
                 scroll_filter=None,
                 limit=100,
                 offset=offset,
-                with_vectors=False,
+                with_vectors=True,
             )
         except Exception as e:
             logger.error(f"Qdrant scroll failed: {e}")
@@ -120,7 +120,7 @@ async def migrate_qdrant(dry_run: bool = False):
                 new_payload = dict(payload)
                 new_payload["name"] = new_payload.pop("title")
                 points_to_update.append(
-                    PointStruct(id=point.id, payload=new_payload)
+                    PointStruct(id=point.id, payload=new_payload, vector=point.vector)
                 )
                 if dry_run:
                     logger.info(f"  [DRY-RUN] Would rename Qdrant point {point.id}: title -> name")
