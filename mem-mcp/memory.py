@@ -698,6 +698,13 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
                 score = max(score, 2.3)
             elif last and last in query_lower:
                 score = max(score, 1.9)
+            # Fuzzy match surname to query surname
+            if len(query_words) >= 2:
+                query_surname = query_words[-1]
+                if last:
+                    s = difflib.SequenceMatcher(None, query_surname, last).ratio()
+                    if s >= 0.7:
+                        score = max(score, 1.4 + s * 0.6)
 
             exact_matches.append({
                 "id": f["id"],
@@ -798,9 +805,9 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
                 name_words = name_norm.split()
                 if len(name_words) >= 2:
                     surname = name_words[-1]
-                    s_surname = difflib.SequenceMatcher(None, query_lower, surname).ratio()
+                    s_surname = difflib.SequenceMatcher(None, query_surname, surname).ratio()
                     if s_surname >= 0.7:
-                        score += s_surname * 0.6
+                        score += s_surname * 0.8
             if aliases and isinstance(aliases, dict):
                 matched_query_words = set()
                 best_ratio = 0
