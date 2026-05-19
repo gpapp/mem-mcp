@@ -87,7 +87,7 @@ async def add_fact(name: str, text: str, category: str):
     return f"Successfully added memory with ID: {memory_id}"
 
 @mcp.tool()
-async def search_facts(query: str, category: Optional[str] = None, limit: int = 5, top_p: float = 0.7):
+async def search_facts(query: str, category: Optional[str] = None, limit: int = 5, top_p: float = 0.7, names_only: bool = False):
     """
     Search for facts matching query criteria.
     Returns results formatted as Markdown for easy reading.
@@ -95,8 +95,11 @@ async def search_facts(query: str, category: Optional[str] = None, limit: int = 
     - category: optional filter (e.g. 'People', 'Client', 'Preferences') to limit output
     - limit: maximum number of results (default 5)
     - top_p: threshold to filter low-probability results (default 0.75, higher = more selective)
+    - names_only: if True, returns only fact names as a newline-separated list
     """
     facts = await mem.db_search_memories(query, _current_user(), limit, category, top_p)
+    if names_only:
+        return "\n".join(f.get("name", "") or f.get("text", "")[:50] for f in facts if f.get("name"))
     return _format_facts_md(facts)
 
 @mcp.tool()
