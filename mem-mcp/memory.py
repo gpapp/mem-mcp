@@ -1042,6 +1042,14 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
                             if last_ratio >= 0.7:
                                 signals.append(0.93)
 
+            # Signal 9b: First name match but last names differ → penalize unless description is very similar
+            if (is_people and p_i["first_name"] and p_j["first_name"]
+                    and p_i["first_name"] == p_j["first_name"]
+                    and p_i["last_name"] and p_j["last_name"]
+                    and p_i["last_name"] != p_j["last_name"]):
+                if vec_sim < 0.88:
+                    signals = [s for s in signals if s < vec_sim - 0.1]
+
             # Signal 10: Full normalized name fuzzy match (only if both have last names)
             if p_i["norm_name"] and p_j["norm_name"] and p_i["last_name"] and p_j["last_name"]:
                 full_ratio = difflib.SequenceMatcher(None, p_i["norm_name"], p_j["norm_name"]).ratio()
