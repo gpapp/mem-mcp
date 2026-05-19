@@ -13,6 +13,7 @@ Provides:
 from typing import Any
 import asyncio
 import os
+import re
 import uuid
 import time
 import socket
@@ -240,6 +241,42 @@ def extract_user_from_headers(headers: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# People metadata extraction
+# ---------------------------------------------------------------------------
+
+def extract_people_metadata(name: Optional[str]) -> dict:
+    """Extract first_name, last_name, aliases from a People name string."""
+    if not name:
+        return {}
+    n = name.strip()
+    if not n:
+        return {}
+    
+    aliases = []
+    if '(' in n and ')' in n:
+        alias_start = n.index('(')
+        alias_end = n.index(')', alias_start)
+        alias = n[alias_start+1:alias_end].strip()
+        n = (n[:alias_start] + n[alias_end+1:]).strip()
+        if alias:
+            aliases.append(alias)
+    
+    n = re.sub(r'\s+', ' ', n)
+    parts = n.split()
+    
+    meta = {}
+    if len(parts) >= 2:
+        meta["first_name"] = parts[0]
+        meta["last_name"] = parts[-1]
+    elif len(parts) == 1:
+        meta["first_name"] = parts[0]
+    
+    if aliases:
+        meta["aliases"] = aliases
+    
+    return meta
+
+# ---------------------------------------------------------------------------
 # CRUD helpers – single source of truth for Qdrant + Neo4j consistency
 # ---------------------------------------------------------------------------
 
@@ -252,7 +289,8 @@ async def db_add_memory(text: str, category: str, user_id: str, metadata: Option
 
     doc_id   = str(uuid.uuid4())
     category = category.strip().capitalize()
-    meta     = metadata or {}
+    people_meta = extract_people_metadata(name) if category.lower() == "people" else {}
+    meta = {**people_meta, **(metadata or {})}
     embed_text = f"{name}: {text}" if name else text
     vector   = await get_embedding(embed_text)
 
@@ -317,6 +355,9 @@ async def db_update_memory(memory_id: str, name: Optional[str], text: Optional[s
     new_name = name if name is not None else old_fact.get("name")
     new_cat  = category.strip().capitalize() if category else old_fact.get("category")
     new_meta = metadata or {} 
+    if new_cat.lower() == "people" and new_name:
+        name_meta = extract_people_metadata(new_name)
+        new_meta = {**name_meta, **new_meta}
     
     logger.info(f"[db_update_memory] New values: name={new_name}, text_len={len(new_text) if new_text else 0}")
     
@@ -647,6 +688,16 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
                         if s >= 0.6:
                             score = max(score, 1.4 * s)
                             break
+            first = (meta.get("first_name") or "").lower()
+            last = (meta.get("last_name") or "").lower()
+            if first and query_lower == first:
+                score = max(score, 2.3)
+            elif first and first in query_lower:
+                score = max(score, 1.9)
+            elif last and query_lower == last:
+                score = max(score, 2.3)
+            elif last and last in query_lower:
+                score = max(score, 1.9)
 
             exact_matches.append({
                 "id": f["id"],
@@ -681,7 +732,7 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
         aliases = metadata.get("aliases", {})
         name = r.payload.get("name")
 
-        # Boost score if query matches the name
+        # Boost score if query matches the name or first_name/last_name metadata
         if name:
             name_lower = name.lower()
             query_words = query_lower.split()
@@ -700,6 +751,17 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
                     if s >= 0.6:
                         score += 0.35 * s
                         break
+            # Also boost if first_name or last_name matches
+            first = (metadata.get("first_name") or "").lower()
+            last = (metadata.get("last_name") or "").lower()
+            if first and query_lower == first:
+                score += 0.8
+            elif first and first in query_lower:
+                score += 0.4
+            elif last and query_lower == last:
+                score += 0.8
+            elif last and last in query_lower:
+                score += 0.4
             if aliases and isinstance(aliases, dict):
                 matched_query_words = set()
                 best_ratio = 0
