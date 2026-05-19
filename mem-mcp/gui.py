@@ -145,6 +145,12 @@ class MemoryUpdate(BaseModel):
         extra = "allow"
 
 
+class MemoryLink(BaseModel):
+    sourceId: str
+    targetId: str
+    relType: str = "KNOWS"
+
+
 @web_app.put("/api/memories/{memory_id}", response_class=JSONResponse)
 async def api_update_memory(memory_id: str, request: Request, body: MemoryUpdate):
     try:
