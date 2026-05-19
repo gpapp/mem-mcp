@@ -62,12 +62,13 @@ Extract all entities from the full transcription text:
 
 ### 4. People Resolution
 
-For **each** name from step 2, search memory with multiple queries before asking:
+For **each** name from step 2, search memory with multiple queries before asking. Use **liberal matching** — search broadly and sort through results; do not expect exact name matches:
 
 ```
-search_facts("<Full Name>", category="People")
-search_facts("<First Name>", category="People")
-search_facts("<role> <company>")          ← if known from transcript
+search_facts("<Full Name>", category="People", top_p=0.4)
+search_facts("<First Name> <Company>", category="People", top_p=0.4)
+search_facts("<First Name> <Role keyword>", category="People", top_p=0.4)
+search_facts("<Company> <Role keyword>", category="People", top_p=0.4)
 ```
 
 Use the **`question` tool** to ask for each person's identity. One question per ambiguous name; batch unambiguous names into a single question with multiple options.
@@ -168,7 +169,7 @@ Store all other extracted entities with rich Markdown context. Use confirmed own
 - `update_fact(memoryId, text, category)` — update existing (new info only)
 - `link_facts(sourceFactId, targetFactId, relationshipType)` — build the graph
 
-**Reprocessing guard:** before creating any fact, run `search_facts` on its name. If it already exists, update instead of creating a duplicate.
+**Reprocessing guard:** before creating any fact, run `search_facts` with liberal parameters (top_p=0.4, high limit) on its key identifiers (name, role+company, etc.). If it already exists, update instead of creating a duplicate.
 
 **Content separation rules by category:**
 

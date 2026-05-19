@@ -641,15 +641,13 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
                     score = 1.7
                 elif query_lower in name_lower:
                     score = 1.5
-                else:
-                    import difflib
-                    name_words = name_lower.split()
-                    if len(query_words) == 1 and len(name_words) >= 1:
-                        for tw in name_words:
-                            s = difflib.SequenceMatcher(None, query_lower, tw).ratio()
-                            if s >= 0.7:
-                                score = 1.4 * s
-                                break
+                name_words = name_lower.split()
+                if len(query_words) == 1 and len(name_words) >= 1:
+                    for tw in name_words:
+                        s = difflib.SequenceMatcher(None, query_lower, tw).ratio()
+                        if s >= 0.7:
+                            score = max(score, 1.4 * s)
+                            break
 
             exact_matches.append({
                 "id": f["id"],
@@ -696,34 +694,29 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
                 score += 0.4
             elif query_lower in name_lower:
                 score += 0.2
-            else:
+            if aliases and isinstance(aliases, dict):
                 import difflib
-                name_words = name_lower.split()
-                if len(query_words) == 1 and len(name_words) >= 1:
-                    for tw in name_words:
-                        s = difflib.SequenceMatcher(None, query_lower, tw).ratio()
-                        if s >= 0.7:
-                            score += 0.35 * s
-                            break
+                matched_query_words = set()
+                best_ratio = 0
+                for alias, confidence in aliases.items():
+                    alias_words = alias.lower().split()
+                    for qw in query_words:
+                        if qw in alias.lower():
+                            continue
+                        for aw in alias_words:
+                            ratio = difflib.SequenceMatcher(None, qw, aw).ratio()
+                            if ratio >= 0.6 and ratio > best_ratio:
+                                best_ratio = ratio
+                                matched_query_words.add(qw)
+                    if query_lower == alias.lower():
+                        try: score += (float(confidence) * 0.2)
+                        except: pass
+                    elif query_lower in alias.lower() or alias.lower() in query_lower:
+                        try: score += (float(confidence) * 0.05)
+                        except: pass
+                if matched_query_words:
+                    score += 0.1 * best_ratio
 
-        # Boost score if query matches an alias
-        if aliases and isinstance(aliases, dict):
-            import difflib
-            for alias, confidence in aliases.items():
-                if query_lower == alias.lower():
-                    try: score += (float(confidence) * 0.2)
-                    except: pass
-                elif query_lower in alias.lower() or alias.lower() in query_lower:
-                    try: score += (float(confidence) * 0.05)
-                    except: pass
-                elif len(query_words) == 1 and len(alias.split()) >= 1:
-                    for aw in alias.lower().split():
-                        s = difflib.SequenceMatcher(None, query_lower, aw).ratio()
-                        if s >= 0.7:
-                            try: score += (float(confidence) * 0.15 * s)
-                            except: pass
-                            break
-        
         results.append({
             "id": r.id,
             "text": r.payload.get("text"),
@@ -1002,7 +995,7 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
             for ali in p_i["aliases"]:
                 ali_words = ali.split()
                 for tw in p_j["norm_name"].split():
-                    if difflib.SequenceMatcher(None, ali, tw).ratio() >= 0.75:
+                    if difflib.SequenceMatcher(None, ali, tw).ratio() >= 0.6:
                         signals.append(0.88)
                         break
 
@@ -1024,7 +1017,7 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
             for wi in p_i["norm_words"]:
                 for wj in p_j["norm_words"]:
                     s = difflib.SequenceMatcher(None, wi, wj).ratio()
-                    if s >= 0.75:
+                    if s >= 0.6:
                         signals.append(min(0.95, 0.7 + 0.25 * s))
                         break
 
