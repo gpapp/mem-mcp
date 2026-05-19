@@ -762,6 +762,12 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
                 score += 0.8
             elif last and last in query_lower:
                 score += 0.4
+            # Fuzzy name match boost (handles spelling variations like Burkart vs Burkhart)
+            if name:
+                name_norm = name.lower().strip()
+                s = difflib.SequenceMatcher(None, query_lower, name_norm).ratio()
+                if s >= 0.75:
+                    score += s * 0.6
             if aliases and isinstance(aliases, dict):
                 matched_query_words = set()
                 best_ratio = 0
