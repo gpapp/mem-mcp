@@ -130,7 +130,7 @@ Execute all writes in one batched response — do not pause between individual c
 
 ### 6. People — update or create
 
-**Existing person** → `update_fact`: append only genuinely new *stable* information (new role, new team, new area of expertise). Do not add event details — those belong in the Diary and linked facts.
+**Existing person** → `update_fact`: append only genuinely new *stable* information (new role, new team, new area of expertise). Preserve the Markdown structure — if existing text uses bold field labels, continue using that format. Do not add event details — those belong in the Diary and linked facts.
 
 **New person** → `add_fact`:
 ```
@@ -140,10 +140,7 @@ Text:
   **Role:** Lead Engineer
   **Company/Team:** SAP
   **Domain:** [area of expertise or responsibility]
-  **Interests/Focus:** [recurring topics, known priorities]
-  **Aliases:** Tim Lohman (100%), Tim Loman (90%), Tim (70%)
-
-metadata: {"tags": ["person"], "aliases": {"Tim Lohman": 1.0, "Tim Loman": 0.9, "Tim": 0.7}}
+  **Notes:** [any other relevant stable information]
 ```
 
 **Do not include:** meeting dates, what they said, decisions they made, tasks assigned to them. Those go in Decision/Action Item facts and the Diary, linked to the person.
@@ -156,7 +153,7 @@ Examples of correct vs incorrect:
 - ✅ Correct: name="LeanIX" (Technology)
 - ❌ Incorrect: name="LeanIX — EA Tool"
 
-General work-related: use `People` (for personnel), `Project`/`Projects` (for initiatives), `Technology` (for tools), `Concepts` (for principles), `Event`/`Events` (for events with specific timestamps)
+General work-related: use `People` (for personnel), `Project`/`Projects` (for initiatives), `Technology` (for tools), `Concepts` (for principles).
 
 Use mem0_add_fact for storing facts and mem0_link_facts for creating relationships between facts.
 
@@ -284,7 +281,7 @@ Store one summary fact per meeting:
 
 ```
 Title: Meeting Summary: [Topic] — YYYY-MM-DD
-Category: Event
+Category: Project
 Text:
   # [Topic]
   **Date:** YYYY-MM-DD  **Participants:** [names]

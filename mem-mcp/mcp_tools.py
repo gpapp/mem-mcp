@@ -80,8 +80,16 @@ async def add_fact(name: str, text: str, category: str):
     """
     Save a new fact or memory to the knowledge graph.
     'name' should be a concise header for the fact.
-    'text' should be the detailed content of the fact.
-    'category' should be one of: People, Technology, Client, Project, Event, Tool.
+    'text' should be the detailed content of the fact. Use Markdown formatting (bold for field labels, bullet lists, etc.) to ensure readable output.
+    'category' should be one of: People, Technology, Client, Project, Tool.
+
+    People facts should follow this format:
+    **Role:** [job title or function]
+    **Company/Team:** [organization or team name]
+    **Domain:** [area of expertise or responsibility]
+    **Notes:** [any other relevant stable information]
+
+    Other categories should use similar structured Markdown: bold field labels followed by content.
     """
     memory_id = await mem.db_add_memory(text, category, _current_user(), name=name)
     return f"Successfully added memory with ID: {memory_id}"
@@ -134,6 +142,7 @@ async def get_fact_neighborhood(factId: str, depth: int = 1, relationshipTypes: 
 async def update_fact(memoryId: str, name: Optional[str] = None, text: Optional[str] = None, category: Optional[str] = None):
     """
     Update an existing memory by ID. Provide only the fields that need updating.
+    For text updates, use Markdown formatting to maintain consistent, readable content.
     """
     success = await mem.db_update_memory(memoryId, name, text, category, _current_user())
     if success:
@@ -252,6 +261,10 @@ async def merge_facts(masterId: str, duplicateIds: List[str], mergedName: str, m
     1. Updates the master record with the provided mergedName and mergedText.
     2. Moves all graph relationships from duplicates to the master.
     3. Deletes the duplicate nodes.
+
+    mergedText should use Markdown formatting (bold field labels, bullet lists, etc.)
+    to ensure readable, consistent output. For People facts: include Role, Company,
+    Domain, and other stable information in a structured format.
     """
     user = _current_user()
     await mem.db_update_memory(masterId, mergedName, mergedText, None, user)
