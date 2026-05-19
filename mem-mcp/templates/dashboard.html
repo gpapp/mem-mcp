@@ -824,15 +824,14 @@ npm install @modelcontextprotocol/sdk</code></pre>
                 <input id="ep-tags" value="${escHtml(tags.join(', '))}">
               </div>
             </div>
+            <div id="ep-meta-section" style="margin:.5rem 0;"></div>
             <div style="display:flex; gap:.5rem; justify-content:flex-end;">
               <button class="btn btn-ghost btn-sm" onclick="renderFactPane(memories.find(x=>x.id==='${m.id}'))">Cancel</button>
               <button class="btn btn-primary btn-sm" onclick="saveFactEdit('${m.id}')">Save</button>
             </div>
           </div>
-        </div>
-        <div id="ep-link-section">
-          ${renderLinkSection(m)}
         </div>`;
+      renderMetaEditor(m);
     } else {
       pane.innerHTML = `
         <div>
@@ -844,9 +843,8 @@ npm install @modelcontextprotocol/sdk</code></pre>
             <button class="btn btn-ghost btn-sm" onclick="clearFactPane()" style="flex-shrink:0;" name="Close">✕</button>
           </div>
           <div class="fact-detail-body markdown-body" style="margin:.75rem 0;">${marked.parse(m.text)}</div>
-          <div class="memory-meta" style="margin-bottom:.75rem;">
-            ${tags.map(t => `<span class="tag-badge">#${escHtml(t)}</span>`).join('')}
-          </div>
+          ${tags.length ? `<div class="memory-meta" style="margin-bottom:.75rem;">${tags.map(t => `<span class="tag-badge">#${escHtml(t)}</span>`).join('')}</div>` : ''}
+          <div id="fact-detail-meta" style="margin-bottom:.75rem;"></div>
           <div class="fact-detail-actions">
             <button class="btn btn-ghost btn-sm" onclick="startFactEdit('${m.id}')">✏️ Edit</button>
             <button class="btn btn-ghost btn-sm" onclick="openInGraph('${m.id}')">🕸️ Graph</button>
@@ -869,7 +867,82 @@ npm install @modelcontextprotocol/sdk</code></pre>
             <button class="btn btn-primary btn-sm" onclick="savePaneLink('${m.id}')">Link</button>
           </div>
         </div>`;
+      renderMetaDisplay(m);
     }
+  }
+
+  function renderMetaDisplay(m) {
+    const el = document.getElementById('fact-detail-meta');
+    if (!el) return;
+    const meta = m.metadata || {};
+    const skipKeys = new Set(['tags', 'aliases']);
+    const rows = Object.entries(meta).filter(([k]) => !skipKeys.has(k));
+    if (!rows.length) return;
+    el.innerHTML = `<div style="font-size:.75rem; font-weight:700; text-transform:uppercase; color:var(--muted); letter-spacing:.5px; margin-bottom:.3rem;">Metadata</div>
+      <table style="width:100%; border-collapse:collapse; font-size:.8rem;">
+        ${rows.map(([k, v]) => `<tr><td style="padding:2px 4px; color:var(--muted);">${escHtml(k)}</td><td style="padding:2px 4px;">${escHtml(String(v))}</td></tr>`).join('')}
+      </table>`;
+  }
+
+  function renderMetaEditor(m) {
+    const el = document.getElementById('ep-meta-section');
+    if (!el) return;
+    const meta = m.metadata || {};
+    const skipKeys = new Set(['tags', 'aliases']);
+    const rows = Object.entries(meta).filter(([k]) => !skipKeys.has(k));
+    el.innerHTML = `<div style="font-size:.75rem; font-weight:700; text-transform:uppercase; color:var(--muted); letter-spacing:.5px; margin-bottom:.3rem;">Metadata</div>
+      <table id="meta-editor-table" style="width:100%; border-collapse:collapse; font-size:.8rem; margin-bottom:.3rem;">
+        <thead><tr><th style="text-align:left; padding:2px 4px; color:var(--muted);">Key</th><th style="text-align:left; padding:2px 4px; color:var(--muted);">Value</th><th></th></tr></thead>
+        <tbody>
+          ${rows.map(([k, v]) => `<tr data-key="${escHtml(k)}">
+            <td style="padding:2px 4px;"><input class="meta-key" value="${escHtml(k)}" style="width:100%; border:1px solid var(--border); border-radius:3px; padding:2px 4px;"></td>
+            <td style="padding:2px 4px;"><input class="meta-val" value="${escHtml(String(v))}" style="width:100%; border:1px solid var(--border); border-radius:3px; padding:2px 4px;"></td>
+            <td style="padding:2px 4px;"><button class="btn btn-danger btn-sm" onclick="removeMetaRow(this)" name="Delete">🗑️</button></td>
+          </tr>`).join('')}
+          <tr data-key="">
+            <td style="padding:2px 4px;"><input class="meta-key" placeholder="new key" style="width:100%; border:1px solid var(--border); border-radius:3px; padding:2px 4px;"></td>
+            <td style="padding:2px 4px;"><input class="meta-val" placeholder="value" style="width:100%; border:1px solid var(--border); border-radius:3px; padding:2px 4px;"></td>
+            <td style="padding:2px 4px;"><button class="btn btn-danger btn-sm" onclick="removeMetaRow(this)" name="Delete">🗑️</button></td>
+          </tr>
+        </tbody>
+      </table>
+      <button class="btn btn-ghost btn-sm" onclick="addMetaRow()">➕ Add Row</button>`;
+  }
+
+  function removeMetaRow(btn) {
+    const row = btn.closest('tr');
+    const key = row.querySelector('.meta-key')?.value?.trim();
+    const tbody = row.closest('tbody');
+    if (key && key !== row.dataset.key) return;
+    if (tbody.querySelectorAll('tr').length > 1) {
+      row.remove();
+    } else {
+      row.querySelectorAll('input').forEach(i => i.value = '');
+    }
+  }
+
+  function addMetaRow() {
+    const table = document.getElementById('meta-editor-table');
+    if (!table) return;
+    const tbody = table.querySelector('tbody');
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td style="padding:2px 4px;"><input class="meta-key" placeholder="new key" style="width:100%; border:1px solid var(--border); border-radius:3px; padding:2px 4px;"></td>
+      <td style="padding:2px 4px;"><input class="meta-val" placeholder="value" style="width:100%; border:1px solid var(--border); border-radius:3px; padding:2px 4px;"></td>
+      <td style="padding:2px 4px;"><button class="btn btn-danger btn-sm" onclick="removeMetaRow(this)" name="Delete">🗑️</button></td>`;
+    tbody.appendChild(tr);
+    tr.querySelector('.meta-key').focus();
+  }
+
+  function getMetaFromEditor() {
+    const table = document.getElementById('meta-editor-table');
+    if (!table) return {};
+    const meta = {};
+    table.querySelectorAll('tbody tr').forEach(tr => {
+      const k = tr.querySelector('.meta-key')?.value?.trim();
+      const v = tr.querySelector('.meta-val')?.value?.trim();
+      if (k) meta[k] = v;
+    });
+    return meta;
   }
 
   function renderLinkSection(m) {
@@ -898,9 +971,12 @@ npm install @modelcontextprotocol/sdk</code></pre>
     const text  = document.getElementById('ep-text').value.trim();
     const cat   = document.getElementById('ep-cat').value.trim() || 'General';
     const tags  = document.getElementById('ep-tags').value.trim();
+    const extraMeta = getMetaFromEditor();
     if (!text) return;
     try {
-      const updated = await api.put('memories/' + id, {name, text, category: cat, tags});
+      const payload = {name, text, category: cat, tags};
+      Object.assign(payload, extraMeta);
+      const updated = await api.put('memories/' + id, payload);
       const m = memories.find(x => x.id === id);
       if (m) { m.name = updated.name; m.text = updated.text; m.category = updated.category; m.metadata = updated.metadata; }
       renderMemories();

@@ -141,94 +141,24 @@ class MemoryUpdate(BaseModel):
     category: str = "General"
     tags: Optional[str] = ""
 
-
-class MemoryLink(BaseModel):
-    sourceId: str
-    targetId: str
-    relType: str
+    class Config:
+        extra = "allow"
 
 
-class DiaryCreate(BaseModel):
-    content: str
-    name: str
-    timestamp: str
-    id: Optional[str] = None
-
-
-# ---------------------------------------------------------------------------
-# User extraction (from request, not MCP context)
-# ---------------------------------------------------------------------------
-
-def _user(request: Request) -> str:
-    session_user = request.session.get("user")
-    if session_user:
-        print(f"[GUI] API Request path: {request.url.path} (User: {session_user} [session])")
-        return session_user
-    # Try request.state.user first, then fall back to headers
-    if hasattr(request.state, "user") and request.state.user:
-        print(f"[GUI] API Request path: {request.url.path} (User: {request.state.user} [state])")
-        return request.state.user
-    # Fallback to extracting from headers if not set by middleware (e.g., for non-API routes)
-    # This might be redundant if auth_guard always sets request.state.user for relevant paths
-    user = mem.extract_user_from_headers(dict(request.headers))
-    print(f"[GUI] API Request path: {request.url.path} (User: {user})")
-    return user
-
-def _require_user(request: Request) -> str:
-    user = _user(request)
-    if user == "anonymous" or not user:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    return user
-
-# ---------------------------------------------------------------------------
-# Login / Logout Routes
-# ---------------------------------------------------------------------------
-
-class LoginForm(BaseModel):
-    username: str
-    password: str
-
-
-async def _set_session(request: Request, user: str, password: str):
-    request.session["user"] = user
-    request.session["pass"] = password
-    request.session["expires"] = (datetime.now() + timedelta(days=30)).isoformat()
-
-
-@web_app.post("/api/auth/login")
-async def api_login(request: Request, response: Response, form: LoginForm):
-    if not _verify_htpasswd(form.username, form.password):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    await _set_session(request, form.username, form.password)
-    return {"status": "ok", "user": form.username}
-
-
-@web_app.post("/api/auth/logout")
-async def api_logout(request: Request, response: Response):
-    request.session.clear()
-    return {"status": "ok"}
-
-
-@web_app.get("/api/auth/check")
-async def api_auth_check(request: Request):
-    creds = _check_session_auth(request)
-    if creds:
-        user, _pass = creds
-        return {"authenticated": True, "user": user}
-    return {"authenticated": False}
-
-
-# ---------------------------------------------------------------------------
-# REST API
-# ---------------------------------------------------------------------------
-@web_app.get("/api/ping")
-async def api_ping():
-    return {"status": "ok", "version": "1.3", "base_url": mem.BASE_URL}
-
-@web_app.get("/api/memories", response_class=JSONResponse)
-async def api_list_memories(request: Request):
+@web_app.put("/api/memories/{memory_id}", response_class=JSONResponse)
+async def api_update_memory(memory_id: str, request: Request, body: MemoryUpdate):
     try:
-        return mem.db_list_memories(_require_user(request))
+        metadata = {"tags": [t.strip() for t in body.tags.split(",") if t.strip()]} if body.tags else {}
+        # Include extra fields (like first_name, last_name, role, company) from the request
+        extra = body.__dict__
+        for std_key in ("text", "name", "category", "tags"):
+            extra.pop(std_key, None)
+        if extra:
+            metadata.update({k: v for k, v in extra.items() if v is not None and v != ""})
+        found = await mem.db_update_memory(memory_id, body.name, body.text, body.category, _require_user(request), metadata)
+        if not found:
+            raise HTTPException(status_code=404, detail="Memory not found or access denied.")
+        return {"id": memory_id, "name": body.name, "text": body.text, "category": body.category.strip().capitalize(), "metadata": metadata}
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
