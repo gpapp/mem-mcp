@@ -1020,28 +1020,33 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
                             boosted = max(boosted, 0.88)
                         signals.append(min(1.0, boosted))
 
-            # Signal 7: Fuzzy name word match
-            for wi in p_i["norm_words"]:
-                for wj in p_j["norm_words"]:
-                    s = difflib.SequenceMatcher(None, wi, wj).ratio()
-                    if s >= 0.6:
-                        signals.append(min(0.95, 0.7 + 0.25 * s))
-                        break
-
-            # Signal 8: Full normalized name fuzzy match
-            if p_i["norm_name"] and p_j["norm_name"]:
-                full_ratio = difflib.SequenceMatcher(None, p_i["norm_name"], p_j["norm_name"]).ratio()
-                if full_ratio >= 0.85:
-                    signals.append(min(0.95, full_ratio))
+            # Signal 7: Fuzzy name word match (only if both have last names)
+            if p_i["last_name"] and p_j["last_name"]:
+                for wi in p_i["norm_words"]:
+                    for wj in p_j["norm_words"]:
+                        s = difflib.SequenceMatcher(None, wi, wj).ratio()
+                        if s >= 0.6:
+                            signals.append(min(0.95, 0.7 + 0.25 * s))
+                            break
 
             # Signal 9: First name match (strong signal for people)
             if is_people and p_i["first_name"] and p_j["first_name"]:
                 if p_i["first_name"] == p_j["first_name"]:
-                    signals.append(0.92)
-                elif len(p_i["first_name"]) > 2 and len(p_j["first_name"]) > 2:
-                    fn_ratio = difflib.SequenceMatcher(None, p_i["first_name"], p_j["first_name"]).ratio()
-                    if fn_ratio >= 0.85:
-                        signals.append(min(0.90, fn_ratio))
+                    # If at least one record has only first name (no last name), boost strongly
+                    if not p_i["last_name"] or not p_j["last_name"]:
+                        signals.append(0.95)
+                    else:
+                        # Both have last names - require surname similarity
+                        if p_i["last_name"] and p_j["last_name"]:
+                            last_ratio = difflib.SequenceMatcher(None, p_i["last_name"], p_j["last_name"]).ratio()
+                            if last_ratio >= 0.7:
+                                signals.append(0.93)
+
+            # Signal 10: Full normalized name fuzzy match (only if both have last names)
+            if p_i["norm_name"] and p_j["norm_name"] and p_i["last_name"] and p_j["last_name"]:
+                full_ratio = difflib.SequenceMatcher(None, p_i["norm_name"], p_j["norm_name"]).ratio()
+                if full_ratio >= 0.85:
+                    signals.append(min(0.95, full_ratio))
 
             similarity = max(signals)
             pair_scores[(i, j)] = similarity
