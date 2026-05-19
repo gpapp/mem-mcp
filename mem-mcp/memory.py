@@ -589,6 +589,7 @@ def db_get_connections_by_type(fact_id: str, user_id: str) -> dict:
 
 async def db_search_memories(query: str, user_id: str, limit: int = 5, category: Optional[str] = None, top_p: float = 0.4) -> list:
     """Vector-similarity search with optional category filter. Also does a basic substring match on names."""
+    import difflib
     qdrant = await get_qdrant()
     neo4j_driver = get_neo4j()
     if not qdrant or not neo4j_driver:
@@ -645,7 +646,7 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
                 if len(query_words) == 1 and len(name_words) >= 1:
                     for tw in name_words:
                         s = difflib.SequenceMatcher(None, query_lower, tw).ratio()
-                        if s >= 0.7:
+                        if s >= 0.6:
                             score = max(score, 1.4 * s)
                             break
 
@@ -694,8 +695,14 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
                 score += 0.4
             elif query_lower in name_lower:
                 score += 0.2
+            name_words = name_lower.split()
+            if len(query_words) == 1 and len(name_words) >= 1:
+                for tw in name_words:
+                    s = difflib.SequenceMatcher(None, query_lower, tw).ratio()
+                    if s >= 0.6:
+                        score += 0.35 * s
+                        break
             if aliases and isinstance(aliases, dict):
-                import difflib
                 matched_query_words = set()
                 best_ratio = 0
                 for alias, confidence in aliases.items():
