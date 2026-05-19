@@ -512,6 +512,8 @@ npm install @modelcontextprotocol/sdk</code></pre>
   let insightsLoaded = false, graphLoaded = false;
   let activeCategory = null;
   let activeLetterFilter = null;
+  let lastSortOrder = 'newest';
+  let lastSearchQuery = '';
 
   function init() {
     loadMemories();
@@ -538,6 +540,8 @@ npm install @modelcontextprotocol/sdk</code></pre>
         memories = memories.filter(m => m.id !== data.id);
         if (graphLoaded && network) graphData.nodes.remove(data.id);
         if (selectedFactId === data.id) clearFactPane();
+        renderCategorySidebar();
+        renderAlphabetFilter();
       } else {
         // For add/update/merge, fetch the specific item to get full metadata and links
         try {
@@ -574,7 +578,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
         try {
           const updatedSource = await api.get(`memories/${data.source_id}`);
           const idx = memories.findIndex(m => m.id === data.source_id);
-          if (idx !== -1) { memories[idx] = updatedSource; renderMemories(); }
+          if (idx !== -1) { memories[idx] = updatedSource; renderMemories(); renderCategorySidebar(); }
           if (selectedFactId === data.source_id) renderFactPane(updatedSource);
         } catch(_) {}
       }
@@ -634,6 +638,8 @@ npm install @modelcontextprotocol/sdk</code></pre>
   async function loadMemories() {
     try { 
       memories = await api.get('memories'); 
+      document.getElementById('search-query').value = lastSearchQuery;
+      document.getElementById('sort-order').value = lastSortOrder;
       renderMemories(); 
       renderCategorySidebar();
       renderAlphabetFilter();
@@ -700,6 +706,8 @@ npm install @modelcontextprotocol/sdk</code></pre>
     const el = document.getElementById('memories-list');
     const query = document.getElementById('search-query').value.toLowerCase();
     const sort = document.getElementById('sort-order').value;
+    lastSearchQuery = query;
+    lastSortOrder = sort;
 
     let filtered = memories.filter(m => {
       const matchCat = activeCategory === null || m.category === activeCategory;
@@ -817,7 +825,13 @@ npm install @modelcontextprotocol/sdk</code></pre>
             <div class="fact-edit-row">
               <div class="fact-edit-field">
                 <label for="ep-cat">Category</label>
-                <input id="ep-cat" value="${escHtml(m.category)}">
+                <select id="ep-cat">
+                  <option value="People">People</option>
+                  <option value="Technology">Technology</option>
+                  <option value="Client">Client</option>
+                  <option value="Project">Project</option>
+                  <option value="Tool">Tool</option>
+                </select>
               </div>
               <div class="fact-edit-field">
                 <label for="ep-tags">Tags</label>
@@ -831,6 +845,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
             </div>
           </div>
         </div>`;
+      document.getElementById('ep-cat').value = m.category;
       renderMetaEditor(m);
     } else {
       pane.innerHTML = `
