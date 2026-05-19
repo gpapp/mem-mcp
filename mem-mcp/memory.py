@@ -1034,6 +1034,15 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
                 if full_ratio >= 0.85:
                     signals.append(min(0.95, full_ratio))
 
+            # Signal 9: First name match (strong signal for people)
+            if is_people and p_i["first_name"] and p_j["first_name"]:
+                if p_i["first_name"] == p_j["first_name"]:
+                    signals.append(0.92)
+                elif len(p_i["first_name"]) > 2 and len(p_j["first_name"]) > 2:
+                    fn_ratio = difflib.SequenceMatcher(None, p_i["first_name"], p_j["first_name"]).ratio()
+                    if fn_ratio >= 0.85:
+                        signals.append(min(0.90, fn_ratio))
+
             similarity = max(signals)
             pair_scores[(i, j)] = similarity
 
