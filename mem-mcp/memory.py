@@ -922,6 +922,7 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
         return n
 
     is_people = category.strip().lower() == "people"
+    import difflib
 
     prepared = []
     for item in items_with_vectors:
@@ -1020,13 +1021,18 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
                         signals.append(min(1.0, boosted))
 
             # Signal 7: Fuzzy name word match
-            import difflib
             for wi in p_i["norm_words"]:
                 for wj in p_j["norm_words"]:
                     s = difflib.SequenceMatcher(None, wi, wj).ratio()
                     if s >= 0.6:
                         signals.append(min(0.95, 0.7 + 0.25 * s))
                         break
+
+            # Signal 8: Full normalized name fuzzy match
+            if p_i["norm_name"] and p_j["norm_name"]:
+                full_ratio = difflib.SequenceMatcher(None, p_i["norm_name"], p_j["norm_name"]).ratio()
+                if full_ratio >= 0.85:
+                    signals.append(min(0.95, full_ratio))
 
             similarity = max(signals)
             pair_scores[(i, j)] = similarity
