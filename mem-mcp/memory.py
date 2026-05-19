@@ -777,40 +777,7 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
                     score += 0.4
                 elif s >= 0.7:
                     score += s * 0.6
-# Also fuzzy match last_name to surname part of query (handles Burkart vs Burkhart)
-            query_words_l = query_lower.split()
-            if last:
-                s = difflib.SequenceMatcher(None, query_lower, last).ratio()
-                if query_lower == last:
-                    score += 0.8
-                elif last in query_lower:
-                    score += 0.4
-                elif s >= 0.7:
-                    score += s * 0.6
-                if len(query_words_l) >= 2:
-                    query_surname = query_words_l[-1]
-                    s_q = difflib.SequenceMatcher(None, query_surname, last).ratio()
-                    if s_q >= 0.7:
-                        score += s_q * 0.8
-            elif len(query_words_l) >= 2:
-                query_surname = query_words_l[-1]
-                if first:
-                    s_q = difflib.SequenceMatcher(None, query_surname, first).ratio()
-                    if s_q >= 0.7:
-                        score += s_q * 0.6
-            # Also fuzzy match first_name to surname part of query
-            if first and len(query_words_l) >= 2:
-                query_surname = query_words_l[-1]
-                s_q = difflib.SequenceMatcher(None, query_surname, first).ratio()
-                if s_q >= 0.7:
-                    score += s_q * 0.6
-            # Also fuzzy match first_name to surname part of query
-            if first and len(query_words_l) >= 2:
-                query_surname = query_words_l[-1]
-                s_q = difflib.SequenceMatcher(None, query_surname, first).ratio()
-                if s_q >= 0.7:
-                    score += s_q * 0.6
-            # Fuzzy name match boost (handles spelling variations like Burkart vs Burkhart)
+# Fuzzy name match boost (handles spelling variations like Burkart vs Burkhart)
             if name:
                 name_norm = name.lower().strip()
                 s = difflib.SequenceMatcher(None, query_lower, name_norm).ratio()
@@ -820,9 +787,12 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
                 name_words = name_norm.split()
                 if len(name_words) >= 2:
                     surname = name_words[-1]
-                    s_surname = difflib.SequenceMatcher(None, query_surname, surname).ratio()
-                    if s_surname >= 0.7:
-                        score += s_surname * 0.8
+                    query_words_l = query_lower.split()
+                    if len(query_words_l) >= 2:
+                        query_surname = query_words_l[-1]
+                        s_surname = difflib.SequenceMatcher(None, query_surname, surname).ratio()
+                        if s_surname >= 0.7:
+                            score += s_surname * 0.8
             if aliases and isinstance(aliases, dict):
                 matched_query_words = set()
                 best_ratio = 0
