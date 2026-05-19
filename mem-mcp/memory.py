@@ -745,6 +745,8 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
             merged_results[r["id"]] = r
 
     final_list = list(merged_results.values())
+    if category:
+        final_list = [r for r in final_list if r.get("category", "").lower() == category.lower()]
     final_list.sort(key=lambda x: x["score"], reverse=True)
     return final_list[:limit]
 
