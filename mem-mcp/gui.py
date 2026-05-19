@@ -366,6 +366,13 @@ async def api_get_connections(request: Request, fact_id: str):
         raise HTTPException(status_code=503, detail=str(e))
 
 
+class DiaryCreate(BaseModel):
+    content: str
+    name: str
+    id: Optional[str] = None
+    timestamp: str
+
+
 @web_app.post("/api/diary", response_class=JSONResponse, status_code=201)
 async def api_save_diary(request: Request, body: DiaryCreate):
     try:
