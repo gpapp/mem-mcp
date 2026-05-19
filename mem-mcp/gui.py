@@ -188,6 +188,16 @@ async def api_update_memory(memory_id: str, request: Request, body: MemoryUpdate
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
+
+@web_app.get("/api/memories", response_class=JSONResponse)
+async def api_list_memories(request: Request):
+    """List all memories for the current user."""
+    try:
+        return mem.db_list_memories(_require_user(request))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
 @web_app.get("/api/memories/{memory_id}", response_class=JSONResponse)
 async def api_get_memory(memory_id: str, request: Request):
     """Fetch a single memory enriched with links and metadata."""
