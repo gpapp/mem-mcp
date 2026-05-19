@@ -134,12 +134,22 @@ class MemoryCreate(BaseModel):
     category: str = "General"
     tags: Optional[str] = ""
 
-
-class MemoryUpdate(BaseModel):
+    class Config:
+        extra = "allow"
     text: str
     name: Optional[str] = None
     category: str = "General"
     tags: Optional[str] = ""
+
+    class Config:
+        extra = "allow"
+
+
+class MemoryUpdate(BaseModel):
+    text: Optional[str] = None
+    name: Optional[str] = None
+    category: Optional[str] = None
+    tags: Optional[str] = None
 
     class Config:
         extra = "allow"
@@ -174,17 +184,18 @@ def _require_user(request: Request) -> str:
 @web_app.put("/api/memories/{memory_id}", response_class=JSONResponse)
 async def api_update_memory(memory_id: str, request: Request, body: MemoryUpdate):
     try:
-        metadata = {"tags": [t.strip() for t in body.tags.split(",") if t.strip()]} if body.tags else {}
-        # Include extra fields (like first_name, last_name, role, company) from the request
-        extra = body.__dict__
+        # Build metadata from tags and any extra fields
+        all_fields = body.dict()
+        metadata = {"tags": [t.strip() for t in (all_fields.pop("tags", "") or "").split(",") if t.strip()]}
         for std_key in ("text", "name", "category", "tags"):
-            extra.pop(std_key, None)
-        if extra:
-            metadata.update({k: v for k, v in extra.items() if v is not None and v != ""})
-        found = await mem.db_update_memory(memory_id, body.name, body.text, body.category, _require_user(request), metadata)
+            all_fields.pop(std_key, None)
+        for k, v in all_fields.items():
+            if v is not None and v != "":
+                metadata[k] = v
+        found = await mem.db_update_memory(memory_id, all_fields.get("name"), all_fields.get("text"), all_fields.get("category"), _require_user(request), metadata)
         if not found:
             raise HTTPException(status_code=404, detail="Memory not found or access denied.")
-        return {"id": memory_id, "name": body.name, "text": body.text, "category": body.category.strip().capitalize(), "metadata": metadata}
+        return {"id": memory_id, "name": metadata.get("name"), "text": metadata.get("text"), "category": metadata.get("category", "General").strip().capitalize(), "metadata": metadata}
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
