@@ -151,6 +151,26 @@ class MemoryLink(BaseModel):
     relType: str = "KNOWS"
 
 
+# ---------------------------------------------------------------------------
+# User extraction (from request, not MCP context)
+# ---------------------------------------------------------------------------
+
+def _user(request: Request) -> str:
+    session_user = request.session.get("user")
+    if session_user:
+        return session_user
+    if hasattr(request.state, "user") and request.state.user:
+        return request.state.user
+    user = mem.extract_user_from_headers(dict(request.headers))
+    return user
+
+def _require_user(request: Request) -> str:
+    user = _user(request)
+    if user == "anonymous" or not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return user
+
+
 @web_app.put("/api/memories/{memory_id}", response_class=JSONResponse)
 async def api_update_memory(memory_id: str, request: Request, body: MemoryUpdate):
     try:
