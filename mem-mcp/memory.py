@@ -1118,7 +1118,7 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
                 if full_ratio >= 0.85:
                     signals.append(min(0.95, full_ratio))
 
-            similarity = max(signals)
+            similarity = max(signals) if signals else vec_sim
             pair_scores[(i, j)] = similarity
 
     logger.info(f"[db_find_duplicates] Computed {len(pair_scores)} pairwise scores for {num_items} items")
