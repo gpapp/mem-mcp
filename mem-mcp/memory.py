@@ -607,13 +607,11 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
             MATCH (f:Fact {userId: $userId})
             WHERE toLower(f.name) CONTAINS toLower($query_str)
                OR toLower(f.text) CONTAINS toLower($query_str)
-               OR any(alias IN keys(f.aliases) WHERE toLower(alias) CONTAINS toLower($query_str))
             """
         else:
             cypher = """
             MATCH (f:Fact {userId: $userId})
             WHERE toLower(f.name) CONTAINS toLower($query_str)
-               OR any(alias IN keys(f.aliases) WHERE toLower(alias) CONTAINS toLower($query_str))
             """
         if category:
             cypher += " AND toLower(f.category) = toLower($category)"
