@@ -751,23 +751,31 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
                     if s >= 0.6:
                         score += 0.35 * s
                         break
-            # Also boost if first_name or last_name matches
+            # Also boost if first_name or last_name matches (including fuzzy)
             first = (metadata.get("first_name") or "").lower()
             last = (metadata.get("last_name") or "").lower()
-            if first and query_lower == first:
-                score += 0.8
-            elif first and first in query_lower:
-                score += 0.4
-            elif last and query_lower == last:
-                score += 0.8
-            elif last and last in query_lower:
-                score += 0.4
+            if first:
+                s = difflib.SequenceMatcher(None, query_lower, first).ratio()
+                if query_lower == first:
+                    score += 0.8
+                elif first in query_lower:
+                    score += 0.4
+                elif s >= 0.7:
+                    score += s * 0.6
+            if last:
+                s = difflib.SequenceMatcher(None, query_lower, last).ratio()
+                if query_lower == last:
+                    score += 0.8
+                elif last in query_lower:
+                    score += 0.4
+                elif s >= 0.7:
+                    score += s * 0.6
             # Fuzzy name match boost (handles spelling variations like Burkart vs Burkhart)
             if name:
                 name_norm = name.lower().strip()
                 s = difflib.SequenceMatcher(None, query_lower, name_norm).ratio()
-                if s >= 0.75:
-                    score += s * 0.6
+                if s >= 0.7:
+                    score += s * 0.8
             if aliases and isinstance(aliases, dict):
                 matched_query_words = set()
                 best_ratio = 0
