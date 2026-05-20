@@ -1243,13 +1243,15 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
             avg_item_sim = sum(item_scores) / len(item_scores) if item_scores else 1.0
             cluster_scores.extend(item_scores)
 
+            text = item["text"]
+            if len(text) > 300:
+                text = text[:297] + "..."
             member_info = {
                 "id": item["id"],
-                "text": item["text"],
+                "text": text,
                 "name": item["name"],
                 "similarity": round(avg_item_sim, 4),
             }
-            member_info.update(item.get("metadata") or {})
             members.append(member_info)
 
         avg_similarity = sum(cluster_scores) / len(cluster_scores) if cluster_scores else 0.0
