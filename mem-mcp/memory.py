@@ -1386,8 +1386,30 @@ async def db_merge_memories(master_id: str, duplicate_ids: List[str], user_id: s
     # Delete duplicates from Qdrant
     await qdrant.delete(
         collection_name=COLLECTION_NAME,
-        points_selector=duplicate_ids,
+        points_selector=PointIdsList(points=duplicate_ids),
     )
+
+    # Re-embed the master with merged text
+    await qdrant.delete(
+        collection_name=COLLECTION_NAME,
+        points_selector=PointIdsList(points=[master_id]),
+    )
+    master_text = None
+    with neo4j_driver.session() as s:
+        row = s.run(
+            "MATCH (f:Fact {id: $id, userId: $userId}) RETURN f.text AS text, f.name AS name",
+            id=master_id, userId=user_id
+        ).single()
+        if row:
+            master_text = row["text"]
+            master_name = row.get("name", "")
+    if master_text:
+        vector = await get_embedding(master_text)
+        await qdrant.upsert(
+            collection_name=COLLECTION_NAME,
+            points=[PointStruct(id=master_id, vector=vector, payload={"text": master_text, "name": master_name, "user_id": user_id})],
+        )
+
     await publish_db_event(user_id, "memory_changed", {
         "action": "merge",
         "master_id": master_id,
