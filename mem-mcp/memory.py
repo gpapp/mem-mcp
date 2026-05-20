@@ -1759,7 +1759,7 @@ async def sync_orphans():
         return
 
     with neo4j_driver.session() as s:
-        user_rows = s.run("MATCH (f:Fact) RETURN DISTINCT f.userId AS userId").fetch()
+        user_rows = list(s.run("MATCH (f:Fact) RETURN DISTINCT f.userId AS userId"))
     user_ids = [r["userId"] for r in user_rows if r["userId"]]
     if not user_ids:
         logger.info("sync_orphans: no users found")
@@ -1771,10 +1771,10 @@ async def sync_orphans():
     for user_id in user_ids:
         # 1. Get all fact IDs + text from Neo4j
         with neo4j_driver.session() as s:
-            facts = s.run(
+            facts = list(s.run(
                 "MATCH (f:Fact {userId: $userId}) RETURN f.id AS id, f.text AS text, f.name AS name",
                 userId=user_id
-            ).fetch()
+            ))
         neo4j_ids = {r["id"] for r in facts}
         neo4j_map  = {r["id"]: {"text": r["text"], "name": r.get("name", "")} for r in facts}
         if not neo4j_ids:
