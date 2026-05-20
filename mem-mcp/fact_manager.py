@@ -1293,7 +1293,7 @@ async def sync_orphans():
                 offset=offset,
                 with_payload=False,
                 with_vectors=False,
-                filter=Filter(must=[FieldCondition(key="userId", match=MatchValue(value=user_id))]),
+                scroll_filter=Filter(must=[FieldCondition(key="userId", match=MatchValue(value=user_id))]),
             )
             points, next_offset = result
             for p in points:
