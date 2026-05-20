@@ -145,55 +145,6 @@ async def get_embedding(text: str) -> List[float]:
         resp.raise_for_status()
         return resp.json()["embedding"]
 
-async def get_llm_completion(prompt: str, system: Optional[str] = None) -> str:
-    """Run a local LLM completion using Ollama."""
-    model = os.getenv("MEM_LLM_MODEL", "llama3")
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        payload = {
-            "model": model,
-            "prompt": prompt,
-            "stream": False
-        }
-        if system:
-            payload["system"] = system
-
-        logger.info(f"[Ollama] GENERATE request to {OLLAMA_URL} with model={model}. Prompt length: {len(prompt)} chars.")
-
-        # Log prompt upfront in case of timeout
-        timestamp = datetime.now().isoformat().replace(":", "-")
-        log_file = f"logs/ollama_generate_{timestamp}.txt"
-        try:
-            os.makedirs("logs", exist_ok=True)
-            with open(log_file, "w", encoding="utf-8") as f:
-                f.write(f"=== SYSTEM ===\n{system or 'None'}\n\n")
-                f.write(f"=== PROMPT ===\n{prompt}\n\n")
-                f.write(f"=== RESPONSE ===\n[Pending or Timeout]\n")
-        except Exception as e:
-            logger.error(f"Failed to write initial Ollama log: {e}")
-
-        try:
-            resp = await client.post(f"{OLLAMA_URL}/api/generate", json=payload)
-            resp.raise_for_status()
-            response_text = resp.json()["response"]
-
-            # Update log with actual response
-            try:
-                with open(log_file, "w", encoding="utf-8") as f:
-                    f.write(f"=== SYSTEM ===\n{system or 'None'}\n\n")
-                    f.write(f"=== PROMPT ===\n{prompt}\n\n")
-                    f.write(f"=== RESPONSE ===\n{response_text}\n")
-            except Exception as e:
-                pass
-
-            return response_text
-        except Exception as api_err:
-            try:
-                with open(log_file, "a", encoding="utf-8") as f:
-                    f.write(f"\n[ERROR] {str(api_err)}\n")
-            except Exception:
-                pass
-            raise api_err
-
 # ---------------------------------------------------------------------------
 # User extraction
 # ---------------------------------------------------------------------------
