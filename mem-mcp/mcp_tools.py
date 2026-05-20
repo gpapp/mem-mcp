@@ -233,13 +233,13 @@ async def diary_delete_entry(entryId: str):
     return f"Deleted diary entry {entryId}"
     
 @mcp.tool()
-async def find_duplicates(category: str = "People", limit: int = 50, threshold: float = 0.6, max_cluster: int = 4, group_by: Optional[str] = "first_name"):
+async def find_duplicates(category: str = "People", limit: int = 50, threshold: float = 0.75, max_cluster: int = 4, group_by: Optional[str] = "first_name"):
     """
     Find potential duplicate entries in memory by comparing embeddings similarity ranking.
     Returns grouped clusters of similar items for manual deduplication.
     - category: category to search (default 'People')
     - limit: max items to fetch (default 50)
-    - threshold: starting similarity threshold (default 0.6). If clusters exceed max_cluster, threshold is increased iteratively.
+    - threshold: starting similarity threshold (default 0.75). If clusters exceed max_cluster, threshold is increased iteratively.
     - max_cluster: max items per cluster (default 4). Large clusters are split by increasing threshold.
     """
     try:

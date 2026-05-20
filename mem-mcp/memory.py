@@ -923,7 +923,7 @@ def db_list_categories(user_id: str) -> list:
         return [r["category"] for r in result]
 
 
-async def db_find_duplicates(user_id: str, category: str = "People", limit: int = 50, threshold: float = 0.6, max_cluster: int = 4):
+async def db_find_duplicates(user_id: str, category: str = "People", limit: int = 50, threshold: float = 0.75, max_cluster: int = 4):
     """
     Find potential duplicates in a category using multi-signal similarity and clustering.
 
@@ -1254,6 +1254,9 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
 
         avg_similarity = sum(cluster_scores) / len(cluster_scores) if cluster_scores else 0.0
         recommendation = "MERGE - high overlap" if avg_similarity > 0.9 else "MERGE - verify and combine"
+
+        if avg_similarity < 0.85:
+            continue
 
         result_clusters.append({
             "cluster_id": len(result_clusters) + 1,
