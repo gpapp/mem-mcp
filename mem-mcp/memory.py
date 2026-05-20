@@ -10,7 +10,7 @@ from common import (
     HTTP_TIMEOUT, BASE_URL, COLLECTION_NAME, DIARY_COLLECTION,
     SESSION_SECRET, SESSION_MAX_AGE, db_subscribers,
     publish_db_event, get_qdrant, get_neo4j, wait_for_service,
-    get_embedding, get_llm_completion, extract_user_from_headers, logger
+    get_embedding, extract_user_from_headers, logger
 )
 
 from fact_manager import (
