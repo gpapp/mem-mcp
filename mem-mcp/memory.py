@@ -1298,8 +1298,8 @@ async def db_merge_memories(master_id: str, duplicate_ids: List[str], user_id: s
         dup_rels_res = s.run(
             """
             MATCH (dup:Fact) WHERE dup.id IN $duplicateIds AND dup.userId = $userId
-            OPTIONAL MATCH (dup)-[out_r]->(out_t) WHERE out_t.id <> $masterId AND NOT out_t.id IN $duplicateIds
-            OPTIONAL MATCH (in_t)-[in_r]->(dup) WHERE in_t.id <> $masterId AND NOT in_t.id IN $duplicateIds
+            OPTIONAL MATCH (dup)-[out_r]->(out_t) WHERE (out_t.id IS NULL) OR (out_t.id <> $masterId AND NOT out_t.id IN $duplicateIds)
+            OPTIONAL MATCH (in_t)-[in_r]->(dup) WHERE (in_t.id IS NULL) OR (in_t.id <> $masterId AND NOT in_t.id IN $duplicateIds)
             RETURN
                 collect(DISTINCT {type: type(out_r), target: out_t.id, props: properties(out_r), dir: 'out'}) as out_rels,
                 collect(DISTINCT {type: type(in_r), source: in_t.id, props: properties(in_r), dir: 'in'}) as in_rels
@@ -1325,6 +1325,8 @@ async def db_merge_memories(master_id: str, duplicate_ids: List[str], user_id: s
 
         # 3. Create missing edges on the merge target (master)
         for r in missing_out:
+            if not r['target']:
+                continue
             s.run(
                 """
                 MATCH (master:Fact {id: $masterId, userId: $userId})
@@ -1336,6 +1338,8 @@ async def db_merge_memories(master_id: str, duplicate_ids: List[str], user_id: s
             )
 
         for r in missing_in:
+            if not r['source']:
+                continue
             s.run(
                 """
                 MATCH (master:Fact {id: $masterId, userId: $userId})
