@@ -1131,12 +1131,21 @@ async def db_merge_memories(master_id: str, duplicate_ids: List[str], user_id: s
                     userId: 'discard',
                     timestamp: 'discard',
                     category: 'discard',
-                    `*`: 'combine'
+                    `.*`: 'combine'
                 }
             }) YIELD node
             RETURN count(*)
             """,
             masterId=master_id, duplicateIds=duplicate_ids, userId=user_id
+        )
+
+        # 6. Explicitly delete duplicate nodes as a safety measure to ensure they are removed from Neo4j
+        s.run(
+            """
+            MATCH (dup:Fact) WHERE dup.id IN $duplicateIds AND dup.userId = $userId
+            DETACH DELETE dup
+            """,
+            duplicateIds=duplicate_ids, userId=user_id
         )
 
     # Delete duplicates from Qdrant
