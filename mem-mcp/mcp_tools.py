@@ -292,11 +292,22 @@ async def suggest_merge(cluster_json: str):
     if not isinstance(records, list) or not records:
         return "Empty or invalid cluster data."
 
-    # If items are plain strings, treat them as IDs and fetch full records.
-    if records and isinstance(records[0], str):
+    # Ensure we have full records. If items are plain strings or dicts missing 'text', fetch them.
+    if records:
         user = _current_user()
         fetched = []
-        for rid in records:
+        for r in records:
+            if isinstance(r, str):
+                rid = r
+            elif isinstance(r, dict) and "id" in r and "text" not in r:
+                rid = r["id"]
+            elif isinstance(r, dict) and "text" in r:
+                fetched.append(r)
+                continue
+            else:
+                logger.warning(f"suggest_merge: skipping invalid record format: {r!r}")
+                continue
+
             result = mem.db_get_fact_by_id(rid, user)
             if result:
                 fetched.append(result)
