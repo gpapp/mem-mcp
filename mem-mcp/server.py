@@ -59,6 +59,7 @@ from contextlib import asynccontextmanager
 @asynccontextmanager
 async def lifespan(app):
     async with mcp_app.lifespan(mcp_app):
+        await mem.sync_orphans()
         yield
 
 web_app.router.lifespan_context = lifespan

@@ -1407,7 +1407,7 @@ async def db_merge_memories(master_id: str, duplicate_ids: List[str], user_id: s
         vector = await get_embedding(master_text)
         await qdrant.upsert(
             collection_name=COLLECTION_NAME,
-            points=[PointStruct(id=master_id, vector=vector, payload={"text": master_text, "name": master_name, "user_id": user_id})],
+            points=[PointStruct(id=master_id, vector=vector, payload={"text": master_text, "name": master_name, "userId": user_id})],
         )
 
     await publish_db_event(user_id, "memory_changed", {
@@ -1744,3 +1744,87 @@ def db_get_graph(user_id: str) -> dict:
             "nodes": list(node_map.values()),
             "edges": edges
         }
+
+
+# ---------------------------------------------------------------------------
+# Startup orphan sync: detect and fix Qdrant ↔ Neo4j inconsistencies
+# ---------------------------------------------------------------------------
+
+async def sync_orphans():
+    """Detect and fix Qdrant ↔ Neo4j orphans for every user on startup."""
+    qdrant = await get_qdrant()
+    neo4j_driver = get_neo4j()
+    if not qdrant or not neo4j_driver:
+        logger.warning("sync_orphans: DB not available, skipping")
+        return
+
+    with neo4j_driver.session() as s:
+        user_rows = s.run("MATCH (f:Fact) RETURN DISTINCT f.userId AS userId").fetch()
+    user_ids = [r["userId"] for r in user_rows if r["userId"]]
+    if not user_ids:
+        logger.info("sync_orphans: no users found")
+        return
+
+    total_deleted = 0
+    total_reembedded = 0
+
+    for user_id in user_ids:
+        # 1. Get all fact IDs + text from Neo4j
+        with neo4j_driver.session() as s:
+            facts = s.run(
+                "MATCH (f:Fact {userId: $userId}) RETURN f.id AS id, f.text AS text, f.name AS name",
+                userId=user_id
+            ).fetch()
+        neo4j_ids = {r["id"] for r in facts}
+        neo4j_map  = {r["id"]: {"text": r["text"], "name": r.get("name", "")} for r in facts}
+        if not neo4j_ids:
+            continue
+
+        # 2. Scroll all Qdrant point IDs for this user
+        qdrant_ids = set()
+        offset = None
+        while True:
+            result = await qdrant.scroll(
+                collection_name=COLLECTION_NAME,
+                limit=1000,
+                offset=offset,
+                with_payload=False,
+                with_vectors=False,
+                filter=Filter(must=[FieldCondition(key="userId", match=MatchValue(value=user_id))]),
+            )
+            points, next_offset = result
+            for p in points:
+                qdrant_ids.add(str(p.id))
+            if next_offset is None:
+                break
+            offset = next_offset
+
+        # 3. Qdrant-only → delete
+        orphan_qdrant = qdrant_ids - neo4j_ids
+        if orphan_qdrant:
+            logger.info(f"sync_orphans [{user_id}]: deleting {len(orphan_qdrant)} Qdrant-only orphans")
+            await qdrant.delete(
+                collection_name=COLLECTION_NAME,
+                points_selector=PointIdsList(points=list(orphan_qdrant)),
+            )
+            total_deleted += len(orphan_qdrant)
+
+        # 4. Neo4j-only → re-embed
+        orphan_neo4j = neo4j_ids - qdrant_ids
+        if orphan_neo4j:
+            logger.info(f"sync_orphans [{user_id}]: re-embedding {len(orphan_neo4j)} Neo4j-only records")
+            for oid in orphan_neo4j:
+                info = neo4j_map[oid]
+                text = info["text"]
+                name = info["name"]
+                vector = await get_embedding(text)
+                await qdrant.upsert(
+                    collection_name=COLLECTION_NAME,
+                    points=[PointStruct(id=oid, vector=vector, payload={"text": text, "name": name, "userId": user_id})],
+                )
+            total_reembedded += len(orphan_neo4j)
+
+    if total_deleted or total_reembedded:
+        logger.info(f"sync_orphans done: deleted {total_deleted} Qdrant orphans, re-embedded {total_reembedded} Neo4j orphans")
+    else:
+        logger.info("sync_orphans: nothing to fix")
