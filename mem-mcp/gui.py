@@ -250,6 +250,49 @@ async def api_delete_diary_entry(entry_id: str, request: Request):
         raise HTTPException(status_code=503, detail=str(e))
 
 
+class DiaryCreate(BaseModel):
+    content: str
+    name: str
+    id: Optional[str] = None
+    timestamp: str
+
+class DiaryLink(BaseModel):
+    factId: str
+
+
+@web_app.put("/api/diary/{entry_id}", response_class=JSONResponse)
+async def api_update_diary_entry(entry_id: str, request: Request, body: DiaryCreate):
+    """Update a diary entry's content, name, and/or timestamp."""
+    try:
+        user_id = _require_user(request)
+        ok = await mem.db_update_diary(entry_id, user_id, content=body.content, name=body.name, timestamp=body.timestamp)
+        if not ok:
+            raise HTTPException(status_code=404, detail="Diary entry not found or access denied.")
+        return {"id": entry_id, "content": body.content, "name": body.name, "timestamp": body.timestamp}
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@web_app.post("/api/diary/{entry_id}/link", response_class=JSONResponse, status_code=201)
+async def api_link_diary_mention(entry_id: str, request: Request, body: DiaryLink):
+    """Link a diary entry to a fact via MENTIONS."""
+    try:
+        await mem.db_link_diary_mention(entry_id, body.factId, _require_user(request))
+        return {"status": "linked"}
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@web_app.delete("/api/diary/{entry_id}/link/{fact_id}", response_class=JSONResponse)
+async def api_unlink_diary_mention(entry_id: str, fact_id: str, request: Request):
+    """Remove a MENTIONS link from a diary entry to a fact."""
+    try:
+        await mem.db_unlink_diary_mention(entry_id, fact_id, _require_user(request))
+        return {"status": "unlinked"}
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
 @web_app.post("/api/memories", response_class=JSONResponse, status_code=201)
 async def api_create_memory(request: Request, body: MemoryCreate):
     try:
@@ -387,13 +430,6 @@ async def api_get_connections(request: Request, fact_id: str):
         return mem.db_get_connections_by_type(fact_id, _require_user(request))
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
-
-
-class DiaryCreate(BaseModel):
-    content: str
-    name: str
-    id: Optional[str] = None
-    timestamp: str
 
 
 @web_app.post("/api/diary", response_class=JSONResponse, status_code=201)

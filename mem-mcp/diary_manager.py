@@ -163,6 +163,83 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
     return entries
 
 
+async def db_update_diary(entry_id: str, user_id: str, content: str = None, name: str = None, timestamp: str = None) -> bool:
+    """Update a diary entry's content, name, and/or timestamp."""
+    qdrant = await get_qdrant()
+    neo4j_driver = get_neo4j()
+    if not qdrant or not neo4j_driver:
+        raise RuntimeError("Database connections not established.")
+
+    with neo4j_driver.session() as s:
+        res = s.run(
+            "MATCH (d:DiaryEntry {id: $id, userId: $userId}) RETURN d.content as content, d.name as name, d.timestamp as timestamp",
+            id=entry_id, userId=user_id
+        )
+        existing = res.single()
+        if not existing:
+            return False
+
+        new_content = content if content is not None else existing["content"]
+        new_name = name if name is not None else existing["name"]
+        new_ts = timestamp if timestamp is not None else existing["timestamp"]
+        entry_date = new_ts[:10]
+
+        s.run(
+            """
+            MATCH (d:DiaryEntry {id: $id, userId: $userId})
+            SET d.content = $content, d.name = $name, d.timestamp = $ts, d.date = $date
+            """,
+            id=entry_id, userId=user_id, content=new_content, name=new_name, ts=new_ts, date=entry_date
+        )
+
+    # Re-embed in Qdrant
+    vector = await get_embedding(f"{new_name}: {new_content}" if new_name else new_content)
+    await qdrant.upsert(
+        collection_name=DIARY_COLLECTION,
+        points=[PointStruct(
+            id=entry_id,
+            vector=vector,
+            payload={"content": new_content, "name": new_name, "date": entry_date, "timestamp": new_ts, "userId": user_id},
+        )],
+    )
+
+    await publish_db_event(user_id, "diary_changed", {"action": "update", "id": entry_id, "date": entry_date})
+    return True
+
+
+async def db_link_diary_mention(entry_id: str, fact_id: str, user_id: str):
+    """Create a MENTIONS relationship from a diary entry to a fact."""
+    neo4j_driver = get_neo4j()
+    if not neo4j_driver:
+        raise RuntimeError("Neo4j not connected.")
+    with neo4j_driver.session() as s:
+        s.run(
+            """
+            MATCH (d:DiaryEntry {id: $entryId, userId: $userId})
+            MATCH (f:Fact {id: $factId, userId: $userId})
+            MERGE (d)-[:MENTIONS]->(f)
+            """,
+            entryId=entry_id, factId=fact_id, userId=user_id
+        )
+    await publish_db_event(user_id, "diary_changed", {"action": "link", "id": entry_id})
+
+
+async def db_unlink_diary_mention(entry_id: str, fact_id: str, user_id: str):
+    """Remove a MENTIONS relationship from a diary entry to a fact."""
+    neo4j_driver = get_neo4j()
+    if not neo4j_driver:
+        raise RuntimeError("Neo4j not connected.")
+    with neo4j_driver.session() as s:
+        s.run(
+            """
+            MATCH (d:DiaryEntry {id: $entryId, userId: $userId})-[r:MENTIONS]->(f:Fact {id: $factId, userId: $userId})
+            DELETE r
+            """,
+            entryId=entry_id, factId=fact_id, userId=user_id
+        )
+    await publish_db_event(user_id, "diary_changed", {"action": "unlink", "id": entry_id})
+
+
 async def db_delete_diary(entry_id: str, user_id: str) -> bool:
     """Delete a single diary entry by id. Returns True if the entry existed and was deleted."""
     qdrant = await get_qdrant()

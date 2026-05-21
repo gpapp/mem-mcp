@@ -22,6 +22,7 @@ from fact_manager import (
 )
 
 from diary_manager import (
-    _diary_id, db_save_diary, db_search_diary, db_delete_diary,
+    _diary_id, db_save_diary, db_update_diary, db_search_diary, db_delete_diary,
+    db_link_diary_mention, db_unlink_diary_mention,
     db_list_diary_entries, db_list_diary
 )

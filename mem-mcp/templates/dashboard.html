@@ -200,10 +200,14 @@
     .diary-search-box input { width: 100%; padding: .4rem .6rem; border: 1px solid var(--border); border-radius: 6px;
                               background: var(--bg); color: var(--text); font-size: .85rem; box-sizing: border-box; outline: none; }
     .diary-search-box input:focus { border-color: var(--primary); }
-    .diary-calendar-box { padding: .5rem .75rem; border-bottom: 1px solid var(--border); }
-    .diary-calendar-box input { width: 100%; padding: .35rem .5rem; border: 1px solid var(--border); border-radius: 6px;
-                               background: var(--bg); color: var(--text); font-size: .8rem; box-sizing: border-box; outline: none; }
-    .diary-calendar-box input:focus { border-color: var(--primary); }
+    .diary-month-pager { padding: .5rem .75rem; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; gap: .25rem; }
+    .diary-month-pager .btn-month { background: none; border: 1px solid var(--border); border-radius: 6px; cursor: pointer; padding: .25rem .5rem; font-size: .8rem; color: var(--text); line-height: 1; }
+    .diary-month-pager .btn-month:hover { background: var(--bg); }
+    .diary-month-label { font-weight: 700; font-size: .85rem; color: var(--text); white-space: nowrap; }
+    .diary-month-dates { padding: .35rem .75rem; border-bottom: 1px solid var(--border); display: flex; flex-wrap: wrap; gap: .3rem; }
+    .diary-month-dates .date-btn { background: var(--bg); border: 1px solid var(--border); border-radius: 4px; cursor: pointer; padding: .15rem .45rem; font-size: .75rem; color: var(--text); min-width: 24px; text-align: center; }
+    .diary-month-dates .date-btn:hover { background: var(--primary-light); border-color: var(--primary); }
+    .diary-month-dates .date-btn.active { background: var(--primary); color: #fff; border-color: var(--primary); }
     .diary-date-group { padding: .5rem .75rem; background: var(--bg); border-bottom: 1px solid var(--border); }
     .diary-date-group-label { font-size: .7rem; font-weight: 700; color: var(--primary); text-transform: uppercase; letter-spacing: .5px; }
     .diary-search-result { padding: .6rem 1rem; cursor: pointer; border-bottom: 1px solid var(--bg); transition: all .15s;
@@ -386,10 +390,12 @@
         <span>History</span>
         <button class="btn btn-primary btn-sm" onclick="showDiaryEditor()">＋ New</button>
       </div>
-      <div class="diary-calendar-box">
-        <input type="date" id="diary-calendar" onchange="onDiaryCalendarChange(this.value)">
-        <span id="diary-calendar-clear" style="display:none; cursor:pointer; color:var(--primary); font-size:.75rem; margin-left:.5rem;" onclick="clearDiaryDateFilter()">✕ Clear</span>
+      <div class="diary-month-pager">
+        <button class="btn-month" onclick="prevMonth()">◀</button>
+        <span class="diary-month-label" id="diary-month-label"></span>
+        <button class="btn-month" onclick="nextMonth()">▶</button>
       </div>
+      <div class="diary-month-dates" id="diary-month-dates"></div>
       <div class="diary-search-box">
         <input type="search" id="diary-search-input" placeholder="Search entries…" oninput="onDiarySearch(this.value)" autocomplete="off">
       </div>
@@ -508,7 +514,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     fetch(`${apiBase}/auth/logout`, {method:'POST'}).then(() => window.location.href = "{{BASE_URL}}/");
   }
 
-  let memories = [], diaryEntries = [], activeDiaryId = null, selectedDiaryDate = null;
+  let memories = [], diaryEntries = [], activeDiaryId = null, selectedDiaryDate = null, diaryMonthYear = null, diarySearchQuery = '';
   let insightsLoaded = false, graphLoaded = false;
   let activeCategory = null;
   let activeLetterFilter = null;
@@ -608,6 +614,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
       try {
         const entry = await api.get(`diary/${data.id}`);
         diaryEntries.unshift(entry);
+        renderDiaryMonthPager();
         renderDiarySidebar();
         if (!activeDiaryId) selectDiaryEntry(entry.id);
       } catch(_) { loadDiary(); }
@@ -1140,7 +1147,13 @@ npm install @modelcontextprotocol/sdk</code></pre>
   }
 
   async function loadDiary() {
-    try { diaryEntries = await api.get('diary'); renderDiarySidebar(); if (diaryEntries.length && !activeDiaryId) selectDiaryEntry(diaryEntries[0].id); }
+    try {
+      diaryEntries = await api.get('diary');
+      diaryMonthYear = null; // reset to current month
+      renderDiaryMonthPager();
+      renderDiarySidebar();
+      if (diaryEntries.length && !activeDiaryId) selectDiaryEntry(diaryEntries[0].id);
+    }
     catch(e) { document.getElementById('diary-dates-list').innerHTML = '<p class="empty">⚠️ Error</p>'; }
   }
 
@@ -1148,20 +1161,14 @@ npm install @modelcontextprotocol/sdk</code></pre>
 
   function onDiarySearch(q) {
     clearTimeout(diarySearchTimer);
-    if (!q.trim()) { renderDiarySidebar(); return; }
-
-    const datePattern = parseDateQuery(q);
-    const lower = q.toLowerCase();
-
-    const matched = diaryEntries.filter(e => {
-      const name = (e.name || '').toLowerCase();
-      const content = (e.content || '').toLowerCase();
-      const matchesText = name.includes(lower) || content.includes(lower) || e.date.includes(lower);
-      const matchesDate = datePattern && matchesDatePattern(e.date, datePattern);
-      return matchesText || matchesDate;
-    });
-    renderDiarySearchResults(matched, q);
-    diarySearchTimer = setTimeout(() => runDiaryVectorSearch(q), 400);
+    diarySearchQuery = q.trim();
+    if (!diarySearchQuery) {
+      renderDiaryMonthPager();
+      renderDiarySidebar();
+      return;
+    }
+    renderDiarySidebar();
+    diarySearchTimer = setTimeout(() => runDiaryVectorSearch(diarySearchQuery), 400);
   }
 
   function parseDateQuery(q) {
@@ -1184,7 +1191,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     // Pattern: YYYY-MM (e.g., "2026-05", "2026-5")
     const ymMatch = trimmed.match(/^(\d{4})-(\d{1,2})$/);
     if (ymMatch) {
-      return { year: ymMatch[1], month: parseInt(ymdMatch[2]) };
+      return { year: ymMatch[1], month: parseInt(ymMatch[2]) };
     }
 
     // Pattern: Year only (e.g., "2026")
@@ -1293,9 +1300,24 @@ npm install @modelcontextprotocol/sdk</code></pre>
     const el = document.getElementById('diary-dates-list');
     if (!diaryEntries.length) { el.innerHTML = '<p class="empty">No entries.</p>'; return; }
 
-    let filtered = diaryEntries;
+    const my = getDiaryMonthYear();
+    const monthPrefix = `${my.year}-${String(my.month).padStart(2, '0')}`;
+    let filtered = diaryEntries.filter(e => e.date && e.date.startsWith(monthPrefix));
+
     if (selectedDiaryDate) {
-      filtered = diaryEntries.filter(e => e.date === selectedDiaryDate);
+      filtered = filtered.filter(e => e.date === selectedDiaryDate);
+    }
+
+    if (diarySearchQuery) {
+      const lower = diarySearchQuery.toLowerCase();
+      const datePattern = parseDateQuery(diarySearchQuery);
+      filtered = filtered.filter(e => {
+        const name = (e.name || '').toLowerCase();
+        const content = (e.content || '').toLowerCase();
+        const matchesText = name.includes(lower) || content.includes(lower) || e.date.includes(lower);
+        const matchesDate = datePattern && matchesDatePattern(e.date, datePattern);
+        return matchesText || matchesDate;
+      });
     }
 
     const sorted = [...filtered].sort((a, b) => (b.timestamp || b.date || '').localeCompare(a.timestamp || a.date || ''));
@@ -1335,17 +1357,62 @@ npm install @modelcontextprotocol/sdk</code></pre>
     return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' });
   }
 
-  function onDiaryCalendarChange(value) {
-    selectedDiaryDate = value || null;
-    document.getElementById('diary-calendar-clear').style.display = selectedDiaryDate ? 'inline' : 'none';
+  function getDiaryMonthYear() {
+    if (!diaryMonthYear) {
+      const now = new Date();
+      diaryMonthYear = { year: now.getFullYear(), month: now.getMonth() + 1 };
+    }
+    return diaryMonthYear;
+  }
+
+  function prevMonth() {
+    const my = getDiaryMonthYear();
+    my.month -= 1;
+    if (my.month < 1) { my.month = 12; my.year -= 1; }
+    diaryMonthYear = my;
+    selectedDiaryDate = null;
+    renderDiaryMonthPager();
     renderDiarySidebar();
   }
 
-  function clearDiaryDateFilter() {
+  function nextMonth() {
+    const my = getDiaryMonthYear();
+    my.month += 1;
+    if (my.month > 12) { my.month = 1; my.year += 1; }
+    diaryMonthYear = my;
     selectedDiaryDate = null;
-    document.getElementById('diary-calendar').value = '';
-    document.getElementById('diary-calendar-clear').style.display = 'none';
+    renderDiaryMonthPager();
     renderDiarySidebar();
+  }
+
+  function onDiaryDateClick(dateStr) {
+    if (selectedDiaryDate === dateStr) {
+      selectedDiaryDate = null;
+    } else {
+      selectedDiaryDate = dateStr;
+    }
+    renderDiaryMonthPager();
+    renderDiarySidebar();
+  }
+
+  function renderDiaryMonthPager() {
+    const my = getDiaryMonthYear();
+    const monthNames = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+    document.getElementById('diary-month-label').textContent = `${monthNames[my.month - 1]} ${my.year}`;
+
+    const monthPrefix = `${my.year}-${String(my.month).padStart(2, '0')}`;
+    const datesInMonth = [...new Set(
+      diaryEntries
+        .filter(e => e.date && e.date.startsWith(monthPrefix))
+        .map(e => e.date)
+    )].sort();
+
+    const el = document.getElementById('diary-month-dates');
+    el.innerHTML = datesInMonth.map(d => {
+      const dayNum = parseInt(d.split('-')[2]);
+      const active = d === selectedDiaryDate ? ' active' : '';
+      return `<button class="date-btn${active}" onclick="onDiaryDateClick('${d}')">${dayNum}</button>`;
+    }).join('');
   }
 
   function selectDiaryEntry(id) {
@@ -1376,10 +1443,19 @@ npm install @modelcontextprotocol/sdk</code></pre>
   function renderDiaryEntryView(entry) {
     const viewEl = document.getElementById('diary-view-content');
     viewEl.classList.remove('empty');
-    const time = entry.timestamp && entry.timestamp.includes('T') ? entry.timestamp.split('T')[1].substring(0, 5) : '';
-    const mentions = (entry.mentions || []).map(m => `<span class="link-badge" onclick="jumpToMemory('${m.id}')" style="cursor:pointer;" name="Click to view">👤 ${escHtml(m.name || m.text.substring(0,20))}</span>`).join('');
+    viewEl.innerHTML = renderDiaryViewMode(entry);
+  }
 
-    viewEl.innerHTML = `
+  function renderDiaryViewMode(entry) {
+    const time = entry.timestamp && entry.timestamp.includes('T') ? entry.timestamp.split('T')[1].substring(0, 5) : '';
+    const mentions = (entry.mentions || []).map(m =>
+      `<span class="link-badge" id="dlink-badge-${entry.id}-${m.id}">
+        <span class="link-content" onclick="jumpToMemory('${m.id}')" style="cursor:pointer;">👤 ${escHtml(m.name || (m.text||'').substring(0,30))}</span>
+        <button class="link-action-btn" onclick="deleteDiaryLink('${entry.id}', '${m.id}')" name="Delete">🗑️</button>
+      </span>`
+    ).join('');
+
+    return `
       <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:1.5rem; border-bottom: 2px solid var(--primary-light); padding-bottom: 0.75rem;">
         <div>
           <div style="font-size:.75rem; font-weight:600; color:var(--muted); text-transform:uppercase; letter-spacing:.03em; margin-bottom:.25rem;">
@@ -1389,22 +1465,127 @@ npm install @modelcontextprotocol/sdk</code></pre>
         </div>
         <div style="display:flex; gap:0.5rem; align-items:center; flex-shrink:0; margin-left:1rem;">
           ${mentions}
-          <button class="btn btn-ghost btn-sm" onclick="editEntry('${entry.id}')" style="padding:0.15rem 0.5rem; font-size:0.75rem;">✏️</button>
-          <button class="btn btn-danger btn-sm" onclick="deleteDiaryEntry('${entry.id}')" name="Delete entry" style="padding:0.15rem 0.5rem; font-size:0.75rem;">🗑️</button>
+          <button class="btn btn-ghost btn-sm" onclick="renderDiaryEditMode('${entry.id}')" style="padding:0.15rem 0.5rem; font-size:0.75rem;">✏️</button>
+          <button class="btn btn-danger btn-sm" onclick="deleteDiaryEntry('${entry.id}')" style="padding:0.15rem 0.5rem; font-size:0.75rem;">🗑️</button>
         </div>
       </div>
-      <div class="markdown-body">${marked.parse(entry.content || '')}</div>`;
+      <div class="markdown-body">${marked.parse(entry.content || '')}</div>
+      <div style="margin-top:1.5rem; padding-top:1rem; border-top:1px solid var(--border);">
+        <div style="font-size:.75rem; font-weight:700; text-transform:uppercase; color:var(--muted); letter-spacing:.5px; margin-bottom:.4rem;">Linked Facts ${mentions ? '(' + (entry.mentions||[]).length + ')' : ''}</div>
+        ${mentions || '<span style="font-size:.85rem;color:var(--muted);">No linked facts.</span>'}
+        <div style="margin-top:.5rem; display:flex; gap:.5rem; flex-wrap:wrap;">
+          <button class="btn btn-ghost btn-sm" onclick="toggleDiaryLinkForm('${entry.id}')">🔗 Link to fact</button>
+        </div>
+        <div id="dlink-form-${entry.id}" style="display:none; margin-top:.5rem; padding:.5rem; background:var(--bg); border-radius:6px; border:1px solid var(--border);">
+          <input id="dlink-target-${entry.id}" placeholder="Fact ID or name…" style="width:100%; padding:.3rem .5rem; border:1px solid var(--border); border-radius:4px; font-size:.8rem; margin-bottom:.3rem;">
+          <div style="display:flex; gap:.3rem;">
+            <button class="btn btn-primary btn-sm" onclick="saveDiaryLink('${entry.id}')">Link</button>
+            <button class="btn btn-ghost btn-sm" onclick="toggleDiaryLinkForm('${entry.id}')">Cancel</button>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  function renderDiaryEditMode(entryId) {
+    const entry = diaryEntries.find(e => e.id === entryId);
+    if (!entry) return;
+    activeDiaryId = entryId;
+    const viewEl = document.getElementById('diary-view-content');
+    viewEl.classList.remove('empty');
+
+    const mentions = (entry.mentions || []).map(m =>
+      `<span class="link-badge" id="dlink-badge-${entry.id}-${m.id}">
+        <span class="link-content" onclick="jumpToMemory('${m.id}')" style="cursor:pointer;">👤 ${escHtml(m.name || (m.text||'').substring(0,30))}</span>
+        <button class="link-action-btn" onclick="deleteDiaryLink('${entry.id}', '${m.id}', true)" name="Delete">🗑️</button>
+      </span>`
+    ).join('');
+
+    viewEl.innerHTML = `
+      <div style="border-bottom: 2px solid var(--primary-light); padding-bottom: .75rem; margin-bottom:1rem;">
+        <div style="font-size:.75rem;font-weight:700;text-transform:uppercase;color:var(--muted);letter-spacing:.5px;margin-bottom:.5rem;">✏️ Editing Entry</div>
+        <div style="margin-bottom:.5rem;">
+          <label style="font-size:.75rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;display:block;margin-bottom:.2rem;">Title</label>
+          <input id="de-name" value="${escHtml(entry.name || '')}" style="width:100%;padding:.4rem .5rem;border:1px solid var(--border);border-radius:6px;font-size:.85rem;">
+        </div>
+        <div style="margin-bottom:.5rem;">
+          <label style="font-size:.75rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;display:block;margin-bottom:.2rem;">Date & Time</label>
+          <input type="datetime-local" id="de-timestamp" value="${entry.timestamp || ''}" style="width:100%;padding:.4rem .5rem;border:1px solid var(--border);border-radius:6px;font-size:.85rem;">
+        </div>
+        <div style="margin-bottom:.5rem;">
+          <label style="font-size:.75rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;display:block;margin-bottom:.2rem;">Content</label>
+          <textarea id="de-content" style="width:100%;min-height:200px;padding:.4rem .5rem;border:1px solid var(--border);border-radius:6px;font-size:.85rem;font-family:inherit;">${escHtml(entry.content || '')}</textarea>
+        </div>
+      </div>
+      <div style="margin-top:.5rem; padding-top:.5rem; border-top:1px solid var(--border);">
+        <div style="font-size:.75rem;font-weight:700;text-transform:uppercase;color:var(--muted);letter-spacing:.5px;margin-bottom:.4rem;">Linked Facts</div>
+        ${mentions || '<span style="font-size:.85rem;color:var(--muted);">No linked facts.</span>'}
+        <div style="margin-top:.5rem; display:flex; gap:.5rem; flex-wrap:wrap;">
+          <button class="btn btn-ghost btn-sm" onclick="toggleDiaryLinkForm('${entry.id}')">🔗 Link to fact</button>
+        </div>
+        <div id="dlink-form-${entry.id}" style="display:none; margin-top:.5rem; padding:.5rem; background:var(--bg); border-radius:6px; border:1px solid var(--border);">
+          <input id="dlink-target-${entry.id}" placeholder="Fact ID or name…" style="width:100%; padding:.3rem .5rem; border:1px solid var(--border); border-radius:4px; font-size:.8rem; margin-bottom:.3rem;">
+          <div style="display:flex; gap:.3rem;">
+            <button class="btn btn-primary btn-sm" onclick="saveDiaryLink('${entry.id}')">Link</button>
+            <button class="btn btn-ghost btn-sm" onclick="toggleDiaryLinkForm('${entry.id}')">Cancel</button>
+          </div>
+        </div>
+      </div>
+      <div style="display:flex; gap:.5rem; justify-content:flex-end; margin-top:1rem; padding-top:.75rem; border-top:1px solid var(--border);">
+        <button class="btn btn-ghost" onclick="selectDiaryEntry('${entry.id}')">Cancel</button>
+        <button class="btn btn-primary" onclick="saveDiaryEdit('${entry.id}')">💾 Save</button>
+      </div>`;
+  }
+
+  async function saveDiaryEdit(entryId) {
+    const name = document.getElementById('de-name').value.trim();
+    const timestamp = document.getElementById('de-timestamp').value;
+    const content = document.getElementById('de-content').value.trim();
+    if (!name || !timestamp || !content) { toast('⚠️ Title, Date, and Content are required'); return; }
+    try {
+      const updated = await api.put('diary/' + entryId, {name, timestamp, content});
+      const entry = diaryEntries.find(e => e.id === entryId);
+      if (entry) { entry.name = updated.name; entry.content = updated.content; entry.timestamp = updated.timestamp; entry.date = updated.timestamp.substring(0,10); }
+      toast('✅ Diary entry updated');
+      selectDiaryEntry(entryId);
+    } catch(e) { toast('❌ Error updating entry'); }
+  }
+
+  function toggleDiaryLinkForm(entryId) {
+    const el = document.getElementById('dlink-form-' + entryId);
+    if (el) el.style.display = el.style.display === 'none' ? 'block' : 'none';
+  }
+
+  async function saveDiaryLink(entryId) {
+    const targetVal = document.getElementById('dlink-target-' + entryId).value.trim();
+    if (!targetVal) { toast('⚠️ Enter a fact ID'); return; }
+    try {
+      await api.post('diary/' + entryId + '/link', {factId: targetVal});
+      toast('🔗 Linked');
+      const entry = diaryEntries.find(e => e.id === entryId);
+      if (entry && !entry.mentions) entry.mentions = [];
+      const updated = await api.get('diary/' + entryId);
+      if (entry) { Object.assign(entry, updated); }
+      // Re-render in the current mode
+      const inEdit = document.getElementById('de-name');
+      if (inEdit) renderDiaryEditMode(entryId);
+      else renderDiaryEntryView(entry);
+    } catch(e) { toast('❌ Error linking'); }
+  }
+
+  async function deleteDiaryLink(entryId, factId, keepEdit) {
+    if (!confirm('Remove this link?')) return;
+    try {
+      await api.delete('diary/' + entryId + '/link/' + factId);
+      toast('🗑️ Link removed');
+      const entry = diaryEntries.find(e => e.id === entryId);
+      if (entry && entry.mentions) { entry.mentions = entry.mentions.filter(m => m.id !== factId); }
+      if (keepEdit) renderDiaryEditMode(entryId);
+      else renderDiaryEntryView(entry);
+    } catch(e) { toast('❌ Error removing link'); }
   }
 
   function editEntry(id) {
-    const entry = diaryEntries.find(e => e.id === id);
-    if (!entry) return;
-    document.getElementById('diary-viewer').style.display = 'none';
-    document.getElementById('diary-editor').style.display = 'block';
-    document.getElementById('diary-id').value = entry.id;
-    document.getElementById('diary-name').value = entry.name || '';
-    document.getElementById('diary-timestamp').value = entry.timestamp || '';
-    document.getElementById('diary-content').value = entry.content;
+    renderDiaryEditMode(id);
   }
 
   function editLastEntry(date) {
@@ -1416,7 +1597,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
   function showDiaryEditor() { 
     activeDiaryId = null; 
     selectedDiaryDate = null;
-    document.getElementById('diary-calendar').value = '';
+    renderDiaryMonthPager();
     renderDiarySidebar(); 
     document.getElementById('diary-viewer').style.display = 'none'; 
     const ed = document.getElementById('diary-editor');
@@ -1433,6 +1614,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     try {
       await api.delete('diary/' + id);
       diaryEntries = diaryEntries.filter(e => e.id !== id);
+      renderDiaryMonthPager();
       renderDiarySidebar();
       if (activeDiaryId === id) { activeDiaryId = null; document.getElementById('diary-viewer').style.display = 'block'; document.getElementById('diary-view-content').innerHTML = '<p class="empty">Entry deleted.</p>'; }
       else if (diaryEntries.length && !activeDiaryId) selectDiaryEntry(diaryEntries[0].id);
