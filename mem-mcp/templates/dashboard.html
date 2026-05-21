@@ -493,7 +493,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
 
 <script>
   // Enable GFM (task lists, tables, etc.) — marked v18 default renderer handles checkboxes
-  marked.use({ gfm: true });
+  marked.use({ gfm: true, breaks: true });
 
   const apiBase = "{{BASE_URL}}/api";
   const api = {
