@@ -136,13 +136,6 @@ class MemoryCreate(BaseModel):
 
     class Config:
         extra = "allow"
-    text: str
-    name: Optional[str] = None
-    category: str = "General"
-    tags: Optional[str] = ""
-
-    class Config:
-        extra = "allow"
 
 
 class MemoryUpdate(BaseModel):
@@ -192,10 +185,10 @@ async def api_update_memory(memory_id: str, request: Request, body: MemoryUpdate
         for k, v in all_fields.items():
             if v is not None and v != "":
                 metadata[k] = v
-        found = await mem.db_update_memory(memory_id, all_fields.get("name"), all_fields.get("text"), all_fields.get("category"), _require_user(request), metadata)
+        found = await mem.db_update_memory(memory_id, body.name, body.text, body.category, _require_user(request), metadata)
         if not found:
             raise HTTPException(status_code=404, detail="Memory not found or access denied.")
-        return {"id": memory_id, "name": metadata.get("name"), "text": metadata.get("text"), "category": metadata.get("category", "General").strip().capitalize(), "metadata": metadata}
+        return {"id": memory_id, "name": body.name, "text": body.text, "category": (body.category.strip().capitalize() if body.category else "General"), "metadata": metadata}
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
@@ -266,17 +259,6 @@ async def api_create_memory(request: Request, body: MemoryCreate):
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
-
-@web_app.put("/api/memories/{memory_id}", response_class=JSONResponse)
-async def api_update_memory(memory_id: str, request: Request, body: MemoryUpdate):
-    try:
-        metadata = {"tags": [t.strip() for t in body.tags.split(",") if t.strip()]} if body.tags else {}
-        found = await mem.db_update_memory(memory_id, body.name, body.text, body.category, _require_user(request), metadata)
-        if not found:
-            raise HTTPException(status_code=404, detail="Memory not found or access denied.")
-        return {"id": memory_id, "name": body.name, "text": body.text, "category": body.category.strip().capitalize(), "metadata": metadata}
-    except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
 
 @web_app.post("/api/memories/link", response_class=JSONResponse, status_code=201)
 async def api_link_memory(request: Request, body: MemoryLink):
