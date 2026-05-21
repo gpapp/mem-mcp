@@ -420,6 +420,7 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
             cypher = """
             MATCH (f:Fact {userId: $userId})
             WHERE toLower(f.name) CONTAINS toLower($query_str)
+               OR (size(f.name) > 3 AND toLower($query_str) CONTAINS toLower(f.name))
                OR toLower(f.text) CONTAINS toLower($query_str)
             """
         else:
@@ -429,9 +430,9 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
             """
         if category:
             cypher += " AND toLower(f.category) = toLower($category)"
-        cypher += " RETURN f LIMIT $limit"
+        cypher += " RETURN f LIMIT 100"
 
-        params = {"userId": user_id, "query_str": query, "limit": limit}
+        params = {"userId": user_id, "query_str": query}
         if category:
             params["category"] = category.strip()
 
