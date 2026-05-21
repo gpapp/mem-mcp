@@ -62,14 +62,14 @@ Extract all entities from the full transcription text:
 
 ### 4. People Resolution
 
-For **each** name from step 2, search memory with multiple queries before asking. Use **liberal matching** — search broadly and sort through results; do not expect exact name matches:
+For **each** name from step 2, search memory. Use **liberal matching** — the vector search supports partial/name-only queries, so always query with **just the person's name** (no role, company, or context):
 
 ```
 search_facts("<Full Name>", category="People", top_p=0.4)
-search_facts("<First Name> <Company>", category="People", top_p=0.4)
-search_facts("<First Name> <Role keyword>", category="People", top_p=0.4)
-search_facts("<Company> <Role keyword>", category="People", top_p=0.4)
+search_facts("<First Name>", category="People", top_p=0.4)
 ```
+
+If the person's first+last name doesn't match, try querying by their first or last name individually before falling back to broader terms.
 
 Use the **`question` tool** to ask for each person's identity. One question per ambiguous name; batch unambiguous names into a single question with multiple options.
 
@@ -166,7 +166,7 @@ Store all other extracted entities with rich Markdown context. Use confirmed own
 - `update_fact(memoryId, text, category)` — update existing (new info only)
 - `link_facts(sourceFactId, targetFactId, relationshipType)` — build the graph
 
-**Reprocessing guard:** before creating any fact, run `search_facts` with liberal parameters (top_p=0.4, high limit) on its key identifiers (name, role+company, etc.). If it already exists, update instead of creating a duplicate.
+**Reprocessing guard:** before creating any fact, run `search_facts` with liberal parameters (top_p=0.4, limit=10) using **the fact's name only** (no role, company, or description context). The vector search handles partial name matching automatically — extra words in the query dilute the name signal. If it already exists, update instead of creating a duplicate.
 
 **Content separation rules by category:**
 

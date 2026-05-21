@@ -16,6 +16,12 @@ import numpy as np
 import asyncio
 from datetime import datetime
 
+# Session secret – must be set via environment (e.g., Docker). No fallback.
+SESSION_SECRET = os.getenv("MEM_SESSION_SECRET")
+# SESSION_SECRET defined earlier with strict environment check
+if not SESSION_SECRET:
+    raise RuntimeError("MEM_SESSION_SECRET is not set in environment. Please set it to a stable secret.")
+
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import (
     Distance, VectorParams
@@ -44,7 +50,7 @@ BASE_URL       = os.getenv("BASE_URL",            "").rstrip("/")
 COLLECTION_NAME  = "ea_memories"
 DIARY_COLLECTION = "ea_diary"
 
-SESSION_SECRET = os.getenv("MEM_SESSION_SECRET", secrets.token_hex(32))
+
 SESSION_MAX_AGE = 30 * 24 * 60 * 60  # 30 days in seconds
 
 # ---------------------------------------------------------------------------

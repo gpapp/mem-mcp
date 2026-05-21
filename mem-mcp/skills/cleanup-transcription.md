@@ -75,7 +75,7 @@ SPEAKER VOICE PROFILES
 
 For **each** name identified in the transcript or participants list:
 
-1. Search memory with multiple fuzzy queries:
+1. Search memory with **name-only queries** (no role, company, or description text — search_facts handles partial name matching via vector search automatically):
    - Full name: `search_facts("Tim Lohman", category="People")`
    - First name only: `search_facts("Tim", category="People")`
    - Purpose: To find the correct spelling and role for the final output.
