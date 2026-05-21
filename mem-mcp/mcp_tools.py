@@ -175,6 +175,7 @@ async def diary_save_entry(content: str, name: str, timestamp: str, entryId: Opt
 
     - name: Concise name for the entry.
     - timestamp: ISO-8601 datetime string including time (e.g. '2026-05-15T14:30:00').
+      **Must be aligned to 15-minute boundaries** (:00, :15, :30, :45) — round the original time to the nearest 15 minutes.
       Passing the same timestamp a second time **replaces** the existing entry.
     - entryId: Optional ID of an existing entry. Use this if you are changing the 
       timestamp of an existing entry to ensure the old one is moved/deleted.
