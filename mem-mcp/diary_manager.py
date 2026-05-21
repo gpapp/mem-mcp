@@ -265,7 +265,7 @@ async def db_delete_diary(entry_id: str, user_id: str) -> bool:
     # Delete from Qdrant
     await qdrant.delete(
         collection_name=DIARY_COLLECTION,
-        points_selector=[entry_id],
+        points_selector=PointIdsList(points=[entry_id]),
     )
 
     await publish_db_event(user_id, "diary_changed", {"action": "delete", "id": entry_id})
