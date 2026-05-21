@@ -204,10 +204,23 @@
     .diary-month-pager .btn-month { background: none; border: 1px solid var(--border); border-radius: 6px; cursor: pointer; padding: .25rem .5rem; font-size: .8rem; color: var(--text); line-height: 1; }
     .diary-month-pager .btn-month:hover { background: var(--bg); }
     .diary-month-label { font-weight: 700; font-size: .85rem; color: var(--text); white-space: nowrap; }
-    .diary-month-dates { padding: .35rem .75rem; border-bottom: 1px solid var(--border); display: flex; flex-wrap: wrap; gap: .3rem; }
-    .diary-month-dates .date-btn { background: var(--bg); border: 1px solid var(--border); border-radius: 4px; cursor: pointer; padding: .15rem .45rem; font-size: .75rem; color: var(--text); min-width: 24px; text-align: center; }
+    .diary-month-dates { padding: .35rem .75rem; border-bottom: 1px solid var(--border); display: grid; grid-template-columns: repeat(7, 1fr); gap: .15rem; }
+
+    .diary-month-dates .dow-row { display: contents; }
+
+    .diary-month-dates .dow-label { font-size: .65rem; text-align: center; color: var(--muted); padding: .1rem 0; font-weight: 600; }
+
+    .diary-month-dates .date-cell { min-width: 0; text-align: center; padding: .2rem 0; font-size: .75rem; border-radius: 4px; }
+
+    .diary-month-dates .date-cell.empty { border: none; }
+
+    .diary-month-dates .date-btn { background: var(--bg); border: 1px solid var(--border); cursor: pointer; color: var(--text); }
+
     .diary-month-dates .date-btn:hover { background: var(--primary-light); border-color: var(--primary); }
+
     .diary-month-dates .date-btn.active { background: var(--primary); color: #fff; border-color: var(--primary); }
+
+    .diary-month-dates .date-disabled { border: 1px solid transparent; color: var(--muted); opacity: .45; }
     .diary-date-group { padding: .5rem .75rem; background: var(--bg); border-bottom: 1px solid var(--border); }
     .diary-date-group-label { font-size: .7rem; font-weight: 700; color: var(--primary); text-transform: uppercase; letter-spacing: .5px; }
     .diary-search-result { padding: .6rem 1rem; cursor: pointer; border-bottom: 1px solid var(--bg); transition: all .15s;
@@ -1405,14 +1418,33 @@ npm install @modelcontextprotocol/sdk</code></pre>
       diaryEntries
         .filter(e => e.date && e.date.startsWith(monthPrefix))
         .map(e => e.date)
-    )].sort();
+    )];
+
+    const numDays = new Date(my.year, my.month, 0).getDate();
+    const firstDow = new Date(my.year, my.month - 1, 1).getDay(); // 0=Sun
+    const dowLabels = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
 
     const el = document.getElementById('diary-month-dates');
-    el.innerHTML = datesInMonth.map(d => {
-      const dayNum = parseInt(d.split('-')[2]);
-      const active = d === selectedDiaryDate ? ' active' : '';
-      return `<button class="date-btn${active}" onclick="onDiaryDateClick('${d}')">${dayNum}</button>`;
-    }).join('');
+    const cells = [];
+
+    cells.push('<div class="dow-row">' + dowLabels.map(d => '<span class="dow-label">' + d + '</span>').join('') + '</div>');
+
+    for (let pad = 0; pad < firstDow; pad++) {
+      cells.push('<span class="date-cell empty"></span>');
+    }
+
+    for (let day = 1; day <= numDays; day++) {
+      const dateStr = monthPrefix + '-' + String(day).padStart(2, '0');
+      const hasEntry = datesInMonth.includes(dateStr);
+      const active = dateStr === selectedDiaryDate ? ' active' : '';
+      if (hasEntry) {
+        cells.push(`<button class="date-cell date-btn${active}" onclick="onDiaryDateClick('${dateStr}')">${day}</button>`);
+      } else {
+        cells.push(`<span class="date-cell date-disabled">${day}</span>`);
+      }
+    }
+
+    el.innerHTML = cells.join('');
   }
 
   function selectDiaryEntry(id) {
