@@ -5,11 +5,13 @@ diary_manager.py – Diary entry management, search, and automatic link generati
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
-from qdrant_client.models import PointStruct, Filter, FieldCondition, MatchValue, PointIdsList
+
+import httpx
+from qdrant_client.models import PointStruct, Filter, FieldCondition, MatchValue
 
 from common import (
     get_qdrant, get_neo4j, logger, get_embedding, publish_db_event,
-    DIARY_COLLECTION
+    DIARY_COLLECTION, QDRANT_URL
 )
 
 # ---------------------------------------------------------------------------
@@ -262,11 +264,14 @@ async def db_delete_diary(entry_id: str, user_id: str) -> bool:
             id=entry_id, userId=user_id
         )
 
-    # Delete from Qdrant
-    await qdrant.delete(
-        collection_name=DIARY_COLLECTION,
-        points_selector=PointIdsList(points=[entry_id]),
-    )
+    # Delete from Qdrant (direct HTTP call to avoid serializing shard_key: null)
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            f"{QDRANT_URL}/collections/{DIARY_COLLECTION}/points/delete",
+            json={"points": [entry_id]},
+            params={"wait": "true"},
+        )
+        r.raise_for_status()
 
     await publish_db_event(user_id, "diary_changed", {"action": "delete", "id": entry_id})
     return True
