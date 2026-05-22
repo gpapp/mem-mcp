@@ -22,6 +22,7 @@ After completing any code changes:
 1. Run `python -m py_compile <file.py>` to verify syntax
 2. If successful, commit and push to git
 3. If running in Docker, rebuild and restart: `docker-compose up -d --build mem-mcp` (or pull + rebuild on the target machine)
+4. **Do NOT attempt to access Docker or databases directly** — containers run on a remote machine; only use git to push changes (the ops team deploys)
 
 ## Architecture
 
