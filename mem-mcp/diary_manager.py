@@ -22,7 +22,7 @@ def _diary_id(user_id: str, timestamp: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"diary_{user_id}_{timestamp}"))
 
 
-async def db_save_diary(content: str, user_id: str, timestamp: str, name: str) -> str:
+async def db_save_diary(content: str, user_id: str, timestamp: str, name: str, metadata: Optional[dict] = None) -> str:
     """Upsert a diary entry keyed by user + timestamp. Returns the ISO timestamp string.
     """
     qdrant = await get_qdrant()
@@ -36,26 +36,37 @@ async def db_save_diary(content: str, user_id: str, timestamp: str, name: str) -
     entry_date = timestamp[:10]
     vector   = await get_embedding(f"{name}: {content}" if name else content)
 
+    payload = {"content": content, "name": name, "date": entry_date, "timestamp": timestamp, "userId": user_id}
+    if metadata:
+        payload["metadata"] = metadata
+
     # Qdrant — upsert by the stable doc_id so re-saving replaces the vector
     await qdrant.upsert(
         collection_name=DIARY_COLLECTION,
         points=[PointStruct(
             id=doc_id,
             vector=vector,
-            payload={"content": content, "name": name, "date": entry_date, "timestamp": timestamp, "userId": user_id},
+            payload=payload,
         )],
     )
 
+    neo4j_props = "d.date = $date, d.timestamp = $timestamp, d.content = $content, d.name = $name"
+    if metadata:
+        neo4j_props += ", d.metadata = $metadata"
+
     # Neo4j — MERGE on id so re-saving the same timestamp updates content in-place
     with neo4j_driver.session() as s:
+        params = dict(userId=user_id, id=doc_id, date=entry_date, timestamp=timestamp, content=content, name=name)
+        if metadata:
+            params["metadata"] = metadata
         s.run(
-            """
-            MERGE (u:User {id: $userId})
-            MERGE (d:DiaryEntry {id: $id, userId: $userId})
-            SET d.date = $date, d.timestamp = $timestamp, d.content = $content, d.name = $name
+            f"""
+            MERGE (u:User {{id: $userId}})
+            MERGE (d:DiaryEntry {{id: $id, userId: $userId}})
+            SET {neo4j_props}
             MERGE (u)-[:WROTE_DIARY]->(d)
             """,
-            userId=user_id, id=doc_id, date=entry_date, timestamp=timestamp, content=content, name=name
+            **params
         )
 
         # Automatic linking to People and Client facts
@@ -165,8 +176,8 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
     return entries
 
 
-async def db_update_diary(entry_id: str, user_id: str, content: str = None, name: str = None, timestamp: str = None) -> bool:
-    """Update a diary entry's content, name, and/or timestamp."""
+async def db_update_diary(entry_id: str, user_id: str, content: str = None, name: str = None, timestamp: str = None, metadata: Optional[dict] = None) -> bool:
+    """Update a diary entry's content, name, timestamp, and/or metadata."""
     qdrant = await get_qdrant()
     neo4j_driver = get_neo4j()
     if not qdrant or not neo4j_driver:
@@ -174,7 +185,7 @@ async def db_update_diary(entry_id: str, user_id: str, content: str = None, name
 
     with neo4j_driver.session() as s:
         res = s.run(
-            "MATCH (d:DiaryEntry {id: $id, userId: $userId}) RETURN d.content as content, d.name as name, d.timestamp as timestamp",
+            "MATCH (d:DiaryEntry {id: $id, userId: $userId}) RETURN d.content as content, d.name as name, d.timestamp as timestamp, d.metadata as metadata",
             id=entry_id, userId=user_id
         )
         existing = res.single()
@@ -184,24 +195,34 @@ async def db_update_diary(entry_id: str, user_id: str, content: str = None, name
         new_content = content if content is not None else existing["content"]
         new_name = name if name is not None else existing["name"]
         new_ts = timestamp if timestamp is not None else existing["timestamp"]
+        new_metadata = metadata if metadata is not None else existing.get("metadata")
         entry_date = new_ts[:10]
 
+        neo4j_props = "d.content = $content, d.name = $name, d.timestamp = $ts, d.date = $date"
+        params = dict(id=entry_id, userId=user_id, content=new_content, name=new_name, ts=new_ts, date=entry_date)
+        if new_metadata is not None:
+            neo4j_props += ", d.metadata = $metadata"
+            params["metadata"] = new_metadata
+
         s.run(
-            """
-            MATCH (d:DiaryEntry {id: $id, userId: $userId})
-            SET d.content = $content, d.name = $name, d.timestamp = $ts, d.date = $date
+            f"""
+            MATCH (d:DiaryEntry {{id: $id, userId: $userId}})
+            SET {neo4j_props}
             """,
-            id=entry_id, userId=user_id, content=new_content, name=new_name, ts=new_ts, date=entry_date
+            **params
         )
 
     # Re-embed in Qdrant
     vector = await get_embedding(f"{new_name}: {new_content}" if new_name else new_content)
+    payload = {"content": new_content, "name": new_name, "date": entry_date, "timestamp": new_ts, "userId": user_id}
+    if new_metadata is not None:
+        payload["metadata"] = new_metadata
     await qdrant.upsert(
         collection_name=DIARY_COLLECTION,
         points=[PointStruct(
             id=entry_id,
             vector=vector,
-            payload={"content": new_content, "name": new_name, "date": entry_date, "timestamp": new_ts, "userId": user_id},
+            payload=payload,
         )],
     )
 

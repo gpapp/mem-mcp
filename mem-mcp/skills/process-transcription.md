@@ -20,6 +20,7 @@ Use this skill when you have:
 
 - Extract date/time from filename (pattern: `YYYY-MM-DD hh-mm-ss`) round it to the nearest 15 minutes.
 - Identify meeting name, topic, and context (internal/client/etc.)
+- Capture the **original file path** — pass it through all phases for use in diary metadata and local save filename.
 - Apply stored corrections: `search_facts("correction")` → fix recurring misspellings of names and terms before proceeding.
 
 ### 2. Participant List
@@ -223,7 +224,71 @@ Text:
 | Diary Entry → Person | `MENTIONS` |
 | Diary Entry → Project | `MENTIONS` |
 
-### 8. Diary Logging
+### 8. Summarization via Subagent
+
+Before writing anything to memory, spawn a **dedicated subagent** (using the `task` tool with `subagent_type="general"`) to produce the structured summary. Pass it the following as the prompt:
+
+```
+You are a summarization agent. Based on the extracted data below, produce:
+
+1. A diary entry in the exact format below.
+2. A local save file in the exact same format.
+
+TIMESTAMP (rounded to 15 min): {ISO timestamp}
+TITLE: {Meeting Title}
+ORIGINAL FILE: {path to original transcription file, if any}
+
+EXTRACTED PARTICIPANTS:
+- {Name} ({role/context})
+- ...
+
+EXTRACTED DECISIONS:
+- ...
+
+EXTRACTED ACTIONS:
+- ...
+
+EXTRACTED PROJECTS / TECHNOLOGIES / NOTES:
+- ...
+
+===
+
+DIARY FORMAT (use this exactly):
+
+## Participants
+- **{Name}** ({role/context})
+
+## Context
+2-3 sentences: what meeting, why, who led.
+
+## Decisions
+- {numbered list of every decision made}
+
+## Actions
+- [ ] {Owner}: {action description}
+
+## Notes
+- challenges, risks, dependencies, context not captured above
+
+===
+
+LOCAL SAVE FILE:
+Save the exact same content (including the ## headers) to a local file named:
+{YYYY-MM-DD hh-mm-ss Title.md}
+(use the rounded timestamp and the meeting title).
+
+Return ONLY the rendered diary content as your output — nothing else.
+```
+
+Capture the subagent's output as the rendered diary content.
+
+### 9. Local File Save
+
+Write the subagent output to a file named `YYYY-MM-DD hh-mm-ss Title.md` in the working directory, using the **rounded timestamp** (15-minute boundary) and the meeting title as the filename.
+
+Use the `write` tool or equivalent to create the file.
+
+### 10. Diary Logging
 
 **Before writing, find existing entries for the meeting timeframe:**
 ```
@@ -235,33 +300,15 @@ Returns `[(id, timestamp, name), ...]` for entries on that date.
 ```
 diary_search_entries("<meeting topic> <date>")
 ```
-- **No match:** write a fresh entry with `diary_save_entry(content, timestamp="YYYY-MM-DDTHH:MM:SS")`.
-  Use the meeting's start time as the timestamp rounded to the nearest 15 minutes.
--(ISO-8601, e.g. `2026-05-15T10:00:00`).
+- **No match:** write a fresh entry with the subagent-rendered content.
 - **Match found, new info:** call `diary_save_entry` again with the **same `timestamp`** and the **full updated content** (merge old + new). The server replaces the existing entry for that timestamp.
 - **Match found, nothing new:** skip entirely.
 
-Each entry covers one meeting. Re-saving with the same timestamp replaces the existing entry — there is always exactly one entry per meeting.
-
-Content focus: **what the user did** — outcomes, decisions made, tasks assigned to the user. Not a processing log, no smalltalk.
-
-Use the d
-**Uniform diary entry format** (always use this exact structure):
-
-```markdown
-**Participants:** [Name (Role), Name (Role), ...]
-
-**Context:** [one-line summary of what this meeting was about]
-
-### Decisions
-- [Decision made, with brief rationale]
-
-### Actions
-- [ ] [Task description] — Owner: [Name] — Due: [date or "TBD"]
-
-### Notes
-[Any important context, open questions, or next steps not captured above]
-```
+Call `diary_save_entry` with:
+- `content` = the subagent-rendered diary content (exact format above)
+- `name` = meeting title
+- `timestamp` = ISO-8601 with time **rounded to the nearest 15 minutes** (:00, :15, :30, :45), e.g. `2026-05-15T10:00:00`
+- `metadata` = `{"original_file": "<path to original transcription file>"}` (omit if no source file)
 
 **After saving the diary entry, link it to every fact it references:**
 
@@ -275,7 +322,7 @@ link_facts(diary_entry_id, action_id, "RECORDS")       ← for each action item
 
 These links make the diary navigable from any fact and vice versa.
 
-### 9. Meeting Summary Fact
+### 11. Meeting Summary Fact
 
 Store one summary fact per meeting:
 
@@ -319,5 +366,8 @@ Link the summary fact to each participant: `summary → person: ATTENDED_BY`.
 5. **Batch writes** — after Phase 2, fire all `add_fact`, `update_fact`, and `link_facts` calls in a single response without pausing.
 6. **Never create a People record without human confirmation.**
 7. **Facts describe entities, not events** — People and Project facts contain stable identity information (role, expertise, purpose, status). Meeting outcomes, discussions, and assignments go in Decision/Action Item facts and the Diary.
-8. **Diary entries are uniform** — always use the standard format: heading, participants, context, decisions, actions, notes.
-9. **Diary entries are linked** — every diary entry must be linked to the meeting summary, all mentioned people, projects, decisions, and action items.
+8. **Summarize via subagent** — use a dedicated `task` subagent (`subagent_type="general"`) for the structured summary.
+9. **Save locally** — write `YYYY-MM-DD hh-mm-ss Title.md` with the rounded timestamp.
+10. **Diary entries use exact format** — `## Participants`, `## Context`, `## Decisions`, `## Actions`, `## Notes`.
+11. **Original file is metadata** — pass `{"original_file": "..."}` as `metadata` to `diary_save_entry`.
+12. **Diary entries are linked** — every diary entry must be linked to the meeting summary, all mentioned people, projects, decisions, and action items.

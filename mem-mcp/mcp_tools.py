@@ -170,7 +170,7 @@ async def find_patterns():
     return "\n".join(lines)
 
 @mcp.tool()
-async def diary_save_entry(content: str, name: str, timestamp: str, entryId: Optional[str] = None):
+async def diary_save_entry(content: str, name: str, timestamp: str, entryId: Optional[str] = None, metadata: Optional[dict] = None):
     """Save or update a diary entry.
 
     - name: Concise name for the entry.
@@ -179,6 +179,7 @@ async def diary_save_entry(content: str, name: str, timestamp: str, entryId: Opt
       Passing the same timestamp a second time **replaces** the existing entry.
     - entryId: Optional ID of an existing entry. Use this if you are changing the 
       timestamp of an existing entry to ensure the old one is moved/deleted.
+    - metadata: Optional dict with extra fields (e.g. {"original_file": "path/to/file.txt"}).
     - Returns a dict with 'id' (use this to update or delete the entry later) and 
       'timestamp' (the ISO string that keys the entry).
     """
@@ -187,7 +188,7 @@ async def diary_save_entry(content: str, name: str, timestamp: str, entryId: Opt
         new_id = mem._diary_id(user, timestamp)
         if entryId != new_id:
             await mem.db_delete_diary(entryId, user)
-    entry_ts = await mem.db_save_diary(content, user, timestamp, name)
+    entry_ts = await mem.db_save_diary(content, user, timestamp, name, metadata=metadata)
     entry_id = mem._diary_id(user, entry_ts)
     return {"id": entry_id, "timestamp": entry_ts}
 
