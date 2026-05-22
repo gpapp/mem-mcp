@@ -59,6 +59,7 @@ User identity is resolved automatically from:
 1. **Configure secrets**: `cp .env.example .env` and set `MEM_NEO4J_PASSWORD`.
 2. **Launch**: `docker-compose up -d`
 3. **Initialize Embedder**: `docker exec ollama ollama pull nomic-embed-text`
+4. **After code changes**: rebuild the image with `docker-compose up -d --build mem-mcp`
 
 Visit **http://localhost:8086/** for the interactive setup guide.
 
