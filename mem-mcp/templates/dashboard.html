@@ -333,7 +333,6 @@
 <div class="tabs">
   <button class="tab-btn active" onclick="switchTab('memories')">📝 Memories</button>
   <button class="tab-btn" onclick="switchTab('diary')">📖 Diary</button>
-  <button class="tab-btn" onclick="switchTab('insights')">✨ Insights</button>
   <button class="tab-btn" onclick="switchTab('graph')">🕸️ Graph</button>
   <button class="tab-btn" onclick="switchTab('setup')">🔌 Setup</button>
 </div>
@@ -446,13 +445,7 @@
   </div>
 </div>
 
-<!-- ═══ INSIGHTS PAGE ═══ -->
-<div id="page-insights" class="page">
-  <div class="card">
-    <h2 style="margin-top:0;">✨ Knowledge Patterns</h2>
-    <div id="insights-list"></div>
-  </div>
-</div>
+
 
 <!-- ═══ GRAPH PAGE ═══ -->
 <div id="page-graph" class="page">
@@ -542,8 +535,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
   }
 
   let memories = [], diaryEntries = [], activeDiaryId = null, selectedDiaryDate = null, diaryMonthYear = null, diarySearchQuery = '';
-  let insightsLoaded = false, graphLoaded = false;
-  let activeCategories = new Set();
+  let graphLoaded = false;
   let activeGraphCategories = new Set();
   let activeCategory = null;
   let activeLetterFilter = null;
@@ -564,7 +556,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
         activeTab: activeTab,
         lastSearchQuery: lastSearchQuery,
         lastSortOrder: lastSortOrder,
-        activeCategories: Array.from(activeCategories),
+        activeCategory: activeCategory,
         activeGraphCategories: Array.from(activeGraphCategories),
         activeLetterFilter: activeLetterFilter,
         selectedFactId: selectedFactId,
@@ -589,7 +581,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
         if (state.activeTab) activeTab = state.activeTab;
         if (state.lastSearchQuery !== undefined) lastSearchQuery = state.lastSearchQuery;
         if (state.lastSortOrder !== undefined) lastSortOrder = state.lastSortOrder;
-        if (state.activeCategories !== undefined) activeCategories = new Set(state.activeCategories);
+        if (state.activeCategory !== undefined) activeCategory = state.activeCategory;
         if (state.activeGraphCategories !== undefined) activeGraphCategories = new Set(state.activeGraphCategories);
         if (state.activeLetterFilter !== undefined) activeLetterFilter = state.activeLetterFilter;
         if (state.selectedFactId !== undefined) selectedFactId = state.selectedFactId;
@@ -662,7 +654,6 @@ npm install @modelcontextprotocol/sdk</code></pre>
       renderMemories();
       renderCategorySidebar();
       renderAlphabetFilter();
-      if (insightsLoaded) loadInsights(); // Insights are aggregate, still require reload
     });
 
     eventSource.addEventListener('graph_changed', async (e) => {
@@ -730,7 +721,6 @@ npm install @modelcontextprotocol/sdk</code></pre>
     });
     if (tab === 'memories' && !memories.length) loadMemories();
     if (tab === 'diary' && !diaryEntries.length) loadDiary();
-    if (tab === 'insights' && !insightsLoaded) loadInsights();
     if (tab === 'graph' && !graphLoaded) loadGraph();
     saveSessionState();
   }
@@ -762,21 +752,16 @@ npm install @modelcontextprotocol/sdk</code></pre>
     const counts = {};
     memories.forEach(m => { counts[m.category] = (counts[m.category] || 0) + 1; });
     const categories = Object.keys(counts).sort();
-    // Initialize default active categories if not set
-    if (activeCategories.size === 0) {
-        if (categories.includes('People')) activeCategories.add('People');
-        if (categories.includes('Client')) activeCategories.add('Client');
-    }
     // Build chips HTML
     const chipsHtml = categories.map(cat => {
-        const isActive = activeCategories.has(cat);
+        const isActive = activeCategory === cat;
         const className = 'chip' + (isActive ? ' active' : '');
-        return `<div class="${className}" onclick="toggleCategory('${cat.replace(/'/g, "\\'")}')">${cat} <span class="count">${counts[cat]}</span></div>`;
+        return `<div class="${className}" onclick="setCategory('${cat.replace(/'/g, "\\'")}')">${cat} <span class="count">${counts[cat]}</span></div>`;
     }).join('');
     // All chip
-    const allActive = activeCategories.size === 0;
+    const allActive = activeCategory === null;
     const allClass = 'chip' + (allActive ? ' active' : '');
-    const allChip = `<div class="${allClass}" onclick="clearCategoryFilter()">All <span class="count">${memories.length}</span></div>`;
+    const allChip = `<div class="${allClass}" onclick="setCategory(null)">All <span class="count">${memories.length}</span></div>`;
     el.innerHTML = allChip + chipsHtml;
     // Update datalist for add form
     const datalist = document.getElementById('category-datalist');
@@ -1855,17 +1840,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     } catch(e) { toast('❌ Error saving entry'); }
   }
 
-  async function loadInsights() {
-    const el = document.getElementById('insights-list'); el.innerHTML = '<p class="empty">Analyzing…</p>';
-    try {
-      const patterns = await api.get('insights');
-      insightsLoaded = true;
-      if (!patterns.length) { el.innerHTML = '<p class="empty">No patterns yet.</p>'; return; }
-      el.innerHTML = patterns.map(p => `
-        <div class="memory-item" style="border-left-color: var(--success);"><div class="memory-text"><strong>${p.pattern}</strong><div class="memory-meta">${p.strength} associations.</div></div></div>
-      `).join('');
-    } catch(e) { el.innerHTML = '<p class="empty">⚠️ Error</p>'; }
-  }
+
 
   // Declared at top of script to allow loadSessionState initialization
 
