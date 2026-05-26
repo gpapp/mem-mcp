@@ -531,14 +531,73 @@ npm install @modelcontextprotocol/sdk</code></pre>
   let insightsLoaded = false, graphLoaded = false;
   let activeCategory = null;
   let activeLetterFilter = null;
-  let lastSortOrder = 'newest';
+  let lastSortOrder = 'alphabetical';
   let lastSearchQuery = '';
+  let activeTab = 'memories';
+  let selectedFactId = null;
+  let network = null;
+  let graphData = { nodes: null, edges: null };
+  let isBuildMode = false;
+  let buildGraphNodes = new Set();
+  let buildGraphEdges = new Set();
+  let currentContextNode = null;
+
+  function saveSessionState() {
+    try {
+      const state = {
+        activeTab: activeTab,
+        lastSearchQuery: lastSearchQuery,
+        lastSortOrder: lastSortOrder,
+        activeCategory: activeCategory,
+        activeLetterFilter: activeLetterFilter,
+        selectedFactId: selectedFactId,
+        diarySearchQuery: diarySearchQuery,
+        diaryMonthYear: diaryMonthYear,
+        selectedDiaryDate: selectedDiaryDate,
+        activeDiaryId: activeDiaryId,
+        isBuildMode: isBuildMode,
+        buildGraphNodes: Array.from(buildGraphNodes)
+      };
+      localStorage.setItem('mem_vault_session_state', JSON.stringify(state));
+    } catch(e) {
+      console.error("Failed to save session state", e);
+    }
+  }
+
+  function loadSessionState() {
+    try {
+      const saved = localStorage.getItem('mem_vault_session_state');
+      if (saved) {
+        const state = JSON.parse(saved);
+        if (state.activeTab) activeTab = state.activeTab;
+        if (state.lastSearchQuery !== undefined) lastSearchQuery = state.lastSearchQuery;
+        if (state.lastSortOrder !== undefined) lastSortOrder = state.lastSortOrder;
+        if (state.activeCategory !== undefined) activeCategory = state.activeCategory;
+        if (state.activeLetterFilter !== undefined) activeLetterFilter = state.activeLetterFilter;
+        if (state.selectedFactId !== undefined) selectedFactId = state.selectedFactId;
+        
+        if (state.diarySearchQuery !== undefined) diarySearchQuery = state.diarySearchQuery;
+        if (state.diaryMonthYear !== undefined) diaryMonthYear = state.diaryMonthYear;
+        if (state.selectedDiaryDate !== undefined) selectedDiaryDate = state.selectedDiaryDate;
+        if (state.activeDiaryId !== undefined) activeDiaryId = state.activeDiaryId;
+
+        if (state.isBuildMode !== undefined) isBuildMode = state.isBuildMode;
+        if (state.buildGraphNodes !== undefined) buildGraphNodes = new Set(state.buildGraphNodes);
+      }
+    } catch(e) {
+      console.warn("Failed to load session state", e);
+    }
+  }
+
+  // Load session state immediately upon script parsing so globals are populated
+  loadSessionState();
 
   function init() {
     loadMemories();
     loadDiary();
     loadWhoami();
     initSSE();
+    switchTab(activeTab);
   }
 
   function toast(msg, ms=2500) {
@@ -639,6 +698,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
   }
 
   function switchTab(tab) {
+    activeTab = tab;
     document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
     document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
     document.getElementById('page-' + tab).classList.add('active');
@@ -649,6 +709,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     if (tab === 'diary' && !diaryEntries.length) loadDiary();
     if (tab === 'insights' && !insightsLoaded) loadInsights();
     if (tab === 'graph' && !graphLoaded) loadGraph();
+    saveSessionState();
   }
 
   async function loadWhoami() {
@@ -663,6 +724,9 @@ npm install @modelcontextprotocol/sdk</code></pre>
       renderMemories(); 
       renderCategorySidebar();
       renderAlphabetFilter();
+      if (selectedFactId) {
+        selectFact(selectedFactId);
+      }
     }
     catch(e) { document.getElementById('memories-list').innerHTML = '<p class="empty">⚠️ Could not load memories.</p>'; }
   }
@@ -690,6 +754,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     activeCategory = cat;
     renderCategorySidebar();
     renderMemories();
+    saveSessionState();
   }
 
   function renderAlphabetFilter() {
@@ -720,6 +785,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     }
     renderAlphabetFilter();
     renderMemories();
+    saveSessionState();
   }
 
   function renderMemories() {
@@ -728,6 +794,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     const sort = document.getElementById('sort-order').value;
     lastSearchQuery = query;
     lastSortOrder = sort;
+    saveSessionState();
 
     let filtered = memories.filter(m => {
       const matchCat = activeCategory === null || m.category === activeCategory;
@@ -771,16 +838,20 @@ npm install @modelcontextprotocol/sdk</code></pre>
   }
 
   /* ── Fact Detail Pane ── */
-  let selectedFactId = null;
+  // Declared at top of script to allow loadSessionState initialization
 
   function selectFact(id) {
-    selectedFactId = id;
-    // Update selected highlight in list
-    document.querySelectorAll('#memories-list .memory-item').forEach(el => {
-      el.classList.toggle('selected', el.id === 'mem-' + id);
-    });
     const m = memories.find(x => x.id === id);
-    if (m) renderFactPane(m);
+    if (m) {
+      selectedFactId = id;
+      document.querySelectorAll('#memories-list .memory-item').forEach(el => {
+        el.classList.toggle('selected', el.id === 'mem-' + id);
+      });
+      renderFactPane(m);
+    } else {
+      clearFactPane();
+    }
+    saveSessionState();
   }
 
   function clearFactPane() {
@@ -820,6 +891,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
       </div>`;
     // Repopulate datalist
     renderCategorySidebar();
+    saveSessionState();
   }
 
   function renderFactPane(m, editMode = false) {
@@ -1162,10 +1234,17 @@ npm install @modelcontextprotocol/sdk</code></pre>
   async function loadDiary() {
     try {
       diaryEntries = await api.get('diary');
-      diaryMonthYear = null; // reset to current month
+      if (!diaryMonthYear) {
+        diaryMonthYear = null; // reset to current month only if not loaded from state
+      }
+      document.getElementById('diary-search-input').value = diarySearchQuery;
       renderDiaryMonthPager();
       renderDiarySidebar();
-      if (diaryEntries.length && !activeDiaryId) selectDiaryEntry(diaryEntries[0].id);
+      if (activeDiaryId && diaryEntries.some(e => e.id === activeDiaryId)) {
+        selectDiaryEntry(activeDiaryId);
+      } else if (diaryEntries.length) {
+        selectDiaryEntry(diaryEntries[0].id);
+      }
     }
     catch(e) { document.getElementById('diary-dates-list').innerHTML = '<p class="empty">⚠️ Error</p>'; }
   }
@@ -1175,6 +1254,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
   function onDiarySearch(q) {
     clearTimeout(diarySearchTimer);
     diarySearchQuery = q.trim();
+    saveSessionState();
     if (!diarySearchQuery) {
       renderDiaryMonthPager();
       renderDiarySidebar();
@@ -1386,6 +1466,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     selectedDiaryDate = null;
     renderDiaryMonthPager();
     renderDiarySidebar();
+    saveSessionState();
   }
 
   function nextMonth() {
@@ -1396,6 +1477,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     selectedDiaryDate = null;
     renderDiaryMonthPager();
     renderDiarySidebar();
+    saveSessionState();
   }
 
   function onDiaryDateClick(dateStr) {
@@ -1406,6 +1488,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     }
     renderDiaryMonthPager();
     renderDiarySidebar();
+    saveSessionState();
   }
 
   function renderDiaryMonthPager() {
@@ -1451,6 +1534,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     activeDiaryId = id;
     let entry = diaryEntries.find(e => e.id === id);
     renderDiarySidebar();
+    saveSessionState();
 
     document.getElementById('diary-editor').style.display = 'none';
     document.getElementById('diary-viewer').style.display = 'block';
@@ -1638,6 +1722,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     document.getElementById('diary-name').value = '';
     document.getElementById('diary-timestamp').value = new Date().toISOString().slice(0, 16);
     document.getElementById('diary-content').value = ''; 
+    saveSessionState();
   }
   function cancelDiaryEdit() { if (activeDiaryId) selectDiaryEntry(activeDiaryId); else if (diaryEntries.length) selectDiaryEntry(diaryEntries[0].id); else document.getElementById('diary-editor').style.display = 'none'; }
 
@@ -1650,6 +1735,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
       renderDiarySidebar();
       if (activeDiaryId === id) { activeDiaryId = null; document.getElementById('diary-viewer').style.display = 'block'; document.getElementById('diary-view-content').innerHTML = '<p class="empty">Entry deleted.</p>'; }
       else if (diaryEntries.length && !activeDiaryId) selectDiaryEntry(diaryEntries[0].id);
+      saveSessionState();
       toast('🗑️ Entry deleted');
     } catch(e) { toast('❌ Error deleting entry'); }
   }
@@ -1688,12 +1774,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     } catch(e) { el.innerHTML = '<p class="empty">⚠️ Error</p>'; }
   }
 
-  let network = null;
-  let graphData = { nodes: null, edges: null };
-  let isBuildMode = false;
-  let buildGraphNodes = new Set();
-  let buildGraphEdges = new Set();
-  let currentContextNode = null;
+  // Declared at top of script to allow loadSessionState initialization
 
   async function loadGraph() {
     const container = document.getElementById('graph-container');
@@ -1815,6 +1896,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     } else if (!graphLoaded) {
       loadGraph();
     }
+    saveSessionState();
   }
 
   function rebuildNetwork() {
@@ -1867,6 +1949,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     const container = document.getElementById('graph-container');
     container.innerHTML = '<p class="empty" style="padding-top: 3rem;">Select a memory and click "📍 Show on map" to start building your graph.</p>';
     updateBuildStatus();
+    saveSessionState();
   }
 
   function updateBuildStatus() {
@@ -2025,6 +2108,7 @@ let contextMenu = null;
       updateBuildStatus();
       
       rebuildNetwork();
+      saveSessionState();
       
       setTimeout(() => {
         if (network) {
@@ -2067,6 +2151,7 @@ let contextMenu = null;
       
       updateBuildStatus();
       rebuildNetwork();
+      saveSessionState();
       
       setTimeout(() => {
         if (network) {
@@ -2097,6 +2182,7 @@ let contextMenu = null;
       
       updateBuildStatus();
       rebuildNetwork();
+      saveSessionState();
       
       setTimeout(() => {
         if (network) {
@@ -2116,6 +2202,7 @@ let contextMenu = null;
     buildGraphEdges.delete(nodeId);
     updateBuildStatus();
     rebuildNetwork();
+    saveSessionState();
     toast('🗑️ Node removed from graph');
   }
 
