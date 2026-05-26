@@ -22,8 +22,9 @@ def _diary_id(user_id: str, timestamp: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"diary_{user_id}_{timestamp}"))
 
 
-async def db_save_diary(content: str, user_id: str, timestamp: str, name: str, metadata: Optional[dict] = None) -> str:
+async def db_save_diary(content: str, user_id: str, timestamp: str, name: str, metadata: Optional[dict] = None, linked_facts: Optional[list] = None) -> str:
     """Upsert a diary entry keyed by user + timestamp. Returns the ISO timestamp string.
+    Optional linked_facts is a list of fact IDs to create MENTIONS relationships.
     """
     qdrant = await get_qdrant()
     neo4j_driver = get_neo4j()
@@ -54,7 +55,6 @@ async def db_save_diary(content: str, user_id: str, timestamp: str, name: str, m
     if metadata:
         neo4j_props += ", d.metadata = $metadata"
 
-    # Neo4j — MERGE on id so re-saving the same timestamp updates content in-place
     with neo4j_driver.session() as s:
         params = dict(userId=user_id, id=doc_id, date=entry_date, timestamp=timestamp, content=content, name=name)
         if metadata:
@@ -69,45 +69,53 @@ async def db_save_diary(content: str, user_id: str, timestamp: str, name: str, m
             **params
         )
 
-        # Automatic linking to People and Client facts
-        # 1. Fetch relevant facts
-        res = s.run(
-            """
-            MATCH (f:Fact {userId: $userId})
-            WHERE f.category IN ['People', 'Client']
-            RETURN f.id as id, f.text as text, f.aliases as aliases
-            """,
-            userId=user_id
-        )
-        
-        content_lower = content.lower()
-        mentioned_ids = []
-        for r in res:
-            name_val = r["text"].lower()
-            # Check for name or aliases
-            if name_val in content_lower:
-                mentioned_ids.append(r["id"])
-                continue
-            
-            aliases = r["aliases"]
-            if aliases:
-                if isinstance(aliases, list):
-                    if any(a.lower() in content_lower for a in aliases):
-                        mentioned_ids.append(r["id"])
-                elif isinstance(aliases, dict):
-                    if any(a.lower() in content_lower for a in aliases.keys()):
-                        mentioned_ids.append(r["id"])
-
-        # 2. Create MENTIONS links using the unique doc_id
-        if mentioned_ids:
-            s.run(
+        # Handle linked_facts — create MENTIONS links if provided
+        if linked_facts:
+            # Ensure we have a list of IDs
+            fact_ids = [fid for fid in linked_facts if fid]
+            if fact_ids:
+                s.run(
+                    """
+                    MATCH (d:DiaryEntry {id: $id, userId: $userId})
+                    MATCH (f:Fact) WHERE f.id IN $factIds
+                    MERGE (d)-[:MENTIONS]->(f)
+                    """,
+                    id=doc_id, userId=user_id, factIds=fact_ids
+                )
+        else:
+            # Automatic linking as before (People & Client) for backward compatibility
+            res = s.run(
                 """
-                MATCH (d:DiaryEntry {id: $id, userId: $userId})
-                MATCH (f:Fact) WHERE f.id IN $factIds
-                MERGE (d)-[:MENTIONS]->(f)
+                MATCH (f:Fact {userId: $userId})
+                WHERE f.category IN ['People', 'Client']
+                RETURN f.id as id, f.text as text, f.aliases as aliases
                 """,
-                id=doc_id, userId=user_id, factIds=mentioned_ids
+                userId=user_id
             )
+            content_lower = content.lower()
+            mentioned_ids = []
+            for r in res:
+                name_val = r["text"].lower()
+                if name_val in content_lower:
+                    mentioned_ids.append(r["id"])
+                    continue
+                aliases = r["aliases"]
+                if aliases:
+                    if isinstance(aliases, list):
+                        if any(a.lower() in content_lower for a in aliases):
+                            mentioned_ids.append(r["id"])
+                    elif isinstance(aliases, dict):
+                        if any(a.lower() in content_lower for a in aliases.keys()):
+                            mentioned_ids.append(r["id"])
+            if mentioned_ids:
+                s.run(
+                    """
+                    MATCH (d:DiaryEntry {id: $id, userId: $userId})
+                    MATCH (f:Fact) WHERE f.id IN $factIds
+                    MERGE (d)-[:MENTIONS]->(f)
+                    """,
+                    id=doc_id, userId=user_id, factIds=mentioned_ids
+                )
 
     await publish_db_event(user_id, "diary_changed", {
         "action": "add",
@@ -176,8 +184,10 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
     return entries
 
 
-async def db_update_diary(entry_id: str, user_id: str, content: str = None, name: str = None, timestamp: str = None, metadata: Optional[dict] = None) -> bool:
-    """Update a diary entry's content, name, timestamp, and/or metadata."""
+async def db_update_diary(entry_id: str, user_id: str, content: Optional[str] = None, name: Optional[str] = None, timestamp: Optional[str] = None, metadata: Optional[dict] = None, linked_facts: Optional[list] = None) -> bool:
+    """Update a diary entry's content, name, timestamp, metadata, and optionally replace linked facts.
+    If linked_facts is provided, existing MENTIONS relationships are cleared and new ones are created.
+    """
     qdrant = await get_qdrant()
     neo4j_driver = get_neo4j()
     if not qdrant or not neo4j_driver:
@@ -185,7 +195,9 @@ async def db_update_diary(entry_id: str, user_id: str, content: str = None, name
 
     with neo4j_driver.session() as s:
         res = s.run(
-            "MATCH (d:DiaryEntry {id: $id, userId: $userId}) RETURN d.content as content, d.name as name, d.timestamp as timestamp, d.metadata as metadata",
+            """
+            MATCH (d:DiaryEntry {id: $id, userId: $userId}) RETURN d.content as content, d.name as name, d.timestamp as timestamp, d.metadata as metadata
+            """,
             id=entry_id, userId=user_id
         )
         existing = res.single()
@@ -211,6 +223,29 @@ async def db_update_diary(entry_id: str, user_id: str, content: str = None, name
             """,
             **params
         )
+
+        # Replace linked facts if provided
+        if linked_facts is not None:
+            # Delete existing MENTIONS
+            s.run(
+                """
+                MATCH (d:DiaryEntry {id: $id, userId: $userId})-[r:MENTIONS]->()
+                DELETE r
+                """,
+                id=entry_id, userId=user_id
+            )
+            if linked_facts:
+                s.run(
+                    """
+                    MATCH (d:DiaryEntry {id: $id, userId: $userId})
+                    MATCH (f:Fact) WHERE f.id IN $factIds
+                    MERGE (d)-[:MENTIONS]->(f)
+                    """,
+                    id=entry_id, userId=user_id, factIds=linked_facts
+                )
+        else:
+            # Keep existing behavior (automatic link detection) if linked_facts omitted
+            pass
 
     # Re-embed in Qdrant
     vector = await get_embedding(f"{new_name}: {new_content}" if new_name else new_content)

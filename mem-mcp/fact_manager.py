@@ -1215,6 +1215,44 @@ def db_get_graph(user_id: str) -> dict:
                     edge_lookup[edge_sig] = new_edge
                     edges.append(new_edge)
                 
+        # Add DiaryEntry nodes and MENTIONS edges
+        diag_res = s.run(
+            """
+            MATCH (d:DiaryEntry {userId: $userId})
+            OPTIONAL MATCH (d)-[r:MENTIONS]->(f:Fact)
+            WHERE f.userId = $userId
+            RETURN d, type(r) as rel_type, f
+            """,
+            userId=user_id
+        )
+        for dr in diag_res:
+            d_node = dr["d"]
+            d_id = d_node["id"]
+            if d_id not in node_map:
+                node_map[d_id] = {
+                    "id": d_id,
+                    "label": "DiaryEntry",
+                    "name": d_node.get("title") or d_node.get("content", ""),
+                    "group": "Diary"
+                }
+            f_node = dr["f"]
+            rel = dr["rel_type"]
+            if f_node and rel:
+                f_id = f_node["id"]
+                edge_sig = (d_id, f_id, rel)
+                reverse_sig = (f_id, d_id, rel)
+                if reverse_sig in edge_lookup:
+                    edge_lookup[reverse_sig]["arrows"] = "to,from"
+                elif edge_sig not in edge_lookup:
+                    edge_lookup[edge_sig] = {
+                        "id": f"{d_id}_{f_id}_{rel}",
+                        "from": d_id,
+                        "to": f_id,
+                        "label": rel,
+                        "arrows": "to"
+                    }
+                    edges.append(edge_lookup[edge_sig])
+
         return {
             "nodes": list(node_map.values()),
             "edges": edges

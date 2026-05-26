@@ -156,7 +156,6 @@
     .memories-list-scroll { flex: 1; overflow-y: auto; }
     .memories-main { flex: 1; min-width: 0; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 1.25rem; overflow-y: auto; }
     
-    .sidebar-list { list-style: none; padding: 0; margin: 0; }
     .sidebar-item { 
       padding: .6rem .8rem; cursor: pointer; border-radius: 6px; 
       font-size: .88rem; color: var(--muted); transition: all .15s;
@@ -165,6 +164,17 @@
     .sidebar-item:hover { background: var(--primary-light); color: var(--primary); }
     .sidebar-item.active { background: var(--primary); color: #fff; font-weight: 600; }
     .sidebar-item .count { font-size: .7rem; opacity: .7; }
+
+    /* Chip styles for category filter */
+    .chips-container {
+      display: flex; flex-wrap: wrap; gap: .4rem; padding: .5rem;
+    }
+    .chip {
+      padding: .4rem .8rem; border: 1px solid var(--border);
+      border-radius: 12px; background: var(--bg); color: var(--muted);
+      cursor: pointer; font-size: .85rem; transition: background .15s, color .15s;
+    }
+    .chip.active { background: var(--primary-light); color: var(--primary); }
 
     .search-row { display: flex; gap: .75rem; margin-bottom: 1rem; align-items: center; }
     .search-input-wrapper { position: relative; flex: 1; }
@@ -335,9 +345,7 @@
     <!-- Col 1: Categories -->
     <div class="memories-sidebar" style="padding: .75rem .5rem;">
       <div style="font-size:.7rem; font-weight:700; text-transform:uppercase; letter-spacing:.5px; color:var(--muted); padding:.25rem .5rem .6rem;">Categories</div>
-      <ul id="categories-sidebar" class="sidebar-list">
-        <li class="sidebar-item active" onclick="setCategory(null)">All <span class="count"></span></li>
-      </ul>
+      <div id="categories-sidebar" class="chips-container"></div>
     </div>
 
     <!-- Col 2: Fact list -->
@@ -460,8 +468,13 @@
         🗑️ Clear
       </button>
     </div>
-    <div id="graph-container" style="height: 70vh; min-height: 500px; border: 1px solid var(--border); border-radius: 8px; background: #fff;"></div>
-  </div>
+    <div class="graph-layout" style="display: flex; gap: 1rem;">
+      <div class="graph-sidebar" style="width: 200px; flex-shrink: 0; border-right: 1px solid var(--border); padding-right: 1rem;">
+        <div style="font-size:.7rem; font-weight:700; text-transform:uppercase; letter-spacing:.5px; color:var(--muted); padding-bottom:.6rem;">Categories</div>
+        <div id="graph-categories-sidebar" class="chips-container" style="flex-direction: column;"></div>
+      </div>
+      <div id="graph-container" style="flex: 1; height: 70vh; min-height: 500px; border: 1px solid var(--border); border-radius: 8px; background: #fff;"></div>
+    </div>
 </div>
 
 <!-- ═══ SETUP PAGE (Landing as Tab) ═══ -->
@@ -508,6 +521,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
   </div>
 </div>
 
+<datalist id="fact-datalist-dropdown"></datalist>
 <div id="toast"></div>
 
 <script>
@@ -529,7 +543,8 @@ npm install @modelcontextprotocol/sdk</code></pre>
 
   let memories = [], diaryEntries = [], activeDiaryId = null, selectedDiaryDate = null, diaryMonthYear = null, diarySearchQuery = '';
   let insightsLoaded = false, graphLoaded = false;
-  let activeCategory = null;
+  let activeCategories = new Set();
+  let activeGraphCategories = new Set();
   let activeLetterFilter = null;
   let lastSortOrder = 'alphabetical';
   let lastSearchQuery = '';
@@ -548,7 +563,8 @@ npm install @modelcontextprotocol/sdk</code></pre>
         activeTab: activeTab,
         lastSearchQuery: lastSearchQuery,
         lastSortOrder: lastSortOrder,
-        activeCategory: activeCategory,
+        activeCategories: Array.from(activeCategories),
+        activeGraphCategories: Array.from(activeGraphCategories),
         activeLetterFilter: activeLetterFilter,
         selectedFactId: selectedFactId,
         diarySearchQuery: diarySearchQuery,
@@ -572,7 +588,8 @@ npm install @modelcontextprotocol/sdk</code></pre>
         if (state.activeTab) activeTab = state.activeTab;
         if (state.lastSearchQuery !== undefined) lastSearchQuery = state.lastSearchQuery;
         if (state.lastSortOrder !== undefined) lastSortOrder = state.lastSortOrder;
-        if (state.activeCategory !== undefined) activeCategory = state.activeCategory;
+        if (state.activeCategories !== undefined) activeCategories = new Set(state.activeCategories);
+        if (state.activeGraphCategories !== undefined) activeGraphCategories = new Set(state.activeGraphCategories);
         if (state.activeLetterFilter !== undefined) activeLetterFilter = state.activeLetterFilter;
         if (state.selectedFactId !== undefined) selectedFactId = state.selectedFactId;
         
@@ -721,8 +738,11 @@ npm install @modelcontextprotocol/sdk</code></pre>
       memories = await api.get('memories'); 
       document.getElementById('search-query').value = lastSearchQuery;
       document.getElementById('sort-order').value = lastSortOrder;
+      const fdl = document.getElementById('fact-datalist-dropdown');
+      if (fdl) fdl.innerHTML = memories.map(m => `<option value="${m.id}">${escHtml(m.name || (m.text||'').substring(0,30))}</option>`).join('');
       renderMemories(); 
       renderCategorySidebar();
+      renderGraphCategorySidebar();
       renderAlphabetFilter();
       if (selectedFactId) {
         selectFact(selectedFactId);
@@ -736,19 +756,82 @@ npm install @modelcontextprotocol/sdk</code></pre>
     const counts = {};
     memories.forEach(m => { counts[m.category] = (counts[m.category] || 0) + 1; });
     const categories = Object.keys(counts).sort();
-    
-    el.innerHTML = `<li class="sidebar-item ${activeCategory === null ? 'active' : ''}" onclick="setCategory(null)">
-      All <span class="count">${memories.length}</span>
-    </li>` + categories.map(cat => `
-      <li class="sidebar-item ${activeCategory === cat ? 'active' : ''}" onclick="setCategory('${escHtml(cat)}')">
-        ${escHtml(cat)} <span class="count">${counts[cat]}</span>
-      </li>
-    `).join('');
-    
-    // Also update datalist for add form
+    // Initialize default active categories if not set
+    if (activeCategories.size === 0) {
+        if (categories.includes('People')) activeCategories.add('People');
+        if (categories.includes('Client')) activeCategories.add('Client');
+    }
+    // Build chips HTML
+    const chipsHtml = categories.map(cat => {
+        const isActive = activeCategories.has(cat);
+        const className = 'chip' + (isActive ? ' active' : '');
+        return `<div class="${className}" onclick="toggleCategory('${cat.replace(/'/g, "\\'")}')">${cat} <span class="count">${counts[cat]}</span></div>`;
+    }).join('');
+    // All chip
+    const allActive = activeCategories.size === 0;
+    const allClass = 'chip' + (allActive ? ' active' : '');
+    const allChip = `<div class="${allClass}" onclick="clearCategoryFilter()">All <span class="count">${memories.length}</span></div>`;
+    el.innerHTML = allChip + chipsHtml;
+    // Update datalist for add form
     const datalist = document.getElementById('category-datalist');
     if (datalist) datalist.innerHTML = categories.map(cat => `<option value="${escHtml(cat)}">`).join('');
   }
+
+  function toggleGraphCategory(cat) {
+    if (activeGraphCategories.has(cat)) {
+        activeGraphCategories.delete(cat);
+    } else {
+        activeGraphCategories.add(cat);
+    }
+    renderGraphCategorySidebar();
+    if (graphLoaded && !isBuildMode) {
+        loadGraph();
+    } else if (graphLoaded && isBuildMode) {
+        loadGraph();
+    }
+    saveSessionState();
+  }
+
+  function clearGraphCategoryFilter() {
+    activeGraphCategories.clear();
+    renderGraphCategorySidebar();
+    if (graphLoaded) {
+        loadGraph();
+    }
+    saveSessionState();
+  }
+
+  function renderGraphCategorySidebar() {
+    const el = document.getElementById('graph-categories-sidebar');
+    if (!el) return;
+    
+    const counts = {};
+    memories.forEach(m => { counts[m.category] = (counts[m.category] || 0) + 1; });
+    const categories = Object.keys(counts).sort();
+    if (diaryEntries && diaryEntries.length > 0) {
+        categories.push('Diary');
+        counts['Diary'] = diaryEntries.length;
+    }
+    
+    if (activeGraphCategories.size === 0 && !activeGraphCategories.hasInit) {
+        if (categories.includes('People')) activeGraphCategories.add('People');
+        if (categories.includes('Client')) activeGraphCategories.add('Client');
+        activeGraphCategories.hasInit = true;
+    }
+    
+    const chipsHtml = categories.map(cat => {
+        const isActive = activeGraphCategories.has(cat);
+        const className = 'chip' + (isActive ? ' active' : '');
+        return `<div class="${className}" onclick="toggleGraphCategory('${cat.replace(/'/g, "\\'")}')">${cat} <span class="count">${counts[cat]}</span></div>`;
+    }).join('');
+    
+    const allActive = activeGraphCategories.size === 0;
+    const allClass = 'chip' + (allActive ? ' active' : '');
+    const allChip = `<div class="${allClass}" onclick="clearGraphCategoryFilter()">All</div>`;
+    
+    el.innerHTML = allChip + chipsHtml;
+  }
+
 
   function setCategory(cat) {
     activeCategory = cat;
@@ -1240,6 +1323,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
       document.getElementById('diary-search-input').value = diarySearchQuery;
       renderDiaryMonthPager();
       renderDiarySidebar();
+      renderGraphCategorySidebar();
       if (activeDiaryId && diaryEntries.some(e => e.id === activeDiaryId)) {
         selectDiaryEntry(activeDiaryId);
       } else if (diaryEntries.length) {
@@ -1593,7 +1677,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
           <button class="btn btn-ghost btn-sm" onclick="toggleDiaryLinkForm('${entry.id}')">🔗 Link to fact</button>
         </div>
         <div id="dlink-form-${entry.id}" style="display:none; margin-top:.5rem; padding:.5rem; background:var(--bg); border-radius:6px; border:1px solid var(--border);">
-          <input id="dlink-target-${entry.id}" placeholder="Fact ID or name…" style="width:100%; padding:.3rem .5rem; border:1px solid var(--border); border-radius:4px; font-size:.8rem; margin-bottom:.3rem;">
+          <input id="dlink-target-${entry.id}" list="fact-datalist-dropdown" placeholder="Search fact..." style="width:100%; padding:.3rem .5rem; border:1px solid var(--border); border-radius:4px; font-size:.8rem; margin-bottom:.3rem;">
           <div style="display:flex; gap:.3rem;">
             <button class="btn btn-primary btn-sm" onclick="saveDiaryLink('${entry.id}')">Link</button>
             <button class="btn btn-ghost btn-sm" onclick="toggleDiaryLinkForm('${entry.id}')">Cancel</button>
@@ -1639,7 +1723,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
           <button class="btn btn-ghost btn-sm" onclick="toggleDiaryLinkForm('${entry.id}')">🔗 Link to fact</button>
         </div>
         <div id="dlink-form-${entry.id}" style="display:none; margin-top:.5rem; padding:.5rem; background:var(--bg); border-radius:6px; border:1px solid var(--border);">
-          <input id="dlink-target-${entry.id}" placeholder="Fact ID or name…" style="width:100%; padding:.3rem .5rem; border:1px solid var(--border); border-radius:4px; font-size:.8rem; margin-bottom:.3rem;">
+          <input id="dlink-target-${entry.id}" list="fact-datalist-dropdown" placeholder="Search fact..." style="width:100%; padding:.3rem .5rem; border:1px solid var(--border); border-radius:4px; font-size:.8rem; margin-bottom:.3rem;">
           <div style="display:flex; gap:.3rem;">
             <button class="btn btn-primary btn-sm" onclick="saveDiaryLink('${entry.id}')">Link</button>
             <button class="btn btn-ghost btn-sm" onclick="toggleDiaryLinkForm('${entry.id}')">Cancel</button>
@@ -1784,17 +1868,41 @@ npm install @modelcontextprotocol/sdk</code></pre>
       graphLoaded = true;
       container.innerHTML = '';
       
-      graphData.nodes = new vis.DataSet(data.nodes.map(n => ({
+      let nodesToKeep = new Set();
+      const allActive = activeGraphCategories.size === 0;
+
+      const filteredDataNodes = data.nodes.filter(n => {
+        if (allActive) {
+            nodesToKeep.add(n.id);
+            return true;
+        }
+        if (n.label === 'Category') {
+            if (activeGraphCategories.has(n.name)) {
+                nodesToKeep.add(n.id);
+                return true;
+            }
+            return false;
+        }
+        if (activeGraphCategories.has(n.group)) {
+            nodesToKeep.add(n.id);
+            return true;
+        }
+        return false;
+      });
+
+      graphData.nodes = new vis.DataSet(filteredDataNodes.map(n => ({
         id: n.id,
-        label: n.label === 'Category' ? n.name : truncateText(n.name, 20),
+        label: n.label === 'Category' ? n.name : (n.label === 'DiaryEntry' ? n.name : truncateText(n.name, 20)),
         name: n.name,
         group: n.group,
-        shape: n.label === 'Category' ? 'box' : 'dot',
-        size: n.label === 'Category' ? 20 : 10,
-        font: { size: 12, face: 'Inter' }
+        shape: n.label === 'Category' ? 'box' : (n.label === 'DiaryEntry' ? 'diamond' : 'dot'),
+        size: n.label === 'Category' ? 20 : (n.label === 'DiaryEntry' ? 15 : 10),
+        font: { size: 12, face: 'Inter' },
+        color: n.label === 'DiaryEntry' ? { background: '#fbbf24', border: '#b45309' } : undefined
       })));
       
-      graphData.edges = new vis.DataSet(data.edges.map(e => ({
+      const filteredEdges = data.edges.filter(e => nodesToKeep.has(e.from) && nodesToKeep.has(e.to));
+      graphData.edges = new vis.DataSet(filteredEdges.map(e => ({
         from: e.from,
         to: e.to,
         label: e.label,
@@ -1802,12 +1910,13 @@ npm install @modelcontextprotocol/sdk</code></pre>
         arrows: 'to',
         color: { color: '#e5e7eb', highlight: '#4f46e5' }
       })));
+
       
       if (isBuildMode && buildGraphNodes.size > 0) {
         const filteredNodes = new vis.DataSet(
           data.nodes.filter(n => buildGraphNodes.has(n.id)).map(n => ({
             id: n.id,
-            label: n.label === 'Category' ? n.name : truncateText(n.name, 20),
+            label: n.label === 'Category' ? n.name : (n.label === 'DiaryEntry' ? n.name : truncateText(n.name, 20)),
             name: n.name,
             group: n.group,
             shape: n.label === 'Category' ? 'box' : 'dot',
