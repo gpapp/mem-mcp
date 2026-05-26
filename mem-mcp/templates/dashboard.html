@@ -702,7 +702,12 @@ npm install @modelcontextprotocol/sdk</code></pre>
       const data = JSON.parse(e.data);
       try {
         const entry = await api.get(`diary/${data.id}`);
-        diaryEntries.unshift(entry);
+        const existingIdx = diaryEntries.findIndex(x => x.id === entry.id);
+        if (existingIdx >= 0) {
+          diaryEntries[existingIdx] = entry;
+        } else {
+          diaryEntries.unshift(entry);
+        }
         renderDiaryMonthPager();
         renderDiarySidebar();
         if (!activeDiaryId) selectDiaryEntry(entry.id);
@@ -1246,7 +1251,10 @@ npm install @modelcontextprotocol/sdk</code></pre>
   function jumpToMemory(targetId) {
     switchTab('memories');
     const m = memories.find(x => x.id === targetId);
-    if (m && activeCategory !== null && activeCategory !== m.category) setCategory(null);
+    if (m && typeof activeCategory !== 'undefined' && activeCategory !== null && activeCategory !== m.category) {
+      if (typeof setCategory === 'function') setCategory(null);
+      else activeCategory = null;
+    }
     document.getElementById('search-query').value = '';
     activeLetterFilter = null;
     renderMemories();
@@ -1973,9 +1981,22 @@ npm install @modelcontextprotocol/sdk</code></pre>
     network.on("doubleClick", function (params) {
       if (params.nodes.length > 0) {
         const nodeId = params.nodes[0];
-        const m = memories.find(x => x.id === nodeId);
-        if (m) {
-          jumpToMemory(nodeId);
+        let isDiary = false;
+        if (graphData && graphData.nodes) {
+          try { 
+            const nodeData = graphData.nodes.get(nodeId); 
+            if (nodeData && nodeData.label === 'DiaryEntry') isDiary = true;
+          } catch(e) {}
+        }
+        
+        if (isDiary) {
+          switchTab('diary');
+          selectDiaryEntry(nodeId);
+        } else {
+          const m = memories.find(x => x.id === nodeId);
+          if (m) {
+            jumpToMemory(nodeId);
+          }
         }
       }
     });
