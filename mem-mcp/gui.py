@@ -449,6 +449,25 @@ async def api_save_diary(request: Request, body: DiaryCreate):
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+@web_app.post("/api/auth/login", response_class=JSONResponse)
+async def api_login(request: Request, body: LoginRequest):
+    if _verify_htpasswd(body.username, body.password):
+        request.session["user"] = body.username
+        request.session["pass"] = body.password
+        return {"status": "ok"}
+    else:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+@web_app.post("/api/auth/logout", response_class=JSONResponse)
+async def api_logout(request: Request):
+    request.session.clear()
+    return {"status": "ok"}
+
+
 @web_app.get("/api/whoami", response_class=JSONResponse)
 async def api_whoami(request: Request):
     return {"user": _require_user(request)}
