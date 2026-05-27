@@ -645,10 +645,18 @@ def db_list_memories(user_id: str) -> list:
         result = s.run(
             """
             MATCH (c:Category)<-[:IN_CATEGORY]-(f:Fact {userId: $userId})
-            OPTIONAL MATCH (f)-[r]->(target:Fact {userId: $userId})
-            WHERE type(r) <> 'IN_CATEGORY' AND type(r) <> 'KNOWS'
-            RETURN f, c.name as category, 
-                   collect({rel: type(r), target_id: target.id, target_text: target.text, target_name: target.name}) as links
+            OPTIONAL MATCH (f)-[r]-(other {userId: $userId})
+            WHERE (other:Fact OR other:DiaryEntry)
+              AND type(r) <> 'IN_CATEGORY' AND type(r) <> 'KNOWS'
+            RETURN f, c.name as category,
+                   collect(CASE WHEN other IS NOT NULL THEN {
+                     rel: type(r),
+                     target_id: other.id,
+                     target_text: coalesce(other.text, other.content),
+                     target_name: other.name,
+                     target_label: head(labels(other)),
+                     direction: CASE WHEN startNode(r) = f THEN 'out' ELSE 'in' END
+                   } END) as links
             ORDER BY coalesce(f.name, f.text) ASC
             """,
             userId=user_id,
@@ -663,8 +671,8 @@ def db_list_memories(user_id: str) -> list:
                 if k not in core_keys:
                     metadata[k] = v.iso_format() if hasattr(v, "iso_format") else v
             
-            # Clean up links (remove null targets)
-            links = [l for l in r["links"] if l.get("target_id")]
+            # Clean up links (remove null entries from collect)
+            links = [l for l in r["links"] if l and l.get("target_id")]
 
             memories.append({
                 "id":        f_node["id"],

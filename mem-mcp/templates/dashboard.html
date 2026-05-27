@@ -660,13 +660,13 @@ npm install @modelcontextprotocol/sdk</code></pre>
       const data = JSON.parse(e.data);
       console.log("[SSE] Graph change received:", data);
       
-      // Update local memory objects to refresh badges in the list
-      if (data.source_id) {
+      // Refresh both source and target facts so link badges update on both sides
+      for (const factId of [data.source_id, data.target_id].filter(Boolean)) {
         try {
-          const updatedSource = await api.get(`memories/${data.source_id}`);
-          const idx = memories.findIndex(m => m.id === data.source_id);
-          if (idx !== -1) { memories[idx] = updatedSource; renderMemories(); renderCategorySidebar(); }
-          if (selectedFactId === data.source_id) renderFactPane(updatedSource);
+          const updated = await api.get(`memories/${factId}`);
+          const idx = memories.findIndex(m => m.id === factId);
+          if (idx !== -1) { memories[idx] = updated; renderMemories(); renderCategorySidebar(); }
+          if (selectedFactId === factId) renderFactPane(updated);
         } catch(_) {}
       }
 
@@ -1128,16 +1128,33 @@ npm install @modelcontextprotocol/sdk</code></pre>
 
   function renderLinkSection(m) {
     if (!m.links || !m.links.length) return '';
+    const isFact = (l) => l.target_label === 'Fact' || !l.target_label;
     return `<div style="margin-top:.5rem;">
       <div style="font-size:.75rem; font-weight:700; text-transform:uppercase; color:var(--muted); letter-spacing:.5px; margin-bottom:.4rem;">Links</div>
       <div>
-        ${m.links.map(l => `
-          <span class="link-badge" id="link-badge-${m.id}-${l.target_id}">
-            <span class="link-content" onclick="selectFact('${l.target_id}')" style="cursor:pointer;">🔗 ${escHtml(l.rel)} → ${escHtml(l.target_name || l.target_text.substring(0,30))}</span>
-            <button class="link-action-btn" onclick="showLinkEdit('${m.id}','${l.target_id}','${escHtml(l.rel)}','${escHtml(l.target_name||l.target_text.substring(0,30))}')" name="Edit">✏️</button>
-            <button class="link-action-btn" onclick="deleteLink('${m.id}','${l.target_id}','${l.rel}')" name="Delete">🗑️</button>
-          </span>
-        `).join('')}
+        ${m.links.map(l => {
+          const isIncoming = l.direction === 'in';
+          const displayRel = escHtml(l.rel);
+          const displayName = escHtml(l.target_name || (l.target_text || '').substring(0,30));
+          const icon = isIncoming ? (isFact(l) ? '🔗' : '📝') : '🔗';
+          const label = isIncoming
+            ? `${icon} ${displayName} ← ${displayRel}`
+            : `${icon} ${displayRel} → ${displayName}`;
+
+          if (!isFact(l)) {
+            return `<span class="link-badge" id="link-badge-${m.id}-${l.target_id}">
+              <span class="link-content" style="cursor:pointer;" onclick="switchTab('diary')">${label}</span>
+            </span>`;
+          }
+
+          const apiSource = isIncoming ? l.target_id : m.id;
+          const apiTarget = isIncoming ? m.id : l.target_id;
+          return `<span class="link-badge" id="link-badge-${m.id}-${l.target_id}">
+            <span class="link-content" onclick="selectFact('${l.target_id}')" style="cursor:pointer;">${label}</span>
+            <button class="link-action-btn" onclick="showLinkEdit('${m.id}','${l.target_id}','${displayRel}','${displayName}','${apiSource}','${apiTarget}')" name="Edit">✏️</button>
+            <button class="link-action-btn" onclick="deleteLink('${apiSource}','${apiTarget}','${l.rel}')" name="Delete">🗑️</button>
+          </span>`;
+        }).join('')}
       </div>
     </div>`;
   }
@@ -1185,52 +1202,52 @@ npm install @modelcontextprotocol/sdk</code></pre>
     } catch(e) { toast('❌ Error linking'); }
   }
 
-  function showLinkEdit(sourceId, targetId, relType, targetLabel) {
-    const badge = document.getElementById('link-badge-' + sourceId + '-' + targetId);
+  function showLinkEdit(badgeSource, badgeTarget, relType, targetLabel, apiSource, apiTarget) {
+    const badge = document.getElementById('link-badge-' + badgeSource + '-' + badgeTarget);
     if (!badge) return;
     
     badge.innerHTML = `
-      <form class="link-edit-form" onsubmit="event.preventDefault(); saveLinkEdit('${sourceId}', '${targetId}', '${escHtml(relType)}')">
-        <input id="edit-rel-${sourceId}-${targetId}" value="${escHtml(relType)}" placeholder="Relationship">
+      <form class="link-edit-form" onsubmit="event.preventDefault(); saveLinkEdit('${apiSource}', '${apiTarget}', '${escHtml(relType)}')">
+        <input id="edit-rel-${apiSource}-${apiTarget}" value="${escHtml(relType)}" placeholder="Relationship">
         <button type="submit" name="Save" style="color: var(--success);">✓</button>
-        <button type="button" onclick="deleteLink('${sourceId}', '${targetId}', '${escHtml(relType)}')" name="Delete" style="color: var(--danger);">🗑️</button>
-        <button type="button" onclick="cancelLinkEdit('${sourceId}', '${targetId}', '${escHtml(relType)}', '${escHtml(targetLabel)}')" name="Cancel" style="color: var(--muted);">✕</button>
+        <button type="button" onclick="deleteLink('${apiSource}', '${apiTarget}', '${escHtml(relType)}')" name="Delete" style="color: var(--danger);">🗑️</button>
+        <button type="button" onclick="cancelLinkEdit('${badgeSource}', '${badgeTarget}', '${escHtml(relType)}', '${escHtml(targetLabel)}', '${apiSource}', '${apiTarget}')" name="Cancel" style="color: var(--muted);">✕</button>
       </form>
     `;
   }
 
-  async function saveLinkEdit(sourceId, targetId, oldRelType) {
-    const newRelType = document.getElementById('edit-rel-' + sourceId + '-' + targetId).value.trim();
+  async function saveLinkEdit(apiSource, apiTarget, oldRelType) {
+    const newRelType = document.getElementById('edit-rel-' + apiSource + '-' + apiTarget).value.trim();
     if (!newRelType) { toast('⚠️ Relationship type required'); return; }
     
     try {
-      await api.delete('memories/link', {sourceId, targetId, relType: oldRelType});
-      await api.post('memories/link', {sourceId, targetId, relType: newRelType});
+      await api.delete('memories/link', {sourceId: apiSource, targetId: apiTarget, relType: oldRelType});
+      await api.post('memories/link', {sourceId: apiSource, targetId: apiTarget, relType: newRelType});
       toast('✅ Link updated');
       await loadMemories();
-      const m = memories.find(x => x.id === sourceId);
-      if (m && selectedFactId === sourceId) renderFactPane(m);
+      const m = memories.find(x => x.id === apiSource);
+      if (m && selectedFactId === apiSource) renderFactPane(m);
     } catch(e) { toast('❌ Error updating link'); }
   }
 
-  async function deleteLink(sourceId, targetId, relType) {
+  async function deleteLink(apiSource, apiTarget, relType) {
     if (!confirm('Delete this link?')) return;
     try {
-      await api.delete('memories/link', {sourceId, targetId, relType});
+      await api.delete('memories/link', {sourceId: apiSource, targetId: apiTarget, relType});
       toast('🗑️ Link deleted');
       await loadMemories();
-      const m = memories.find(x => x.id === sourceId);
-      if (m && selectedFactId === sourceId) renderFactPane(m);
+      const m = memories.find(x => x.id === apiSource);
+      if (m && selectedFactId === apiSource) renderFactPane(m);
     } catch(e) { toast('❌ Error deleting link'); }
   }
 
-  function cancelLinkEdit(sourceId, targetId, relType, targetLabel) {
-    const badge = document.getElementById('link-badge-' + sourceId + '-' + targetId);
+  function cancelLinkEdit(badgeSource, badgeTarget, relType, targetLabel, apiSource, apiTarget) {
+    const badge = document.getElementById('link-badge-' + badgeSource + '-' + badgeTarget);
     if (!badge) return;
     badge.innerHTML = `
-      <span class="link-content" onclick="selectFact('${targetId}')" style="cursor:pointer;">🔗 ${escHtml(relType)} → ${escHtml(targetLabel)}</span>
-      <button class="link-action-btn" onclick="showLinkEdit('${sourceId}', '${targetId}', '${escHtml(relType)}', '${escHtml(targetLabel)}')" name="Edit link">✏️</button>
-      <button class="link-action-btn" onclick="deleteLink('${sourceId}', '${targetId}', '${escHtml(relType)}')" name="Delete link">🗑️</button>
+      <span class="link-content" onclick="selectFact('${badgeTarget}')" style="cursor:pointer;">🔗 ${escHtml(relType)} → ${escHtml(targetLabel)}</span>
+      <button class="link-action-btn" onclick="showLinkEdit('${badgeSource}', '${badgeTarget}', '${escHtml(relType)}', '${escHtml(targetLabel)}', '${apiSource}', '${apiTarget}')" name="Edit link">✏️</button>
+      <button class="link-action-btn" onclick="deleteLink('${apiSource}', '${apiTarget}', '${escHtml(relType)}')" name="Delete link">🗑️</button>
     `;
   }
 
