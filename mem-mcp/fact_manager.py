@@ -1388,6 +1388,25 @@ async def run_consistency_checks():
         )
 
 
+def _normalize_point_id(raw_id: str):
+    """Ensure ID is valid for Qdrant (unsigned integer or UUID).
+    Returns (normalized_id, needs_update) — needs_update is True when Neo4j
+    must be updated to match the new ID.
+    """
+    raw_id = raw_id.strip()
+    # All digits → unsigned integer (valid Qdrant point ID)
+    if raw_id.isdigit():
+        return raw_id, False
+    # Already valid UUID: 32 hex chars (no dashes) or 8-4-4-4-12 with dashes
+    if re.match(r'^[0-9a-f]{32}$', raw_id, re.I):
+        return raw_id, False
+    if re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', raw_id, re.I):
+        return raw_id, False
+    # Not a valid Qdrant ID — generate a deterministic UUID5 from it
+    new_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, raw_id))
+    return new_id, True
+
+
 async def _scroll_qdrant_ids(qdrant, collection: str, user_id: str) -> set:
     """Scroll all Qdrant point IDs for a user in a collection."""
     ids = set()
@@ -1570,6 +1589,16 @@ async def sync_orphans():
             )
             for oid in orphan_diary_neo4j:
                 info = neo4j_diary_map[oid]
+                qdrant_id, needs_update = _normalize_point_id(oid)
+                if needs_update:
+                    # Update Neo4j to use the canonical UUID as its ID
+                    logger.info(f"sync_orphans: migrating diary ID {oid} → {qdrant_id}")
+                    with neo4j_driver.session() as s:
+                        s.run(
+                            "MATCH (d:DiaryEntry {id: $oldId, userId: $userId}) "
+                            "SET d.id = $newId",
+                            oldId=oid, userId=user_id, newId=qdrant_id
+                        )
                 embed_text = f"{info['name']}: {info['content']}" if info["name"] else info["content"]
                 vector = await get_embedding(embed_text)
                 payload = {
@@ -1581,7 +1610,7 @@ async def sync_orphans():
                 }
                 await qdrant.upsert(
                     collection_name=DIARY_COLLECTION,
-                    points=[PointStruct(id=oid, vector=vector, payload=payload)],
+                    points=[PointStruct(id=qdrant_id, vector=vector, payload=payload)],
                 )
             total_reembedded += len(orphan_diary_neo4j)
 
