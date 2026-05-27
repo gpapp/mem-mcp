@@ -9,6 +9,7 @@ from typing import Optional
 import httpx
 from qdrant_client.models import PointStruct, Filter, FieldCondition, MatchValue
 
+import re
 from common import (
     get_qdrant, get_neo4j, logger, get_embedding, publish_db_event,
     DIARY_COLLECTION, QDRANT_URL
@@ -408,3 +409,131 @@ def db_list_diary(user_id: str) -> list:
                 "mentions": [m for m in r["mentions"] if m.get("id")]
             } for r in result
         ]
+
+
+async def _scroll_diary_ids(qdrant, user_id: str) -> set:
+    """Scroll all Qdrant point IDs for a user in the diary collection."""
+    ids = set()
+    try:
+        offset = None
+        while True:
+            result = await qdrant.scroll(
+                collection_name=DIARY_COLLECTION,
+                limit=1000,
+                offset=offset,
+                with_payload=False,
+                with_vectors=False,
+                scroll_filter=Filter(must=[FieldCondition(key="userId", match=MatchValue(value=user_id))]),
+            )
+            points, next_offset = result
+            for p in points:
+                ids.add(str(p.id))
+            if next_offset is None:
+                break
+            offset = next_offset
+    except Exception as e:
+        logger.error(f"consistency: Qdrant diary scroll failed for {user_id}: {e}")
+    return ids
+
+
+async def run_diary_consistency_checks():
+    """Read-only diary-specific consistency checks across Neo4j and Qdrant. Logs all discrepancies."""
+    qdrant = await get_qdrant()
+    neo4j_driver = get_neo4j()
+    if not qdrant or not neo4j_driver:
+        logger.warning("consistency: DB not available, skipping diary checks")
+        return
+
+    with neo4j_driver.session() as s:
+        user_rows = list(s.run("MATCH (d:DiaryEntry) RETURN DISTINCT d.userId AS userId"))
+    user_ids = [r["userId"] for r in user_rows if r["userId"]]
+    if not user_ids:
+        logger.info("consistency: no diary users found")
+        return
+
+    issues_found = False
+    dangling_links = 0
+
+    for user_id in sorted(user_ids):
+        # --- Diary counts: Neo4j vs Qdrant ---
+        with neo4j_driver.session() as s:
+            diary_rows = list(s.run(
+                "MATCH (d:DiaryEntry {userId: $userId}) RETURN d.id AS id",
+                userId=user_id
+            ))
+        neo4j_ids = {r["id"] for r in diary_rows}
+        neo4j_count = len(neo4j_ids)
+
+        qdrant_ids = await _scroll_diary_ids(qdrant, user_id)
+        qdrant_count = len(qdrant_ids)
+
+        if neo4j_count != qdrant_count:
+            issues_found = True
+            logger.warning(
+                f"consistency [{user_id}]: Diary count mismatch — "
+                f"Neo4j: {neo4j_count}, Qdrant: {qdrant_count}"
+            )
+            only_neo4j = neo4j_ids - qdrant_ids
+            only_qdrant = qdrant_ids - neo4j_ids
+            if only_neo4j:
+                logger.warning(
+                    f"consistency [{user_id}]: {len(only_neo4j)} diary(s) in Neo4j only: "
+                    f"{','.join(sorted(only_neo4j)[:20])}"
+                )
+            if only_qdrant:
+                logger.warning(
+                    f"consistency [{user_id}]: {len(only_qdrant)} diary(s) in Qdrant only: "
+                    f"{','.join(sorted(only_qdrant)[:20])}"
+                )
+        else:
+            logger.info(f"consistency [{user_id}]: Diary OK ({neo4j_count})")
+
+        # --- Dangling MENTIONS ---
+        with neo4j_driver.session() as s:
+            bad = list(s.run(
+                "MATCH (d:DiaryEntry {userId: $userId})-[r:MENTIONS]->(target) "
+                "WHERE NOT target:Fact RETURN count(*) AS count",
+                userId=user_id
+            ))
+        count = bad[0]["count"] if bad else 0
+        if count:
+            issues_found = True
+            dangling_links += count
+            logger.warning(f"consistency [{user_id}]: {count} MENTIONS link(s) to non-Fact nodes")
+
+    # --- Cross-user diary checks ---
+    with neo4j_driver.session() as s:
+        no_user = list(s.run("MATCH (d:DiaryEntry) WHERE d.userId IS NULL RETURN count(*) AS count"))
+    count = no_user[0]["count"] if no_user else 0
+    if count:
+        issues_found = True
+        logger.warning(f"consistency: {count} diary entries have no userId")
+
+    with neo4j_driver.session() as s:
+        untitled = list(s.run(
+            "MATCH (d:DiaryEntry) WHERE d.name IS NULL OR d.name = '' "
+            "RETURN d.id AS id LIMIT 20"
+        ))
+    if untitled:
+        issues_found = True
+        logger.warning(
+            f"consistency: {len(untitled)}+ diary entries without a title "
+            f"(IDs: {', '.join(r['id'] for r in untitled)})"
+        )
+
+    with neo4j_driver.session() as s:
+        bad_ts = list(s.run(
+            "MATCH (d:DiaryEntry) WHERE d.timestamp IS NULL OR d.timestamp = '' "
+            "RETURN d.id AS id LIMIT 20"
+        ))
+    if bad_ts:
+        issues_found = True
+        logger.warning(
+            f"consistency: {len(bad_ts)}+ diary entries without a valid timestamp "
+            f"(IDs: {', '.join(r['id'] for r in bad_ts)})"
+        )
+
+    if not issues_found:
+        logger.info("consistency diary: All checks passed")
+    else:
+        logger.info(f"consistency diary: Summary — {len(user_ids)} users checked, {dangling_links} dangling links")
