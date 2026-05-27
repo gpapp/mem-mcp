@@ -231,48 +231,92 @@ async def db_delete_memory(memory_id: str, user_id: str) -> bool:
 
 
 async def db_link_facts(source_id: str, target_id: str, rel_type: str, metadata: dict, user_id: str):
-    """Create a bidirectional relationship between two facts in Neo4j.
-    Creates forward link (source->target) and reverse link (target->source).
+    """Create a relationship between two nodes in Neo4j.
+    
+    Handles:
+    - Fact ↔ Fact → bidirectional REL_TYPE (existing behavior)
+    - DiaryEntry → Fact → unidirectional MENTIONS
     """
     neo4j_driver = get_neo4j()
     if not neo4j_driver:
         raise RuntimeError("Neo4j not connected.")
 
     rel_type = rel_type.upper().replace(" ", "_")
-    reverse_rel = rel_type  # Same verb works for reverse direction (e.g., "CONNECTED_TO" works both ways)
     
     with neo4j_driver.session() as s:
-        # Create forward relationship (source -> target)
-        s.run(
-            f"""
-            MATCH (a:Fact {{id: $sid, userId: $userId}})
-            MATCH (b:Fact {{id: $tid, userId: $userId}})
-            MERGE (a)-[r:{rel_type}]->(b)
-            SET r += $metadata
-            """,
-            sid=source_id, tid=target_id, userId=user_id, metadata=metadata
-        )
-        # Create reverse relationship (target -> source) for two-way navigation
-        s.run(
-            f"""
-            MATCH (a:Fact {{id: $sid, userId: $userId}})
-            MATCH (b:Fact {{id: $tid, userId: $userId}})
-            MERGE (b)-[r:{reverse_rel}]->(a)
-            SET r += $metadata
-            """,
-            sid=source_id, tid=target_id, userId=user_id, metadata=metadata
-        )
+        # Determine node labels
+        a_label = s.run(
+            "MATCH (n {id: $id, userId: $userId}) RETURN head(labels(n)) AS label",
+            id=source_id, userId=user_id
+        ).single()
+        b_label = s.run(
+            "MATCH (n {id: $id, userId: $userId}) RETURN head(labels(n)) AS label",
+            id=target_id, userId=user_id
+        ).single()
+        
+        if not a_label or not b_label:
+            raise RuntimeError(f"Cannot link: node not found (source={source_id}, target={target_id})")
 
-    await publish_db_event(user_id, "graph_changed", {
-        "action": "link",
-        "source_id": source_id,
-        "target_id": target_id,
-        "rel_type": rel_type
-    })
+        a_label = a_label["label"]
+        b_label = b_label["label"]
+
+        if a_label == "Fact" and b_label == "Fact":
+            # Bidirectional fact-to-fact
+            s.run(
+                f"""
+                MATCH (a:Fact {{id: $sid, userId: $userId}})
+                MATCH (b:Fact {{id: $tid, userId: $userId}})
+                MERGE (a)-[r:{rel_type}]->(b)
+                SET r += $metadata
+                """,
+                sid=source_id, tid=target_id, userId=user_id, metadata=metadata
+            )
+            s.run(
+                f"""
+                MATCH (a:Fact {{id: $sid, userId: $userId}})
+                MATCH (b:Fact {{id: $tid, userId: $userId}})
+                MERGE (b)-[r:{rel_type}]->(a)
+                SET r += $metadata
+                """,
+                sid=source_id, tid=target_id, userId=user_id, metadata=metadata
+            )
+            await publish_db_event(user_id, "graph_changed", {
+                "action": "link", "source_id": source_id,
+                "target_id": target_id, "rel_type": rel_type
+            })
+
+        elif a_label == "DiaryEntry" and b_label == "Fact":
+            s.run(
+                """
+                MATCH (d:DiaryEntry {id: $sid, userId: $userId})
+                MATCH (f:Fact {id: $tid, userId: $userId})
+                MERGE (d)-[:MENTIONS]->(f)
+                """,
+                sid=source_id, tid=target_id, userId=user_id
+            )
+            await publish_db_event(user_id, "diary_changed", {"action": "link", "id": source_id})
+
+        elif a_label == "Fact" and b_label == "DiaryEntry":
+            # User wanted to link from fact to diary — create MENTIONS from diary to fact
+            s.run(
+                """
+                MATCH (f:Fact {id: $sid, userId: $userId})
+                MATCH (d:DiaryEntry {id: $tid, userId: $userId})
+                MERGE (d)-[:MENTIONS]->(f)
+                """,
+                sid=source_id, tid=target_id, userId=user_id
+            )
+            await publish_db_event(user_id, "diary_changed", {"action": "link", "id": target_id})
+
+        else:
+            raise RuntimeError(f"Cannot link {a_label} to {b_label}: only Fact↔Fact and DiaryEntry↔Fact are supported")
 
 
 async def db_unlink_facts(source_id: str, target_id: str, rel_type: str, user_id: str):
-    """Remove a bidirectional relationship between two facts in Neo4j."""
+    """Remove a relationship between two nodes in Neo4j.
+    
+    Handles Fact↔Fact and DiaryEntry↔Fact (MENTIONS).
+    """
     neo4j_driver = get_neo4j()
     if not neo4j_driver:
         raise RuntimeError("Neo4j not connected.")
@@ -280,42 +324,78 @@ async def db_unlink_facts(source_id: str, target_id: str, rel_type: str, user_id
     rel_type = rel_type.upper().replace(" ", "_") if rel_type else None
     
     with neo4j_driver.session() as s:
-        if rel_type:
-            s.run(
-                f"""
-                MATCH (a:Fact {{id: $sid, userId: $userId}})-[r:{rel_type}]->(b:Fact {{id: $tid, userId: $userId}})
-                DELETE r
-                """,
-                sid=source_id, tid=target_id, userId=user_id
-            )
-            s.run(
-                f"""
-                MATCH (a:Fact {{id: $sid, userId: $userId}})<-[r:{rel_type}]-(b:Fact {{id: $tid, userId: $userId}})
-                DELETE r
-                """,
-                sid=source_id, tid=target_id, userId=user_id
-            )
-        else:
-            s.run(
-                """
-                MATCH (a:Fact {id: $sid, userId: $userId})-[r]->(b:Fact {id: $tid, userId: $userId})
-                DELETE r
-                """,
-                sid=source_id, tid=target_id, userId=user_id
-            )
-            s.run(
-                """
-                MATCH (a:Fact {id: $sid, userId: $userId})<-[r]-(b:Fact {id: $tid, userId: $userId})
-                DELETE r
-                """,
-                sid=source_id, tid=target_id, userId=user_id
-            )
+        a_label = s.run(
+            "MATCH (n {id: $id, userId: $userId}) RETURN head(labels(n)) AS label",
+            id=source_id, userId=user_id
+        ).single()
+        b_label = s.run(
+            "MATCH (n {id: $id, userId: $userId}) RETURN head(labels(n)) AS label",
+            id=target_id, userId=user_id
+        ).single()
 
-    await publish_db_event(user_id, "graph_changed", {
-        "action": "unlink",
-        "source_id": source_id,
-        "target_id": target_id
-    })
+        if not a_label or not b_label:
+            raise RuntimeError(f"Cannot unlink: node not found (source={source_id}, target={target_id})")
+
+        a_label = a_label["label"]
+        b_label = b_label["label"]
+
+        if a_label == "Fact" and b_label == "Fact":
+            if rel_type:
+                s.run(
+                    f"""
+                    MATCH (a:Fact {{id: $sid, userId: $userId}})
+                    MATCH (b:Fact {{id: $tid, userId: $userId}})
+                    OPTIONAL MATCH (a)-[r:{rel_type}]->(b)
+                    DELETE r
+                    """,
+                    sid=source_id, tid=target_id, userId=user_id
+                )
+                s.run(
+                    f"""
+                    MATCH (a:Fact {{id: $sid, userId: $userId}})
+                    MATCH (b:Fact {{id: $tid, userId: $userId}})
+                    OPTIONAL MATCH (b)-[r:{rel_type}]->(a)
+                    DELETE r
+                    """,
+                    sid=source_id, tid=target_id, userId=user_id
+                )
+            else:
+                s.run(
+                    """
+                    MATCH (a:Fact {id: $sid, userId: $userId})
+                    MATCH (b:Fact {id: $tid, userId: $userId})
+                    OPTIONAL MATCH (a)-[r]-(b)
+                    DELETE r
+                    """,
+                    sid=source_id, tid=target_id, userId=user_id
+                )
+            await publish_db_event(user_id, "graph_changed", {
+                "action": "unlink", "source_id": source_id,
+                "target_id": target_id, "rel_type": rel_type or ""
+            })
+
+        elif a_label == "DiaryEntry" and b_label == "Fact":
+            s.run(
+                """
+                MATCH (d:DiaryEntry {id: $sid, userId: $userId})-[r:MENTIONS]->(f:Fact {id: $tid, userId: $userId})
+                DELETE r
+                """,
+                sid=source_id, tid=target_id, userId=user_id
+            )
+            await publish_db_event(user_id, "diary_changed", {"action": "unlink", "id": source_id})
+
+        elif a_label == "Fact" and b_label == "DiaryEntry":
+            s.run(
+                """
+                MATCH (d:DiaryEntry {id: $tid, userId: $userId})-[r:MENTIONS]->(f:Fact {id: $sid, userId: $userId})
+                DELETE r
+                """,
+                sid=source_id, tid=target_id, userId=user_id
+            )
+            await publish_db_event(user_id, "diary_changed", {"action": "unlink", "id": target_id})
+
+        else:
+            raise RuntimeError(f"Cannot unlink {a_label} to {b_label}: only Fact↔Fact and DiaryEntry↔Fact are supported")
 
 
 def db_get_neighborhood(fact_id: str, depth: int, rel_types: List[str], user_id: str) -> list:
