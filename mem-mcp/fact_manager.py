@@ -1441,7 +1441,11 @@ async def sync_orphans():
         return
 
     with neo4j_driver.session() as s:
-        user_rows = list(s.run("MATCH (f:Fact) RETURN DISTINCT f.userId AS userId"))
+        user_rows = list(s.run(
+            "MATCH (f:Fact) RETURN DISTINCT f.userId AS userId "
+            "UNION "
+            "MATCH (d:DiaryEntry) RETURN DISTINCT d.userId AS userId"
+        ))
     user_ids = [r["userId"] for r in user_rows if r["userId"]]
     if not user_ids:
         logger.info("sync_orphans: no users found")
@@ -1451,19 +1455,19 @@ async def sync_orphans():
     total_reembedded = 0
 
     for user_id in user_ids:
-        # 1. Get all fact IDs + text from Neo4j
+        # -----------------------------------------------------------------------
+        # Fact orphans
+        # -----------------------------------------------------------------------
         with neo4j_driver.session() as s:
             facts = list(s.run(
                 "MATCH (f:Fact {userId: $userId}) RETURN f.id AS id, f.text AS text, f.name AS name",
                 userId=user_id
             ))
-        neo4j_ids = {r["id"] for r in facts}
-        neo4j_map  = {r["id"]: {"text": r["text"], "name": r.get("name", "")} for r in facts}
-        if not neo4j_ids:
-            continue
+        neo4j_fact_ids = {r["id"] for r in facts}
+        neo4j_fact_map = {r["id"]: {"text": r["text"], "name": r.get("name", "")} for r in facts}
 
-        # 2. Scroll all Qdrant point IDs for this user
-        qdrant_ids = set()
+        # Scroll Qdrant fact collection
+        qdrant_fact_ids = set()
         offset = None
         while True:
             result = await qdrant.scroll(
@@ -1476,37 +1480,133 @@ async def sync_orphans():
             )
             points, next_offset = result
             for p in points:
-                qdrant_ids.add(str(p.id))
+                qdrant_fact_ids.add(str(p.id))
             if next_offset is None:
                 break
             offset = next_offset
 
-        # 3. Qdrant-only → delete
-        orphan_qdrant = qdrant_ids - neo4j_ids
-        if orphan_qdrant:
-            logger.info(f"sync_orphans [{user_id}]: deleting {len(orphan_qdrant)} Qdrant-only orphans")
+        # Qdrant-only fact points → delete
+        orphan_fact_qdrant = qdrant_fact_ids - neo4j_fact_ids
+        if orphan_fact_qdrant:
+            logger.info(f"sync_orphans [{user_id}]: deleting {len(orphan_fact_qdrant)} Qdrant-only fact orphans")
             await qdrant.delete(
                 collection_name=COLLECTION_NAME,
-                points_selector=PointIdsList(points=list(orphan_qdrant)),
+                points_selector=PointIdsList(points=list(orphan_fact_qdrant)),
             )
-            total_deleted += len(orphan_qdrant)
+            total_deleted += len(orphan_fact_qdrant)
 
-        # 4. Neo4j-only → re-embed
-        orphan_neo4j = neo4j_ids - qdrant_ids
-        if orphan_neo4j:
-            logger.info(f"sync_orphans [{user_id}]: re-embedding {len(orphan_neo4j)} Neo4j-only records")
-            for oid in orphan_neo4j:
-                info = neo4j_map[oid]
-                text = info["text"]
-                name = info["name"]
-                vector = await get_embedding(text)
+        # Neo4j-only facts → re-embed
+        orphan_fact_neo4j = neo4j_fact_ids - qdrant_fact_ids
+        if orphan_fact_neo4j:
+            logger.info(f"sync_orphans [{user_id}]: re-embedding {len(orphan_fact_neo4j)} Neo4j-only facts")
+            for oid in orphan_fact_neo4j:
+                info = neo4j_fact_map[oid]
+                vector = await get_embedding(info["text"])
                 await qdrant.upsert(
                     collection_name=COLLECTION_NAME,
-                    points=[PointStruct(id=oid, vector=vector, payload={"text": text, "name": name, "userId": user_id})],
+                    points=[PointStruct(id=oid, vector=vector, payload={
+                        "text": info["text"], "name": info["name"], "userId": user_id
+                    })],
                 )
-            total_reembedded += len(orphan_neo4j)
+            total_reembedded += len(orphan_fact_neo4j)
 
-    if total_deleted or total_reembedded:
-        logger.info(f"sync_orphans done: deleted {total_deleted} Qdrant orphans, re-embedded {total_reembedded} Neo4j orphans")
+        # -----------------------------------------------------------------------
+        # Diary entry orphans
+        # -----------------------------------------------------------------------
+        with neo4j_driver.session() as s:
+            diaries = list(s.run(
+                "MATCH (d:DiaryEntry {userId: $userId}) "
+                "RETURN d.id AS id, d.content AS content, d.name AS name, "
+                "       d.date AS date, d.timestamp AS timestamp",
+                userId=user_id
+            ))
+        neo4j_diary_ids = {r["id"] for r in diaries}
+        neo4j_diary_map = {
+            r["id"]: {
+                "content": r["content"], "name": r.get("name", ""),
+                "date": r.get("date", ""), "timestamp": r.get("timestamp", ""),
+            }
+            for r in diaries
+        }
+
+        # Scroll Qdrant diary collection
+        qdrant_diary_ids = set()
+        offset = None
+        while True:
+            result = await qdrant.scroll(
+                collection_name=DIARY_COLLECTION,
+                limit=1000,
+                offset=offset,
+                with_payload=False,
+                with_vectors=False,
+                scroll_filter=Filter(must=[FieldCondition(key="userId", match=MatchValue(value=user_id))]),
+            )
+            points, next_offset = result
+            for p in points:
+                qdrant_diary_ids.add(str(p.id))
+            if next_offset is None:
+                break
+            offset = next_offset
+
+        # Qdrant-only diary points → delete
+        orphan_diary_qdrant = qdrant_diary_ids - neo4j_diary_ids
+        if orphan_diary_qdrant:
+            logger.info(
+                f"sync_orphans [{user_id}]: deleting {len(orphan_diary_qdrant)} "
+                f"Qdrant-only diary orphans"
+            )
+            await qdrant.delete(
+                collection_name=DIARY_COLLECTION,
+                points_selector=PointIdsList(points=list(orphan_diary_qdrant)),
+            )
+            total_deleted += len(orphan_diary_qdrant)
+
+        # Neo4j-only diary entries → re-embed
+        orphan_diary_neo4j = neo4j_diary_ids - qdrant_diary_ids
+        if orphan_diary_neo4j:
+            logger.info(
+                f"sync_orphans [{user_id}]: re-embedding {len(orphan_diary_neo4j)} "
+                f"Neo4j-only diary entries"
+            )
+            for oid in orphan_diary_neo4j:
+                info = neo4j_diary_map[oid]
+                embed_text = f"{info['name']}: {info['content']}" if info["name"] else info["content"]
+                vector = await get_embedding(embed_text)
+                payload = {
+                    "content": info["content"],
+                    "name": info["name"],
+                    "date": info["date"],
+                    "timestamp": info["timestamp"],
+                    "userId": user_id,
+                }
+                await qdrant.upsert(
+                    collection_name=DIARY_COLLECTION,
+                    points=[PointStruct(id=oid, vector=vector, payload=payload)],
+                )
+            total_reembedded += len(orphan_diary_neo4j)
+
+    # -----------------------------------------------------------------------
+    # Orphan categories: Category nodes with no facts → delete
+    # -----------------------------------------------------------------------
+    with neo4j_driver.session() as s:
+        orphan_cats = list(s.run(
+            "MATCH (c:Category) WHERE NOT (c)<-[:IN_CATEGORY]-(:Fact) "
+            "RETURN c.name AS name, id(c) AS node_id"
+        ))
+    if orphan_cats:
+        names = [r["name"] for r in orphan_cats]
+        logger.info(f"sync_orphans: deleting {len(orphan_cats)} orphan categories: {names}")
+        with neo4j_driver.session() as s:
+            s.run(
+                "MATCH (c:Category) WHERE NOT (c)<-[:IN_CATEGORY]-(:Fact) "
+                "DETACH DELETE c"
+            )
+
+    if total_deleted or total_reembedded or orphan_cats:
+        logger.info(
+            f"sync_orphans done: deleted {total_deleted} Qdrant orphans, "
+            f"re-embedded {total_reembedded} Neo4j orphans, "
+            f"pruned {len(orphan_cats)} orphan categories"
+        )
     else:
         logger.info("sync_orphans: nothing to fix")

@@ -69,21 +69,33 @@ async def db_save_diary(content: str, user_id: str, timestamp: str, name: str, m
             **params
         )
 
-        # Handle linked_facts — create MENTIONS links if provided
-        if linked_facts:
-            # Ensure we have a list of IDs
-            fact_ids = [fid for fid in linked_facts if fid]
-            if fact_ids:
+        # Sync linked facts: remove stale, add new
+        if linked_facts is not None:
+            # Remove MENTIONS to facts NOT in the incoming list
+            s.run(
+                """
+                MATCH (d:DiaryEntry {id: $id, userId: $userId})-[r:MENTIONS]->(f:Fact)
+                WHERE NOT f.id IN $factIds
+                DELETE r
+                """,
+                id=doc_id, userId=user_id, factIds=linked_facts
+            )
+            # Add MENTIONS for links not yet present
+            if linked_facts:
                 s.run(
                     """
                     MATCH (d:DiaryEntry {id: $id, userId: $userId})
                     MATCH (f:Fact) WHERE f.id IN $factIds
                     MERGE (d)-[:MENTIONS]->(f)
                     """,
-                    id=doc_id, userId=user_id, factIds=fact_ids
+                    id=doc_id, userId=user_id, factIds=linked_facts
                 )
         else:
-            # Automatic linking as before (People & Client) for backward compatibility
+            # Automatic linking — first clear stale mentions, then rebuild from current content
+            s.run(
+                "MATCH (d:DiaryEntry {id: $id, userId: $userId})-[r:MENTIONS]->() DELETE r",
+                id=doc_id, userId=user_id
+            )
             res = s.run(
                 """
                 MATCH (f:Fact {userId: $userId})
@@ -224,16 +236,18 @@ async def db_update_diary(entry_id: str, user_id: str, content: Optional[str] = 
             **params
         )
 
-        # Replace linked facts if provided
+        # Sync linked facts: remove stale, add new
         if linked_facts is not None:
-            # Delete existing MENTIONS
+            # Remove MENTIONS to facts NOT in the incoming list
             s.run(
                 """
-                MATCH (d:DiaryEntry {id: $id, userId: $userId})-[r:MENTIONS]->()
+                MATCH (d:DiaryEntry {id: $id, userId: $userId})-[r:MENTIONS]->(f:Fact)
+                WHERE NOT f.id IN $factIds
                 DELETE r
                 """,
-                id=entry_id, userId=user_id
+                id=entry_id, userId=user_id, factIds=linked_facts
             )
+            # Add MENTIONS for links not yet present
             if linked_facts:
                 s.run(
                     """
@@ -243,9 +257,6 @@ async def db_update_diary(entry_id: str, user_id: str, content: Optional[str] = 
                     """,
                     id=entry_id, userId=user_id, factIds=linked_facts
                 )
-        else:
-            # Keep existing behavior (automatic link detection) if linked_facts omitted
-            pass
 
     # Re-embed in Qdrant
     vector = await get_embedding(f"{new_name}: {new_content}" if new_name else new_content)
