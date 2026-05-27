@@ -220,8 +220,8 @@ async def api_search_diary(request: Request, q: str = "", limit: int = 10, top_p
     user_id = _require_user(request)
     try:
         if not q.strip():
-            return mem.db_list_diary(user_id)
-        return mem.db_search_diary(q.strip(), user_id, limit=limit, top_p=top_p)
+            return await mem.db_list_diary(user_id)
+        return await mem.db_search_diary(q.strip(), user_id, limit=limit, top_p=top_p)
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
