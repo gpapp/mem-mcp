@@ -18,7 +18,7 @@ from fact_manager import (
     db_link_facts, db_unlink_facts, db_get_neighborhood, db_get_fact_by_id,
     db_get_connections_by_type, db_search_memories, db_find_patterns,
     db_list_memories, db_list_categories, db_find_duplicates, db_merge_memories,
-    db_get_graph, sync_orphans
+    db_get_graph, run_consistency_checks, sync_orphans
 )
 
 from diary_manager import (
