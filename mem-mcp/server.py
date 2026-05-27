@@ -59,6 +59,7 @@ from contextlib import asynccontextmanager
 @asynccontextmanager
 async def lifespan(app):
     async with mcp_app.lifespan(mcp_app):
+        await mem.run_consistency_checks()
         await mem.sync_orphans()
         yield
 

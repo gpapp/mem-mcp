@@ -11,7 +11,7 @@ from qdrant_client.models import PointStruct, Filter, FieldCondition, MatchValue
 
 from common import (
     get_qdrant, get_neo4j, logger, get_embedding, publish_db_event,
-    COLLECTION_NAME
+    COLLECTION_NAME, DIARY_COLLECTION
 )
 
 # ---------------------------------------------------------------------------
@@ -1265,6 +1265,168 @@ def db_get_graph(user_id: str) -> dict:
             "nodes": list(node_map.values()),
             "edges": edges
         }
+
+
+# ---------------------------------------------------------------------------
+# Startup consistency checks: read-only validation across all stores
+# ---------------------------------------------------------------------------
+async def run_consistency_checks():
+    """Read-only consistency checks across Neo4j and Qdrant. Logs all discrepancies."""
+    qdrant = await get_qdrant()
+    neo4j_driver = get_neo4j()
+    if not qdrant or not neo4j_driver:
+        logger.warning("consistency: DB not available, skipping checks")
+        return
+
+    # Collect all user IDs from both Fact and DiaryEntry nodes
+    with neo4j_driver.session() as s:
+        user_rows = list(s.run(
+            "MATCH (f:Fact) RETURN DISTINCT f.userId AS userId "
+            "UNION "
+            "MATCH (d:DiaryEntry) RETURN DISTINCT d.userId AS userId"
+        ))
+    user_ids = [r["userId"] for r in user_rows if r["userId"]]
+    if not user_ids:
+        logger.info("consistency: no users found in graph")
+        return
+
+    issues_found = False
+    total_dangling_links = 0
+
+    for user_id in sorted(user_ids):
+        # --- Fact counts: Neo4j vs Qdrant ---
+        with neo4j_driver.session() as s:
+            fact_rows = list(s.run(
+                "MATCH (f:Fact {userId: $userId}) RETURN f.id AS id",
+                userId=user_id
+            ))
+        neo4j_fact_ids = {r["id"] for r in fact_rows}
+        neo4j_fact_count = len(neo4j_fact_ids)
+
+        qdrant_fact_ids = await _scroll_qdrant_ids(qdrant, COLLECTION_NAME, user_id)
+        qdrant_fact_count = len(qdrant_fact_ids)
+
+        if neo4j_fact_count != qdrant_fact_count:
+            issues_found = True
+            logger.warning(
+                f"consistency [{user_id}]: Fact count mismatch — "
+                f"Neo4j: {neo4j_fact_count}, Qdrant: {qdrant_fact_count}"
+            )
+            _log_diff(neo4j_fact_ids, qdrant_fact_ids, user_id, "fact", "Neo4j", "Qdrant")
+        else:
+            logger.info(f"consistency [{user_id}]: Facts OK ({neo4j_fact_count})")
+
+        # --- Diary counts: Neo4j vs Qdrant ---
+        with neo4j_driver.session() as s:
+            diary_rows = list(s.run(
+                "MATCH (d:DiaryEntry {userId: $userId}) RETURN d.id AS id",
+                userId=user_id
+            ))
+        neo4j_diary_ids = {r["id"] for r in diary_rows}
+        neo4j_diary_count = len(neo4j_diary_ids)
+
+        qdrant_diary_ids = await _scroll_qdrant_ids(qdrant, DIARY_COLLECTION, user_id)
+        qdrant_diary_count = len(qdrant_diary_ids)
+
+        if neo4j_diary_count != qdrant_diary_count:
+            issues_found = True
+            logger.warning(
+                f"consistency [{user_id}]: Diary count mismatch — "
+                f"Neo4j: {neo4j_diary_count}, Qdrant: {qdrant_diary_count}"
+            )
+            _log_diff(neo4j_diary_ids, qdrant_diary_ids, user_id, "diary", "Neo4j", "Qdrant")
+        else:
+            logger.info(f"consistency [{user_id}]: Diary OK ({neo4j_diary_count})")
+
+        # --- Dangling MENTIONS: diary links to non-existent facts ---
+        with neo4j_driver.session() as s:
+            bad_mentions = list(s.run(
+                """
+                MATCH (d:DiaryEntry {userId: $userId})-[r:MENTIONS]->(target)
+                WHERE NOT target:Fact
+                RETURN count(*) AS count
+                """,
+                userId=user_id
+            ))
+        count = bad_mentions[0]["count"] if bad_mentions else 0
+        if count:
+            issues_found = True
+            total_dangling_links += count
+            logger.warning(f"consistency [{user_id}]: {count} MENTIONS link(s) to non-Fact nodes")
+
+    # --- Data quality (cross-user) ---
+    with neo4j_driver.session() as s:
+        no_user = list(s.run("MATCH (f:Fact) WHERE f.userId IS NULL RETURN count(*) AS count"))
+    no_user_count = no_user[0]["count"] if no_user else 0
+    if no_user_count:
+        issues_found = True
+        logger.warning(f"consistency: {no_user_count} facts have no userId")
+
+    with neo4j_driver.session() as s:
+        diary_no_user = list(s.run("MATCH (d:DiaryEntry) WHERE d.userId IS NULL RETURN count(*) AS count"))
+    diary_no_user_count = diary_no_user[0]["count"] if diary_no_user else 0
+    if diary_no_user_count:
+        issues_found = True
+        logger.warning(f"consistency: {diary_no_user_count} diary entries have no userId")
+
+    with neo4j_driver.session() as s:
+        orphan_cats = list(s.run("""
+            MATCH (c:Category)
+            WHERE NOT (c)<-[:IN_CATEGORY]-(:Fact)
+            RETURN c.name AS name
+        """))
+    for r in orphan_cats:
+        issues_found = True
+        logger.warning(f"consistency: Orphan category '{r['name']}' has no facts linked")
+
+    if not issues_found:
+        logger.info("consistency: All checks passed — no discrepancies found")
+    else:
+        logger.info(
+            f"consistency: Summary — {len(user_ids)} users checked, "
+            f"{total_dangling_links} dangling links"
+        )
+
+
+async def _scroll_qdrant_ids(qdrant, collection: str, user_id: str) -> set:
+    """Scroll all Qdrant point IDs for a user in a collection."""
+    ids = set()
+    try:
+        offset = None
+        while True:
+            result = await qdrant.scroll(
+                collection_name=collection,
+                limit=1000,
+                offset=offset,
+                with_payload=False,
+                with_vectors=False,
+                scroll_filter=Filter(must=[FieldCondition(key="userId", match=MatchValue(value=user_id))]),
+            )
+            points, next_offset = result
+            for p in points:
+                ids.add(str(p.id))
+            if next_offset is None:
+                break
+            offset = next_offset
+    except Exception as e:
+        logger.error(f"consistency: Qdrant scroll failed for {collection}/{user_id}: {e}")
+    return ids
+
+
+def _log_diff(set_a: set, set_b: set, user_id: str, label: str, label_a: str, label_b: str):
+    """Log IDs that are in one set but not the other."""
+    only_a = set_a - set_b
+    only_b = set_b - set_a
+    if only_a:
+        logger.warning(
+            f"consistency [{user_id}]: {len(only_a)} {label}(s) in {label_a} only: "
+            f"{','.join(sorted(only_a)[:20])}"
+        )
+    if only_b:
+        logger.warning(
+            f"consistency [{user_id}]: {len(only_b)} {label}(s) in {label_b} only: "
+            f"{','.join(sorted(only_b)[:20])}"
+        )
 
 
 # ---------------------------------------------------------------------------
