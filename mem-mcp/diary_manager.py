@@ -537,3 +537,41 @@ async def run_diary_consistency_checks():
         logger.info("consistency diary: All checks passed")
     else:
         logger.info(f"consistency diary: Summary — {len(user_ids)} users checked, {dangling_links} dangling links")
+
+
+async def fix_diary_entries():
+    """Auto-fix diary entries with missing title or timestamp."""
+    neo4j_driver = get_neo4j()
+    if not neo4j_driver:
+        return
+
+    fixed_any = False
+
+    with neo4j_driver.session() as s:
+        # Fix missing titles
+        result = s.run(
+            "MATCH (d:DiaryEntry) WHERE d.name IS NULL OR d.name = '' "
+            "SET d.name = 'Untitled Diary Entry' "
+            "RETURN count(*) AS count"
+        )
+        count = result.single()["count"]
+        if count:
+            fixed_any = True
+            logger.info(f"fix: Set title on {count} untitled diary entries")
+
+    with neo4j_driver.session() as s:
+        # Fix missing timestamps
+        now = datetime.now(timezone.utc).isoformat()
+        result = s.run(
+            "MATCH (d:DiaryEntry) WHERE d.timestamp IS NULL OR d.timestamp = '' "
+            "SET d.timestamp = $now "
+            "RETURN count(*) AS count",
+            now=now
+        )
+        count = result.single()["count"]
+        if count:
+            fixed_any = True
+            logger.info(f"fix: Set timestamp on {count} diary entries to {now}")
+
+    if not fixed_any:
+        logger.info("fix diary: Nothing to fix")

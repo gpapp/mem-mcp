@@ -61,6 +61,7 @@ async def lifespan(app):
     async with mcp_app.lifespan(mcp_app):
         await mem.run_consistency_checks()
         await mem.run_diary_consistency_checks()
+        await mem.fix_diary_entries()
         await mem.sync_orphans()
         yield
 
