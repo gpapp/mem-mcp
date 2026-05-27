@@ -645,18 +645,18 @@ def db_list_memories(user_id: str) -> list:
         result = s.run(
             """
             MATCH (c:Category)<-[:IN_CATEGORY]-(f:Fact {userId: $userId})
-            OPTIONAL MATCH (f)-[r]-(other {userId: $userId})
-            WHERE (other:Fact OR other:DiaryEntry)
-              AND type(r) <> 'IN_CATEGORY' AND type(r) <> 'KNOWS'
             RETURN f, c.name as category,
-                   collect(CASE WHEN other IS NOT NULL THEN {
-                     rel: type(r),
-                     target_id: other.id,
-                     target_text: coalesce(other.text, other.content),
-                     target_name: other.name,
-                     target_label: head(labels(other)),
-                     direction: CASE WHEN startNode(r) = f THEN 'out' ELSE 'in' END
-                   } END) as links
+                   [(f)-[r]-(other {userId: $userId})
+                    WHERE (other:Fact OR other:DiaryEntry)
+                      AND type(r) <> 'IN_CATEGORY' AND type(r) <> 'KNOWS'
+                    | {
+                      rel: type(r),
+                      target_id: other.id,
+                      target_text: coalesce(other.text, other.content),
+                      target_name: other.name,
+                      target_label: head(labels(other)),
+                      direction: CASE WHEN startNode(r) = f THEN 'out' ELSE 'in' END
+                    }] as links
             ORDER BY coalesce(f.name, f.text) ASC
             """,
             userId=user_id,
