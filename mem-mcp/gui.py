@@ -256,6 +256,7 @@ class DiaryCreate(BaseModel):
     id: Optional[str] = None
     timestamp: str
     linked_facts: Optional[list[str]] = None
+    metadata: Optional[dict] = None
 
 class DiaryLink(BaseModel):
     factId: str
@@ -266,10 +267,10 @@ async def api_update_diary_entry(entry_id: str, request: Request, body: DiaryCre
     """Update a diary entry's content, name, and/or timestamp."""
     try:
         user_id = _require_user(request)
-        ok = await mem.db_update_diary(entry_id, user_id, content=body.content, name=body.name, timestamp=body.timestamp, linked_facts=body.linked_facts)
+        ok = await mem.db_update_diary(entry_id, user_id, content=body.content, name=body.name, timestamp=body.timestamp, linked_facts=body.linked_facts, metadata=body.metadata)
         if not ok:
             raise HTTPException(status_code=404, detail="Diary entry not found or access denied.")
-        return {"id": entry_id, "content": body.content, "name": body.name, "timestamp": body.timestamp}
+        return {"id": entry_id, "content": body.content, "name": body.name, "timestamp": body.timestamp, "metadata": body.metadata}
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
@@ -445,7 +446,7 @@ async def api_save_diary(request: Request, body: DiaryCreate):
             if body.id != new_id:
                 await mem.db_delete_diary(body.id, user_id)
 
-        entry_ts = await mem.db_save_diary(body.content, user_id, body.timestamp, body.name, linked_facts=body.linked_facts)
+        entry_ts = await mem.db_save_diary(body.content, user_id, body.timestamp, body.name, linked_facts=body.linked_facts, metadata=body.metadata)
         return {"timestamp": entry_ts, "content": body.content, "name": body.name}
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))

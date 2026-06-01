@@ -1655,6 +1655,19 @@ npm install @modelcontextprotocol/sdk</code></pre>
     const viewEl = document.getElementById('diary-view-content');
     viewEl.classList.remove('empty');
     viewEl.innerHTML = renderDiaryViewMode(entry);
+    renderDiaryMetaDisplay(entry);
+  }
+
+  function renderDiaryMetaDisplay(entry) {
+    const el = document.getElementById('diary-detail-meta');
+    if (!el) return;
+    const meta = entry.metadata || {};
+    const rows = Object.entries(meta);
+    if (!rows.length) return;
+    el.innerHTML = `<div style="font-size:.75rem; font-weight:700; text-transform:uppercase; color:var(--muted); letter-spacing:.5px; margin-bottom:.3rem;">Metadata</div>
+      <table style="width:100%; border-collapse:collapse; font-size:.8rem;">
+        ${rows.map(([k, v]) => `<tr><td style="padding:2px 4px; color:var(--muted);">${escHtml(k)}</td><td style="padding:2px 4px;">${escHtml(String(v))}</td></tr>`).join('')}
+      </table>`;
   }
 
   function renderDiaryViewMode(entry) {
@@ -1681,6 +1694,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
         </div>
       </div>
       <div class="markdown-body">${marked.parse(entry.content || '')}</div>
+      <div id="diary-detail-meta" style="margin-top:1rem;"></div>
       <div style="margin-top:1.5rem; padding-top:1rem; border-top:1px solid var(--border);">
         <div style="font-size:.75rem; font-weight:700; text-transform:uppercase; color:var(--muted); letter-spacing:.5px; margin-bottom:.4rem;">Linked Facts ${mentions ? '(' + (entry.mentions||[]).length + ')' : ''}</div>
         ${mentions || '<span style="font-size:.85rem;color:var(--muted);">No linked facts.</span>'}
@@ -1726,6 +1740,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
           <label style="font-size:.75rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;display:block;margin-bottom:.2rem;">Content</label>
           <textarea id="de-content" style="width:100%;min-height:200px;padding:.4rem .5rem;border:1px solid var(--border);border-radius:6px;font-size:.85rem;font-family:inherit;">${escHtml(entry.content || '')}</textarea>
         </div>
+        <div id="de-meta-section"></div>
       </div>
       <div style="margin-top:.5rem; padding-top:.5rem; border-top:1px solid var(--border);">
         <div style="font-size:.75rem;font-weight:700;text-transform:uppercase;color:var(--muted);letter-spacing:.5px;margin-bottom:.4rem;">Linked Facts</div>
@@ -1745,6 +1760,67 @@ npm install @modelcontextprotocol/sdk</code></pre>
         <button class="btn btn-ghost" onclick="selectDiaryEntry('${entry.id}')">Cancel</button>
         <button class="btn btn-primary" onclick="saveDiaryEdit('${entry.id}')">💾 Save</button>
       </div>`;
+    renderDiaryMetaEditor(entry);
+  }
+
+  function renderDiaryMetaEditor(entry) {
+    const el = document.getElementById('de-meta-section');
+    if (!el) return;
+    const meta = entry.metadata || {};
+    const rows = Object.entries(meta);
+    el.innerHTML = `<div style="font-size:.75rem; font-weight:700; text-transform:uppercase; color:var(--muted); letter-spacing:.5px; margin-bottom:.3rem;">Metadata</div>
+      <table id="de-meta-editor-table" style="width:100%; border-collapse:collapse; font-size:.8rem; margin-bottom:.3rem;">
+        <thead><tr><th style="text-align:left; padding:2px 4px; color:var(--muted);">Key</th><th style="text-align:left; padding:2px 4px; color:var(--muted);">Value</th><th></th></tr></thead>
+        <tbody>
+          ${rows.map(([k, v]) => `<tr data-key="${escHtml(k)}">
+            <td style="padding:2px 4px;"><input class="de-meta-key" value="${escHtml(k)}" style="width:100%; border:1px solid var(--border); border-radius:3px; padding:2px 4px;"></td>
+            <td style="padding:2px 4px;"><input class="de-meta-val" value="${escHtml(String(v))}" style="width:100%; border:1px solid var(--border); border-radius:3px; padding:2px 4px;"></td>
+            <td style="padding:2px 4px;"><button class="btn btn-danger btn-sm" onclick="removeDiaryMetaRow(this)" name="Delete">🗑️</button></td>
+          </tr>`).join('')}
+          <tr data-key="">
+            <td style="padding:2px 4px;"><input class="de-meta-key" placeholder="new key" style="width:100%; border:1px solid var(--border); border-radius:3px; padding:2px 4px;"></td>
+            <td style="padding:2px 4px;"><input class="de-meta-val" placeholder="value" style="width:100%; border:1px solid var(--border); border-radius:3px; padding:2px 4px;"></td>
+            <td style="padding:2px 4px;"><button class="btn btn-danger btn-sm" onclick="removeDiaryMetaRow(this)" name="Delete">🗑️</button></td>
+          </tr>
+        </tbody>
+      </table>
+      <button class="btn btn-ghost btn-sm" onclick="addDiaryMetaRow()">➕ Add Row</button>`;
+  }
+
+  function removeDiaryMetaRow(btn) {
+    const row = btn.closest('tr');
+    const key = row.querySelector('.de-meta-key')?.value?.trim();
+    const tbody = row.closest('tbody');
+    if (key && key !== row.dataset.key) return;
+    if (tbody.querySelectorAll('tr').length > 1) {
+      row.remove();
+    } else {
+      row.querySelectorAll('input').forEach(i => i.value = '');
+    }
+  }
+
+  function addDiaryMetaRow() {
+    const table = document.getElementById('de-meta-editor-table');
+    if (!table) return;
+    const tbody = table.querySelector('tbody');
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td style="padding:2px 4px;"><input class="de-meta-key" placeholder="new key" style="width:100%; border:1px solid var(--border); border-radius:3px; padding:2px 4px;"></td>
+      <td style="padding:2px 4px;"><input class="de-meta-val" placeholder="value" style="width:100%; border:1px solid var(--border); border-radius:3px; padding:2px 4px;"></td>
+      <td style="padding:2px 4px;"><button class="btn btn-danger btn-sm" onclick="removeDiaryMetaRow(this)" name="Delete">🗑️</button></td>`;
+    tbody.appendChild(tr);
+    tr.querySelector('.de-meta-key').focus();
+  }
+
+  function getDiaryMetaFromEditor() {
+    const table = document.getElementById('de-meta-editor-table');
+    if (!table) return {};
+    const meta = {};
+    table.querySelectorAll('tbody tr').forEach(tr => {
+      const k = tr.querySelector('.de-meta-key')?.value?.trim();
+      const v = tr.querySelector('.de-meta-val')?.value?.trim();
+      if (k) meta[k] = v;
+    });
+    return meta;
   }
 
   async function saveDiaryEdit(entryId) {
@@ -1752,10 +1828,13 @@ npm install @modelcontextprotocol/sdk</code></pre>
     const timestamp = document.getElementById('de-timestamp').value;
     const content = document.getElementById('de-content').value.trim();
     if (!name || !timestamp || !content) { toast('⚠️ Title, Date, and Content are required'); return; }
+    const metadata = getDiaryMetaFromEditor();
+    const payload = {name, timestamp, content};
+    if (Object.keys(metadata).length) payload.metadata = metadata;
     try {
-      const updated = await api.put('diary/' + entryId, {name, timestamp, content});
+      const updated = await api.put('diary/' + entryId, payload);
       const entry = diaryEntries.find(e => e.id === entryId);
-      if (entry) { entry.name = updated.name; entry.content = updated.content; entry.timestamp = updated.timestamp; entry.date = updated.timestamp.substring(0,10); }
+      if (entry) { entry.name = updated.name; entry.content = updated.content; entry.timestamp = updated.timestamp; entry.date = updated.timestamp.substring(0,10); entry.metadata = updated.metadata; }
       toast('✅ Diary entry updated');
       selectDiaryEntry(entryId);
     } catch(e) { toast('❌ Error updating entry'); }
