@@ -308,7 +308,7 @@ Call `diary_save_entry` with:
 - `content` = the subagent-rendered diary content (exact format above)
 - `name` = meeting title
 - `timestamp` = ISO-8601 with time **rounded to the nearest 15 minutes** (:00, :15, :30, :45), e.g. `2026-05-15T10:00:00`
-- `metadata` = `{"original_file": "<path to original transcription file>"}` (omit if no source file)
+- `metadata` = `{"original_file": "<path to original transcription file>", "meeting_date": "<date>", "topic": "<topic>"}` — always include metadata when processing transcripts; it enables cross-referencing, source tracing, and downstream queries
 
 **After saving the diary entry, link it to every fact it references:**
 
