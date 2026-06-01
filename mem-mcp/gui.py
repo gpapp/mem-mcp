@@ -447,7 +447,7 @@ async def api_save_diary(request: Request, body: DiaryCreate):
                 await mem.db_delete_diary(body.id, user_id)
 
         entry_ts = await mem.db_save_diary(body.content, user_id, body.timestamp, body.name, linked_facts=body.linked_facts, metadata=body.metadata)
-        return {"timestamp": entry_ts, "content": body.content, "name": body.name}
+        return {"timestamp": entry_ts, "content": body.content, "name": body.name, "metadata": body.metadata}
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 

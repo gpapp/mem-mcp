@@ -2,6 +2,7 @@
 diary_manager.py – Diary entry management, search, and automatic link generation.
 """
 
+import json
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -59,7 +60,7 @@ async def db_save_diary(content: str, user_id: str, timestamp: str, name: str, m
     with neo4j_driver.session() as s:
         params = dict(userId=user_id, id=doc_id, date=entry_date, timestamp=timestamp, content=content, name=name)
         if metadata:
-            params["metadata"] = metadata
+            params["metadata"] = json.dumps(metadata)
         s.run(
             f"""
             MERGE (u:User {{id: $userId}})
@@ -189,6 +190,7 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
             "content": content,
             "name": name,
             "score": score,
+            "metadata": r.payload.get("metadata") or {},
             "mentions": mentions
         })
 
@@ -220,14 +222,16 @@ async def db_update_diary(entry_id: str, user_id: str, content: Optional[str] = 
         new_content = content if content is not None else existing["content"]
         new_name = name if name is not None else existing["name"]
         new_ts = timestamp if timestamp is not None else existing["timestamp"]
-        new_metadata = metadata if metadata is not None else existing.get("metadata")
+        raw_meta = existing.get("metadata")
+        existing_meta = json.loads(raw_meta) if isinstance(raw_meta, str) else (raw_meta or {})
+        new_metadata = metadata if metadata is not None else existing_meta
         entry_date = new_ts[:10]
 
         neo4j_props = "d.content = $content, d.name = $name, d.timestamp = $ts, d.date = $date"
         params = dict(id=entry_id, userId=user_id, content=new_content, name=new_name, ts=new_ts, date=entry_date)
         if new_metadata is not None:
             neo4j_props += ", d.metadata = $metadata"
-            params["metadata"] = new_metadata
+            params["metadata"] = json.dumps(new_metadata)
 
         s.run(
             f"""
@@ -394,6 +398,7 @@ def db_list_diary(user_id: str) -> list:
             MATCH (d:DiaryEntry {userId: $userId})
             OPTIONAL MATCH (d)-[:MENTIONS]->(f:Fact)
             RETURN d.id as id, d.date as date, d.content as content, d.timestamp as timestamp, d.name as name,
+                   d.metadata as metadata,
                    collect({id: f.id, text: f.text, name: f.name}) as mentions
             ORDER BY d.date DESC, d.timestamp DESC
             """,
@@ -406,6 +411,7 @@ def db_list_diary(user_id: str) -> list:
                 "content": r["content"], 
                 "name": r.get("name") or "Unnamed Entry",
                 "timestamp": format_ts_for_picker(r.get("timestamp")),
+                "metadata": (json.loads(r["metadata"]) if isinstance(r.get("metadata"), str) else (r.get("metadata") or {})),
                 "mentions": [m for m in r["mentions"] if m.get("id")]
             } for r in result
         ]
