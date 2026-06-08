@@ -32,7 +32,7 @@ services:
       - ./neo4j_logs:/logs
 
   ollama:
-    image: alpine/ollama:latest
+    image: ollama/ollama:latest
     container_name: ollama
     restart: always
     volumes:
