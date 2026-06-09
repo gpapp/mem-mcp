@@ -250,28 +250,6 @@ link_facts(diary_entry_id, action_id, "RECORDS")       ← for each action item
 
 These links make the diary navigable from any fact and vice versa.
 
-### 11. Meeting Summary Fact
-
-Store one summary fact per meeting:
-
-```
-Title: Meeting Summary: [Topic] — YYYY-MM-DD
-Category: Project
-Text:
-  # [Topic]
-  **Date:** YYYY-MM-DD  **Participants:** [names]
-
-  ## Decisions
-  - ...
-
-  ## Action Items
-  - [ ] Task — Owner: Name — Due: date
-
-  ## Links
-  - [Fact name] (created/updated)
-```
-
-Link the summary fact to each participant: `summary → person: ATTENDED_BY`.
 
 ---
 
