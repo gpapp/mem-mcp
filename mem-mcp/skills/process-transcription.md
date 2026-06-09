@@ -131,30 +131,15 @@ General work-related: use `People` (for personnel), `Project`/`Projects` (for in
 
 Use mem0_add_fact for storing facts and mem0_link_facts for creating relationships between facts.
 
-### 7. Facts, Decisions, Action Items
-
-Store all other extracted entities with rich Markdown context. Use confirmed ownership from Phase 2.
-
-**Tools:**
-- `add_fact(name, text, category)` — new facts
-- `update_fact(memoryId, text, category)` — update existing (new info only)
 - `link_facts(sourceFactId, targetFactId, relationshipType)` — build the graph
-
-**Reprocessing guard:** before creating any fact, run `search_facts` with liberal parameters (top_p=0.4, limit=10) using **the fact's name only** (no role, company, or description context). The vector search handles partial name matching automatically — extra words in the query dilute the name signal. If it already exists, update instead of creating a duplicate.
 
 **Link immediately after creating each fact:**
 
 | Relationship | Type |
 |---|---|
 | Person → Project | `WORKS_ON` |
-| Person → Action Item | `ASSIGNED_TO` |
-| Person → Decision | `DECIDED` |
-| Decision → Project | `DECIDED_FOR` |
-| Action Item → Project | `PART_OF` |
 | Person → Client/Org | `WORKS_FOR` |
 | Meeting Summary → Person | `ATTENDED_BY` |
-| Meeting Summary → Decision | `CONTAINS` |
-| Meeting Summary → Action Item | `CONTAINS` |
 | Diary Entry → Meeting Summary | `REFERENCES` |
 | Diary Entry → Person | `MENTIONS` |
 | Diary Entry → Project | `MENTIONS` |
@@ -197,6 +182,12 @@ DIARY FORMAT (use this exactly):
 
 ## Context
 2-3 sentences: what meeting, why, who led.
+
+## Description
+Detailed description of the meeting subject.
+If processes were described, make sure all steps, responsibles are listed. Mention all architecture components, caveats that were mentioned.
+Make sure to list all relevant information for the role you are working in. 
+Ignore personal stories/nicities.
 
 ## Decisions
 - {numbered list of every decision made}
