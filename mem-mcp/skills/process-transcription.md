@@ -1,7 +1,6 @@
 ---
 name: process-transcription
 description: Structured workflow for processing meeting transcriptions into the knowledge graph. Includes interactive human checkpoints for people resolution and fact-person assignment before writing anything to memory.
-context: fork
 ---
 
 ## When to Use This Skill
@@ -13,6 +12,9 @@ Use this skill when you have:
 - Need to store extracted information in memory systems for future reference
 
 ---
+Consider the original role defined in AGENTS.md to ensure the summarization is relevant to the role.
+
+Use @general subagent to execute the processing in it's own space.
 
 ## Phase 1 — Extract (read-only, no writes)
 
@@ -94,38 +96,9 @@ Rules:
 - **Never create a People record without explicit human confirmation.**
 - Batch unambiguous names into one `question` call using `multiple: true`.
 
-### 5. Fact–Person Assignment
-
-After all people are resolved, use the **`question` tool** once to assign all decisions, actions, and project involvements in a single interaction:
-
-```
-header: "Fact–Person Assignment"
-question: "Who is involved in each of the following? Reply with the letter(s) for each item."
-options:
-  - label: "A) Rafael Papp"
-  - label: "B) Tim Lohman"
-  - label: "C) Kate Müller"
-  - label: "D) Someone not listed — I'll name them"
-  - label: "E) Unassigned / unknown"
-multiple: true
-```
-
-Present the full list of items in the question body:
-```
-1. Decision: Proceed with Concur LEC on SAP ISP
-2. Action:   Complete schema mapping by end of month
-3. Action:   Schedule DB AI workshop for week of Mar 16
-4. Project:  Deutsche Bank AI Adoption (involvement — multi ok)
-```
-
-- Accept multiple letters per item (e.g. `A,C`).
-- If the human answers `D`, ask for the name before proceeding.
-- If `E`, store the fact unlinked and note it as unassigned.
-- **Do not proceed to Phase 3 until the human has replied to this message.**
-
 ---
 
-## Phase 3 — Store (after human confirmation only)
+## Phase 2 — Store (after human confirmation only)
 
 Execute all writes in one batched response — do not pause between individual calls.
 
@@ -169,44 +142,6 @@ Store all other extracted entities with rich Markdown context. Use confirmed own
 
 **Reprocessing guard:** before creating any fact, run `search_facts` with liberal parameters (top_p=0.4, limit=10) using **the fact's name only** (no role, company, or description context). The vector search handles partial name matching automatically — extra words in the query dilute the name signal. If it already exists, update instead of creating a duplicate.
 
-**Content separation rules by category:**
-
-*Project facts* describe the project itself — not meeting outcomes:
-```
-Title: Deutsche Bank AI Adoption
-Category: Project
-Text:
-  **Purpose:** [what the project is for]
-  **Status:** [current state]
-  **Tech stack:** [technologies used]
-  **Open questions:** [unresolved design/direction questions]
-```
-Do not add: who attended a meeting about it, what was decided in a meeting. Link the project to Decision and Action Item facts instead.
-
-*Decision facts* describe a specific decision with full event context:
-```
-Title: Decision: Proceed with Concur LEC on SAP ISP — YYYY-MM-DD
-Category: Decision
-Text:
-  **Decided:** YYYY-MM-DD  **Meeting:** [name]
-  **Owner:** [confirmed person]
-  **Decision:** [what was decided]
-  **Rationale:** [why]
-  **Impact:** [affected projects/systems]
-```
-
-*Action Item facts* carry the task with all context needed to act on it:
-```
-Title: Action: Complete schema mapping by end of month — YYYY-MM-DD
-Category: Action
-Text:
-  **Assigned to:** [confirmed person]
-  **Due:** [date]
-  **From meeting:** [name] — YYYY-MM-DD
-  **Task:** [full description]
-  **Linked project:** [project name]
-```
-
 **Link immediately after creating each fact:**
 
 | Relationship | Type |
@@ -230,6 +165,8 @@ Before writing anything to memory, spawn a **dedicated subagent** (using the `ta
 
 ```
 You are a summarization agent. Based on the extracted data below, produce:
+
+{INTEREST FROM THE AGENTS.MD FILE}
 
 1. A diary entry in the exact format below.
 2. A local save file in the exact same format.
