@@ -1,7 +1,6 @@
 ---
 name: process-transcription
 description: Structured workflow for processing meeting transcriptions into the knowledge graph. Includes interactive human checkpoints for people resolution and fact-person assignment before writing anything to memory.
-context: fork
 ---
 
 ## When to Use This Skill
@@ -13,6 +12,9 @@ Use this skill when you have:
 - Need to store extracted information in memory systems for future reference
 
 ---
+Consider the original role defined in AGENTS.md to ensure the summarization is relevant to the role.
+
+Use @general subagent to execute the processing in it's own space.
 
 ## Phase 1 — Extract (read-only, no writes)
 
@@ -169,44 +171,6 @@ Store all other extracted entities with rich Markdown context. Use confirmed own
 
 **Reprocessing guard:** before creating any fact, run `search_facts` with liberal parameters (top_p=0.4, limit=10) using **the fact's name only** (no role, company, or description context). The vector search handles partial name matching automatically — extra words in the query dilute the name signal. If it already exists, update instead of creating a duplicate.
 
-**Content separation rules by category:**
-
-*Project facts* describe the project itself — not meeting outcomes:
-```
-Title: Deutsche Bank AI Adoption
-Category: Project
-Text:
-  **Purpose:** [what the project is for]
-  **Status:** [current state]
-  **Tech stack:** [technologies used]
-  **Open questions:** [unresolved design/direction questions]
-```
-Do not add: who attended a meeting about it, what was decided in a meeting. Link the project to Decision and Action Item facts instead.
-
-*Decision facts* describe a specific decision with full event context:
-```
-Title: Decision: Proceed with Concur LEC on SAP ISP — YYYY-MM-DD
-Category: Decision
-Text:
-  **Decided:** YYYY-MM-DD  **Meeting:** [name]
-  **Owner:** [confirmed person]
-  **Decision:** [what was decided]
-  **Rationale:** [why]
-  **Impact:** [affected projects/systems]
-```
-
-*Action Item facts* carry the task with all context needed to act on it:
-```
-Title: Action: Complete schema mapping by end of month — YYYY-MM-DD
-Category: Action
-Text:
-  **Assigned to:** [confirmed person]
-  **Due:** [date]
-  **From meeting:** [name] — YYYY-MM-DD
-  **Task:** [full description]
-  **Linked project:** [project name]
-```
-
 **Link immediately after creating each fact:**
 
 | Relationship | Type |
@@ -230,6 +194,8 @@ Before writing anything to memory, spawn a **dedicated subagent** (using the `ta
 
 ```
 You are a summarization agent. Based on the extracted data below, produce:
+
+{INTEREST FROM THE AGENTS.MD FILE}
 
 1. A diary entry in the exact format below.
 2. A local save file in the exact same format.
