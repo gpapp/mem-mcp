@@ -214,6 +214,13 @@ async def db_delete_memory(memory_id: str, user_id: str) -> bool:
         collection_name=COLLECTION_NAME,
         points_selector=[memory_id],
     )
+    with neo4j_driver.session() as s:
+        # Find category to check for orphans after deletion
+        cat_res = s.run(
+            "MATCH (f:Fact {id: $id, userId: $userId})-[:IN_CATEGORY]->(c:Category) RETURN c.name as cat",
+            id=memory_id, userId=user_id
+        ).single()
+        category_to_check = cat_res["cat"] if cat_res else None
 
     with neo4j_driver.session() as s:
         result = s.run(
@@ -222,12 +229,26 @@ async def db_delete_memory(memory_id: str, user_id: str) -> bool:
         )
         rec = result.single()
         if (rec and rec["n"] > 0):
+        deleted = (rec and rec["n"] > 0)
+
+        if category_to_check:
+            # Prune category if it has no more facts
+            s.run("MATCH (c:Category {name: $cat}) WHERE NOT (c)<-[:IN_CATEGORY]-() DETACH DELETE c", cat=category_to_check)
+
+        if deleted:
+            # Delete from Qdrant only if found in Neo4j
+            await qdrant.delete(
+                collection_name=COLLECTION_NAME,
+                points_selector=[memory_id],
+            )
+
             await publish_db_event(user_id, "memory_changed", {
                 "action": "delete",
                 "id": memory_id
             })
             return True
         return True # Qdrant already done
+        return False
 
 
 async def db_link_facts(source_id: str, target_id: str, rel_type: str, metadata: dict, user_id: str):
@@ -1206,6 +1227,11 @@ async def db_merge_memories(master_id: str, duplicate_ids: List[str], user_id: s
             duplicateIds=duplicate_ids, userId=user_id
         )
 
+        # Prune orphan categories that might have been left behind by merged duplicates
+        s.run(
+            "MATCH (c:Category) WHERE NOT (c)<-[:IN_CATEGORY]-() DETACH DELETE c"
+        )
+
 
 
         # 6. Explicitly delete duplicate nodes as a safety measure to ensure they are removed from Neo4j
@@ -1515,6 +1541,7 @@ async def sync_orphans():
 
     total_deleted = 0
     total_reembedded = 0
+    total_pruned_links = 0
 
     for user_id in user_ids:
         # -----------------------------------------------------------------------
@@ -1657,6 +1684,34 @@ async def sync_orphans():
                 )
             total_reembedded += len(orphan_diary_neo4j)
 
+        # -----------------------------------------------------------------------
+        # Dangling links: relationships to nodes with wrong labels
+        # -----------------------------------------------------------------------
+        with neo4j_driver.session() as s:
+            # Mentions from diary entries must point to Facts
+            res = s.run(
+                "MATCH (d:DiaryEntry {userId: $userId})-[r:MENTIONS]->(t) WHERE NOT t:Fact DELETE r RETURN count(*) as n",
+                userId=user_id
+            ).single()
+            if res and res["n"] > 0:
+                logger.info(f"sync_orphans [{user_id}]: deleted {res['n']} dangling MENTIONS")
+                total_pruned_links += res["n"]
+
+            # Knowledge graph links from Facts must point to other Facts or DiaryEntries
+            res = s.run(
+                """
+                MATCH (f:Fact {userId: $userId})-[r]->(t)
+                WHERE NOT type(r) IN ['IN_CATEGORY', 'KNOWS']
+                  AND NOT t:Fact AND NOT t:DiaryEntry
+                DELETE r
+                RETURN count(*) as n
+                """,
+                userId=user_id
+            ).single()
+            if res and res["n"] > 0:
+                logger.info(f"sync_orphans [{user_id}]: deleted {res['n']} dangling Fact links")
+                total_pruned_links += res["n"]
+
     # -----------------------------------------------------------------------
     # Orphan categories: Category nodes with no facts → delete
     # -----------------------------------------------------------------------
@@ -1674,11 +1729,12 @@ async def sync_orphans():
                 "DETACH DELETE c"
             )
 
-    if total_deleted or total_reembedded or orphan_cats:
+    if total_deleted or total_reembedded or orphan_cats or total_pruned_links:
         logger.info(
             f"sync_orphans done: deleted {total_deleted} Qdrant orphans, "
             f"re-embedded {total_reembedded} Neo4j orphans, "
-            f"pruned {len(orphan_cats)} orphan categories"
+            f"pruned {len(orphan_cats)} orphan categories, "
+            f"removed {total_pruned_links} dangling links"
         )
     else:
         logger.info("sync_orphans: nothing to fix")
