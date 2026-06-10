@@ -229,7 +229,7 @@ async def db_delete_memory(memory_id: str, user_id: str) -> bool:
         )
         rec = result.single()
         if (rec and rec["n"] > 0):
-            deleted = (rec and rec["n"] > 0)
+        deleted = (rec and rec["n"] > 0)
 
         if category_to_check:
             # Prune category if it has no more facts
