@@ -1,7 +1,23 @@
 import time
+import os
+import logging
+from logging.handlers import RotatingFileHandler
 import structlog
 from functools import wraps
 from typing import Any, Dict, Callable, Optional
+
+# Ensure logs directory exists
+LOG_DIR = "/app/logs"
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_DIR, "mcp_tools.log")
+
+# Configure standard logging handler for the file
+file_handler = RotatingFileHandler(LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=5)
+file_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(name)s %(message)s'))
+
+# Attach to the standard logger that structlog will wrap
+logging.getLogger("mcp.memory").addHandler(file_handler)
+logging.getLogger("mcp.memory").setLevel(logging.INFO)
 
 logger = structlog.get_logger("mcp.memory")
 
