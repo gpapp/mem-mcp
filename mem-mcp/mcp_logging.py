@@ -18,7 +18,7 @@ def log_mcp_interaction(
     search queries, tool descriptions, and skill mapping.
     """
     log_payload = {
-        "event": "mcp_tool_execution",
+        "mcp_event": "mcp_tool_execution",
         "tool": tool_name,
         "arguments": arguments,
         "duration_ms": round(duration_ms, 2),
