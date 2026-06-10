@@ -1,0 +1,55 @@
+import time
+import structlog
+from functools import wraps
+from typing import Any, Dict, Callable, Optional
+
+logger = structlog.get_logger("mcp.memory")
+
+def log_mcp_interaction(
+    tool_name: str,
+    arguments: Dict[str, Any],
+    result: Any = None,
+    duration_ms: float = 0.0,
+    error: Optional[str] = None,
+    context: Optional[str] = None
+):
+    """
+    Logs an MCP tool interaction with specific fields for refining 
+    search queries, tool descriptions, and skill mapping.
+    """
+    log_payload = {
+        "event": "mcp_tool_execution",
+        "tool": tool_name,
+        "arguments": arguments,
+        "duration_ms": round(duration_ms, 2),
+        "success": error is None,
+        "context_hint": context,
+    }
+
+    if result:
+        # Truncate result for logs to avoid bloat while keeping enough for analysis
+        log_payload["result_summary"] = str(result)[:500]
+    
+    if error:
+        log_payload["error"] = error
+
+    logger.info("tool_use_stats", **log_payload)
+
+def monitor_mcp_tool(tool_name: str, context_provider: Optional[Callable] = None):
+    """Decorator for async MCP tool handlers."""
+    def decorator(func: Callable):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            start_time = time.perf_counter()
+            ctx = context_provider() if context_provider else None
+            try:
+                res = await func(*args, **kwargs)
+                duration = (time.perf_counter() - start_time) * 1000
+                log_mcp_interaction(tool_name, kwargs, result=res, duration_ms=duration, context=ctx)
+                return res
+            except Exception as e:
+                duration = (time.perf_counter() - start_time) * 1000
+                log_mcp_interaction(tool_name, kwargs, error=str(e), duration_ms=duration, context=ctx)
+                raise
+        return wrapper
+    return decorator

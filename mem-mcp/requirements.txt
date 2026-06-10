@@ -11,3 +11,4 @@ markdown2
 openai
 itsdangerous
 jinja2
+structlog

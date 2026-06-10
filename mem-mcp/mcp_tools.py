@@ -3,6 +3,7 @@ from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_http_headers
 from typing import Optional, List
 import memory as mem
+from mcp_logging import monitor_mcp_tool
 
 logger = logging.getLogger("memory-vault")
 
@@ -76,6 +77,7 @@ def _format_facts_md(facts: list) -> str:
     return "\n\n---\n\n".join(blocks)
 
 @mcp.tool()
+@monitor_mcp_tool("add_fact", context_provider=_current_user)
 async def add_fact(name: str, text: str, category: str):
     """
     Save a new fact or memory to the knowledge graph.
@@ -95,6 +97,7 @@ async def add_fact(name: str, text: str, category: str):
     return f"Successfully added memory with ID: {memory_id}"
 
 @mcp.tool()
+@monitor_mcp_tool("search_facts", context_provider=_current_user)
 async def search_facts(query: str, category: Optional[str] = None, limit: int = 5, top_p: float = 0.7, names_only: bool = False):
     """
     Search for facts matching query criteria.
@@ -111,23 +114,27 @@ async def search_facts(query: str, category: Optional[str] = None, limit: int = 
     return _format_facts_md(facts)
 
 @mcp.tool()
+@monitor_mcp_tool("list_categories", context_provider=_current_user)
 async def list_categories():
     """List all distinct categories currently used in the memory vault."""
     return mem.db_list_categories(_current_user())
 
 @mcp.tool()
+@monitor_mcp_tool("link_facts", context_provider=_current_user)
 async def link_facts(sourceFactId: str, targetFactId: str, relationshipType: str, metadata: Optional[dict] = None):
     """Create a bidirectional relationship between two facts (two-way link)."""
     await mem.db_link_facts(sourceFactId, targetFactId, relationshipType, metadata or {}, _current_user())
     return f"Linked: {sourceFactId} <-> {targetFactId}"
 
 @mcp.tool()
+@monitor_mcp_tool("unlink_facts", context_provider=_current_user)
 async def unlink_facts(sourceFactId: str, targetFactId: str, relationshipType: Optional[str] = None):
     """Remove a bidirectional relationship between two facts."""
     await mem.db_unlink_facts(sourceFactId, targetFactId, relationshipType, _current_user())
     return f"Unlinked: {sourceFactId} <-> {targetFactId}"
 
 @mcp.tool()
+@monitor_mcp_tool("get_fact_neighborhood", context_provider=_current_user)
 async def get_fact_neighborhood(factId: str, depth: int = 1, relationshipTypes: Optional[List[str]] = None):
     """
     Explore context around a fact.
@@ -139,6 +146,7 @@ async def get_fact_neighborhood(factId: str, depth: int = 1, relationshipTypes: 
     return _format_facts_md(neighbors)
 
 @mcp.tool()
+@monitor_mcp_tool("update_fact", context_provider=_current_user)
 async def update_fact(memoryId: str, name: Optional[str] = None, text: Optional[str] = None, category: Optional[str] = None):
     """
     Update an existing memory by ID. Provide only the fields that need updating.
@@ -150,12 +158,14 @@ async def update_fact(memoryId: str, name: Optional[str] = None, text: Optional[
     return f"Error: Memory {memoryId} not found or unauthorized."
 
 @mcp.tool()
+@monitor_mcp_tool("delete_fact", context_provider=_current_user)
 async def delete_fact(factId: str):
     """Delete a fact."""
     await mem.db_delete_memory(factId, _current_user())
     return f"Fact {factId} deleted"
 
 @mcp.tool()
+@monitor_mcp_tool("find_patterns", context_provider=_current_user)
 async def find_patterns():
     """
     Discover recurring themes across the knowledge graph.
@@ -170,6 +180,7 @@ async def find_patterns():
     return "\n".join(lines)
 
 @mcp.tool()
+@monitor_mcp_tool("diary_save_entry", context_provider=_current_user)
 async def diary_save_entry(content: str, name: str, timestamp: str, entryId: Optional[str] = None, metadata: Optional[dict] = None):
     """Save or update a diary entry.
 
@@ -193,6 +204,7 @@ async def diary_save_entry(content: str, name: str, timestamp: str, entryId: Opt
     return {"id": entry_id, "timestamp": entry_ts}
 
 @mcp.tool()
+@monitor_mcp_tool("diary_search_entries", context_provider=_current_user)
 async def diary_search_entries(query: str, limit: int = 3, top_p: float = 0.4):
     """Search diary entries using vector similarity or date/time filters.
 
@@ -213,6 +225,7 @@ async def diary_search_entries(query: str, limit: int = 3, top_p: float = 0.4):
     return await mem.db_search_diary(query, _current_user(), limit, top_p)
 
 @mcp.tool()
+@monitor_mcp_tool("list_diary_entries", context_provider=_current_user)
 async def list_diary_entries(fromTs: Optional[str] = None, toTs: Optional[str] = None):
     """
     List diary entry names with timestamps within a time range.
@@ -223,6 +236,7 @@ async def list_diary_entries(fromTs: Optional[str] = None, toTs: Optional[str] =
     return mem.db_list_diary_entries(_current_user(), fromTs, toTs)
 
 @mcp.tool()
+@monitor_mcp_tool("diary_delete_entry", context_provider=_current_user)
 async def diary_delete_entry(entryId: str):
     """Delete a diary entry by its ID.
 
@@ -235,6 +249,7 @@ async def diary_delete_entry(entryId: str):
     return f"Deleted diary entry {entryId}"
     
 @mcp.tool()
+@monitor_mcp_tool("find_duplicates", context_provider=_current_user)
 async def find_duplicates(category: str = "People", limit: int = 50, threshold: float = 0.75, max_cluster: int = 4, group_by: Optional[str] = "first_name"):
     """
     Find potential duplicate entries in memory by comparing embeddings similarity ranking.
@@ -251,6 +266,7 @@ async def find_duplicates(category: str = "People", limit: int = 50, threshold: 
         return f"Error: {str(e)}"
 
 @mcp.tool()
+@monitor_mcp_tool("merge_facts", context_provider=_current_user)
 async def merge_facts(masterId: str, duplicateIds: List[str], mergedName: str, mergedText: str):
     """
     Merge duplicate facts into a single master record.
@@ -274,6 +290,7 @@ async def merge_facts(masterId: str, duplicateIds: List[str], mergedName: str, m
     return f"Successfully merged {len(duplicateIds)} facts into {masterId}"
 
 @mcp.tool()
+@monitor_mcp_tool("suggest_merge", context_provider=_current_user)
 async def suggest_merge(cluster_json: str):
     """
     Analyze a cluster of potential duplicates and return a structured comparison
@@ -351,6 +368,7 @@ async def suggest_merge(cluster_json: str):
     }
 
 @mcp.tool()
+@monitor_mcp_tool("find_skills", context_provider=_current_user)
 async def find_skills():
     """
     Scan the skills/ directory and list all available skill workflows.
@@ -363,6 +381,7 @@ async def find_skills():
     return [f[:-3] for f in os.listdir(skills_dir) if f.endswith(".md")]
 
 @mcp.tool()
+@monitor_mcp_tool("get_skill_workflow", context_provider=_current_user)
 async def get_skill_workflow(skillName: str):
     """
     Retrieve the detailed markdown workflow for a specific skill.
