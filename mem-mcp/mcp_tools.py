@@ -122,16 +122,31 @@ async def list_categories():
 @mcp.tool()
 @monitor_mcp_tool("link_facts", context_provider=_current_user)
 async def link_facts(sourceFactId: str, targetFactId: str, relationshipType: str, metadata: Optional[dict] = None):
-    """Create a bidirectional relationship between two facts (two-way link)."""
-    await mem.db_link_facts(sourceFactId, targetFactId, relationshipType, metadata or {}, _current_user())
-    return f"Linked: {sourceFactId} <-> {targetFactId}"
+    """
+    Create a bidirectional relationship between two facts or a fact and a diary entry.
+    IMPORTANT: Use the exact 'id' field returned by search_facts or diary_search_entries. 
+    Do not use raw timestamp strings as IDs.
+    """
+    try:
+        await mem.db_link_facts(sourceFactId, targetFactId, relationshipType, metadata or {}, _current_user())
+        return f"Linked: {sourceFactId} <-> {targetFactId}"
+    except Exception as e:
+        logger.warning(f"Failed to link facts: {e}")
+        return f"Error: Could not link facts. Ensure both IDs are correct and exist. Details: {str(e)}"
 
 @mcp.tool()
 @monitor_mcp_tool("unlink_facts", context_provider=_current_user)
 async def unlink_facts(sourceFactId: str, targetFactId: str, relationshipType: Optional[str] = None):
-    """Remove a bidirectional relationship between two facts."""
-    await mem.db_unlink_facts(sourceFactId, targetFactId, relationshipType, _current_user())
-    return f"Unlinked: {sourceFactId} <-> {targetFactId}"
+    """
+    Remove a bidirectional relationship between two facts.
+    Use the exact 'id' fields returned by the system.
+    """
+    try:
+        await mem.db_unlink_facts(sourceFactId, targetFactId, relationshipType, _current_user())
+        return f"Unlinked: {sourceFactId} <-> {targetFactId}"
+    except Exception as e:
+        logger.warning(f"Failed to unlink facts: {e}")
+        return f"Error: Could not unlink facts. Details: {str(e)}"
 
 @mcp.tool()
 @monitor_mcp_tool("get_fact_neighborhood", context_provider=_current_user)
