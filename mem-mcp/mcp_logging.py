@@ -19,6 +19,20 @@ file_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(name)s 
 logging.getLogger("mcp.memory").addHandler(file_handler)
 logging.getLogger("mcp.memory").setLevel(logging.INFO)
 
+# Configure structlog to use the standard library logging so messages reach the file handler
+structlog.configure(
+    processors=[
+        structlog.stdlib.add_log_level,
+        structlog.stdlib.add_logger_name,
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.format_exc_info,
+        structlog.processors.JSONRenderer() if os.getenv("LOG_JSON") else structlog.dev.ConsoleRenderer(),
+    ],
+    logger_factory=structlog.stdlib.LoggerFactory(),
+    wrapper_class=structlog.stdlib.BoundLogger,
+    cache_logger_on_first_use=True,
+)
+
 logger = structlog.get_logger("mcp.memory")
 
 def log_mcp_interaction(

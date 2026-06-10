@@ -33,7 +33,7 @@ from neo4j import GraphDatabase
 # ---------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("memory-vault")
-logging.getLogger("mcp").setLevel(logging.DEBUG)
+logging.getLogger("mcp").setLevel(logging.INFO)
 
 # ---------------------------------------------------------------------------
 # Configuration
