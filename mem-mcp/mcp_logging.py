@@ -17,12 +17,21 @@ def log_mcp_interaction(
     Logs an MCP tool interaction with specific fields for refining 
     search queries, tool descriptions, and skill mapping.
     """
+    # Detect "soft errors" where the tool returns an error message instead of raising
+    is_soft_error = isinstance(result, str) and result.startswith("Error:")
+    effective_success = error is None and not is_soft_error
+    
+    # If it's a soft error and no hard error was passed, use the result as the error message
+    effective_error = error
+    if is_soft_error and not effective_error:
+        effective_error = result
+
     log_payload = {
         "mcp_event": "mcp_tool_execution",
         "tool": tool_name,
         "arguments": arguments,
         "duration_ms": round(duration_ms, 2),
-        "success": error is None,
+        "success": effective_success,
         "context_hint": context,
     }
 
@@ -30,8 +39,8 @@ def log_mcp_interaction(
         # Truncate result for logs to avoid bloat while keeping enough for analysis
         log_payload["result_summary"] = str(result)[:500]
     
-    if error:
-        log_payload["error"] = error
+    if effective_error:
+        log_payload["error"] = str(effective_error)
 
     logger.info("tool_use_stats", **log_payload)
 

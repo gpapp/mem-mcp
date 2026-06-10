@@ -132,7 +132,7 @@ async def link_facts(sourceFactId: str, targetFactId: str, relationshipType: str
         return f"Linked: {sourceFactId} <-> {targetFactId}"
     except Exception as e:
         logger.warning(f"Failed to link facts: {e}")
-        return f"Error: Could not link facts. Ensure both IDs are correct and exist. Details: {str(e)}"
+        return f"Error: Could not link facts. Ensure both IDs exist in the vault. If you just created them, verify the IDs. If they are older, use 'search_facts' to retrieve the correct IDs before linking. Details: {str(e)}"
 
 @mcp.tool()
 @monitor_mcp_tool("unlink_facts", context_provider=_current_user)
