@@ -1143,7 +1143,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
 
           if (!isFact(l)) {
             return `<span class="link-badge" id="link-badge-${m.id}-${l.target_id}">
-              <span class="link-content" style="cursor:pointer;" onclick="switchTab('diary')">${label}</span>
+              <span class="link-content" style="cursor:pointer;" onclick="switchTab('diary');selectDiaryEntry('${l.target_id}')">${label}</span>
             </span>`;
           }
 
@@ -1488,15 +1488,9 @@ npm install @modelcontextprotocol/sdk</code></pre>
     const el = document.getElementById('diary-dates-list');
     if (!diaryEntries.length) { el.innerHTML = '<p class="empty">No entries.</p>'; return; }
 
-    const my = getDiaryMonthYear();
-    const monthPrefix = `${my.year}-${String(my.month).padStart(2, '0')}`;
-    let filtered = diaryEntries.filter(e => e.date && e.date.startsWith(monthPrefix));
-
-    if (selectedDiaryDate) {
-      filtered = filtered.filter(e => e.date === selectedDiaryDate);
-    }
-
+    let filtered;
     if (diarySearchQuery) {
+      filtered = [...diaryEntries];
       const lower = diarySearchQuery.toLowerCase();
       const datePattern = parseDateQuery(diarySearchQuery);
       filtered = filtered.filter(e => {
@@ -1506,6 +1500,13 @@ npm install @modelcontextprotocol/sdk</code></pre>
         const matchesDate = datePattern && matchesDatePattern(e.date, datePattern);
         return matchesText || matchesDate;
       });
+    } else {
+      const my = getDiaryMonthYear();
+      const monthPrefix = `${my.year}-${String(my.month).padStart(2, '0')}`;
+      filtered = diaryEntries.filter(e => e.date && e.date.startsWith(monthPrefix));
+      if (selectedDiaryDate) {
+        filtered = filtered.filter(e => e.date === selectedDiaryDate);
+      }
     }
 
     const sorted = [...filtered].sort((a, b) => (b.timestamp || b.date || '').localeCompare(a.timestamp || a.date || ''));
@@ -1628,6 +1629,11 @@ npm install @modelcontextprotocol/sdk</code></pre>
   function selectDiaryEntry(id) {
     activeDiaryId = id;
     let entry = diaryEntries.find(e => e.id === id);
+    if (entry && entry.date) {
+      const parts = entry.date.split('-');
+      diaryMonthYear = { year: parseInt(parts[0]), month: parseInt(parts[1]) };
+      selectedDiaryDate = entry.date;
+    }
     renderDiarySidebar();
     saveSessionState();
 

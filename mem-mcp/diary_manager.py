@@ -280,6 +280,7 @@ async def db_unlink_diary_mention(entry_id: str, fact_id: str, user_id: str):
             entryId=entry_id, factId=fact_id, userId=user_id
         )
     await publish_db_event(user_id, "diary_changed", {"action": "unlink", "id": entry_id})
+    await publish_db_event(user_id, "memory_changed", {"action": "update", "id": fact_id})
 
 
 async def db_delete_diary(entry_id: str, user_id: str) -> bool:
