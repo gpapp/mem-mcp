@@ -71,19 +71,19 @@ async def db_save_diary(content: str, user_id: str, timestamp: str, name: str, m
             **params
         )
 
-        # Sync linked facts: remove stale, add new
+        # Sync linked facts: only modify MENTIONS if explicitly provided
         if linked_facts is not None:
-            # Remove MENTIONS to facts NOT in the incoming list
-            s.run(
-                """
-                MATCH (d:DiaryEntry {id: $id, userId: $userId})-[r:MENTIONS]->(f:Fact)
-                WHERE NOT f.id IN $factIds
-                DELETE r
-                """,
-                id=doc_id, userId=user_id, factIds=linked_facts
-            )
-            # Add MENTIONS for links not yet present
             if linked_facts:
+                # Remove MENTIONS to facts NOT in the incoming list
+                s.run(
+                    """
+                    MATCH (d:DiaryEntry {id: $id, userId: $userId})-[r:MENTIONS]->(f:Fact)
+                    WHERE NOT f.id IN $factIds
+                    DELETE r
+                    """,
+                    id=doc_id, userId=user_id, factIds=linked_facts
+                )
+                # Add MENTIONS for links not yet present
                 s.run(
                     """
                     MATCH (d:DiaryEntry {id: $id, userId: $userId})
@@ -92,43 +92,11 @@ async def db_save_diary(content: str, user_id: str, timestamp: str, name: str, m
                     """,
                     id=doc_id, userId=user_id, factIds=linked_facts
                 )
-        else:
-            # Automatic linking — first clear stale mentions, then rebuild from current content
-            s.run(
-                "MATCH (d:DiaryEntry {id: $id, userId: $userId})-[r:MENTIONS]->() DELETE r",
-                id=doc_id, userId=user_id
-            )
-            res = s.run(
-                """
-                MATCH (f:Fact {userId: $userId})
-                WHERE f.category IN ['People', 'Client']
-                RETURN f.id as id, f.text as text, f.aliases as aliases
-                """,
-                userId=user_id
-            )
-            content_lower = content.lower()
-            mentioned_ids = []
-            for r in res:
-                name_val = r["text"].lower()
-                if name_val in content_lower:
-                    mentioned_ids.append(r["id"])
-                    continue
-                aliases = r["aliases"]
-                if aliases:
-                    if isinstance(aliases, list):
-                        if any(a.lower() in content_lower for a in aliases):
-                            mentioned_ids.append(r["id"])
-                    elif isinstance(aliases, dict):
-                        if any(a.lower() in content_lower for a in aliases.keys()):
-                            mentioned_ids.append(r["id"])
-            if mentioned_ids:
+            else:
+                # Explicit empty list: clear all MENTIONS
                 s.run(
-                    """
-                    MATCH (d:DiaryEntry {id: $id, userId: $userId})
-                    MATCH (f:Fact) WHERE f.id IN $factIds
-                    MERGE (d)-[:MENTIONS]->(f)
-                    """,
-                    id=doc_id, userId=user_id, factIds=mentioned_ids
+                    "MATCH (d:DiaryEntry {id: $id, userId: $userId})-[r:MENTIONS]->() DELETE r",
+                    id=doc_id, userId=user_id
                 )
 
     await publish_db_event(user_id, "diary_changed", {

@@ -196,7 +196,7 @@ async def find_patterns():
 
 @mcp.tool()
 @monitor_mcp_tool("diary_save_entry", context_provider=_current_user)
-async def diary_save_entry(content: str, name: str, timestamp: str, entryId: Optional[str] = None, metadata: Optional[dict] = None):
+async def diary_save_entry(content: str, name: str, timestamp: str, entryId: Optional[str] = None, metadata: Optional[dict] = None, linked_facts: Optional[list[str]] = None):
     """Save or update a diary entry.
 
     - name: Concise name for the entry.
@@ -206,6 +206,8 @@ async def diary_save_entry(content: str, name: str, timestamp: str, entryId: Opt
     - entryId: Optional ID of an existing entry. Use this if you are changing the 
       timestamp of an existing entry to ensure the old one is moved/deleted.
     - metadata: Optional dict with extra fields (e.g. {"original_file": "path/to/file.txt"}).
+    - linked_facts: Optional list of fact IDs to link via MENTIONS. Pass [] to clear existing links.
+      When omitted, existing MENTIONS relationships are preserved.
     - Returns a dict with 'id' (use this to update or delete the entry later) and 
       'timestamp' (the ISO string that keys the entry).
     """
@@ -214,7 +216,7 @@ async def diary_save_entry(content: str, name: str, timestamp: str, entryId: Opt
         new_id = mem._diary_id(user, timestamp)
         if entryId != new_id:
             await mem.db_delete_diary(entryId, user)
-    entry_ts = await mem.db_save_diary(content, user, timestamp, name, metadata=metadata)
+    entry_ts = await mem.db_save_diary(content, user, timestamp, name, metadata=metadata, linked_facts=linked_facts)
     entry_id = mem._diary_id(user, entry_ts)
     return {"id": entry_id, "timestamp": entry_ts}
 
