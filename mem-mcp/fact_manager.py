@@ -1451,6 +1451,32 @@ async def run_consistency_checks():
             f"(showing first IDs: {', '.join(r['id'] for r in untitled_facts[:20])})"
         )
 
+    # --- Dangling MENTIONS from diary entries to non-Fact nodes ---
+    with neo4j_driver.session() as s:
+        dangling_mentions = list(s.run(
+            "MATCH (d:DiaryEntry)-[r:MENTIONS]->(t) WHERE NOT t:Fact "
+            "RETURN d.userId AS userId, count(*) AS count"
+        ))
+    for row in dangling_mentions:
+        issues_found = True
+        logger.warning(
+            f"consistency [{row['userId']}]: {row['count']} MENTIONS link(s) "
+            f"from diary entry to non-Fact node"
+        )
+
+    # --- Cross-user MENTIONS ---
+    with neo4j_driver.session() as s:
+        cross_user = list(s.run(
+            "MATCH (d:DiaryEntry)-[r:MENTIONS]->(f:Fact) WHERE d.userId <> f.userId "
+            "RETURN d.userId AS diaryUser, f.userId AS factUser, count(*) AS count"
+        ))
+    for row in cross_user:
+        issues_found = True
+        logger.warning(
+            f"consistency [{row['diaryUser']}]: {row['count']} MENTIONS link(s) "
+            f"crossing user boundary (fact belongs to '{row['factUser']}')"
+        )
+
     if not issues_found:
         logger.info("consistency: All checks passed — no discrepancies found")
     else:
@@ -1695,6 +1721,15 @@ async def sync_orphans():
             ).single()
             if res and res["n"] > 0:
                 logger.info(f"sync_orphans [{user_id}]: deleted {res['n']} dangling MENTIONS")
+                total_pruned_links += res["n"]
+
+            # Cross-user MENTIONS: diary entry owner must match fact owner
+            res = s.run(
+                "MATCH (d:DiaryEntry {userId: $userId})-[r:MENTIONS]->(f:Fact) WHERE f.userId <> $userId DELETE r RETURN count(*) as n",
+                userId=user_id
+            ).single()
+            if res and res["n"] > 0:
+                logger.info(f"sync_orphans [{user_id}]: deleted {res['n']} cross-user MENTIONS")
                 total_pruned_links += res["n"]
 
             # Knowledge graph links from Facts must point to other Facts or DiaryEntries
