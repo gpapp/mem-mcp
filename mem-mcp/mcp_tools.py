@@ -245,10 +245,10 @@ async def diary_search_entries(query: str, limit: int = 3, top_p: float = 0.4):
 @monitor_mcp_tool("list_diary_entries", context_provider=_current_user)
 async def list_diary_entries(fromTs: Optional[str] = None, toTs: Optional[str] = None):
     """
-    List diary entry names with timestamps within a time range.
+    List diary entry names with timestamps within a time range, also provides original file information.
     - fromTs: Start timestamp (ISO-8601). Defaults to 30 days ago.
     - toTs: End timestamp (ISO-8601). Defaults to now.
-    Returns a list of (id, timestamp, name) tuples.
+    Returns a list of (id, timestamp, name, original_file) tuples.
     """
     return mem.db_list_diary_entries(_current_user(), fromTs, toTs)
 

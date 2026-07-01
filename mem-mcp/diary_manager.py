@@ -336,14 +336,15 @@ def db_list_diary_entries(user_id: str, from_ts: Optional[str] = None, to_ts: Op
             """
             MATCH (d:DiaryEntry {userId: $userId})
             WHERE d.timestamp >= $fromTs AND d.timestamp <= $toTs
-            RETURN d.id as id, d.timestamp as timestamp, d.name as name
+            RETURN d.id as id, d.timestamp as timestamp, d.name as name, d.metadata as metadata
             ORDER BY d.timestamp DESC
             """,
             userId=user_id,
             fromTs=from_clause,
             toTs=to_clause,
         )
-        return [(r["id"], str(r["timestamp"]) if r["timestamp"] else None, r.get("name") or "Unnamed")
+        return [(r["id"], str(r["timestamp"]) if r["timestamp"] else None, r.get("name") or "Unnamed", 
+                 r.get("metadata", {}).get("original_file") if r.get("metadata") else "")
                 for r in result]
 
 
