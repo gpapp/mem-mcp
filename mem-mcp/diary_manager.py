@@ -343,9 +343,12 @@ def db_list_diary_entries(user_id: str, from_ts: Optional[str] = None, to_ts: Op
             fromTs=from_clause,
             toTs=to_clause,
         )
-        return [(r["id"], str(r["timestamp"]) if r["timestamp"] else None, r.get("name") or "Unnamed", 
-                json.loads(r.get("metadata", "{}")).get("original_file", ""))
-                for r in result]
+        return [(
+            r["id"],
+            str(r["timestamp"]) if r["timestamp"] else None,
+            r.get("name") or "Unnamed",
+            json.loads(r.get("metadata") or "{}").get("original_file", ""),
+        ) for r in result]
 
 
 def db_list_diary(user_id: str) -> list:
