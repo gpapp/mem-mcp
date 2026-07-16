@@ -535,7 +535,7 @@ async def rewrite_search_query(query: str) -> list:
                 logger.debug(f"[rewrite_search_query] '{q}' → {keywords}")
                 return [(kw, 1.0) for kw in keywords]
     except Exception as exc:
-        logger.warning(f"[rewrite_search_query] LLM rewrite failed, using heuristic: {exc}")
+        logger.warning(f"[rewrite_search_query] LLM rewrite failed, using heuristic: {type(exc).__name__}: {exc}")
 
     return _expand_query(q)
 

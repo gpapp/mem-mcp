@@ -51,7 +51,7 @@ async def extract_diary_keywords(name: str, content: str) -> list:
             logger.debug(f"[extract_diary_keywords] extracted: {kws}")
             return kws[:10]
     except Exception as exc:
-        logger.warning(f"[extract_diary_keywords] failed: {exc}")
+        logger.warning(f"[extract_diary_keywords] failed: {type(exc).__name__}: {exc}")
     return []
 
 

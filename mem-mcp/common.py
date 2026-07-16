@@ -159,6 +159,7 @@ async def get_llm_response(prompt: str, system: str = "", model: str = "") -> st
 
     Uses LLM_QUERY_MODEL (default: qwen3.5:0.8b) unless overridden by `model`.
     Times out after 60 s — intentionally short for interactive search calls.
+    Strips <think>…</think> blocks produced by reasoning models (e.g. Qwen3).
     """
     resolved_model = model or LLM_QUERY_MODEL
     messages: list = []
@@ -168,10 +169,20 @@ async def get_llm_response(prompt: str, system: str = "", model: str = "") -> st
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(
             f"{OLLAMA_URL}/api/chat",
-            json={"model": resolved_model, "messages": messages, "stream": False},
+            json={
+                "model": resolved_model,
+                "messages": messages,
+                "stream": False,
+                "think": False,          # disable chain-of-thought for Qwen3/thinking models
+                "options": {"temperature": 0.0},
+            },
         )
         resp.raise_for_status()
-        return resp.json()["message"]["content"]
+        content = resp.json()["message"]["content"]
+        # Strip any residual <think>…</think> blocks just in case
+        import re as _re
+        content = _re.sub(r"<think>.*?</think>", "", content, flags=_re.DOTALL).strip()
+        return content
 
 # ---------------------------------------------------------------------------
 # User extraction
