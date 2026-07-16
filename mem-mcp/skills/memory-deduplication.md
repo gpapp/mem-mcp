@@ -31,13 +31,13 @@ Call `merge_facts` with the master ID, duplicate IDs, and your consolidated cont
 merge_facts(
     masterId = <chosen master ID>,
     duplicateIds = [<all other IDs in the cluster>],
-    mergedTitle = <consolidated title>,
+    mergedName = <consolidated title>,
     mergedText = <consolidated text>
 )
 ```
 
 This tool:
-1. Updates the master record with your merged title and text (and re-indexes the vector).
+1. Updates the master record with your merged name and text (and re-indexes the vector).
 2. Moves all graph relationships from the duplicate nodes to the master.
 3. Deletes the duplicate nodes.
 

@@ -129,7 +129,7 @@ Examples of correct vs incorrect:
 
 General work-related: use `People` (for personnel), `Project`/`Projects` (for initiatives), `Technology` (for tools), `Concepts` (for principles).
 
-Use mem0_add_fact for storing facts and mem0_link_facts for creating relationships between facts.
+Use `add_fact` for storing facts and `link_facts` for creating relationships between facts.
 
 - `link_facts(sourceFactId, targetFactId, relationshipType)` — build the graph
 

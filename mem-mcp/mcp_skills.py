@@ -46,7 +46,7 @@ CORE TASKS:
     - `timestamp` = meeting start time **rounded to the nearest 15 minutes** (:00, :15, :30, :45) — e.g. '2026-05-15T10:00:00'
     - `metadata` = {{"original_file": "<path to transcription file>", "meeting_date": "<date>", "topic": "<topic>"}} — always include metadata when processing transcripts; it enables cross-referencing and transcript-source tracking
     Re-saving with the same timestamp replaces the existing entry, so use the original timestamp to update rather than duplicate.
-11. PERFORMANCE: Batch multiple 'create_fact' and 'link_facts' calls into a single response for maximum efficiency.
+11. PERFORMANCE: Batch multiple 'add_fact' and 'link_facts' calls into a single response for maximum efficiency.
 TRANSCRIPTION CONTENT:
 {transcription_text}
 """
