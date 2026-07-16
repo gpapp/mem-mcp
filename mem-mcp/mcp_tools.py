@@ -100,13 +100,28 @@ async def add_fact(name: str, text: str, category: str):
 @monitor_mcp_tool("search_facts", context_provider=_current_user)
 async def search_facts(query: str, category: Optional[str] = None, limit: int = 5, top_p: float = 0.5, names_only: bool = False):
     """
-    Search for facts matching query criteria.
-    Returns results formatted as Markdown for easy reading.
-    - query: semantic search string
-    - category: optional filter (e.g. 'People', 'Client', 'Preferences') to limit output
-    - limit: maximum number of results (default 5)
-    - top_p: threshold to filter low-probability results (default 0.5, higher = more selective)
-    - names_only: if True, returns only fact names as a newline-separated list
+    Search for facts in the knowledge graph. Returns Markdown-formatted results.
+
+    HOW TO QUERY — use keywords that appear in fact names, not natural language:
+      Good: "Alice" (name), "SAP" (keyword), "DB AI Adoption" (project name),
+            "work" (broad keyword), "project" (category word), "2026" (year)
+      Bad:  "who do I work with on AI projects" (too verbose),
+            "things I need to follow up on" (abstract),
+            "what am I passionate about" (no matching facts)
+
+    The search combines Neo4j substring matching (fast, exact) with Qdrant
+    vector similarity (semantic). Vector scores peak at ~0.67 for nomic-embed-text,
+    so verbose/abstract queries often return low-confidence results.
+
+    Parameters:
+      query: keyword or short phrase matching fact names/content
+      category: optional filter ('People', 'Technology', 'Client', 'Project', 'Tool')
+      limit: max results (default 5)
+      top_p: similarity threshold (default 0.5; raise to 0.7 for strict, lower to 0.4 for broad)
+      names_only: if True, returns only fact names as newline-separated list
+
+    Strategy: If the first search returns weak results, try shorter/simpler queries.
+    For people, use first name only. For projects, use the project name directly.
     """
     facts = await mem.db_search_memories(query, _current_user(), limit, category, top_p)
     if names_only:
@@ -223,21 +238,24 @@ async def diary_save_entry(content: str, name: str, timestamp: str, entryId: Opt
 @mcp.tool()
 @monitor_mcp_tool("diary_search_entries", context_provider=_current_user)
 async def diary_search_entries(query: str, limit: int = 3, top_p: float = 0.4):
-    """Search diary entries using vector similarity or date/time filters.
+    """
+    Search diary entries by vector similarity. Best for finding entries about specific topics.
 
-    Query supports:
-    - Natural language: "May 2026", "May 15 2026", "15 May 2026"
-    - ISO formats: "2026-05", "2026-05-15", "2026-05-15 14:30"
-    - Month names: "May", "May 2026", "May 15"
-    - Year only: "2026"
+    HOW TO QUERY — use topic keywords or dates, not full sentences:
+      Good: "SAP evaluation" (topic), "Deutsche Bank" (client), "AI kickoff" (event),
+            "May 2026" (date), "2026-07-15" (ISO date), "meeting with Tim" (event)
+      Bad:  "what did I discuss with the client last week" (too verbose),
+            "things that happened recently" (too vague)
 
-    Returns a list of matching entries. Each entry contains:
-    - id: use this with diary_delete_entry or diary_save_entry (as timestamp key) to update/delete
-    - timestamp: ISO-8601 datetime string (e.g. '2026-05-15T14:30:00') — the time the entry was saved
-    - date: YYYY-MM-DD portion of the timestamp
-    - content: the full Markdown text of the entry
-    - score: similarity score (higher = more relevant)
-    - mentions: list of facts linked to this entry
+    Date-aware queries work well: "May 2026", "2026-07", "last Tuesday"
+
+    Parameters:
+      query: topic keywords or date string
+      limit: max results (default 3)
+      top_p: similarity threshold (default 0.4)
+
+    Returns list of entries with: id, timestamp, date, content, score, mentions.
+    Use 'id' with diary_delete_entry or diary_save_entry to modify entries.
     """
     return await mem.db_search_diary(query, _current_user(), limit, top_p)
 
