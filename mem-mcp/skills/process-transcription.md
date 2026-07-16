@@ -153,6 +153,7 @@ You are a summarization agent. Based on the extracted data below, produce:
 
 1. A diary entry in the exact format below.
 2. A local save file in the exact same format.
+3. An extracted list of 5-12 keyword tags representing the key technologies, projects, topics, and decisions discussed.
 
 TIMESTAMP (rounded to 15 min): {ISO timestamp}
 TITLE: {Meeting Title}
@@ -196,10 +197,13 @@ Ignore personal stories/nicities.
 ## Notes
 - challenges, risks, dependencies, context not captured above
 
+## Keywords
+{comma-separated list of 5-12 keywords}
+
 ===
 
 LOCAL SAVE FILE:
-Save the exact same content (including the ## headers) to a local file named:
+Save the exact same content (including the ## headers and ## Keywords) to a local file named:
 {YYYY-MM-DD hh-mm-ss Title.md}
 (use the rounded timestamp and the meeting title).
 
@@ -234,7 +238,7 @@ Call `diary_save_entry` with:
 - `content` = the subagent-rendered diary content (exact format above)
 - `name` = meeting title
 - `timestamp` = ISO-8601 with time **rounded to the nearest 15 minutes** (:00, :15, :30, :45), e.g. `2026-05-15T10:00:00`
-- `metadata` = `{"original_file": "<path to original transcription file>", "meeting_date": "<date>", "topic": "<topic>"}` — always include metadata when processing transcripts; it enables cross-referencing, source tracing, and downstream queries
+- `metadata` = `{"original_file": "<path to original transcription file>", "meeting_date": "<date>", "topic": "<topic>", "keywords": "<comma-separated list of extracted keywords>"}` — always include metadata and keywords when processing transcripts; it enables cross-referencing, source tracing, keyword searching/filtering, and automatic UI rendering.
 
 **After saving the diary entry, link it to every fact it references:**
 
