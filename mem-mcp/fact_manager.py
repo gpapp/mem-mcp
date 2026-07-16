@@ -10,7 +10,7 @@ import difflib
 from qdrant_client.models import PointStruct, Filter, FieldCondition, MatchValue, PointIdsList
 
 from common import (
-    get_qdrant, get_neo4j, logger, get_embedding, publish_db_event,
+    get_qdrant, get_neo4j, logger, get_embedding, get_llm_response, publish_db_event,
     COLLECTION_NAME, DIARY_COLLECTION
 )
 
@@ -503,6 +503,43 @@ def db_get_connections_by_type(fact_id: str, user_id: str) -> dict:
         return connections
 
 
+async def rewrite_search_query(query: str) -> list:
+    """Use a tiny LLM to rewrite natural language into keyword search phrases.
+
+    Returns a list of (keyword_string, weight) tuples.
+    Short queries (<=2 words) are returned as-is.
+    Falls back to _expand_query() heuristic on any LLM error.
+    """
+    q = query.strip()
+    if len(q.split()) <= 2:
+        return [(q, 1.0)]
+
+    system = (
+        "You are a search query rewriter. Given a natural language query, "
+        "extract 2-4 short keyword phrases optimised for vector similarity search. "
+        "Return ONLY a JSON object with this exact structure: "
+        "{\"keywords\": [\"phrase1\", \"phrase2\"]}. "
+        "Rules: max 3 words per phrase, use nouns and proper nouns, "
+        "omit stop words, no questions, most specific terms first."
+    )
+    try:
+        import json as _json
+        raw = await get_llm_response(q, system=system)
+        # Strip optional markdown code fences
+        raw = re.sub(r"```[a-z]*\n?", "", raw).strip()
+        json_match = re.search(r'\{[^{}]*"keywords"[^{}]*\}', raw, re.DOTALL)
+        if json_match:
+            data = _json.loads(json_match.group())
+            keywords = [kw.strip() for kw in data.get("keywords", []) if kw.strip()]
+            if keywords:
+                logger.debug(f"[rewrite_search_query] '{q}' → {keywords}")
+                return [(kw, 1.0) for kw in keywords]
+    except Exception as exc:
+        logger.warning(f"[rewrite_search_query] LLM rewrite failed, using heuristic: {exc}")
+
+    return _expand_query(q)
+
+
 def _expand_query(query: str) -> list:
     """Generate multiple query variants for better semantic coverage.
     
@@ -748,8 +785,8 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
             })
 
     # 2. Multi-query vector search
-    # Generate query variants for better semantic coverage
-    query_variants = _expand_query(query)
+    # Use LLM rewrite for better semantic coverage on long queries
+    query_variants = await rewrite_search_query(query)
     fetch_limit = max(limit * 5, 50)
     
     # Collect all results from all query variants

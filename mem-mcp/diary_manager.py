@@ -12,7 +12,7 @@ from qdrant_client.models import PointStruct, Filter, FieldCondition, MatchValue
 
 import re
 from common import (
-    get_qdrant, get_neo4j, logger, get_embedding, publish_db_event,
+    get_qdrant, get_neo4j, logger, get_embedding, get_llm_response, publish_db_event,
     DIARY_COLLECTION, QDRANT_URL
 )
 
@@ -22,6 +22,37 @@ from common import (
 
 def _diary_id(user_id: str, timestamp: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"diary_{user_id}_{timestamp}"))
+
+
+async def extract_diary_keywords(name: str, content: str) -> list:
+    """Use the query LLM to extract searchable keywords from a diary entry.
+
+    Returns a list of lowercase keyword strings (max ~10).
+    Falls back to an empty list on any error so saves are never blocked.
+    """
+    text = f"{name}\n{content}" if name else content
+    # Truncate to keep the prompt fast on a tiny model
+    if len(text) > 1500:
+        text = text[:1500] + "…"
+
+    system = (
+        "You are a keyword extractor. Given a diary entry, extract the most important "
+        "searchable keywords and short phrases (people, places, projects, topics, events). "
+        "Return ONLY a JSON object: {\"keywords\": [\"kw1\", \"kw2\", ...]}. "
+        "Max 10 items, lowercase, 1-3 words each, no generic words like 'meeting' or 'today'."
+    )
+    try:
+        raw = await get_llm_response(text, system=system)
+        raw = re.sub(r"```[a-z]*\n?", "", raw).strip()
+        json_match = re.search(r'\{[^{}]*"keywords"[^{}]*\}', raw, re.DOTALL)
+        if json_match:
+            data = json.loads(json_match.group())
+            kws = [k.strip().lower() for k in data.get("keywords", []) if k.strip()]
+            logger.debug(f"[extract_diary_keywords] extracted: {kws}")
+            return kws[:10]
+    except Exception as exc:
+        logger.warning(f"[extract_diary_keywords] failed: {exc}")
+    return []
 
 
 async def db_save_diary(content: str, user_id: str, timestamp: str, name: str, metadata: Optional[dict] = None, linked_facts: Optional[list] = None) -> str:
@@ -39,7 +70,12 @@ async def db_save_diary(content: str, user_id: str, timestamp: str, name: str, m
     entry_date = timestamp[:10]
     vector   = await get_embedding(f"{name}: {content}" if name else content)
 
+    # Extract keywords asynchronously — non-blocking; empty list on failure
+    keywords = await extract_diary_keywords(name or "", content)
+
     payload = {"content": content, "name": name, "date": entry_date, "timestamp": timestamp, "userId": user_id}
+    if keywords:
+        payload["keywords"] = keywords
     if metadata:
         payload["metadata"] = metadata
 
@@ -54,11 +90,15 @@ async def db_save_diary(content: str, user_id: str, timestamp: str, name: str, m
     )
 
     neo4j_props = "d.date = $date, d.timestamp = $timestamp, d.content = $content, d.name = $name"
+    if keywords:
+        neo4j_props += ", d.keywords = $keywords"
     if metadata:
         neo4j_props += ", d.metadata = $metadata"
 
     with neo4j_driver.session() as s:
         params = dict(userId=user_id, id=doc_id, date=entry_date, timestamp=timestamp, content=content, name=name)
+        if keywords:
+            params["keywords"] = keywords
         if metadata:
             params["metadata"] = json.dumps(metadata)
         s.run(
@@ -109,40 +149,75 @@ async def db_save_diary(content: str, user_id: str, timestamp: str, name: str, m
 
 
 async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float = 0.4) -> list:
-    """Vector-similarity search across the diary collection with mention enrichment."""
+    """Vector-similarity search across the diary collection with mention enrichment.
+
+    Uses LLM query rewriting for multi-variant search and boosts results whose
+    stored keywords match the query terms.
+    """
+    from fact_manager import rewrite_search_query
+
     qdrant = await get_qdrant()
     neo4j_driver = get_neo4j()
     if not qdrant or not neo4j_driver:
         raise RuntimeError("Database connections not established.")
 
-    vec    = await get_embedding(query)
-    filt   = Filter(must=[FieldCondition(key="userId", match=MatchValue(value=user_id))])
-    result = await qdrant.query_points(
-        collection_name=DIARY_COLLECTION,
-        query=vec,
-        query_filter=filt,
-        limit=limit,
-        with_payload=True,
-        score_threshold=top_p,
-    )
-    
+    # 1. Rewrite query into keyword variants for better semantic coverage
+    query_variants = await rewrite_search_query(query)
+    fetch_limit = max(limit * 4, 20)
+    filt = Filter(must=[FieldCondition(key="userId", match=MatchValue(value=user_id))])
+
+    # 2. Multi-variant vector search — merge by best score per entry
+    all_results: dict = {}  # id -> {payload, score}
+    for variant_query, weight in query_variants:
+        vec = await get_embedding(variant_query)
+        result = await qdrant.query_points(
+            collection_name=DIARY_COLLECTION,
+            query=vec,
+            query_filter=filt,
+            limit=fetch_limit,
+            with_payload=True,
+            score_threshold=0.0,  # apply threshold after merging and boosting
+        )
+        variant_lower = variant_query.lower()
+        for r in result.points:
+            score = r.score * weight
+
+            # Boost if variant matches the entry name
+            name = r.payload.get("name") or ""
+            if name:
+                name_lower = name.lower()
+                if variant_lower == name_lower:
+                    score += 0.5
+                elif variant_lower in name_lower or name_lower in variant_lower:
+                    score += 0.2
+
+            # Boost if variant matches any stored keyword
+            stored_kws = r.payload.get("keywords") or []
+            for kw in stored_kws:
+                kw_lower = kw.lower()
+                if variant_lower == kw_lower:
+                    score += 0.4
+                    break
+                elif variant_lower in kw_lower or kw_lower in variant_lower:
+                    score += 0.15
+                    break
+
+            if r.id not in all_results or score > all_results[r.id]["score"]:
+                all_results[r.id] = {"point": r, "score": score}
+
+    # 3. Apply top_p threshold after merging all variants
+    passing = {rid: v for rid, v in all_results.items() if v["score"] >= top_p}
+
+    # 4. Enrich with Neo4j MENTIONS and format output
     entries = []
-    query_lower = query.lower()
-    for r in result.points:
+    for rid, v in passing.items():
+        r = v["point"]
+        score = v["score"]
         date = r.payload.get("date")
         entry_ts = r.payload.get("timestamp", date)
         content = r.payload.get("content")
         name = r.payload.get("name")
-        score = r.score
 
-        # Boost score if query matches the name
-        if name:
-            if query_lower == name.lower():
-                score += 0.5
-            elif query_lower in name.lower() or name.lower() in query_lower:
-                score += 0.2
-        
-        # Enrich with mentions from Neo4j — match by stable entry id
         mentions = []
         with neo4j_driver.session() as s:
             m_res = s.run(
@@ -150,7 +225,7 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
                 id=str(r.id), userId=user_id
             )
             mentions = [{"id": mr["id"], "text": mr["text"]} for mr in m_res]
-            
+
         entries.append({
             "id": r.id,
             "date": date,
@@ -158,13 +233,13 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
             "content": content,
             "name": name,
             "score": score,
+            "keywords": r.payload.get("keywords") or [],
             "metadata": r.payload.get("metadata") or {},
-            "mentions": mentions
+            "mentions": mentions,
         })
 
-    # Re-sort based on boosted scores
     entries.sort(key=lambda x: x["score"], reverse=True)
-    return entries
+    return entries[:limit]
 
 
 async def db_update_diary(entry_id: str, user_id: str, content: Optional[str] = None, name: Optional[str] = None, timestamp: Optional[str] = None, metadata: Optional[dict] = None, linked_facts: Optional[list] = None) -> bool:

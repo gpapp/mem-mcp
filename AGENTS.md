@@ -10,6 +10,7 @@ cp .env.example .env
 # Infra (must run first)
 docker-compose up -d
 docker exec ollama ollama pull nomic-embed-text
+docker exec ollama ollama pull qwen3.5:0.8b
 
 # Local dev (infra must be running)
 .\.venv\Scripts\Activate.ps1

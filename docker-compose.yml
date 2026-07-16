@@ -62,6 +62,7 @@ services:
       - MEM_PROVIDER=ollama
       - MEM_LLM_MODEL=phi4-mini
       - MEM_LLM_URL=http://ollama:11434
+      - LLM_QUERY_MODEL=qwen3.5:0.8b
       - HTTPX_TIMEOUT=600.0
       - REQUESTS_TIMEOUT=600
 

@@ -7,10 +7,10 @@ from common.py, fact_manager.py, and diary_manager.py.
 
 from common import (
     QDRANT_URL, NEO4J_URL, NEO4J_USER, NEO4J_PASS, OLLAMA_URL, EMBED_MODEL,
-    HTTP_TIMEOUT, BASE_URL, COLLECTION_NAME, DIARY_COLLECTION,
+    LLM_QUERY_MODEL, HTTP_TIMEOUT, BASE_URL, COLLECTION_NAME, DIARY_COLLECTION,
     SESSION_SECRET, SESSION_MAX_AGE, db_subscribers,
     publish_db_event, get_qdrant, get_neo4j, wait_for_service,
-    get_embedding, extract_user_from_headers, logger
+    get_embedding, get_llm_response, extract_user_from_headers, logger
 )
 
 from fact_manager import (

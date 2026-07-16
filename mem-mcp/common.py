@@ -44,9 +44,10 @@ QDRANT_URL     = os.getenv("MEM_QDRANT_URL",      "http://qdrant:6333")
 NEO4J_URL      = os.getenv("MEM_NEO4J_URL",       "bolt://neo4j:7687")
 NEO4J_USER     = os.getenv("MEM_NEO4J_USER",      "neo4j")
 NEO4J_PASS     = os.getenv("MEM_NEO4J_PASSWORD",  "password")
-OLLAMA_URL     = os.getenv("MEM_LLM_URL",         os.getenv("MEM_EMBEDDER_URL", "http://ollama:11434"))
-EMBED_MODEL    = os.getenv("MEM_EMBEDDER_MODEL",  "nomic-embed-text")
-HTTP_TIMEOUT   = float(os.getenv("MEM_HTTP_TIMEOUT", "300.0"))
+OLLAMA_URL      = os.getenv("MEM_LLM_URL",         os.getenv("MEM_EMBEDDER_URL", "http://ollama:11434"))
+EMBED_MODEL     = os.getenv("MEM_EMBEDDER_MODEL",  "nomic-embed-text")
+LLM_QUERY_MODEL = os.getenv("LLM_QUERY_MODEL",    "qwen3.5:0.8b")
+HTTP_TIMEOUT    = float(os.getenv("MEM_HTTP_TIMEOUT", "300.0"))
 BASE_URL       = os.getenv("BASE_URL",            "").rstrip("/")
 
 COLLECTION_NAME  = "ea_memories"
@@ -151,6 +152,26 @@ async def get_embedding(text: str) -> List[float]:
         )
         resp.raise_for_status()
         return resp.json()["embedding"]
+
+
+async def get_llm_response(prompt: str, system: str = "", model: str = "") -> str:
+    """Call Ollama /api/chat and return the assistant's text response.
+
+    Uses LLM_QUERY_MODEL (default: qwen3.5:0.8b) unless overridden by `model`.
+    Times out after 60 s — intentionally short for interactive search calls.
+    """
+    resolved_model = model or LLM_QUERY_MODEL
+    messages: list = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(
+            f"{OLLAMA_URL}/api/chat",
+            json={"model": resolved_model, "messages": messages, "stream": False},
+        )
+        resp.raise_for_status()
+        return resp.json()["message"]["content"]
 
 # ---------------------------------------------------------------------------
 # User extraction
