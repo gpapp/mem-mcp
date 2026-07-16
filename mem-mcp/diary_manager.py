@@ -308,7 +308,13 @@ async def db_update_diary(entry_id: str, user_id: str, content: Optional[str] = 
 
     # Re-embed in Qdrant
     vector = await get_embedding(f"{new_name}: {new_content}" if new_name else new_content)
+
+    # Regenerate keywords if content or name changed
+    keywords = await extract_diary_keywords(new_name or "", new_content)
+
     payload = {"content": new_content, "name": new_name, "date": entry_date, "timestamp": new_ts, "userId": user_id}
+    if keywords:
+        payload["keywords"] = keywords
     if new_metadata is not None:
         payload["metadata"] = new_metadata
     await qdrant.upsert(
@@ -319,6 +325,14 @@ async def db_update_diary(entry_id: str, user_id: str, content: Optional[str] = 
             payload=payload,
         )],
     )
+
+    # Also persist keywords to Neo4j
+    with neo4j_driver.session() as s2:
+        if keywords:
+            s2.run(
+                "MATCH (d:DiaryEntry {id: $id, userId: $userId}) SET d.keywords = $keywords",
+                id=entry_id, userId=user_id, keywords=keywords,
+            )
 
     await publish_db_event(user_id, "diary_changed", {"action": "update", "id": entry_id, "date": entry_date})
     return True
