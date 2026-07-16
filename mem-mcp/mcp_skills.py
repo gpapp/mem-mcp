@@ -49,8 +49,6 @@ CORE TASKS:
 11. PERFORMANCE: Batch multiple 'create_fact' and 'link_facts' calls into a single response for maximum efficiency.
 TRANSCRIPTION CONTENT:
 {transcription_text}
-
-TIP: Use 'find_skills' to discover other related workflows like 'cleanup-transcription'.
 """
 
     @mcp.resource("skill://memory-deduplication")
@@ -76,11 +74,3 @@ FOLLOW THIS WORKFLOW:
 
 Be careful not to lose important context or relationships.
 """
-    @mcp.resource("skill://cleanup-transcription")
-    def resource_skill_cleanup() -> str:
-        """The workflow for cleaning up transcriptions, identifying speakers, and summarizing."""
-        import os
-        path = os.path.join(os.path.dirname(__file__), "skills", "cleanup-transcription.md")
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read()
-

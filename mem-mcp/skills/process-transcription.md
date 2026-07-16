@@ -98,7 +98,7 @@ Rules:
 
 ---
 
-## Phase 2 — Store (after human confirmation only)
+## Phase 3 — Store (after human confirmation only)
 
 Execute all writes in one batched response — do not pause between individual calls.
 
@@ -139,8 +139,6 @@ Use mem0_add_fact for storing facts and mem0_link_facts for creating relationshi
 |---|---|
 | Person → Project | `WORKS_ON` |
 | Person → Client/Org | `WORKS_FOR` |
-| Meeting Summary → Person | `ATTENDED_BY` |
-| Diary Entry → Meeting Summary | `REFERENCES` |
 | Diary Entry → Person | `MENTIONS` |
 | Diary Entry → Project | `MENTIONS` |
 
@@ -241,7 +239,6 @@ Call `diary_save_entry` with:
 **After saving the diary entry, link it to every fact it references:**
 
 ```
-link_facts(diary_entry_id, meeting_summary_id, "REFERENCES")
 link_facts(diary_entry_id, person_id, "MENTIONS")      ← for each participant
 link_facts(diary_entry_id, project_id, "MENTIONS")     ← for each project discussed
 link_facts(diary_entry_id, decision_id, "RECORDS")     ← for each decision
@@ -274,6 +271,6 @@ These links make the diary navigable from any fact and vice versa.
 7. **Facts describe entities, not events** — People and Project facts contain stable identity information (role, expertise, purpose, status). Meeting outcomes, discussions, and assignments go in Decision/Action Item facts and the Diary.
 8. **Summarize via subagent** — use a dedicated `task` subagent (`subagent_type="general"`) for the structured summary.
 9. **Save locally** — write `YYYY-MM-DD hh-mm-ss Title.md` with the rounded timestamp.
-10. **Diary entries use exact format** — `## Participants`, `## Context`, `## Decisions`, `## Actions`, `## Notes`.
+10. **Diary entries use exact format** — `## Participants`, `## Context`, `## Description`, `## Decisions`, `## Actions`, `## Notes`.
 11. **Original file is metadata** — pass `{"original_file": "..."}` as `metadata` to `diary_save_entry`.
-12. **Diary entries are linked** — every diary entry must be linked to the meeting summary, all mentioned people, projects, decisions, and action items.
+12. **Diary entries are linked** — every diary entry must be linked to all mentioned people, projects, decisions, and action items.
