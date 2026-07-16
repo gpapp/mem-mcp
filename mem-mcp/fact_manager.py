@@ -503,8 +503,165 @@ def db_get_connections_by_type(fact_id: str, user_id: str) -> dict:
         return connections
 
 
+def _expand_query(query: str) -> list:
+    """Generate multiple query variants for better semantic coverage.
+    
+    For complex queries, decomposes into sub-queries and generates
+    alternative phrasings. Returns list of (query_string, weight) tuples.
+    """
+    q = query.strip()
+    words = q.split()
+    
+    # Simple queries: just return as-is
+    if len(words) <= 2:
+        return [(q, 1.0)]
+    
+    variants = [(q, 1.0)]  # Original query always included
+    
+    # Question queries: extract the core concept
+    if q.endswith("?"):
+        # "who do I work with on AI projects" → "AI projects colleagues"
+        # Remove question words and filler
+        stop_words = {"who", "do", "i", "we", "did", "does", "what", "where", "when", "why", "how", "is", "are", "was", "were", "the", "a", "an", "my", "your", "our", "about", "with", "for", "from", "to", "on", "in", "at", "of"}
+        content_words = [w for w in words if w.lower().rstrip("?") not in stop_words]
+        if content_words:
+            variants.append((" ".join(content_words), 0.9))
+    
+    # Extract noun phrases (consecutive non-stop words)
+    stop_words = {"i", "we", "my", "your", "our", "the", "a", "an", "is", "are", "was", "were", "do", "did", "does", "have", "has", "had", "will", "would", "could", "should", "may", "might", "can", "about", "with", "for", "from", "to", "on", "in", "at", "of", "and", "or", "not", "but", "that", "this", "these", "those", "it", "its"}
+    content_words = [w for w in words if w.lower() not in stop_words]
+    
+    if len(content_words) >= 2:
+        # Full content words
+        variants.append((" ".join(content_words), 0.85))
+        
+        # Word pairs (sliding window)
+        if len(content_words) >= 3:
+            for i in range(len(content_words) - 1):
+                pair = f"{content_words[i]} {content_words[i+1]}"
+                variants.append((pair, 0.6))
+        
+        # Individual important words (last resort)
+        for w in content_words:
+            if len(w) > 3:  # Skip very short words
+                variants.append((w, 0.4))
+    
+    # Deduplicate by query string, keep highest weight
+    seen = {}
+    for q_str, weight in variants:
+        key = q_str.lower().strip()
+        if key not in seen or weight > seen[key]:
+            seen[key] = weight
+    
+    return [(k, v) for k, v in seen.items()]
+
+
+async def _single_vector_search(qdrant, query: str, user_id: str, category: Optional[str], fetch_limit: int, top_p: float) -> list:
+    """Run a single vector search against Qdrant. Returns raw results before boosting."""
+    vec = await get_embedding(query)
+    conditions = [FieldCondition(key="userId", match=MatchValue(value=user_id))]
+    if category:
+        conditions.append(FieldCondition(key="category", match=MatchValue(value=category.strip().capitalize())))
+    
+    filt = Filter(must=conditions)
+    result = await qdrant.query_points(
+        collection_name=COLLECTION_NAME,
+        query=vec,
+        query_filter=filt,
+        limit=fetch_limit,
+        score_threshold=0.0,  # We apply threshold after boosting
+    )
+    return result.points
+
+
+def _boost_result_score(point, query_lower: str) -> float:
+    """Apply name/metadata-based score boosting to a Qdrant result."""
+    score = point.score
+    metadata = point.payload.get("metadata", {})
+    name = point.payload.get("name")
+    aliases = metadata.get("aliases", {})
+    query_words = query_lower.split()
+
+    if name:
+        name_lower = name.lower()
+        if query_lower == name_lower:
+            score += 1.0
+        elif name_lower in query_lower:
+            score += 0.5
+        elif all(w in name_lower for w in query_words):
+            score += 0.4
+        elif query_lower in name_lower:
+            score += 0.2
+        name_words = name_lower.split()
+        if len(query_words) == 1 and len(name_words) >= 1:
+            for tw in name_words:
+                s = difflib.SequenceMatcher(None, query_lower, tw).ratio()
+                if s >= 0.6:
+                    score += 0.35 * s
+                    break
+        first = (metadata.get("first_name") or "").lower()
+        last = (metadata.get("last_name") or "").lower()
+        if first:
+            s = difflib.SequenceMatcher(None, query_lower, first).ratio()
+            if query_lower == first:
+                score += 0.8
+            elif first in query_lower:
+                score += 0.4
+            elif s >= 0.7:
+                score += s * 0.6
+        if last:
+            s = difflib.SequenceMatcher(None, query_lower, last).ratio()
+            if query_lower == last:
+                score += 0.8
+            elif last in query_lower:
+                score += 0.4
+            elif s >= 0.7:
+                score += s * 0.6
+        if name:
+            name_norm = name.lower().strip()
+            s = difflib.SequenceMatcher(None, query_lower, name_norm).ratio()
+            if s >= 0.7:
+                score += s * 0.8
+            name_words = name_norm.split()
+            if len(name_words) >= 2:
+                surname = name_words[-1]
+                query_words_l = query_lower.split()
+                if len(query_words_l) >= 2:
+                    query_surname = query_words_l[-1]
+                    s_surname = difflib.SequenceMatcher(None, query_surname, surname).ratio()
+                    if s_surname >= 0.7:
+                        score += s_surname * 0.8
+        if aliases and isinstance(aliases, dict):
+            matched_query_words = set()
+            best_ratio = 0
+            for alias, confidence in aliases.items():
+                alias_words = alias.lower().split()
+                for qw in query_words:
+                    if qw in alias.lower():
+                        continue
+                    for aw in alias_words:
+                        ratio = difflib.SequenceMatcher(None, qw, aw).ratio()
+                        if ratio >= 0.6 and ratio > best_ratio:
+                            best_ratio = ratio
+                            matched_query_words.add(qw)
+                if query_lower == alias.lower():
+                    try: score += (float(confidence) * 0.2)
+                    except: pass
+                elif query_lower in alias.lower() or alias.lower() in query_lower:
+                    try: score += (float(confidence) * 0.05)
+                    except: pass
+            if matched_query_words:
+                score += 0.1 * best_ratio
+
+    return score
+
+
 async def db_search_memories(query: str, user_id: str, limit: int = 5, category: Optional[str] = None, top_p: float = 0.4) -> list:
-    """Vector-similarity search with optional category filter. Also does a basic substring match on names."""
+    """Vector-similarity search with multi-query expansion and optional category filter.
+    
+    For queries with 3+ words, generates multiple query variants and merges
+    results to improve semantic coverage.
+    """
     qdrant = await get_qdrant()
     neo4j_driver = get_neo4j()
     if not qdrant or not neo4j_driver:
@@ -590,114 +747,37 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
                 "metadata": meta
             })
 
-    # 2. Qdrant vector search
-    vec    = await get_embedding(query)
-    conditions = [FieldCondition(key="userId", match=MatchValue(value=user_id))]
-    if category:
-        conditions.append(FieldCondition(key="category", match=MatchValue(value=category.strip().capitalize())))
-
-    filt   = Filter(must=conditions)
-    # Fetch more results initially so we can re-rank them with our manual boosts
+    # 2. Multi-query vector search
+    # Generate query variants for better semantic coverage
+    query_variants = _expand_query(query)
     fetch_limit = max(limit * 5, 50)
-    result = await qdrant.query_points(
-        collection_name=COLLECTION_NAME,
-        query=vec,
-        query_filter=filt,
-        limit=fetch_limit,
-        score_threshold=top_p,
-    )
-    results = []
-    query_lower = query.lower()
-    for r in result.points:
-        score = r.score
-        metadata = r.payload.get("metadata", {})
-        aliases = metadata.get("aliases", {})
-        name = r.payload.get("name")
-
-        # Boost score if query matches the name or first_name/last_name metadata
-        if name:
-            name_lower = name.lower()
-            query_words = query_lower.split()
-            if query_lower == name_lower:
-                score += 1.0
-            elif name_lower in query_lower:
-                score += 0.5
-            elif all(w in name_lower for w in query_words):
-                score += 0.4
-            elif query_lower in name_lower:
-                score += 0.2
-            name_words = name_lower.split()
-            if len(query_words) == 1 and len(name_words) >= 1:
-                for tw in name_words:
-                    s = difflib.SequenceMatcher(None, query_lower, tw).ratio()
-                    if s >= 0.6:
-                        score += 0.35 * s
-                        break
-            # Also boost if first_name or last_name matches (including fuzzy)
-            first = (metadata.get("first_name") or "").lower()
-            last = (metadata.get("last_name") or "").lower()
-            if first:
-                s = difflib.SequenceMatcher(None, query_lower, first).ratio()
-                if query_lower == first:
-                    score += 0.8
-                elif first in query_lower:
-                    score += 0.4
-                elif s >= 0.7:
-                    score += s * 0.6
-            if last:
-                s = difflib.SequenceMatcher(None, query_lower, last).ratio()
-                if query_lower == last:
-                    score += 0.8
-                elif last in query_lower:
-                    score += 0.4
-                elif s >= 0.7:
-                    score += s * 0.6
-            # Fuzzy name match boost
-            if name:
-                name_norm = name.lower().strip()
-                s = difflib.SequenceMatcher(None, query_lower, name_norm).ratio()
-                if s >= 0.7:
-                    score += s * 0.8
-                # Also check fuzzy match against just the surname (last word)
-                name_words = name_norm.split()
-                if len(name_words) >= 2:
-                    surname = name_words[-1]
-                    query_words_l = query_lower.split()
-                    if len(query_words_l) >= 2:
-                        query_surname = query_words_l[-1]
-                        s_surname = difflib.SequenceMatcher(None, query_surname, surname).ratio()
-                        if s_surname >= 0.7:
-                            score += s_surname * 0.8
-            if aliases and isinstance(aliases, dict):
-                matched_query_words = set()
-                best_ratio = 0
-                for alias, confidence in aliases.items():
-                    alias_words = alias.lower().split()
-                    for qw in query_words:
-                        if qw in alias.lower():
-                            continue
-                        for aw in alias_words:
-                            ratio = difflib.SequenceMatcher(None, qw, aw).ratio()
-                            if ratio >= 0.6 and ratio > best_ratio:
-                                best_ratio = ratio
-                                matched_query_words.add(qw)
-                    if query_lower == alias.lower():
-                        try: score += (float(confidence) * 0.2)
-                        except: pass
-                    elif query_lower in alias.lower() or alias.lower() in query_lower:
-                        try: score += (float(confidence) * 0.05)
-                        except: pass
-                if matched_query_words:
-                    score += 0.1 * best_ratio
-
-        results.append({
-            "id": r.id,
-            "text": r.payload.get("text"),
-            "name": r.payload.get("name"),
-            "category": r.payload.get("category"),
-            "score": score,
-            "metadata": metadata
-        })
+    
+    # Collect all results from all query variants
+    all_vector_results = {}  # id -> best result across all variants
+    
+    for variant_query, weight in query_variants:
+        raw_points = await _single_vector_search(qdrant, variant_query, user_id, category, fetch_limit, top_p)
+        
+        for r in raw_points:
+            boosted_score = _boost_result_score(r, variant_query.lower())
+            # Apply query variant weight
+            weighted_score = boosted_score * weight
+            
+            result_entry = {
+                "id": r.id,
+                "text": r.payload.get("text"),
+                "name": r.payload.get("name"),
+                "category": r.payload.get("category"),
+                "score": weighted_score,
+                "raw_score": r.score,
+                "metadata": r.payload.get("metadata", {})
+            }
+            
+            # Keep the best version of each result
+            if r.id not in all_vector_results or weighted_score > all_vector_results[r.id]["score"]:
+                all_vector_results[r.id] = result_entry
+    
+    results = list(all_vector_results.values())
 
     # Merge exact matches and vector results, deduplicating by ID
     merged_results = {}

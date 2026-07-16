@@ -59,7 +59,7 @@ TEST_QUERIES = [
 ]
 
 
-async def run_batch(threshold: float = 0.7, user_id: str = "default"):
+async def run_batch(threshold: float = 0.5, user_id: str = "default"):
     results = []
     for query, category in TEST_QUERIES:
         print(f"\n{'#'*60}")

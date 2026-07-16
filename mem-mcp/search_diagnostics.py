@@ -547,7 +547,7 @@ async def main():
     parser.add_argument("--interactive", "-i", action="store_true", help="Interactive mode")
     parser.add_argument("--from-log", action="store_true", help="Analyze existing log file")
     parser.add_argument("--diary", action="store_true", help="Test diary search instead of facts")
-    parser.add_argument("--threshold", "-t", type=float, default=None, help="Override top_p threshold")
+    parser.add_argument("--threshold", "-t", type=float, default=0.5, help="Override top_p threshold (default 0.5)")
     parser.add_argument("--user", "-u", default="default", help="User ID")
     parser.add_argument("--inspect", action="store_true", help="Inspect collection contents and user IDs")
     args = parser.parse_args()
@@ -578,14 +578,14 @@ async def main():
             if args.diary:
                 await diagnose_search_diary(q, args.user, top_p=args.threshold or 0.4)
             else:
-                await diagnose_search_facts(q, args.user, top_p=args.threshold or 0.7)
+                await diagnose_search_facts(q, args.user, top_p=args.threshold or 0.5)
         return
 
     if args.query:
         if args.diary:
             await diagnose_search_diary(args.query, args.user, top_p=args.threshold or 0.4)
         else:
-            await diagnose_search_facts(args.query, args.user, top_p=args.threshold or 0.7)
+            await diagnose_search_facts(args.query, args.user, top_p=args.threshold or 0.5)
         return
 
     parser.print_help()
