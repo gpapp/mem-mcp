@@ -90,22 +90,49 @@ async def _patch_entry(qdrant, neo4j_driver, entry: dict, keywords: list, collec
 
     # --- Qdrant: fetch existing payload, merge keywords, upsert ---
     existing_payload = await _fetch_qdrant_payload(qdrant, entry_id, collection)
+    metadata_payload = {}
     if existing_payload:
         updated_payload = dict(existing_payload)
-        updated_payload["keywords"] = keywords
-        from qdrant_client.models import SetPayload
+        existing_meta = updated_payload.get("metadata") or {}
+        if isinstance(existing_meta, str):
+            try:
+                import json
+                existing_meta = json.loads(existing_meta)
+            except Exception:
+                existing_meta = {}
+        metadata_payload = dict(existing_meta)
+        metadata_payload["keywords"] = ", ".join(keywords)
+
         await qdrant.set_payload(
             collection_name=collection,
-            payload={"keywords": keywords},
+            payload={
+                "keywords": keywords,
+                "metadata": metadata_payload
+            },
             points=[entry_id],
         )
 
-    # --- Neo4j: set d.keywords ---
+    # --- Neo4j: set d.keywords and d.metadata ---
     with neo4j_driver.session() as s:
+        import json
+        res = s.run("MATCH (d:DiaryEntry {id: $id}) RETURN d.metadata as metadata", id=entry_id)
+        single = res.single()
+        existing_meta = {}
+        if single and single["metadata"]:
+            raw_m = single["metadata"]
+            existing_meta = json.loads(raw_m) if isinstance(raw_m, str) else (raw_m or {})
+        
+        metadata_payload = dict(existing_meta)
+        metadata_payload["keywords"] = ", ".join(keywords)
+
         s.run(
-            "MATCH (d:DiaryEntry {id: $id}) SET d.keywords = $keywords",
+            """
+            MATCH (d:DiaryEntry {id: $id})
+            SET d.keywords = $keywords, d.metadata = $metadata
+            """,
             id=entry_id,
             keywords=keywords,
+            metadata=json.dumps(metadata_payload),
         )
 
 

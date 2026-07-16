@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <name>Memory Vault — Dashboard</name>
+  <title>Memory Vault — Dashboard</title>
   <link rel="icon" type="image/svg+xml" href="{{BASE_URL}}/favicon.svg">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -1144,6 +1144,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
           if (!isFact(l)) {
             return `<span class="link-badge" id="link-badge-${m.id}-${l.target_id}">
               <span class="link-content" style="cursor:pointer;" onclick="switchTab('diary');selectDiaryEntry('${l.target_id}')">${label}</span>
+              <button class="link-action-btn" onclick="deleteDiaryLinkFromFact('${l.target_id}', '${m.id}')" name="Delete">🗑️</button>
             </span>`;
           }
 
@@ -1239,6 +1240,17 @@ npm install @modelcontextprotocol/sdk</code></pre>
       const m = memories.find(x => x.id === apiSource);
       if (m && selectedFactId === apiSource) renderFactPane(m);
     } catch(e) { toast('❌ Error deleting link'); }
+  }
+
+  async function deleteDiaryLinkFromFact(diaryId, factId) {
+    if (!confirm('Remove this link?')) return;
+    try {
+      await api.delete('diary/' + diaryId + '/link/' + factId);
+      toast('🗑️ Link removed');
+      await loadMemories();
+      const m = memories.find(x => x.id === factId);
+      if (m && selectedFactId === factId) renderFactPane(m);
+    } catch(e) { toast('❌ Error removing link'); }
   }
 
   function cancelLinkEdit(badgeSource, badgeTarget, relType, targetLabel, apiSource, apiTarget) {
@@ -1694,7 +1706,6 @@ npm install @modelcontextprotocol/sdk</code></pre>
           <h2 style="margin:0; font-size:1.15rem;">${escHtml(diaryEntryTitle(entry))}</h2>
         </div>
         <div style="display:flex; gap:0.5rem; align-items:center; flex-shrink:0; margin-left:1rem;">
-          ${mentions}
           <button class="btn btn-ghost btn-sm" onclick="renderDiaryEditMode('${entry.id}')" style="padding:0.15rem 0.5rem; font-size:0.75rem;">✏️</button>
           <button class="btn btn-danger btn-sm" onclick="deleteDiaryEntry('${entry.id}')" style="padding:0.15rem 0.5rem; font-size:0.75rem;">🗑️</button>
         </div>

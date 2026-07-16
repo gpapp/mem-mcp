@@ -76,6 +76,9 @@ async def db_save_diary(content: str, user_id: str, timestamp: str, name: str, m
     payload = {"content": content, "name": name, "date": entry_date, "timestamp": timestamp, "userId": user_id}
     if keywords:
         payload["keywords"] = keywords
+        if not metadata:
+            metadata = {}
+        metadata["keywords"] = ", ".join(keywords)
     if metadata:
         payload["metadata"] = metadata
 
@@ -193,6 +196,13 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
 
             # Boost if variant matches any stored keyword
             stored_kws = r.payload.get("keywords") or []
+            if not stored_kws and "metadata" in r.payload and r.payload["metadata"] and "keywords" in r.payload["metadata"]:
+                meta_kws = r.payload["metadata"]["keywords"]
+                if isinstance(meta_kws, str):
+                    stored_kws = [kw.strip() for kw in meta_kws.split(",") if kw.strip()]
+                elif isinstance(meta_kws, list):
+                    stored_kws = meta_kws
+
             for kw in stored_kws:
                 kw_lower = kw.lower()
                 if variant_lower == kw_lower:
@@ -270,8 +280,18 @@ async def db_update_diary(entry_id: str, user_id: str, content: Optional[str] = 
         new_metadata = metadata if metadata is not None else existing_meta
         entry_date = new_ts[:10]
 
+        # Extract/regenerate keywords asynchronously — non-blocking; empty list on failure
+        keywords = await extract_diary_keywords(new_name or "", new_content)
+        if keywords:
+            if new_metadata is None:
+                new_metadata = {}
+            new_metadata["keywords"] = ", ".join(keywords)
+
         neo4j_props = "d.content = $content, d.name = $name, d.timestamp = $ts, d.date = $date"
         params = dict(id=entry_id, userId=user_id, content=new_content, name=new_name, ts=new_ts, date=entry_date)
+        if keywords:
+            neo4j_props += ", d.keywords = $keywords"
+            params["keywords"] = keywords
         if new_metadata is not None:
             neo4j_props += ", d.metadata = $metadata"
             params["metadata"] = json.dumps(new_metadata)
@@ -309,9 +329,6 @@ async def db_update_diary(entry_id: str, user_id: str, content: Optional[str] = 
     # Re-embed in Qdrant
     vector = await get_embedding(f"{new_name}: {new_content}" if new_name else new_content)
 
-    # Regenerate keywords if content or name changed
-    keywords = await extract_diary_keywords(new_name or "", new_content)
-
     payload = {"content": new_content, "name": new_name, "date": entry_date, "timestamp": new_ts, "userId": user_id}
     if keywords:
         payload["keywords"] = keywords
@@ -325,14 +342,6 @@ async def db_update_diary(entry_id: str, user_id: str, content: Optional[str] = 
             payload=payload,
         )],
     )
-
-    # Also persist keywords to Neo4j
-    with neo4j_driver.session() as s2:
-        if keywords:
-            s2.run(
-                "MATCH (d:DiaryEntry {id: $id, userId: $userId}) SET d.keywords = $keywords",
-                id=entry_id, userId=user_id, keywords=keywords,
-            )
 
     await publish_db_event(user_id, "diary_changed", {"action": "update", "id": entry_id, "date": entry_date})
     return True
@@ -460,7 +469,7 @@ def db_list_diary(user_id: str) -> list:
             MATCH (d:DiaryEntry {userId: $userId})
             OPTIONAL MATCH (d)-[:MENTIONS]->(f:Fact)
             RETURN d.id as id, d.date as date, d.content as content, d.timestamp as timestamp, d.name as name,
-                   d.metadata as metadata,
+                   d.metadata as metadata, d.keywords as keywords,
                    collect({id: f.id, text: f.text, name: f.name}) as mentions
             ORDER BY d.date DESC, d.timestamp DESC
             """,
@@ -474,7 +483,8 @@ def db_list_diary(user_id: str) -> list:
                 "name": r.get("name") or "Unnamed Entry",
                 "timestamp": format_ts_for_picker(r.get("timestamp")),
                 "metadata": (json.loads(r["metadata"]) if isinstance(r.get("metadata"), str) else (r.get("metadata") or {})),
-                "mentions": [m for m in r["mentions"] if m.get("id")]
+                "mentions": [m for m in r["mentions"] if m.get("id")],
+                "keywords": r.get("keywords") or []
             } for r in result
         ]
 
