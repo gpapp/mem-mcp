@@ -461,6 +461,85 @@ def analyze_log():
                   f"neo4j={e.get('neo4j_matches', '?')}, qdrant={e.get('qdrant_raw_count', '?')})")
 
 
+async def inspect_collections():
+    """Inspect Qdrant collections: point counts, unique user IDs, sample data."""
+    qdrant = await get_qdrant()
+    neo4j_driver = get_neo4j()
+    if not qdrant:
+        print("ERROR: Qdrant not connected.")
+        return
+
+    for coll_name in [COLLECTION_NAME, DIARY_COLLECTION]:
+        print(f"\n{'='*60}")
+        print(f"COLLECTION: {coll_name}")
+        print(f"{'='*60}")
+
+        try:
+            info = await qdrant.get_collection(coll_name)
+            print(f"  Points count: {info.points_count}")
+            print(f"  Vectors size: {info.config.params.vectors.size}")
+            print(f"  Status: {info.status}")
+        except Exception as e:
+            print(f"  ERROR getting collection info: {e}")
+            continue
+
+        if info.points_count == 0:
+            print(f"  ** COLLECTION IS EMPTY **")
+            continue
+
+        # Sample points to find user IDs
+        print(f"\n  Sampling points to find user IDs...")
+        try:
+            samples = await qdrant.scroll(
+                collection_name=coll_name,
+                limit=20,
+                with_payload=True,
+            )
+            user_ids = set()
+            for point in samples[0]:
+                uid = point.payload.get("userId", "MISSING")
+                user_ids.add(uid)
+
+            print(f"  Unique userIds found in sample: {user_ids}")
+
+            # Show sample payloads
+            print(f"\n  Sample payloads:")
+            for i, point in enumerate(samples[0][:5]):
+                name = point.payload.get("name", "?")
+                cat = point.payload.get("category", "?")
+                date = point.payload.get("date", "?")
+                uid = point.payload.get("userId", "?")
+                text = (point.payload.get("text") or "")[:80]
+                print(f"    [{i}] id={point.id}")
+                print(f"        userId={uid}")
+                print(f"        name={name}")
+                if coll_name == DIARY_COLLECTION:
+                    print(f"        date={date}")
+                else:
+                    print(f"        category={cat}")
+                    print(f"        text={text}...")
+        except Exception as e:
+            print(f"  ERROR scrolling collection: {e}")
+
+    # Also check Neo4j fact counts
+    if neo4j_driver:
+        print(f"\n{'='*60}")
+        print(f"NEO4J FACTS")
+        print(f"{'='*60}")
+        with neo4j_driver.session() as s:
+            result = s.run("MATCH (f:Fact) RETURN f.userId as uid, count(f) as cnt ORDER BY cnt DESC")
+            for r in result:
+                print(f"  userId={r['uid']}: {r['cnt']} facts")
+
+        print(f"\n{'='*60}")
+        print(f"NEO4J DIARY ENTRIES")
+        print(f"{'='*60}")
+        with neo4j_driver.session() as s:
+            result = s.run("MATCH (d:DiaryEntry) RETURN d.userId as uid, count(d) as cnt ORDER BY cnt DESC")
+            for r in result:
+                print(f"  userId={r['uid']}: {r['cnt']} entries")
+
+
 async def main():
     import argparse
     parser = argparse.ArgumentParser(description="Search diagnostics")
@@ -470,7 +549,12 @@ async def main():
     parser.add_argument("--diary", action="store_true", help="Test diary search instead of facts")
     parser.add_argument("--threshold", "-t", type=float, default=None, help="Override top_p threshold")
     parser.add_argument("--user", "-u", default="default", help="User ID")
+    parser.add_argument("--inspect", action="store_true", help="Inspect collection contents and user IDs")
     args = parser.parse_args()
+
+    if args.inspect:
+        await inspect_collections()
+        return
 
     if args.from_log:
         analyze_log()
