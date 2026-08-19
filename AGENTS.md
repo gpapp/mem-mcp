@@ -46,6 +46,7 @@ After completing any code changes:
 
 - `MEM_NEO4J_PASSWORD` (also mapped to `NEO_PASS` in docker-compose)
 - Embedder: pull `nomic-embed-text` into Ollama container (docker-compose uses `nomic-ea` by default)
+- Query LLM: pull `qwen3.5:0.8b` into Ollama container (used for search rewriting and diary keyword extraction)
 - User vault resolved from `Authorization: Basic` header or session cookie
 - `BASE_URL` must include `/mcp` prefix when behind nginx
 
@@ -96,3 +97,19 @@ Search diary entries from the sidebar.
 - Clicking a result navigates to that date's entries
 - Clearing the input restores the full date history list
 - API endpoint: `GET /api/diary/search?q=<text>&limit=10&top_p=0.4`
+
+### Skills System
+Pluggable skill workflows loaded from Markdown files in `mem-mcp/skills/`.
+
+- `find_skills` — lists all available skill `.md` files
+- `get_skill_workflow(name)` — returns the full Markdown content of a skill
+- MCP prompts (`process-transcription`, `memory-deduplication`) inject skill instructions into the conversation
+- Add new skills by creating a `.md` file in `mem-mcp/skills/` — no server restart required
+
+### Diary Keyword Extraction
+Every diary save/update triggers automatic keyword extraction via the query LLM (`qwen3.5:0.8b`).
+
+- Up to 10 keywords extracted per entry, stored in both Qdrant payload and Neo4j node
+- Keywords boost vector search relevance in `diary_search_entries`
+- Backfill existing entries: `python mem-mcp/reindex_diary_keywords.py -u <user_id>`
+- CLI options: `-f/--force` (re-extract even if keywords exist), `-d/--dry-run`, `-c/--concurrency` (default 3)
