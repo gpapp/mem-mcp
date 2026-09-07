@@ -292,13 +292,16 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
             if (cname or "").lower() == client.lower():
                 e["score"] += 0.3
     else:
+        # Fetch status map first so inactive clients skip the inferred boost too.
+        status_map = db_get_client_status_map(user_id)
         inferred_client, _ = infer_scope_from_text(query, user_id)
         if inferred_client:
             for e in entries:
                 cname = e.get("clientName") or e.get("metadata", {}).get("clientName", "")
-                if (cname or "").lower() == inferred_client.lower():
+                cname_lower = (cname or "").lower()
+                # Don't boost inactive clients even if the query text mentions them.
+                if cname_lower == inferred_client.lower() and status_map.get(cname_lower) is not False:
                     e["score"] += INFERRED_SCOPE_BOOST
-        status_map = db_get_client_status_map(user_id)
         if status_map:
             for e in entries:
                 cname = (e.get("clientName") or e.get("metadata", {}).get("clientName", "") or "").lower()
