@@ -2136,7 +2136,9 @@ npm install @modelcontextprotocol/sdk</code></pre>
   function goToToday() {
     const now = new Date();
     diaryMonthYear = { year: now.getFullYear(), month: now.getMonth() + 1 };
-    selectedDiaryDate = localDateStr(now);
+    const todayStr = localDateStr(now);
+    // Only pin to today's date if there are actually entries on that date
+    selectedDiaryDate = diaryEntries.some(e => e.date === todayStr) ? todayStr : null;
     renderDiaryMonthPager();
     renderDiarySidebar();
     saveSessionState();
