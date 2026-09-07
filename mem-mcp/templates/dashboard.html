@@ -996,7 +996,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
       await api.delete('clients/' + id);
       toast('🗑️ Client deleted');
       await loadClients();
-      loadMemories();
+      await loadMemories();
     } catch(e) { toast('⚠️ Could not delete client'); }
   }
 
@@ -1009,7 +1009,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
       toast('🗑️ Project deleted');
       await loadClients();
       if (_activeSetupTab === 'projects') loadProjects();
-      loadMemories();
+      await loadMemories();
     } catch(e) { toast('⚠️ Could not delete project'); }
   }
 
@@ -1037,7 +1037,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
       await api.put('clients/' + id, {name});
       toast('✏️ Client renamed');
       await loadClients();
-      loadMemories();
+      await loadMemories();
     } catch(e) { toast(e && e.status === 409 ? '⚠️ That client name already exists' : '⚠️ Could not rename client'); }
   }
 
@@ -1053,7 +1053,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
       toast('✏️ Project renamed');
       await loadClients();
       if (_activeSetupTab === 'projects') loadProjects();
-      loadMemories();
+      await loadMemories();
     } catch(e) { toast(e && e.status === 409 ? '⚠️ That project name already exists for this client' : '⚠️ Could not rename project'); }
   }
 
