@@ -264,7 +264,9 @@ _SCOPE_SYSTEM = (
     "\"context\": \"<exact context name or null>\"}. "
     "Rules: use exact names from the list, never invent names; "
     "context must belong to the chosen client; "
-    "return nulls when the item is generic/shared knowledge or matches no client."
+    "return nulls when the item is generic/shared knowledge or matches no client. "
+    "IMPORTANT: if the MENTIONS section lists facts that are already scoped to a specific client, "
+    "strongly prefer that client — it is the strongest signal available."
 )
 
 
@@ -381,16 +383,19 @@ def _enriched_diary_text(item: dict, neo4j_driver, user_id: str) -> str:
                 rows = list(s.run(
                     """
                     MATCH (d:DiaryEntry {userId: $userId, id: $did})-[:MENTIONS]->(f:Fact)
-                    RETURN DISTINCT f.name AS name, f.text AS body
+                    OPTIONAL MATCH (f)-[:FOR_CLIENT]->(cl:Client)
+                    RETURN DISTINCT f.name AS name, f.text AS body, cl.name AS clientName
                     LIMIT 6
                     """,
                     userId=user_id, did=item["id"]
                 ))
             if rows:
-                m_lines = [
-                    f"- {r['name'] or 'Unnamed'}: {_snippet(r['body'])}"
-                    for r in rows
-                ]
+                m_lines = []
+                for r in rows:
+                    line = f"- {r['name'] or 'Unnamed'}: {_snippet(r['body'])}"
+                    if r["clientName"]:
+                        line += f" [client: {r['clientName']}]"
+                    m_lines.append(line)
                 parts.append("MENTIONS:\n" + "\n".join(m_lines))
         except Exception as exc:
             logger.debug(f"[scope_backfill] mentions fetch failed for {item.get('id')}: {exc}")
