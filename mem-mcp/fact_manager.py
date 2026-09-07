@@ -13,6 +13,14 @@ from common import (
     get_qdrant, get_neo4j, logger, get_embedding, get_llm_response, publish_db_event,
     COLLECTION_NAME, DIARY_COLLECTION
 )
+from client_manager import (
+    db_create_client, db_create_context, db_list_clients,
+    db_resolve_client, db_resolve_context,
+    link_fact_to_client, link_fact_to_context,
+    _resolve_client_by_id, _resolve_context_by_id,
+    infer_scope_from_text, db_get_client_status_map,
+    INFERRED_SCOPE_BOOST, INACTIVE_PENALTY
+)
 
 # ---------------------------------------------------------------------------
 # People metadata extraction
@@ -52,7 +60,7 @@ def extract_people_metadata(name: Optional[str]) -> dict:
 # ---------------------------------------------------------------------------
 # CRUD helpers – single source of truth for Qdrant + Neo4j consistency
 # ---------------------------------------------------------------------------
-async def db_add_memory(text: str, category: str, user_id: str, metadata: Optional[dict] = None, name: Optional[str] = None) -> str:
+async def db_add_memory(text: str, category: str, user_id: str, metadata: Optional[dict] = None, name: Optional[str] = None, client_id: Optional[str] = None, context_id: Optional[str] = None) -> str:
     """Insert a fact into Qdrant (vector) and Neo4j (graph). Returns the new ID."""
     qdrant = await get_qdrant()
     neo4j_driver = get_neo4j()
@@ -68,6 +76,19 @@ async def db_add_memory(text: str, category: str, user_id: str, metadata: Option
 
     # Qdrant
     payload = {"text": text, "name": name, "category": category, "userId": user_id, "metadata": meta}
+
+    # Add client/context info to payload if provided
+    if client_id:
+        client_info = _resolve_client_by_id(client_id, user_id)
+        if client_info:
+            payload["clientId"] = client_id
+            payload["clientName"] = client_info["name"]
+    if context_id:
+        ctx_info = _resolve_context_by_id(context_id, user_id)
+        if ctx_info:
+            payload["contextId"] = context_id
+            payload["contextName"] = ctx_info["name"]
+
     await qdrant.upsert(
         collection_name=COLLECTION_NAME,
         points=[PointStruct(
@@ -92,6 +113,14 @@ async def db_add_memory(text: str, category: str, user_id: str, metadata: Option
             userId=user_id, category=category, id=doc_id, text=text, name=name,
             metadata=meta
         )
+
+    # Link to Client if provided
+    if client_id:
+        await link_fact_to_client(doc_id, client_id, user_id)
+
+    # Link to Context if provided
+    if context_id:
+        await link_fact_to_context(doc_id, context_id, user_id)
 
     await publish_db_event(user_id, "memory_changed", {
         "action": "add",
@@ -593,12 +622,16 @@ def _expand_query(query: str) -> list:
     return [(k, v) for k, v in seen.items()]
 
 
-async def _single_vector_search(qdrant, query: str, user_id: str, category: Optional[str], fetch_limit: int, top_p: float) -> list:
+async def _single_vector_search(qdrant, query: str, user_id: str, category: Optional[str], fetch_limit: int, top_p: float, client: Optional[str] = None, context: Optional[str] = None) -> list:
     """Run a single vector search against Qdrant. Returns raw results before boosting."""
     vec = await get_embedding(query)
     conditions = [FieldCondition(key="userId", match=MatchValue(value=user_id))]
     if category:
         conditions.append(FieldCondition(key="category", match=MatchValue(value=category.strip().capitalize())))
+    if client:
+        conditions.append(FieldCondition(key="clientName", match=MatchValue(value=client.strip())))
+    if context:
+        conditions.append(FieldCondition(key="contextName", match=MatchValue(value=context.strip())))
     
     filt = Filter(must=conditions)
     result = await qdrant.query_points(
@@ -693,11 +726,13 @@ def _boost_result_score(point, query_lower: str) -> float:
     return score
 
 
-async def db_search_memories(query: str, user_id: str, limit: int = 5, category: Optional[str] = None, top_p: float = 0.4) -> list:
+async def db_search_memories(query: str, user_id: str, limit: int = 5, category: Optional[str] = None, top_p: float = 0.4, client: Optional[str] = None, context: Optional[str] = None) -> list:
     """Vector-similarity search with multi-query expansion and optional category filter.
     
     For queries with 3+ words, generates multiple query variants and merges
     results to improve semantic coverage.
+    
+    Optional client/context parameters filter results to specific client or context scope.
     """
     qdrant = await get_qdrant()
     neo4j_driver = get_neo4j()
@@ -725,11 +760,21 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
             """
         if category:
             cypher += " AND toLower(f.category) = toLower($category)"
-        cypher += " RETURN f LIMIT 100"
+        if client:
+            cypher += " AND EXISTS((f)-[:FOR_CLIENT]->(:Client {name: $clientName, userId: $userId}))"
+        if context:
+            cypher += " AND EXISTS((f)-[:IN_CONTEXT]->(:Context {name: $contextName, userId: $userId}))"
+        cypher += " OPTIONAL MATCH (f)-[:FOR_CLIENT]->(fc:Client)"
+        cypher += " OPTIONAL MATCH (f)-[:IN_CONTEXT]->(fx:Context)"
+        cypher += " RETURN f, fc.name AS clientName, fx.name AS contextName LIMIT 100"
 
         params = {"userId": user_id, "query_str": query}
         if category:
             params["category"] = category.strip()
+        if client:
+            params["clientName"] = client.strip()
+        if context:
+            params["contextName"] = context.strip()
 
         neo_result = s.run(cypher, **params)
         for r in neo_result:
@@ -781,6 +826,8 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
                 "name": f.get("name"),
                 "category": f.get("category"),
                 "score": score,
+                "clientName": r["clientName"],
+                "contextName": r["contextName"],
                 "metadata": meta
             })
 
@@ -793,7 +840,7 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
     all_vector_results = {}  # id -> best result across all variants
     
     for variant_query, weight in query_variants:
-        raw_points = await _single_vector_search(qdrant, variant_query, user_id, category, fetch_limit, top_p)
+        raw_points = await _single_vector_search(qdrant, variant_query, user_id, category, fetch_limit, top_p, client, context)
         
         for r in raw_points:
             boosted_score = _boost_result_score(r, variant_query.lower())
@@ -807,6 +854,8 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
                 "category": r.payload.get("category"),
                 "score": weighted_score,
                 "raw_score": r.score,
+                "clientName": r.payload.get("clientName"),
+                "contextName": r.payload.get("contextName"),
                 "metadata": r.payload.get("metadata", {})
             }
             
@@ -830,6 +879,34 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
     final_list = list(merged_results.values())
     if category:
         final_list = [r for r in final_list if r.get("category", "").lower() == category.lower()]
+    
+    # Apply client/context scoring (names live top-level; fall back to metadata).
+    # Explicit scope boosts; inferred scope is a weaker boost-only fallback;
+    # inactive clients are penalized in unscoped (global) search only.
+    if client:
+        for r in final_list:
+            cname = r.get("clientName") or r.get("metadata", {}).get("clientName", "")
+            if (cname or "").lower() == client.lower():
+                r["score"] += 0.3
+    else:
+        inferred_client, _ = infer_scope_from_text(query, user_id)
+        if inferred_client:
+            for r in final_list:
+                cname = r.get("clientName") or r.get("metadata", {}).get("clientName", "")
+                if (cname or "").lower() == inferred_client.lower():
+                    r["score"] += INFERRED_SCOPE_BOOST
+        status_map = db_get_client_status_map(user_id)
+        if status_map:
+            for r in final_list:
+                cname = (r.get("clientName") or r.get("metadata", {}).get("clientName", "") or "").lower()
+                if cname and status_map.get(cname) is False:
+                    r["score"] -= INACTIVE_PENALTY
+    if context:
+        for r in final_list:
+            xname = r.get("contextName") or r.get("metadata", {}).get("contextName", "")
+            if (xname or "").lower() == context.lower():
+                r["score"] += 0.3
+    
     final_list.sort(key=lambda x: x["score"], reverse=True)
     return final_list[:limit]
 
@@ -863,7 +940,10 @@ def db_list_memories(user_id: str) -> list:
         result = s.run(
             """
             MATCH (c:Category)<-[:IN_CATEGORY]-(f:Fact {userId: $userId})
-            RETURN f, c.name as category,
+            OPTIONAL MATCH (f)-[:FOR_CLIENT]->(cl:Client)
+            OPTIONAL MATCH (f)-[:IN_CONTEXT]->(ctx:Context)
+            RETURN f, c.name as category, cl.name as clientName, cl.id as clientId,
+                   ctx.name as contextName, ctx.id as contextId,
                    [(f)-[r]-(other {userId: $userId})
                     WHERE (other:Fact OR other:DiaryEntry)
                       AND type(r) <> 'IN_CATEGORY' AND type(r) <> 'KNOWS'
@@ -888,6 +968,14 @@ def db_list_memories(user_id: str) -> list:
             for k, v in f_node.items():
                 if k not in core_keys:
                     metadata[k] = v.iso_format() if hasattr(v, "iso_format") else v
+            
+            # Add client/context to metadata for convenience
+            if r["clientName"]:
+                metadata["clientName"] = r["clientName"]
+                metadata["clientId"] = r["clientId"]
+            if r["contextName"]:
+                metadata["contextName"] = r["contextName"]
+                metadata["contextId"] = r["contextId"]
             
             # Clean up links (remove null entries from collect)
             links = [l for l in r["links"] if l and l.get("target_id")]
@@ -1483,6 +1571,91 @@ def db_get_graph(user_id: str) -> dict:
                         "arrows": "to"
                     }
                     edges.append(edge_lookup[edge_sig])
+
+        # Add Client nodes and FOR_CLIENT edges
+        client_res = s.run(
+            """
+            MATCH (c:Client {userId: $userId})
+            OPTIONAL MATCH (f:Fact)-[:FOR_CLIENT]->(c)
+            WHERE f.userId = $userId
+            RETURN c, f
+            """,
+            userId=user_id
+        )
+        for cr in client_res:
+            c_node = cr["c"]
+            c_id = c_node["id"]
+            if c_id not in node_map:
+                node_map[c_id] = {
+                    "id": c_id,
+                    "label": "Client",
+                    "name": c_node["name"],
+                    "group": "Client"
+                }
+            f_node = cr["f"]
+            if f_node:
+                edge_sig = (f_node["id"], c_id, "FOR_CLIENT")
+                reverse_sig = (c_id, f_node["id"], "FOR_CLIENT")
+                if reverse_sig not in edge_lookup and edge_sig not in edge_lookup:
+                    new_edge = {
+                        "id": f"{f_node['id']}_{c_id}_FOR_CLIENT",
+                        "from": f_node["id"],
+                        "to": c_id,
+                        "label": "FOR_CLIENT",
+                        "arrows": "to"
+                    }
+                    edge_lookup[edge_sig] = new_edge
+                    edges.append(new_edge)
+
+        # Add Context nodes and IN_CONTEXT/HAS_CONTEXT edges
+        ctx_res = s.run(
+            """
+            MATCH (ctx:Context {userId: $userId})
+            OPTIONAL MATCH (f:Fact)-[:IN_CONTEXT]->(ctx)
+            WHERE f.userId = $userId
+            OPTIONAL MATCH (c:Client)-[:HAS_CONTEXT]->(ctx)
+            RETURN ctx, f, c
+            """,
+            userId=user_id
+        )
+        for xrr in ctx_res:
+            ctx_node = xrr["ctx"]
+            ctx_id = ctx_node["id"]
+            if ctx_id not in node_map:
+                node_map[ctx_id] = {
+                    "id": ctx_id,
+                    "label": "Context",
+                    "name": ctx_node["name"],
+                    "group": "Context"
+                }
+            f_node = xrr["f"]
+            if f_node:
+                edge_sig = (f_node["id"], ctx_id, "IN_CONTEXT")
+                reverse_sig = (ctx_id, f_node["id"], "IN_CONTEXT")
+                if reverse_sig not in edge_lookup and edge_sig not in edge_lookup:
+                    new_edge = {
+                        "id": f"{f_node['id']}_{ctx_id}_IN_CONTEXT",
+                        "from": f_node["id"],
+                        "to": ctx_id,
+                        "label": "IN_CONTEXT",
+                        "arrows": "to"
+                    }
+                    edge_lookup[edge_sig] = new_edge
+                    edges.append(new_edge)
+            c_node = xrr["c"]
+            if c_node:
+                edge_sig = (c_node["id"], ctx_id, "HAS_CONTEXT")
+                reverse_sig = (ctx_id, c_node["id"], "HAS_CONTEXT")
+                if reverse_sig not in edge_lookup and edge_sig not in edge_lookup:
+                    new_edge = {
+                        "id": f"{c_node['id']}_{ctx_id}_HAS_CONTEXT",
+                        "from": c_node["id"],
+                        "to": ctx_id,
+                        "label": "HAS_CONTEXT",
+                        "arrows": "to"
+                    }
+                    edge_lookup[edge_sig] = new_edge
+                    edges.append(new_edge)
 
         return {
             "nodes": list(node_map.values()),

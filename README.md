@@ -7,10 +7,12 @@ A self-hosted MCP (Model Context Protocol) server that gives AI agents a **persi
 ```
 mem-mcp/
 ├── server.py              # Entry point – unified FastAPI server (Port 8080)
-├── memory.py              # Facade: re-exports from common, fact_manager, diary_manager
+├── memory.py              # Facade: re-exports from common, fact_manager, diary_manager, client_manager
 ├── common.py              # Config, DB clients (Qdrant, Neo4j, Ollama), helpers
 ├── fact_manager.py        # Fact CRUD, search, dedup, graph operations
 ├── diary_manager.py       # Diary CRUD, search, keyword extraction, consistency
+├── client_manager.py      # Client/Context nodes, scope inference, status management
+├── migrate_client_context.py  # One-time migration: Client/Project facts → Client/Context nodes
 ├── mcp_tools.py           # FastMCP tool definitions
 ├── mcp_skills.py          # MCP prompts and resource definitions for skills
 ├── mcp_logging.py         # MCP tool call logging/monitoring
@@ -32,6 +34,11 @@ mem-mcp/
 - **Skills System** — Pluggable skill workflows (e.g., `process-transcription`, `memory-deduplication`) loaded from Markdown files.
 - **Unified Web UI** — A modern, proxy-aware dashboard to manage memories, view diary history, and explore insights.
 - **Multi-user Isolation** — Secure per-user vaults based on Basic-Auth or proxy headers.
+- **Client & Context Scoping** — Facts and diary entries can be scoped to a Client (e.g. "Deutsche Bank") and a Context within it (e.g. "SAP Implementation") via `FOR_CLIENT` / `IN_CONTEXT` graph links. Explicit `client`/`context` parameters hard-filter search; global search still finds everything.
+- **Scope Inference** — When no explicit client is passed, search infers the client from the query text (boost-only, never filters).
+- **Inactive Client Handling** — Clients untouched for 90 days are auto-deprioritized (−0.15 score, never hidden). Status can be manually pinned via `set_client_status`, `PUT /api/clients/{id}`, or the Setup-tab toggle; pinned clients are never auto-changed.
+- **Setup Tab** — Client list with active/inactive toggles, plus MCP connection details.
+- **Lazy-Loaded Lists** — Memories and diary sidebar render in batches of 50 with infinite scroll; calendar has a 📅 jump-to-today button.
 
 ## Ports & Access
 
@@ -39,7 +46,7 @@ The server is **unified** on port **8080** (mapped to **8086** in Docker).
 
 | Component | Path | Description |
 *   **Landing Page** | `/` | Onboarding, MCP setup instructions, and auto-detected credentials.
-*   **Web Dashboard** | `/gui` | The main interactive dashboard (Memories, Diary, Insights).
+*   **Web Dashboard** | `/gui` | The main interactive dashboard (Memories, Diary, Graph, Setup).
 *   **MCP Endpoint** | `/mcp` | The Model Context Protocol entry point for AI clients.
 *   **REST API** | `/api/*` | Backend endpoints used by the GUI.
 
@@ -53,8 +60,11 @@ User identity is resolved automatically from:
 
 | Tool | Description |
 |---|---|
-| `add_fact` | Store a new fact with optional category and rich metadata. |
-| `search_facts` | Semantic search for facts with optional category filtering and LLM query rewriting. |
+| `add_fact` | Store a new fact with optional category, rich metadata, and client/context scope (auto-created). |
+| `search_facts` | Semantic search for facts with optional category and client/context scoping plus LLM query rewriting. |
+| `list_clients` | List all clients with their contexts for the current user. |
+| `create_client` | Explicitly create a new client (idempotent). |
+| `set_client_status` | Pin a client active/inactive (pinned status is never auto-changed). |
 | `link_facts` | Create semantic relationships (e.g., `WORKS_ON`) between two facts or diary entries. |
 | `unlink_facts` | Remove a relationship between two facts or diary entries. |
 | `get_fact_neighborhood`| Traverse the knowledge graph around a fact (context exploration). |
@@ -65,8 +75,8 @@ User identity is resolved automatically from:
 | `find_duplicates` | Find potential duplicate entries using multi-signal similarity clustering. |
 | `suggest_merge` | Analyze a cluster of duplicates and suggest a master record for merging. |
 | `merge_facts` | Execute a merge: update master, move relationships, delete duplicates. |
-| `diary_save_entry` | Create/update a narrative diary entry with automatic keyword extraction. |
-| `diary_search_entries` | Semantic search across diary entries with keyword boosting. |
+| `diary_save_entry` | Create/update a narrative diary entry with automatic keyword extraction and optional client/context scope. |
+| `diary_search_entries` | Semantic search across diary entries with keyword boosting and optional client/context scoping. |
 | `list_diary_entries` | List diary entries within an optional time range. |
 | `diary_delete_entry` | Delete a diary entry by ID. |
 | `find_skills` | Scan the skills directory and list available skill workflows. |

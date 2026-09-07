@@ -59,6 +59,8 @@ from contextlib import asynccontextmanager
 @asynccontextmanager
 async def lifespan(app):
     async with mcp_app.lifespan(mcp_app):
+        from migrate_client_context import migrate_client_context
+        await migrate_client_context()
         await mem.run_consistency_checks()
         await mem.run_diary_consistency_checks()
         await mem.fix_diary_entries()

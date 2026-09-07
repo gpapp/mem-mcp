@@ -133,6 +133,8 @@ class MemoryCreate(BaseModel):
     name: Optional[str] = None
     category: str = "General"
     tags: Optional[str] = ""
+    client: Optional[str] = None
+    context: Optional[str] = None
 
     class Config:
         extra = "allow"
@@ -143,6 +145,8 @@ class MemoryUpdate(BaseModel):
     name: Optional[str] = None
     category: Optional[str] = None
     tags: Optional[str] = None
+    client: Optional[str] = None
+    context: Optional[str] = None
 
     class Config:
         extra = "allow"
@@ -185,9 +189,18 @@ async def api_update_memory(memory_id: str, request: Request, body: MemoryUpdate
         for k, v in all_fields.items():
             if v is not None and v != "":
                 metadata[k] = v
-        found = await mem.db_update_memory(memory_id, body.name, body.text, body.category, _require_user(request), metadata)
+        user_id = _require_user(request)
+        found = await mem.db_update_memory(memory_id, body.name, body.text, body.category, user_id, metadata)
         if not found:
             raise HTTPException(status_code=404, detail="Memory not found or access denied.")
+        if body.client:
+            c = mem.db_resolve_client(body.client, user_id)
+            client_id = c["id"] if c else await mem.db_create_client(body.client, user_id)
+            await mem.link_fact_to_client(memory_id, client_id, user_id)
+            if body.context:
+                cx = mem.db_resolve_context(body.context, client_id, user_id)
+                context_id = cx["id"] if cx else await mem.db_create_context(body.context, client_id, user_id)
+                await mem.link_fact_to_context(memory_id, context_id, user_id)
         return {"id": memory_id, "name": body.name, "text": body.text, "category": (body.category.strip().capitalize() if body.category else "General"), "metadata": metadata}
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
@@ -257,6 +270,8 @@ class DiaryCreate(BaseModel):
     timestamp: str
     linked_facts: Optional[list[str]] = None
     metadata: Optional[dict] = None
+    client: Optional[str] = None
+    context: Optional[str] = None
 
 class DiaryLink(BaseModel):
     factId: str
@@ -298,8 +313,17 @@ async def api_unlink_diary_mention(entry_id: str, fact_id: str, request: Request
 @web_app.post("/api/memories", response_class=JSONResponse, status_code=201)
 async def api_create_memory(request: Request, body: MemoryCreate):
     try:
+        user_id = _require_user(request)
         metadata = {"tags": [t.strip() for t in body.tags.split(",") if t.strip()]} if body.tags else {}
-        doc_id = await mem.db_add_memory(body.text, body.category, _require_user(request), metadata, name=body.name)
+        client_id = None
+        context_id = None
+        if body.client:
+            c = mem.db_resolve_client(body.client, user_id)
+            client_id = c["id"] if c else await mem.db_create_client(body.client, user_id)
+        if body.context and client_id:
+            cx = mem.db_resolve_context(body.context, client_id, user_id)
+            context_id = cx["id"] if cx else await mem.db_create_context(body.context, client_id, user_id)
+        doc_id = await mem.db_add_memory(body.text, body.category, user_id, metadata, name=body.name, client_id=client_id, context_id=context_id)
         return {"id": doc_id, "text": body.text, "name": body.name, "category": body.category.strip().capitalize(), "metadata": metadata}
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
@@ -342,6 +366,31 @@ async def api_delete_memory(memory_id: str, request: Request):
 async def api_list_categories(request: Request):
     try:
         return mem.db_list_categories(_require_user(request))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@web_app.get("/api/clients", response_class=JSONResponse)
+async def api_list_clients(request: Request):
+    """List all clients with their contexts for the current user."""
+    try:
+        return mem.db_list_clients(_require_user(request))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+class ClientStatusUpdate(BaseModel):
+    active: bool
+
+
+@web_app.put("/api/clients/{client_id}", response_class=JSONResponse)
+async def api_set_client_status(client_id: str, request: Request, body: ClientStatusUpdate):
+    """Pin a client as active or inactive. Pinned status is never auto-overridden."""
+    try:
+        found = mem.db_set_client_active(client_id, body.active, _require_user(request))
+        if not found:
+            raise HTTPException(status_code=404, detail="Client not found or access denied.")
+        return {"id": client_id, "active": body.active, "pinned": True}
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
@@ -446,7 +495,16 @@ async def api_save_diary(request: Request, body: DiaryCreate):
             if body.id != new_id:
                 await mem.db_delete_diary(body.id, user_id)
 
-        entry_ts = await mem.db_save_diary(body.content, user_id, body.timestamp, body.name, linked_facts=body.linked_facts, metadata=body.metadata)
+        client_id = None
+        context_id = None
+        if body.client:
+            c = mem.db_resolve_client(body.client, user_id)
+            client_id = c["id"] if c else await mem.db_create_client(body.client, user_id)
+        if body.context and client_id:
+            cx = mem.db_resolve_context(body.context, client_id, user_id)
+            context_id = cx["id"] if cx else await mem.db_create_context(body.context, client_id, user_id)
+
+        entry_ts = await mem.db_save_diary(body.content, user_id, body.timestamp, body.name, linked_facts=body.linked_facts, metadata=body.metadata, client_id=client_id, context_id=context_id)
         return {"timestamp": entry_ts, "content": body.content, "name": body.name, "metadata": body.metadata}
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))

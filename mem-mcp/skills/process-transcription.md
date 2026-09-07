@@ -25,6 +25,21 @@ Use @general subagent to execute the processing in it's own space.
 - Capture the **original file path** — pass it through all phases for use in diary metadata and local save filename.
 - Apply stored corrections: `search_facts("correction")` → fix recurring misspellings of names and terms before proceeding.
 
+### 1b. Client Detection
+
+Infer which **client** this meeting belongs to from participants' companies, meeting title, and topic:
+
+```
+list_clients()
+```
+
+- If a participant's company matches a known client → that client is the leading candidate.
+- If the meeting is internal (no external participants, no client topic) → client is **none**.
+- If ambiguous (multiple client companies present, or unknown company) → mark tentative, confirm in Phase 2.
+- Also propose a **context** within the client (e.g. project or workstream name like "SAP Implementation") when the topic clearly maps to one; otherwise leave context empty.
+
+Record: `Tentative client: [name | none] · Tentative context: [name | none]`
+
 ### 2. Participant List
 
 Scan for speaker labels and voice profile headers (e.g., `[00:00:20] Speaker A:`).
@@ -96,6 +111,26 @@ Rules:
 - **Never create a People record without explicit human confirmation.**
 - Batch unambiguous names into one `question` call using `multiple: true`.
 
+### 5. Client Confirmation
+
+Confirm the tentative client/context from step 1b via the `question` tool (batch with people questions when possible):
+
+```
+header: "Which client?"
+question: "This meeting appears to belong to which client?"
+options:
+  - label: "Deutsche Bank — SAP Implementation"   [inferred]
+  - label: "Internal — no client"
+  - label: "New client — create from participant company"
+multiple: false
+```
+
+Rules:
+- **Confident single match** (participant company = known client): Y/N confirmation is enough.
+- **Internal meeting** (no external participants): confirm "no client" — facts and diary will be stored without client scope.
+- **New client company**: propose creating it — `create_client` runs in Phase 3 after confirmation.
+- After the human responds, record: `Confirmed client: [name | none] · Confirmed context: [name | none]` — pass both through Phase 3.
+
 ---
 
 ## Phase 3 — Store (after human confirmation only)
@@ -132,6 +167,12 @@ General work-related: use `People` (for personnel), `Project`/`Projects` (for in
 Use `add_fact` for storing facts and `link_facts` for creating relationships between facts.
 
 - `link_facts(sourceFactId, targetFactId, relationshipType)` — build the graph
+
+**Client scoping (applies to every write in this phase):**
+- Pass the confirmed `client` (and `context` when set) to **every** `add_fact` call — client-specific people, projects, decisions, and actions all get scoped.
+- Shared/generic facts (public technologies, general principles with no client relevance) → omit `client` so they stay global.
+- If the confirmed client is new → call `create_client("<name>")` first, then use the name in all subsequent writes (auto-create handles the rest, but explicit creation confirms intent).
+- When searching for existing records in this phase, pass `client` to `search_facts` so matches prefer the meeting's client scope.
 
 **Link immediately after creating each fact:**
 
@@ -239,6 +280,8 @@ Call `diary_save_entry` with:
 - `name` = meeting title
 - `timestamp` = ISO-8601 with time **rounded to the nearest 15 minutes** (:00, :15, :30, :45), e.g. `2026-05-15T10:00:00`
 - `metadata` = `{"original_file": "<path to original transcription file>", "meeting_date": "<date>", "topic": "<topic>", "keywords": "<comma-separated list of extracted keywords>"}` — always include metadata and keywords when processing transcripts; it enables cross-referencing, source tracing, keyword searching/filtering, and automatic UI rendering.
+- `client` = confirmed client name (omit for internal meetings with no client)
+- `context` = confirmed context name within the client (omit when none)
 
 **After saving the diary entry, link it to every fact it references:**
 
@@ -278,3 +321,4 @@ These links make the diary navigable from any fact and vice versa.
 10. **Diary entries use exact format** — `## Participants`, `## Context`, `## Description`, `## Decisions`, `## Actions`, `## Notes`.
 11. **Original file is metadata** — pass `{"original_file": "..."}` as `metadata` to `diary_save_entry`.
 12. **Diary entries are linked** — every diary entry must be linked to all mentioned people, projects, decisions, and action items.
+13. **Client scope on every write** — detect client in Phase 1, confirm in Phase 2, pass `client`/`context` to all Phase 3 writes (facts + diary). Shared knowledge stays global.

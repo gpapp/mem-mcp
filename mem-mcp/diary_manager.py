@@ -15,6 +15,12 @@ from common import (
     get_qdrant, get_neo4j, logger, get_embedding, get_llm_response, publish_db_event,
     DIARY_COLLECTION, QDRANT_URL
 )
+from client_manager import (
+    link_diary_to_client, link_diary_to_context,
+    _resolve_client_by_id, _resolve_context_by_id,
+    infer_scope_from_text, db_get_client_status_map,
+    INFERRED_SCOPE_BOOST, INACTIVE_PENALTY
+)
 
 # ---------------------------------------------------------------------------
 # Diary helpers
@@ -55,9 +61,10 @@ async def extract_diary_keywords(name: str, content: str) -> list:
     return []
 
 
-async def db_save_diary(content: str, user_id: str, timestamp: str, name: str, metadata: Optional[dict] = None, linked_facts: Optional[list] = None) -> str:
+async def db_save_diary(content: str, user_id: str, timestamp: str, name: str, metadata: Optional[dict] = None, linked_facts: Optional[list] = None, client_id: Optional[str] = None, context_id: Optional[str] = None) -> str:
     """Upsert a diary entry keyed by user + timestamp. Returns the ISO timestamp string.
     Optional linked_facts is a list of fact IDs to create MENTIONS relationships.
+    Optional client_id and context_id link the entry to a Client and/or Context.
     """
     qdrant = await get_qdrant()
     neo4j_driver = get_neo4j()
@@ -81,6 +88,18 @@ async def db_save_diary(content: str, user_id: str, timestamp: str, name: str, m
         metadata["keywords"] = ", ".join(keywords)
     if metadata:
         payload["metadata"] = metadata
+
+    # Add client/context info to payload if provided
+    if client_id:
+        client_info = _resolve_client_by_id(client_id, user_id)
+        if client_info:
+            payload["clientId"] = client_id
+            payload["clientName"] = client_info["name"]
+    if context_id:
+        ctx_info = _resolve_context_by_id(context_id, user_id)
+        if ctx_info:
+            payload["contextId"] = context_id
+            payload["contextName"] = ctx_info["name"]
 
     # Qdrant — upsert by the stable doc_id so re-saving replaces the vector
     await qdrant.upsert(
@@ -113,6 +132,14 @@ async def db_save_diary(content: str, user_id: str, timestamp: str, name: str, m
             """,
             **params
         )
+
+        # Link to Client if provided
+        if client_id:
+            await link_diary_to_client(doc_id, client_id, user_id)
+
+        # Link to Context if provided
+        if context_id:
+            await link_diary_to_context(doc_id, context_id, user_id)
 
         # Sync linked facts: only modify MENTIONS if explicitly provided
         if linked_facts is not None:
@@ -151,11 +178,13 @@ async def db_save_diary(content: str, user_id: str, timestamp: str, name: str, m
     return timestamp
 
 
-async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float = 0.4) -> list:
+async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float = 0.4, client: Optional[str] = None, context: Optional[str] = None) -> list:
     """Vector-similarity search across the diary collection with mention enrichment.
 
     Uses LLM query rewriting for multi-variant search and boosts results whose
     stored keywords match the query terms.
+
+    Optional client/context parameters filter results to specific client or context scope.
     """
     from fact_manager import rewrite_search_query
 
@@ -167,7 +196,12 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
     # 1. Rewrite query into keyword variants for better semantic coverage
     query_variants = await rewrite_search_query(query)
     fetch_limit = max(limit * 4, 20)
-    filt = Filter(must=[FieldCondition(key="userId", match=MatchValue(value=user_id))])
+    conditions = [FieldCondition(key="userId", match=MatchValue(value=user_id))]
+    if client:
+        conditions.append(FieldCondition(key="clientName", match=MatchValue(value=client.strip())))
+    if context:
+        conditions.append(FieldCondition(key="contextName", match=MatchValue(value=context.strip())))
+    filt = Filter(must=conditions)
 
     # 2. Multi-variant vector search — merge by best score per entry
     all_results: dict = {}  # id -> {payload, score}
@@ -244,9 +278,37 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
             "name": name,
             "score": score,
             "keywords": r.payload.get("keywords") or [],
+            "clientName": r.payload.get("clientName"),
+            "contextName": r.payload.get("contextName"),
             "metadata": r.payload.get("metadata") or {},
             "mentions": mentions,
         })
+
+    # Apply client/context scoring. Explicit scope boosts; inferred scope is a
+    # weaker boost-only fallback; inactive clients penalized in global search only.
+    if client:
+        for e in entries:
+            cname = e.get("clientName") or e.get("metadata", {}).get("clientName", "")
+            if (cname or "").lower() == client.lower():
+                e["score"] += 0.3
+    else:
+        inferred_client, _ = infer_scope_from_text(query, user_id)
+        if inferred_client:
+            for e in entries:
+                cname = e.get("clientName") or e.get("metadata", {}).get("clientName", "")
+                if (cname or "").lower() == inferred_client.lower():
+                    e["score"] += INFERRED_SCOPE_BOOST
+        status_map = db_get_client_status_map(user_id)
+        if status_map:
+            for e in entries:
+                cname = (e.get("clientName") or e.get("metadata", {}).get("clientName", "") or "").lower()
+                if cname and status_map.get(cname) is False:
+                    e["score"] -= INACTIVE_PENALTY
+    if context:
+        for e in entries:
+            xname = e.get("contextName") or e.get("metadata", {}).get("contextName", "")
+            if (xname or "").lower() == context.lower():
+                e["score"] += 0.3
 
     entries.sort(key=lambda x: x["score"], reverse=True)
     return entries[:limit]
@@ -468,8 +530,12 @@ def db_list_diary(user_id: str) -> list:
             """
             MATCH (d:DiaryEntry {userId: $userId})
             OPTIONAL MATCH (d)-[:MENTIONS]->(f:Fact)
+            OPTIONAL MATCH (d)-[:FOR_CLIENT]->(cl:Client)
+            OPTIONAL MATCH (d)-[:IN_CONTEXT]->(ctx:Context)
             RETURN d.id as id, d.date as date, d.content as content, d.timestamp as timestamp, d.name as name,
                    d.metadata as metadata, d.keywords as keywords,
+                   cl.name as clientName, cl.id as clientId,
+                   ctx.name as contextName, ctx.id as contextId,
                    collect({id: f.id, text: f.text, name: f.name}) as mentions
             ORDER BY d.date DESC, d.timestamp DESC
             """,
@@ -478,13 +544,17 @@ def db_list_diary(user_id: str) -> list:
         return [
             {
                 "id": r["id"],
-                "date": r["date"], 
-                "content": r["content"], 
+                "date": r["date"],
+                "content": r["content"],
                 "name": r.get("name") or "Unnamed Entry",
                 "timestamp": format_ts_for_picker(r.get("timestamp")),
                 "metadata": (json.loads(r["metadata"]) if isinstance(r.get("metadata"), str) else (r.get("metadata") or {})),
                 "mentions": [m for m in r["mentions"] if m.get("id")],
-                "keywords": r.get("keywords") or []
+                "keywords": r.get("keywords") or [],
+                "clientName": r.get("clientName"),
+                "clientId": r.get("clientId"),
+                "contextName": r.get("contextName"),
+                "contextId": r.get("contextId"),
             } for r in result
         ]
 

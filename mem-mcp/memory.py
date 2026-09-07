@@ -2,7 +2,7 @@
 memory.py – Shared library for the Memory Vault (Facade).
 
 Imports and exposes configuration, database clients, and helpers
-from common.py, fact_manager.py, and diary_manager.py.
+from common.py, fact_manager.py, diary_manager.py, and client_manager.py.
 """
 
 from common import (
@@ -25,4 +25,13 @@ from diary_manager import (
     _diary_id, db_save_diary, db_update_diary, db_search_diary, db_delete_diary,
     db_link_diary_mention, db_unlink_diary_mention,
     db_list_diary_entries, db_list_diary, run_diary_consistency_checks, fix_diary_entries
+)
+
+from client_manager import (
+    db_create_client, db_create_context, db_list_clients,
+    db_resolve_client, db_resolve_context,
+    link_fact_to_client, link_fact_to_context,
+    link_diary_to_client, link_diary_to_context,
+    db_set_client_active, db_get_client_status_map,
+    infer_scope_from_text
 )

@@ -13,6 +13,8 @@ Use the `find_duplicates` tool to scan the memory for clusters of similar items.
 - **Threshold**: Adjust the similarity threshold (default 0.75).
 - **Result**: You will receive a list of clusters with an `avg_similarity` score and a basic recommendation.
 
+> **Client caution:** the same person or project name can legitimately exist under **different clients** (e.g. "Tim" at SAP vs "Tim" at Deutsche Bank). Before merging, check each record's client scope — same name + different client is **not** a duplicate. When in doubt, search with the `client` parameter to compare within one scope first.
+
 ### 2. Analyze Each Cluster
 Use the `suggest_merge` tool for each cluster.
 - The tool returns all records sorted by completeness with a `suggested_master_id`.

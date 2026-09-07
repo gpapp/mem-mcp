@@ -31,7 +31,11 @@ def _format_fact_md(fact: dict) -> str:
     category = fact.get("category") or ""
     fact_id  = fact.get("id") or ""
     score    = fact.get("score")
-    metadata = fact.get("metadata") or {}
+    metadata = dict(fact.get("metadata") or {})
+    # Search results carry scope top-level; merge into metadata for display
+    for _k in ("clientName", "clientId", "contextName", "contextId"):
+        if fact.get(_k) and _k not in metadata:
+            metadata[_k] = fact.get(_k)
 
     lines = []
 
@@ -78,7 +82,7 @@ def _format_facts_md(facts: list) -> str:
 
 @mcp.tool()
 @monitor_mcp_tool("add_fact", context_provider=_current_user)
-async def add_fact(name: str, text: str, category: str):
+async def add_fact(name: str, text: str, category: str, client: Optional[str] = None, context: Optional[str] = None):
     """
     Save a new fact or memory to the knowledge graph.
     'name' should be a concise header for the fact.
@@ -92,13 +96,34 @@ async def add_fact(name: str, text: str, category: str):
     **Notes:** [any other relevant stable information]
 
     Other categories should use similar structured Markdown: bold field labels followed by content.
+
+    Optional: 'client' to scope the fact to a specific client (will create if not exists).
+    Optional: 'context' to scope the fact to a specific context within the client (will create if not exists).
     """
-    memory_id = await mem.db_add_memory(text, category, _current_user(), name=name)
+    user_id = _current_user()
+    client_id = None
+    context_id = None
+    
+    if client:
+        client_obj = mem.db_resolve_client(client, user_id)
+        if client_obj:
+            client_id = client_obj["id"]
+        else:
+            client_id = await mem.db_create_client(client, user_id)
+    
+    if context and client_id:
+        ctx_obj = mem.db_resolve_context(context, client_id, user_id)
+        if ctx_obj:
+            context_id = ctx_obj["id"]
+        else:
+            context_id = await mem.db_create_context(context, client_id, user_id)
+    
+    memory_id = await mem.db_add_memory(text, category, user_id, name=name, client_id=client_id, context_id=context_id)
     return f"Successfully added memory with ID: {memory_id}"
 
 @mcp.tool()
 @monitor_mcp_tool("search_facts", context_provider=_current_user)
-async def search_facts(query: str, category: Optional[str] = None, limit: int = 5, top_p: float = 0.5, names_only: bool = False):
+async def search_facts(query: str, category: Optional[str] = None, limit: int = 5, top_p: float = 0.5, names_only: bool = False, client: Optional[str] = None, context: Optional[str] = None):
     """
     Search for facts in the knowledge graph. Returns Markdown-formatted results.
 
@@ -119,11 +144,13 @@ async def search_facts(query: str, category: Optional[str] = None, limit: int = 
       limit: max results (default 5)
       top_p: similarity threshold (default 0.5; raise to 0.7 for strict, lower to 0.4 for broad)
       names_only: if True, returns only fact names as newline-separated list
+      client: optional client name to scope results (e.g. "Deutsche Bank")
+      context: optional context name within the client (e.g. "SAP Implementation")
 
     Strategy: If the first search returns weak results, try shorter/simpler queries.
     For people, use first name only. For projects, use the project name directly.
     """
-    facts = await mem.db_search_memories(query, _current_user(), limit, category, top_p)
+    facts = await mem.db_search_memories(query, _current_user(), limit, category, top_p, client, context)
     if names_only:
         return "\n".join(f.get("name", "") or f.get("text", "")[:50] for f in facts if f.get("name"))
     return _format_facts_md(facts)
@@ -211,7 +238,7 @@ async def find_patterns():
 
 @mcp.tool()
 @monitor_mcp_tool("diary_save_entry", context_provider=_current_user)
-async def diary_save_entry(content: str, name: str, timestamp: str, entryId: Optional[str] = None, metadata: Optional[dict] = None, linked_facts: Optional[list[str]] = None):
+async def diary_save_entry(content: str, name: str, timestamp: str, entryId: Optional[str] = None, metadata: Optional[dict] = None, linked_facts: Optional[list[str]] = None, client: Optional[str] = None, context: Optional[str] = None):
     """Save or update a diary entry.
 
     - name: Concise name for the entry.
@@ -223,6 +250,8 @@ async def diary_save_entry(content: str, name: str, timestamp: str, entryId: Opt
     - metadata: Optional dict with extra fields (e.g. {"original_file": "path/to/file.txt"}).
     - linked_facts: Optional list of fact IDs to link via MENTIONS. Pass [] to clear existing links.
       When omitted, existing MENTIONS relationships are preserved.
+    - client: Optional client name to scope the entry (creates Client node if new).
+    - context: Optional context name within the client (creates Context node if new).
     - Returns a dict with 'id' (use this to update or delete the entry later) and 
       'timestamp' (the ISO string that keys the entry).
     """
@@ -231,13 +260,21 @@ async def diary_save_entry(content: str, name: str, timestamp: str, entryId: Opt
         new_id = mem._diary_id(user, timestamp)
         if entryId != new_id:
             await mem.db_delete_diary(entryId, user)
-    entry_ts = await mem.db_save_diary(content, user, timestamp, name, metadata=metadata, linked_facts=linked_facts)
+    client_id = None
+    context_id = None
+    if client:
+        c = mem.db_resolve_client(client, user)
+        client_id = c["id"] if c else await mem.db_create_client(client, user)
+    if context and client_id:
+        cx = mem.db_resolve_context(context, client_id, user)
+        context_id = cx["id"] if cx else await mem.db_create_context(context, client_id, user)
+    entry_ts = await mem.db_save_diary(content, user, timestamp, name, metadata=metadata, linked_facts=linked_facts, client_id=client_id, context_id=context_id)
     entry_id = mem._diary_id(user, entry_ts)
     return {"id": entry_id, "timestamp": entry_ts}
 
 @mcp.tool()
 @monitor_mcp_tool("diary_search_entries", context_provider=_current_user)
-async def diary_search_entries(query: str, limit: int = 3, top_p: float = 0.4):
+async def diary_search_entries(query: str, limit: int = 3, top_p: float = 0.4, client: Optional[str] = None, context: Optional[str] = None):
     """
     Search diary entries by vector similarity. Best for finding entries about specific topics.
 
@@ -257,7 +294,7 @@ async def diary_search_entries(query: str, limit: int = 3, top_p: float = 0.4):
     Returns list of entries with: id, timestamp, date, content, score, mentions.
     Use 'id' with diary_delete_entry or diary_save_entry to modify entries.
     """
-    return await mem.db_search_diary(query, _current_user(), limit, top_p)
+    return await mem.db_search_diary(query, _current_user(), limit, top_p, client, context)
 
 @mcp.tool()
 @monitor_mcp_tool("list_diary_entries", context_provider=_current_user)
@@ -401,6 +438,42 @@ async def suggest_merge(cluster_json: str):
             "Review all records, confirm or override the suggested master, then call merge_facts."
         ),
     }
+
+@mcp.tool()
+@monitor_mcp_tool("list_clients", context_provider=_current_user)
+async def list_clients():
+    """List all clients with their contexts for the current user."""
+    return mem.db_list_clients(_current_user())
+
+@mcp.tool()
+@monitor_mcp_tool("create_client", context_provider=_current_user)
+async def create_client(name: str):
+    """
+    Create a new client explicitly.
+    'name' is the client organization name (e.g. "Deutsche Bank").
+    Returns the client ID. Idempotent — returns existing client if name matches.
+    """
+    user = _current_user()
+    existing = mem.db_resolve_client(name, user)
+    if existing:
+        return {"id": existing["id"], "name": existing["name"], "created": False}
+    client_id = await mem.db_create_client(name, user)
+    return {"id": client_id, "name": name.strip(), "created": True}
+
+@mcp.tool()
+@monitor_mcp_tool("set_client_status", context_provider=_current_user)
+async def set_client_status(clientId: str, active: bool):
+    """
+    Manually pin a client as active or inactive.
+    Inactive clients are deprioritized (not hidden) in unscoped global search.
+    Pinned status is never overridden by automatic activity tracking.
+    Returns confirmation or a not-found error.
+    """
+    found = mem.db_set_client_active(clientId, active, _current_user())
+    if not found:
+        return f"Error: client '{clientId}' not found."
+    state = "active" if active else "inactive"
+    return f"Client '{clientId}' pinned as {state}."
 
 @mcp.tool()
 @monitor_mcp_tool("find_skills", context_provider=_current_user)
