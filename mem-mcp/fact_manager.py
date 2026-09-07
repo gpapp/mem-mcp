@@ -2044,7 +2044,7 @@ async def sync_orphans():
     with neo4j_driver.session() as s:
         orphan_cats = list(s.run(
             "MATCH (c:Category) WHERE NOT (c)<-[:IN_CATEGORY]-(:Fact) "
-            "RETURN c.name AS name, id(c) AS node_id"
+            "RETURN c.name AS name"
         ))
     if orphan_cats:
         names = [r["name"] for r in orphan_cats]

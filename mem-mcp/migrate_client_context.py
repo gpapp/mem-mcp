@@ -155,78 +155,94 @@ async def _migrate_user(user_id: str, neo4j_driver, qdrant):
 
 
 async def _backfill_qdrant(user_id: str, neo4j_driver, qdrant):
-    """Copy FOR_CLIENT / IN_CONTEXT links into Qdrant payloads for fast filtering."""
+    """Sync FOR_CLIENT / IN_CONTEXT links into Qdrant payloads for fast filtering.
+
+    Diff-based: scrolls current payloads (no vectors) and upserts only points
+    whose scope keys actually differ — including stripping stale keys off
+    unlinked items. Steady-state boots therefore issue zero write requests,
+    while any drift source (UI reassignment, re-saves, restores) self-heals.
+    Vectors are preserved (no re-embed): retrieved only for changed points.
+    """
     with neo4j_driver.session() as s:
-        rows = list(s.run(
+        fact_rows = list(s.run(
             """
             MATCH (f:Fact {userId: $userId})
             OPTIONAL MATCH (f)-[:FOR_CLIENT]->(c:Client)
             OPTIONAL MATCH (f)-[:IN_CONTEXT]->(ctx:Context)
-            WHERE c IS NOT NULL OR ctx IS NOT NULL
             RETURN f.id AS id, c.id AS clientId, c.name AS clientName,
                    ctx.id AS contextId, ctx.name AS contextName
             """,
             userId=user_id
         ))
-    for r in rows:
-        try:
-            existing = await qdrant.retrieve(collection_name=COLLECTION_NAME, ids=[r["id"]], with_payload=True)
-            if not existing:
-                continue
-            payload = dict(existing[0].payload or {})
-            if r["clientId"]:
-                payload["clientId"] = r["clientId"]
-                payload["clientName"] = r["clientName"]
-            if r["contextId"]:
-                payload["contextId"] = r["contextId"]
-                payload["contextName"] = r["contextName"]
-            # Re-embed is expensive; preserve existing vector by retrieving it
-            with_vec = await qdrant.retrieve(collection_name=COLLECTION_NAME, ids=[r["id"]], with_vectors=True)
-            vec = with_vec[0].vector if with_vec else None
-            if vec is None:
-                continue
-            await qdrant.upsert(
-                collection_name=COLLECTION_NAME,
-                points=[PointStruct(id=r["id"], vector=vec, payload=payload)],
-            )
-        except Exception as e:
-            logger.warning(f"migrate_client_context [{user_id}]: Qdrant backfill failed for {r['id']}: {e}")
-
-    # Diary entries
     with neo4j_driver.session() as s:
-        drows = list(s.run(
+        diary_rows = list(s.run(
             """
             MATCH (d:DiaryEntry {userId: $userId})
             OPTIONAL MATCH (d)-[:FOR_CLIENT]->(c:Client)
             OPTIONAL MATCH (d)-[:IN_CONTEXT]->(ctx:Context)
-            WHERE c IS NOT NULL OR ctx IS NOT NULL
             RETURN d.id AS id, c.id AS clientId, c.name AS clientName,
                    ctx.id AS contextId, ctx.name AS contextName
             """,
             userId=user_id
         ))
-    for r in drows:
-        try:
-            existing = await qdrant.retrieve(collection_name=DIARY_COLLECTION, ids=[r["id"]], with_payload=True)
-            if not existing:
-                continue
-            payload = dict(existing[0].payload or {})
+
+    def _desired(rows) -> dict:
+        out = {}
+        for r in rows:
+            scope = {}
             if r["clientId"]:
-                payload["clientId"] = r["clientId"]
-                payload["clientName"] = r["clientName"]
+                scope["clientId"] = r["clientId"]
+                scope["clientName"] = r["clientName"]
             if r["contextId"]:
-                payload["contextId"] = r["contextId"]
-                payload["contextName"] = r["contextName"]
-            with_vec = await qdrant.retrieve(collection_name=DIARY_COLLECTION, ids=[r["id"]], with_vectors=True)
-            vec = with_vec[0].vector if with_vec else None
-            if vec is None:
-                continue
-            await qdrant.upsert(
-                collection_name=DIARY_COLLECTION,
-                points=[PointStruct(id=r["id"], vector=vec, payload=payload)],
+                scope["contextId"] = r["contextId"]
+                scope["contextName"] = r["contextName"]
+            out[r["id"]] = scope
+        return out
+
+    synced = 0
+    for collection, desired in ((COLLECTION_NAME, _desired(fact_rows)),
+                                (DIARY_COLLECTION, _desired(diary_rows))):
+        current: dict = {}
+        offset = None
+        while True:
+            points, next_offset = await qdrant.scroll(
+                collection_name=collection,
+                limit=1000,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+                scroll_filter=Filter(must=[FieldCondition(key="userId", match=MatchValue(value=user_id))]),
             )
-        except Exception as e:
-            logger.warning(f"migrate_client_context [{user_id}]: diary backfill failed for {r['id']}: {e}")
+            for p in points:
+                current[str(p.id)] = dict(p.payload or {})
+            if next_offset is None:
+                break
+            offset = next_offset
+        changed = [
+            pid for pid, payload in current.items()
+            if {k: payload.get(k) for k in _SCOPE_PAYLOAD_KEYS if payload.get(k) is not None}
+            != desired.get(pid, {})
+        ]
+        for pid in changed:
+            try:
+                # Preserve existing vector; skip points with none (sync_orphans re-embeds those).
+                with_vec = await qdrant.retrieve(collection_name=collection, ids=[pid], with_vectors=True)
+                vec = with_vec[0].vector if with_vec else None
+                if vec is None:
+                    continue
+                merged = dict(current[pid])
+                for k in _SCOPE_PAYLOAD_KEYS:
+                    merged.pop(k, None)
+                merged.update(desired.get(pid, {}))
+                await qdrant.upsert(
+                    collection_name=collection,
+                    points=[PointStruct(id=pid, vector=vec, payload=merged)],
+                )
+                synced += 1
+            except Exception as e:
+                logger.warning(f"migrate_client_context [{user_id}]: Qdrant scope sync failed for {pid}: {e}")
+    if synced:
+        logger.info(f"scope_qdrant_sync [{user_id}]: updated {synced} payloads")
 
 
 # ---------------------------------------------------------------------------
@@ -688,8 +704,6 @@ async def _reclassify_all_scope(user_id: str, job: dict) -> None:
             f"{len(diaries)} diary entries with {SCOPE_MODEL}"
         )
         sem = asyncio.Semaphore(max(1, SCOPE_BACKFILL_CONCURRENCY))
-        unlinked_fact_ids: list = []
-        unlinked_diary_ids: list = []
 
         async def _process(kind: str, item: dict) -> None:
             # Clear-then-classify per item: interrupt-safe, and a null verdict
@@ -704,7 +718,6 @@ async def _reclassify_all_scope(user_id: str, job: dict) -> None:
                 job["linked"] += 1
             else:
                 job["unlinked"] += 1
-                (unlinked_fact_ids if kind == "fact" else unlinked_diary_ids).append(item["id"])
             if job["done"] % 25 == 0 or job["done"] == job["total"]:
                 logger.info(f"reclassify [{user_id}]: {job['done']}/{job['total']} classified, "
                             f"{job['linked']} linked")
@@ -712,22 +725,9 @@ async def _reclassify_all_scope(user_id: str, job: dict) -> None:
         await asyncio.gather(*[_process("fact", dict(r)) for r in facts])
         await asyncio.gather(*[_process("diary", dict(r)) for r in diaries])
 
-        # Push the new links into Qdrant payloads, and scrub stale scope keys
-        # off items that are now generic (backfill only ever adds keys).
+        # Push the new links into Qdrant payloads; the diff-based backfill also
+        # strips stale scope keys off items that are now generic.
         await _backfill_qdrant(user_id, neo4j_driver, qdrant)
-        for collection, ids in ((COLLECTION_NAME, unlinked_fact_ids),
-                                (DIARY_COLLECTION, unlinked_diary_ids)):
-            if not ids:
-                continue
-            try:
-                await qdrant.delete_payload(
-                    collection_name=collection,
-                    keys=list(_SCOPE_PAYLOAD_KEYS),
-                    points=ids,
-                )
-            except Exception as exc:
-                logger.warning(f"reclassify [{user_id}]: stale scope-key cleanup failed "
-                               f"for {len(ids)} {collection} points: {exc}")
 
         job.update(state="done", finished_at=_utcnow())
         logger.info(f"reclassify [{user_id}]: done, {job['linked']}/{job['total']} linked to clients")
