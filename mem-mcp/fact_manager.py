@@ -1103,14 +1103,27 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
         norm = normalize_name(item.get("name"))
         norm_words = set(norm.split()) if norm else set()
 
+        # Prefer explicit metadata fields; fall back to parsing norm_name.
+        # Strip suffixes like "— Forme", "(former)", "[archived]" before parsing.
+        meta_first = str(meta.get("first_name", "")).lower().strip()
+        meta_last  = str(meta.get("last_name",  "")).lower().strip()
+        if not meta_first or not meta_last:
+            # Strip anything after "—", "(", "[" before splitting
+            clean_norm = re.split(r"[—–()\[\]]", norm)[0].strip()
+            parts = clean_norm.split()
+            if len(parts) >= 2 and not meta_first:
+                meta_first = parts[0]
+            if len(parts) >= 2 and not meta_last:
+                meta_last = parts[-1]
+
         prepared.append({
             "id": item["id"],
             "vec": np.array(vectors[str(item["id"])]),
             "norm_name": norm,
             "norm_words": norm_words,
             "email": str(meta.get("email", "")).lower().strip(),
-            "first_name": str(meta.get("first_name", "")).lower().strip(),
-            "last_name": str(meta.get("last_name", "")).lower().strip(),
+            "first_name": meta_first,
+            "last_name": meta_last,
             "aliases": [normalize_name(a) for a in aliases_list],
             "name": item.get("name") or "",
             "metadata": meta,
@@ -1213,10 +1226,10 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
                 if vec_sim < 0.88:
                     signals = [s for s in signals if s < vec_sim - 0.1]
 
-            # Signal 10: Full normalized name fuzzy match (only if both have last names)
-            if p_i["norm_name"] and p_j["norm_name"] and p_i["last_name"] and p_j["last_name"]:
+            # Signal 10: Full normalized name fuzzy match
+            if p_i["norm_name"] and p_j["norm_name"]:
                 full_ratio = difflib.SequenceMatcher(None, p_i["norm_name"], p_j["norm_name"]).ratio()
-                if full_ratio >= 0.85:
+                if full_ratio >= 0.8:
                     signals.append(min(0.95, full_ratio))
 
             similarity = max(signals) if signals else vec_sim
