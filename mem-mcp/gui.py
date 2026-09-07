@@ -29,6 +29,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 import memory as mem
+from migrate_client_context import start_reclassify_scope, get_reclassify_status
 from fastapi import Request, HTTPException, FastAPI
 from fastapi.responses import Response, JSONResponse, HTMLResponse, RedirectResponse
 from pydantic import BaseModel
@@ -391,6 +392,29 @@ async def api_set_client_status(client_id: str, request: Request, body: ClientSt
         if not found:
             raise HTTPException(status_code=404, detail="Client not found or access denied.")
         return {"id": client_id, "active": body.active, "pinned": True}
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@web_app.post("/api/maintenance/reclassify", response_class=JSONResponse)
+async def api_start_reclassify(request: Request):
+    """Start a full Ollama scope reclassification as a background job (409 if running)."""
+    try:
+        result = start_reclassify_scope(_require_user(request))
+        if not result["started"]:
+            raise HTTPException(status_code=409, detail="Reclassification already running.")
+        return result["job"]
+    except HTTPException:
+        raise
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@web_app.get("/api/maintenance/reclassify", response_class=JSONResponse)
+async def api_reclassify_status(request: Request):
+    """Return the current (or last) reclassification job status."""
+    try:
+        return get_reclassify_status(_require_user(request))
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 

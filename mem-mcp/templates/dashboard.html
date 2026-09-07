@@ -522,6 +522,18 @@ npm install @modelcontextprotocol/sdk</code></pre>
       </p>
       <div id="client-list"><p class="empty">Loading…</p></div>
     </div>
+
+    <div style="margin-top: 2.5rem; padding-top: 1.5rem; border-top: 1px solid var(--border);">
+      <h3 style="margin-top:0;">🛠️ Maintenance</h3>
+      <p style="font-size: 0.9rem; color: var(--muted); margin-bottom: 1rem;">
+        Re-run the Ollama scope classifier over <strong>all</strong> memories and diary entries, replacing existing client assignments. Each item is classified with its category, keywords and linked neighbours as context. Runs in the background — safe to navigate away.
+      </p>
+      <button id="reclassify-btn" class="btn btn-primary btn-sm" onclick="startReclassify()">🔄 Reclassify all memories</button>
+      <div id="reclassify-status" style="margin-top:.75rem; font-size:.9rem; color:var(--muted);"></div>
+      <div id="reclassify-track" style="margin-top:.4rem; height:8px; border-radius:4px; background:var(--bg); overflow:hidden; display:none; border:1px solid var(--border);">
+        <div id="reclassify-bar" style="height:100%; width:0%; background:var(--primary); transition:width .3s;"></div>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -737,7 +749,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     if (tab === 'memories' && !memories.length) loadMemories();
     if (tab === 'diary' && !diaryEntries.length) loadDiary();
     if (tab === 'graph' && !graphLoaded) loadGraph();
-    if (tab === 'setup') loadClients();
+    if (tab === 'setup') { loadClients(); loadReclassifyStatus(); }
     saveSessionState();
   }
 
@@ -768,6 +780,71 @@ npm install @modelcontextprotocol/sdk</code></pre>
       toast(active ? 'Client activated 📌' : 'Client deactivated 📌');
       loadClients();
     } catch(e) { toast('⚠️ Could not update client'); }
+  }
+
+  let reclassifyTimer = null;
+
+  async function startReclassify() {
+    if (!confirm('Reclassify ALL memories and diary entries? Existing client assignments will be replaced. This runs in the background.')) return;
+    const btn = document.getElementById('reclassify-btn');
+    try {
+      const job = await api.post('maintenance/reclassify', {});
+      if (btn) btn.disabled = true;
+      renderReclassify(job);
+      pollReclassify();
+    } catch(e) {
+      if (e && e.status === 409) { toast('Reclassification already running'); pollReclassify(); }
+      else toast('⚠️ Could not start reclassification');
+    }
+  }
+
+  function renderReclassify(job) {
+    const el = document.getElementById('reclassify-status');
+    const track = document.getElementById('reclassify-track');
+    const bar = document.getElementById('reclassify-bar');
+    const btn = document.getElementById('reclassify-btn');
+    if (!el) return;
+    if (!job || job.state === 'idle') {
+      el.textContent = '';
+      if (track) track.style.display = 'none';
+      return;
+    }
+    const pct = job.total ? Math.round(100 * job.done / job.total) : 0;
+    if (track) track.style.display = job.state === 'running' ? 'block' : 'none';
+    if (bar) bar.style.width = pct + '%';
+    if (job.state === 'running') {
+      el.textContent = `🔄 Classifying… ${job.done}/${job.total} (${job.linked} linked)`;
+    } else if (job.state === 'done') {
+      el.textContent = `✅ Done — ${job.linked}/${job.total} linked, ${job.unlinked} generic.`;
+      if (btn) btn.disabled = false;
+    } else if (job.state === 'error') {
+      el.textContent = `⚠️ Failed: ${job.error || 'unknown error'}`;
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  async function loadReclassifyStatus() {
+    try {
+      const job = await api.get('maintenance/reclassify');
+      renderReclassify(job);
+      if (job && job.state === 'running') pollReclassify();
+    } catch(_) {}
+  }
+
+  async function pollReclassify() {
+    if (reclassifyTimer) { clearInterval(reclassifyTimer); reclassifyTimer = null; }
+    let running = true;
+    const tick = async () => {
+      try {
+        const job = await api.get('maintenance/reclassify');
+        renderReclassify(job);
+        running = !!job && job.state === 'running';
+        if (!running && job && job.state === 'done') loadMemories();
+      } catch(_) { running = false; }
+      if (!running && reclassifyTimer) { clearInterval(reclassifyTimer); reclassifyTimer = null; }
+    };
+    await tick();
+    if (running && !reclassifyTimer) reclassifyTimer = setInterval(tick, 2000);
   }
 
   async function loadMemories() {
