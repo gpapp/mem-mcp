@@ -714,7 +714,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     loadMemories();
     loadDiary();
     loadWhoami();
-    renderClientFilterSelect();
+    loadClients();   // populate clientListCache + clientActiveMap for the filter dropdown
     initSSE();
     switchTab(activeTab);
   }
@@ -856,9 +856,6 @@ npm install @modelcontextprotocol/sdk</code></pre>
   async function onClientFilterChange(value) {
     clientFilter = value;
     hideInactiveClients = clientFilter === 'active';  // back-compat
-    if (clientFilter !== 'all' && Object.keys(clientActiveMap).length === 0) {
-      await loadClients();
-    }
     renderMemories();
     renderCategorySidebar();
     saveSessionState();
