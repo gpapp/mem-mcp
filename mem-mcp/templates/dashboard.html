@@ -784,6 +784,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     }
     renderHideInactiveBtn();
     renderMemories();
+    renderCategorySidebar();
     saveSessionState();
   }
 
@@ -815,6 +816,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
       toast(active ? 'Client activated 📌' : 'Client deactivated 📌');
       await loadClients();
       renderMemories();
+      renderCategorySidebar();
     } catch(e) { toast('⚠️ Could not update client'); }
   }
 
