@@ -364,6 +364,12 @@
   <button class="tab-btn" onclick="switchTab('diary')">📖 Diary</button>
   <button class="tab-btn" onclick="switchTab('graph')">🕸️ Graph</button>
   <button class="tab-btn" onclick="switchTab('setup')">🔌 Setup</button>
+  <div style="margin-left:auto; display:flex; align-items:center; padding-bottom:.25rem;">
+    <select id="client-filter-select" class="form-control" style="font-size:.82rem; min-width:160px;" onchange="onClientFilterChange(this.value)">
+      <option value="all">All clients</option>
+      <option value="active">Active clients only</option>
+    </select>
+  </div>
 </div>
 
 <!-- ═══ MEMORIES PAGE ═══ -->
@@ -390,12 +396,6 @@
         </select>
       </div>
       <div id="alphabet-filter" class="alphabet-filter" style="margin:.4rem 0;"></div>
-      <div style="margin:.2rem 0 .4rem;">
-        <select id="client-filter-select" class="form-control" style="font-size:.82rem;" onchange="onClientFilterChange(this.value)">
-          <option value="all">All clients</option>
-          <option value="active">Active clients only</option>
-        </select>
-      </div>
       <div id="memories-list" class="memories-list-scroll"></div>
     </div>
 
@@ -858,6 +858,8 @@ npm install @modelcontextprotocol/sdk</code></pre>
     hideInactiveClients = clientFilter === 'active';  // back-compat
     renderMemories();
     renderCategorySidebar();
+    renderDiaryMonthPager();
+    renderDiarySidebar();
     saveSessionState();
   }
 
@@ -2123,12 +2125,12 @@ npm install @modelcontextprotocol/sdk</code></pre>
         const content = (e.content || '').toLowerCase();
         const matchesText = name.includes(lower) || content.includes(lower) || e.date.includes(lower);
         const matchesDate = datePattern && matchesDatePattern(e.date, datePattern);
-        return matchesText || matchesDate;
+        return (matchesText || matchesDate) && memPassesScope(e);
       });
     } else {
       const my = getDiaryMonthYear();
       const monthPrefix = `${my.year}-${String(my.month).padStart(2, '0')}`;
-      filtered = diaryEntries.filter(e => e.date && e.date.startsWith(monthPrefix));
+      filtered = diaryEntries.filter(e => e.date && e.date.startsWith(monthPrefix) && memPassesScope(e));
       if (selectedDiaryDate) {
         filtered = filtered.filter(e => e.date === selectedDiaryDate);
       }
@@ -2266,7 +2268,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     const monthPrefix = `${my.year}-${String(my.month).padStart(2, '0')}`;
     const datesInMonth = [...new Set(
       diaryEntries
-        .filter(e => e.date && e.date.startsWith(monthPrefix))
+        .filter(e => e.date && e.date.startsWith(monthPrefix) && memPassesScope(e))
         .map(e => e.date)
     )];
 
