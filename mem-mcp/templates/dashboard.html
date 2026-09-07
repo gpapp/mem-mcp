@@ -391,7 +391,10 @@
       </div>
       <div id="alphabet-filter" class="alphabet-filter" style="margin:.4rem 0;"></div>
       <div style="margin:.2rem 0 .4rem;">
-        <button id="hide-inactive-btn" class="btn btn-sm" onclick="toggleHideInactive()">🙈 Hide inactive-client facts</button>
+        <select id="client-filter-select" class="form-control" style="font-size:.82rem;" onchange="onClientFilterChange(this.value)">
+          <option value="all">All clients</option>
+          <option value="active">Active clients only</option>
+        </select>
       </div>
       <div id="memories-list" class="memories-list-scroll"></div>
     </div>
@@ -620,14 +623,20 @@ npm install @modelcontextprotocol/sdk</code></pre>
   let activeGraphCategories = new Set();
   let activeCategory = null;
   let activeLetterFilter = null;
-  let hideInactiveClients = false;
+  let hideInactiveClients = false;  // kept for session-state back-compat (mapped to clientFilter)
+  let clientFilter = 'all';  // 'all' | 'active' | <clientId>
   let clientActiveMap = {};
   let clientListCache = [];
 
-  // Shared scope predicate: generic facts (no client) and unknown clients
-  // always pass; only known-inactive clients are hidden when the toggle is on.
+  // Shared scope predicate used by renderMemories / renderCategorySidebar.
   function memPassesScope(m) {
-    return !hideInactiveClients || !m.clientId || clientActiveMap[m.clientId] !== false;
+    if (clientFilter === 'all') return true;
+    if (clientFilter === 'active') {
+      // Generic facts (no client) always pass; only known-inactive clients are hidden.
+      return !m.clientId || clientActiveMap[m.clientId] !== false;
+    }
+    // Specific client selected — show only facts belonging to that client.
+    return m.clientId === clientFilter;
   }
   let lastSortOrder = 'alphabetical';
   let lastSearchQuery = '';
@@ -653,7 +662,8 @@ npm install @modelcontextprotocol/sdk</code></pre>
         activeCategory: activeCategory,
         activeGraphCategories: Array.from(activeGraphCategories),
         activeLetterFilter: activeLetterFilter,
-        hideInactiveClients: hideInactiveClients,
+        hideInactiveClients: clientFilter === 'active',  // back-compat
+        clientFilter: clientFilter,
         selectedFactId: selectedFactId,
         diarySearchQuery: diarySearchQuery,
         diaryMonthYear: diaryMonthYear,
@@ -679,7 +689,9 @@ npm install @modelcontextprotocol/sdk</code></pre>
         if (state.activeCategory !== undefined) activeCategory = state.activeCategory;
         if (state.activeGraphCategories !== undefined) activeGraphCategories = new Set(state.activeGraphCategories);
         if (state.activeLetterFilter !== undefined) activeLetterFilter = state.activeLetterFilter;
-        if (state.hideInactiveClients !== undefined) hideInactiveClients = state.hideInactiveClients;
+        if (state.clientFilter !== undefined) clientFilter = state.clientFilter;
+        else if (state.hideInactiveClients !== undefined) clientFilter = state.hideInactiveClients ? 'active' : 'all';
+        hideInactiveClients = clientFilter === 'active';  // back-compat
         if (state.selectedFactId !== undefined) selectedFactId = state.selectedFactId;
         
         if (state.diarySearchQuery !== undefined) diarySearchQuery = state.diarySearchQuery;
@@ -702,7 +714,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     loadMemories();
     loadDiary();
     loadWhoami();
-    renderHideInactiveBtn();
+    renderClientFilterSelect();
     initSSE();
     switchTab(activeTab);
   }
@@ -827,17 +839,36 @@ npm install @modelcontextprotocol/sdk</code></pre>
     try { const info = await api.get('whoami'); document.getElementById('user-badge').textContent = '👤 ' + info.user; } catch(_) {}
   }
 
-  function renderHideInactiveBtn() {
-    const btn = document.getElementById('hide-inactive-btn');
-    if (btn) btn.textContent = hideInactiveClients ? '👁️ Show inactive-client facts' : '🙈 Hide inactive-client facts';
+  function renderClientFilterSelect() {
+    const sel = document.getElementById('client-filter-select');
+    if (!sel) return;
+    // Preserve existing non-client options (All / Active)
+    const clientOptions = clientListCache.map(c =>
+      `<option value="${escHtml(c.id)}">${c.effectiveActive !== false ? '🟢' : '⚪'} ${escHtml(c.name)}</option>`
+    ).join('');
+    sel.innerHTML =
+      `<option value="all">All clients</option>` +
+      `<option value="active">Active clients only</option>` +
+      (clientOptions ? `<optgroup label="──────────">${clientOptions}</optgroup>` : '');
+    sel.value = clientFilter;
+  }
+
+  async function onClientFilterChange(value) {
+    clientFilter = value;
+    hideInactiveClients = clientFilter === 'active';  // back-compat
+    if (clientFilter !== 'all' && Object.keys(clientActiveMap).length === 0) {
+      await loadClients();
+    }
+    renderMemories();
+    renderCategorySidebar();
+    saveSessionState();
   }
 
   async function toggleHideInactive() {
-    hideInactiveClients = !hideInactiveClients;
-    if (hideInactiveClients && Object.keys(clientActiveMap).length === 0) {
-      await loadClients();
-    }
-    renderHideInactiveBtn();
+    // Legacy shim — kept in case anything still calls it
+    clientFilter = clientFilter === 'active' ? 'all' : 'active';
+    hideInactiveClients = clientFilter === 'active';
+    renderClientFilterSelect();
     renderMemories();
     renderCategorySidebar();
     saveSessionState();
@@ -862,6 +893,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
       clientActiveMap = {};
       clients.forEach(c => { clientActiveMap[c.id] = c.effectiveActive !== false; });
       clientListCache = clients;
+      renderClientFilterSelect();
       // also repopulate the project-client selector
       const sel = document.getElementById('new-project-client');
       if (sel) {
