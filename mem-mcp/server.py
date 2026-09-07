@@ -59,8 +59,9 @@ from contextlib import asynccontextmanager
 @asynccontextmanager
 async def lifespan(app):
     async with mcp_app.lifespan(mcp_app):
-        from migrate_client_context import migrate_client_context, strip_scope_properties, restore_scope_links, llm_backfill_scope
+        from migrate_client_context import migrate_client_context, strip_scope_properties, restore_scope_links, llm_backfill_scope, sync_qdrant_scope
         await migrate_client_context()
+        await sync_qdrant_scope()
         await strip_scope_properties()
         await restore_scope_links()
         await llm_backfill_scope()

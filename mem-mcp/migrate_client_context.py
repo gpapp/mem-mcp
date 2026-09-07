@@ -152,8 +152,6 @@ async def _migrate_user(user_id: str, neo4j_driver, qdrant):
                 userId=user_id, factId=fact_id, clientId=client_id
             )
 
-    # 5. Backfill Qdrant payloads with denormalized client/context names
-    await _backfill_qdrant(user_id, neo4j_driver, qdrant)
     logger.info(f"migrate_client_context [{user_id}]: done ({len(client_map)} clients)")
 
 
@@ -246,6 +244,28 @@ async def _backfill_qdrant(user_id: str, neo4j_driver, qdrant):
                 logger.warning(f"migrate_client_context [{user_id}]: Qdrant scope sync failed for {pid}: {e}")
     if synced:
         logger.info(f"scope_qdrant_sync [{user_id}]: updated {synced} payloads")
+
+
+async def sync_qdrant_scope():
+    """Push Neo4j FOR_CLIENT/IN_CONTEXT links into Qdrant payloads for all users.
+
+    Called every boot (after migrate_client_context) so that manual scope
+    assignments made via the UI are reliably reflected in Qdrant before
+    restore_scope_links reads it back.  Diff-based — steady-state is a no-op.
+    """
+    neo4j_driver = get_neo4j()
+    qdrant = await get_qdrant()
+    if not neo4j_driver or not qdrant:
+        logger.warning("sync_qdrant_scope: DB not available, skipping")
+        return
+
+    with neo4j_driver.session() as s:
+        user_rows = list(s.run(
+            "MATCH (c:Client) RETURN DISTINCT c.userId AS userId"
+        ))
+    user_ids = [r["userId"] for r in user_rows if r["userId"]]
+    for user_id in user_ids:
+        await _backfill_qdrant(user_id, neo4j_driver, qdrant)
 
 
 # ---------------------------------------------------------------------------
