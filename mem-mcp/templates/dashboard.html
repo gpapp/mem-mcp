@@ -1660,6 +1660,22 @@ npm install @modelcontextprotocol/sdk</code></pre>
     fillEpProjects(c ? c.value : '', '');
   }
 
+  function fillDeProjects(clientId, selectedCtx) {
+    const sel = document.getElementById('de-project');
+    if (!sel) return;
+    const c = (clientListCache || []).find(x => x.id === (clientId || ''));
+    const ctxs = (c && c.contexts) || [];
+    const extra = (selectedCtx && !ctxs.some(x => x.id === selectedCtx))
+      ? `<option value="${selectedCtx}" selected>⚠️ assigned project</option>` : '';
+    sel.innerHTML = `<option value="">— No project —</option>` + extra + ctxs.map(x =>
+      `<option value="${x.id}"${x.id === (selectedCtx || '') ? ' selected' : ''}>${escHtml(x.name)}</option>`).join('');
+  }
+
+  function onDeClientChange() {
+    const c = document.getElementById('de-client');
+    fillDeProjects(c ? c.value : '', '');
+  }
+
   async function startFactEdit(id) {
     await ensureClients();
     const m = memories.find(x => x.id === id);
@@ -2266,6 +2282,10 @@ npm install @modelcontextprotocol/sdk</code></pre>
           <button class="btn btn-danger btn-sm" onclick="deleteDiaryEntry('${entry.id}')" style="padding:0.15rem 0.5rem; font-size:0.75rem;">🗑️</button>
         </div>
       </div>
+      <div class="fact-detail-scope" style="margin-bottom:.75rem;">
+        <span style="font-size:.8rem;color:var(--muted);">🏢 Client: <strong>${entry.clientName ? escHtml(entry.clientName) : '—'}</strong></span>
+        <span style="margin-left:1rem;font-size:.8rem;color:var(--muted);">📁 Project: <strong>${entry.contextName ? escHtml(entry.contextName) : '—'}</strong></span>
+      </div>
       <div class="markdown-body">${marked.parse(entry.content || '')}</div>
       <div id="diary-detail-meta" style="margin-top:1rem;"></div>
       <div style="margin-top:1.5rem; padding-top:1rem; border-top:1px solid var(--border);">
@@ -2284,7 +2304,8 @@ npm install @modelcontextprotocol/sdk</code></pre>
       </div>`;
   }
 
-  function renderDiaryEditMode(entryId) {
+  async function renderDiaryEditMode(entryId) {
+    await ensureClients();
     const entry = diaryEntries.find(e => e.id === entryId);
     if (!entry) return;
     activeDiaryId = entryId;
@@ -2313,6 +2334,19 @@ npm install @modelcontextprotocol/sdk</code></pre>
           <label style="font-size:.75rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;display:block;margin-bottom:.2rem;">Content</label>
           <textarea id="de-content" style="width:100%;min-height:200px;padding:.4rem .5rem;border:1px solid var(--border);border-radius:6px;font-size:.85rem;font-family:inherit;">${escHtml(entry.content || '')}</textarea>
         </div>
+        <div style="margin-bottom:.5rem;display:flex;gap:.75rem;flex-wrap:wrap;">
+          <div style="flex:1;min-width:120px;">
+            <label for="de-client" style="font-size:.75rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;display:block;margin-bottom:.2rem;">Client</label>
+            <select id="de-client" onchange="onDeClientChange()" style="width:100%;padding:.35rem .5rem;border:1px solid var(--border);border-radius:6px;font-size:.85rem;">
+              <option value="">— No client —</option>
+              ${(clientListCache||[]).map(c=>`<option value="${c.id}"${c.id===(entry.clientId||'')?'  selected':''}>${escHtml(c.name)}</option>`).join('')}
+            </select>
+          </div>
+          <div style="flex:1;min-width:120px;">
+            <label for="de-project" style="font-size:.75rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;display:block;margin-bottom:.2rem;">Project</label>
+            <select id="de-project" style="width:100%;padding:.35rem .5rem;border:1px solid var(--border);border-radius:6px;font-size:.85rem;"></select>
+          </div>
+        </div>
         <div id="de-meta-section"></div>
       </div>
       <div style="margin-top:.5rem; padding-top:.5rem; border-top:1px solid var(--border);">
@@ -2334,6 +2368,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
         <button class="btn btn-primary" onclick="saveDiaryEdit('${entry.id}')">💾 Save</button>
       </div>`;
     renderDiaryMetaEditor(entry);
+    fillDeProjects(entry.clientId, entry.contextId);
   }
 
   function renderDiaryMetaEditor(entry) {
@@ -2408,6 +2443,15 @@ npm install @modelcontextprotocol/sdk</code></pre>
       const updated = await api.put('diary/' + entryId, payload);
       const entry = diaryEntries.find(e => e.id === entryId);
       if (entry) { entry.name = updated.name; entry.content = updated.content; entry.timestamp = updated.timestamp; entry.date = updated.timestamp.substring(0,10); entry.metadata = updated.metadata; }
+      const deClient = document.getElementById('de-client');
+      const deProject = document.getElementById('de-project');
+      if (deClient && deProject) {
+        const scope = await api.put('diary/' + entryId + '/scope', {
+          clientId: deClient.value || null,
+          contextId: deProject.value || null
+        });
+        if (entry) { entry.clientId = scope.clientId; entry.clientName = scope.clientName; entry.contextId = scope.contextId; entry.contextName = scope.contextName; }
+      }
       toast('✅ Diary entry updated');
       selectDiaryEntry(entryId);
     } catch(e) { toast('❌ Error updating entry'); }

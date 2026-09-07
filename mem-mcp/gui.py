@@ -534,6 +534,21 @@ async def api_set_memory_scope(memory_id: str, request: Request, body: ScopeUpda
         raise HTTPException(status_code=503, detail=str(e))
 
 
+@web_app.put("/api/diary/{entry_id}/scope", response_class=JSONResponse)
+async def api_set_diary_scope(entry_id: str, request: Request, body: ScopeUpdate):
+    """Replace a diary entry's client/project assignment (null clears that side)."""
+    try:
+        try:
+            scope = await mem.db_set_diary_scope(entry_id, body.clientId, body.contextId, _require_user(request))
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        if scope is None:
+            raise HTTPException(status_code=404, detail="Diary entry not found or access denied.")
+        return {"id": entry_id, **scope}
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
 @web_app.post("/api/maintenance/reclassify", response_class=JSONResponse)
 async def api_start_reclassify(request: Request):
     """Start a full Ollama scope reclassification as a background job (409 if running)."""

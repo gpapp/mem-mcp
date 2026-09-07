@@ -633,6 +633,68 @@ async def link_fact_to_context(fact_id: str, context_id: str, user_id: str):
         )
 
 
+async def db_set_diary_scope(entry_id: str, client_id: Optional[str], context_id: Optional[str],
+                              user_id: str) -> Optional[dict]:
+    """Replace a DiaryEntry's client/project assignment (None clears that side).
+
+    Mirrors db_set_fact_scope but targets DiaryEntry nodes and DIARY_COLLECTION.
+    Returns the new scope dict, or None if the entry was not found.
+    Raises ValueError on unknown client/context ids.
+    """
+    neo4j_driver = get_neo4j()
+    if not neo4j_driver:
+        raise RuntimeError("Neo4j not connected.")
+    client = _resolve_client_by_id(client_id, user_id) if client_id else None
+    if client_id and not client:
+        raise ValueError(f"Unknown client '{client_id}'.")
+    ctx = _resolve_context_by_id(context_id, user_id) if context_id else None
+    if context_id and not ctx:
+        raise ValueError(f"Unknown project '{context_id}'.")
+    with neo4j_driver.session() as s:
+        found = s.run(
+            "MATCH (d:DiaryEntry {id: $entryId, userId: $userId}) RETURN count(d) AS n",
+            entryId=entry_id, userId=user_id
+        ).single()
+        if not found or found["n"] == 0:
+            return None
+        s.run(
+            "MATCH (d:DiaryEntry {id: $entryId, userId: $userId})-[r:FOR_CLIENT]->(:Client) DELETE r",
+            entryId=entry_id, userId=user_id
+        )
+        s.run(
+            "MATCH (d:DiaryEntry {id: $entryId, userId: $userId})-[r:IN_CONTEXT]->(:Context) DELETE r",
+            entryId=entry_id, userId=user_id
+        )
+    if client:
+        await link_diary_to_client(entry_id, client["id"], user_id)
+    if ctx:
+        await link_diary_to_context(entry_id, ctx["id"], user_id)
+    try:
+        qdrant = await get_qdrant()
+        if qdrant:
+            patch = {}
+            if client:
+                patch["clientId"] = client["id"]
+                patch["clientName"] = client["name"]
+            if ctx:
+                patch["contextId"] = ctx["id"]
+                patch["contextName"] = ctx["name"]
+            if patch:
+                await qdrant.set_payload(collection_name=DIARY_COLLECTION, payload=patch, points=[entry_id])
+            drop = [k for k, present in (("clientId", client), ("clientName", client),
+                                         ("contextId", ctx), ("contextName", ctx)) if not present]
+            if drop:
+                await qdrant.delete_payload(collection_name=DIARY_COLLECTION, keys=drop, points=[entry_id])
+    except Exception as e:
+        logger.warning(f"db_set_diary_scope: Qdrant payload patch failed for {entry_id}: {e}")
+    return {
+        "clientId": client["id"] if client else None,
+        "clientName": client["name"] if client else None,
+        "contextId": ctx["id"] if ctx else None,
+        "contextName": ctx["name"] if ctx else None,
+    }
+
+
 async def link_diary_to_client(entry_id: str, client_id: str, user_id: str):
     """Link a DiaryEntry to a Client via FOR_CLIENT relationship."""
     neo4j_driver = get_neo4j()
