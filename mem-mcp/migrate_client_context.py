@@ -611,6 +611,57 @@ async def restore_scope_links():
             logger.info(f"restore_scope_links [{user_id}]: restored {restored} scope links from Qdrant payloads")
 
 
+_SCOPE_PROP_KEYS = ("clientId", "clientName", "contextId", "contextName")
+
+
+async def strip_scope_properties():
+    """Remove legacy scope keys from node properties (links are the source of truth).
+
+    Scope used to be surfaced inside `metadata`; any copies baked onto Fact nodes
+    (or into DiaryEntry metadata JSON, e.g. via the metadata editor) are stripped
+    here. Links, Qdrant payloads and the scopeCheckedSig boot stamp are untouched —
+    run before restore_scope_links().
+    """
+    neo4j_driver = get_neo4j()
+    if not neo4j_driver:
+        logger.warning("strip_scope_properties: DB not available, skipping")
+        return
+    stripped_facts = 0
+    stripped_diary = 0
+    with neo4j_driver.session() as s:
+        res = s.run(
+            """
+            MATCH (f:Fact)
+            WHERE f.clientId IS NOT NULL OR f.clientName IS NOT NULL
+               OR f.contextId IS NOT NULL OR f.contextName IS NOT NULL
+            REMOVE f.clientId, f.clientName, f.contextId, f.contextName
+            RETURN count(*) as n
+            """
+        ).single()
+        stripped_facts = res["n"] if res else 0
+        # DiaryEntry metadata is a JSON string — prune scope keys inside it.
+        rows = list(s.run(
+            "MATCH (d:DiaryEntry) WHERE d.metadata IS NOT NULL RETURN d.id AS id, d.metadata AS metadata"
+        ))
+    for row in rows:
+        raw = row["metadata"]
+        try:
+            meta = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        except Exception:
+            continue
+        if not isinstance(meta, dict) or not any(k in meta for k in _SCOPE_PROP_KEYS):
+            continue
+        pruned = {k: v for k, v in meta.items() if k not in _SCOPE_PROP_KEYS}
+        with neo4j_driver.session() as s:
+            s.run(
+                "MATCH (d:DiaryEntry {id: $id}) SET d.metadata = $metadata",
+                id=row["id"], metadata=json.dumps(pruned),
+            )
+        stripped_diary += 1
+    if stripped_facts or stripped_diary:
+        logger.info(f"strip_scope_properties: stripped scope props from {stripped_facts} facts, {stripped_diary} diary entries")
+
+
 # ---------------------------------------------------------------------------
 # UI-triggered full reclassification: re-run the (enriched) Ollama classifier
 # over EVERY fact + diary entry, replacing existing scope links. Runs as a

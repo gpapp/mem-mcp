@@ -969,14 +969,9 @@ def db_list_memories(user_id: str) -> list:
                 if k not in core_keys:
                     metadata[k] = v.iso_format() if hasattr(v, "iso_format") else v
             
-            # Add client/context to metadata for convenience
-            if r["clientName"]:
-                metadata["clientName"] = r["clientName"]
-                metadata["clientId"] = r["clientId"]
-            if r["contextName"]:
-                metadata["contextName"] = r["contextName"]
-                metadata["contextId"] = r["contextId"]
-            
+            # Scope lives top-level on the response (clientName/clientId/...);
+            # it is intentionally NOT duplicated into metadata anymore.
+
             # Clean up links (remove null entries from collect)
             links = [l for l in r["links"] if l and l.get("target_id")]
 
