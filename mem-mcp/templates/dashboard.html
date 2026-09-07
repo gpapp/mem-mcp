@@ -1099,6 +1099,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
             <div>
               <div class="fact-detail-name">${escHtml(m.name || 'Unnamed')}</div>
               <span class="fact-detail-cat">${escHtml(m.category)}</span>
+              ${(m.clientName || m.contextName) ? `<span style="display:inline-flex; gap:.35rem; margin-left:.4rem; vertical-align:middle;">${m.clientName ? `<span class="tag-badge">🏢 ${escHtml(m.clientName)}</span>` : ''}${m.contextName ? `<span class="tag-badge">📁 ${escHtml(m.contextName)}</span>` : ''}</span>` : ''}
             </div>
             <button class="btn btn-ghost btn-sm" onclick="clearFactPane()" style="flex-shrink:0;" name="Close">✕</button>
           </div>

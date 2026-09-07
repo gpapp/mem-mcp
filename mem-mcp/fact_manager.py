@@ -2022,12 +2022,13 @@ async def sync_orphans():
                 logger.info(f"sync_orphans [{user_id}]: deleted {res['n']} cross-user MENTIONS")
                 total_pruned_links += res["n"]
 
-            # Knowledge graph links from Facts must point to other Facts or DiaryEntries
+            # Knowledge graph links from Facts must point to other Facts, DiaryEntries,
+            # or scope nodes (Client/Context via FOR_CLIENT/IN_CONTEXT)
             res = s.run(
                 """
                 MATCH (f:Fact {userId: $userId})-[r]->(t)
-                WHERE NOT type(r) IN ['IN_CATEGORY', 'KNOWS']
-                  AND NOT t:Fact AND NOT t:DiaryEntry
+                WHERE NOT type(r) IN ['IN_CATEGORY', 'KNOWS', 'FOR_CLIENT', 'IN_CONTEXT']
+                  AND NOT t:Fact AND NOT t:DiaryEntry AND NOT t:Client AND NOT t:Context
                 DELETE r
                 RETURN count(*) as n
                 """,

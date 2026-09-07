@@ -469,7 +469,7 @@ async def set_client_status(clientId: str, active: bool):
     Pinned status is never overridden by automatic activity tracking.
     Returns confirmation or a not-found error.
     """
-    found = mem.db_set_client_active(clientId, active, _current_user())
+    found = await mem.db_set_client_active(clientId, active, _current_user())
     if not found:
         return f"Error: client '{clientId}' not found."
     state = "active" if active else "inactive"

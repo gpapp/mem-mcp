@@ -12,10 +12,11 @@ from common import (
     COLLECTION_NAME, DIARY_COLLECTION,
     SCOPE_MODEL, SCOPE_BACKFILL_ENABLED, SCOPE_BACKFILL_CONCURRENCY,
 )
-from qdrant_client.models import PointStruct
+from qdrant_client.models import PointStruct, Filter, FieldCondition, MatchValue
 from client_manager import (
     db_create_client, db_create_context, db_list_clients,
     db_resolve_client, db_resolve_context,
+    _resolve_client_by_id, _resolve_context_by_id,
     link_fact_to_client, link_fact_to_context,
     link_diary_to_client, link_diary_to_context,
 )
@@ -422,3 +423,60 @@ async def llm_backfill_scope():
         # Push the new links into Qdrant payloads for filtered search.
         await _backfill_qdrant(user_id, neo4j_driver, qdrant)
         logger.info(f"scope_backfill [{user_id}]: done, {linked}/{total} linked to clients")
+
+
+async def restore_scope_links():
+    """Re-create Neo4j FOR_CLIENT / IN_CONTEXT links from Qdrant payloads.
+
+    Repairs scope links if a janitor query ever deletes them (MERGE = idempotent).
+    Runs before llm_backfill_scope so the LLM pass finds nothing to re-classify.
+    """
+    neo4j_driver = get_neo4j()
+    qdrant = await get_qdrant()
+    if not neo4j_driver or not qdrant:
+        logger.warning("restore_scope_links: DB not available, skipping")
+        return
+
+    with neo4j_driver.session() as s:
+        user_rows = list(s.run("MATCH (c:Client) RETURN DISTINCT c.userId AS userId"))
+    user_ids = [r["userId"] for r in user_rows if r["userId"]]
+    if not user_ids:
+        return
+
+    for user_id in user_ids:
+        restored = 0
+        for collection, is_diary in ((COLLECTION_NAME, False), (DIARY_COLLECTION, True)):
+            offset = None
+            while True:
+                points, next_offset = await qdrant.scroll(
+                    collection_name=collection,
+                    limit=1000,
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False,
+                    scroll_filter=Filter(must=[FieldCondition(key="userId", match=MatchValue(value=user_id))]),
+                )
+                for p in points:
+                    payload = p.payload or {}
+                    client_id = payload.get("clientId")
+                    if not client_id:
+                        continue
+                    if _resolve_client_by_id(client_id, user_id) is None:
+                        continue
+                    node_id = str(p.id)
+                    if is_diary:
+                        await link_diary_to_client(node_id, client_id, user_id)
+                    else:
+                        await link_fact_to_client(node_id, client_id, user_id)
+                    context_id = payload.get("contextId")
+                    if context_id and _resolve_context_by_id(context_id, user_id) is not None:
+                        if is_diary:
+                            await link_diary_to_context(node_id, context_id, user_id)
+                        else:
+                            await link_fact_to_context(node_id, context_id, user_id)
+                    restored += 1
+                if next_offset is None:
+                    break
+                offset = next_offset
+        if restored:
+            logger.info(f"restore_scope_links [{user_id}]: restored {restored} scope links from Qdrant payloads")

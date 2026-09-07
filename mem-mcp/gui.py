@@ -387,7 +387,7 @@ class ClientStatusUpdate(BaseModel):
 async def api_set_client_status(client_id: str, request: Request, body: ClientStatusUpdate):
     """Pin a client as active or inactive. Pinned status is never auto-overridden."""
     try:
-        found = mem.db_set_client_active(client_id, body.active, _require_user(request))
+        found = await mem.db_set_client_active(client_id, body.active, _require_user(request))
         if not found:
             raise HTTPException(status_code=404, detail="Client not found or access denied.")
         return {"id": client_id, "active": body.active, "pinned": True}

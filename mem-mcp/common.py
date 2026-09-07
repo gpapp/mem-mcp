@@ -45,17 +45,18 @@ class _BenignScopeNotificationFilter(logging.Filter):
     materialize once the first such node/relationship is created (via migration
     or client-scoped writes). OPTIONAL MATCH over not-yet-existing schema is
     valid and simply matches nothing — the 01N50/01N51 warnings are noise until
-    then. Gated on both the status code and our identifiers so genuine schema
-    warnings for anything else still surface.
+    then. The 01G11 null-elimination notice from collect() over the optional
+    scope match is likewise expected. Gated on both the status code and our
+    identifiers so genuine schema warnings for anything else still surface.
     """
-    _SUPPRESSED = ("`Context`", "`Client`", "`IN_CONTEXT`", "`FOR_CLIENT`")
+    _SUPPRESSED = ("`Context`", "`Client`", "`IN_CONTEXT`", "`FOR_CLIENT`", "`HAS_CONTEXT`")
 
     def filter(self, record: logging.LogRecord) -> bool:
         try:
             msg = record.getMessage()
         except Exception:
             return True
-        if "01N50" in msg or "01N51" in msg:
+        if "01N50" in msg or "01N51" in msg or "01G11" in msg:
             return not any(s in msg for s in self._SUPPRESSED)
         return True
 
