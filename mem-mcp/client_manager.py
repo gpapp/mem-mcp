@@ -3,6 +3,7 @@ client_manager.py – Client and Context management for multi-client memory sepa
 """
 
 import uuid
+import hashlib
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -270,6 +271,31 @@ async def db_rename_context(context_id: str, name: str, user_id: str) -> bool:
         return bool(rec and rec["n"] > 0)
 
 
+def _stamp_manual_scope(node_id: str, label: str, user_id: str) -> None:
+    """Stamp scopeCheckedSig so the LLM backfill won't overwrite a manual assignment.
+
+    Computes the current client/context signature for this user and writes it onto
+    the node.  Called by db_set_fact_scope and db_set_diary_scope.
+    """
+    neo4j_driver = get_neo4j()
+    if not neo4j_driver:
+        return
+    try:
+        clients = db_list_clients(user_id)
+        parts = []
+        for c in sorted(clients, key=lambda x: x.get("name", "")):
+            ctxs = sorted(x.get("name", "") for x in c.get("contexts", []))
+            parts.append(c.get("name", "") + "|" + ",".join(ctxs))
+        sig = hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+        with neo4j_driver.session() as s:
+            s.run(
+                f"MATCH (n:{label} {{id: $id, userId: $userId}}) SET n.scopeCheckedSig = $sig",
+                id=node_id, userId=user_id, sig=sig,
+            )
+    except Exception as exc:
+        logger.debug(f"_stamp_manual_scope: failed for {node_id}: {exc}")
+
+
 async def db_set_fact_scope(fact_id: str, client_id: Optional[str], context_id: Optional[str],
                             user_id: str) -> Optional[dict]:
     """Replace a Fact's client/project assignment (None clears that side).
@@ -325,6 +351,7 @@ async def db_set_fact_scope(fact_id: str, client_id: Optional[str], context_id: 
                 await qdrant.delete_payload(collection_name=COLLECTION_NAME, keys=drop, points=[fact_id])
     except Exception as e:
         logger.warning(f"db_set_fact_scope: Qdrant payload patch failed for {fact_id}: {e}")
+    _stamp_manual_scope(fact_id, "Fact", user_id)
     return {
         "clientId": client["id"] if client else None,
         "clientName": client["name"] if client else None,
@@ -687,6 +714,7 @@ async def db_set_diary_scope(entry_id: str, client_id: Optional[str], context_id
                 await qdrant.delete_payload(collection_name=DIARY_COLLECTION, keys=drop, points=[entry_id])
     except Exception as e:
         logger.warning(f"db_set_diary_scope: Qdrant payload patch failed for {entry_id}: {e}")
+    _stamp_manual_scope(entry_id, "DiaryEntry", user_id)
     return {
         "clientId": client["id"] if client else None,
         "clientName": client["name"] if client else None,
