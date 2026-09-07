@@ -986,6 +986,10 @@ def db_list_memories(user_id: str) -> list:
                 "name":     f_node.get("name"),
                 "category":  r["category"],
                 "timestamp": f_node["timestamp"].iso_format() if f_node.get("timestamp") else None,
+                "clientName":  r["clientName"],
+                "clientId":    r["clientId"],
+                "contextName": r["contextName"],
+                "contextId":   r["contextId"],
                 "metadata":  metadata,
                 "links":     links
             })
