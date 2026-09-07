@@ -362,6 +362,9 @@
         </select>
       </div>
       <div id="alphabet-filter" class="alphabet-filter" style="margin:.4rem 0;"></div>
+      <div style="margin:.2rem 0 .4rem;">
+        <button id="hide-inactive-btn" class="btn btn-sm" onclick="toggleHideInactive()">🙈 Hide inactive-client facts</button>
+      </div>
       <div id="memories-list" class="memories-list-scroll"></div>
     </div>
 
@@ -562,6 +565,8 @@ npm install @modelcontextprotocol/sdk</code></pre>
   let activeGraphCategories = new Set();
   let activeCategory = null;
   let activeLetterFilter = null;
+  let hideInactiveClients = false;
+  let clientActiveMap = {};
   let lastSortOrder = 'alphabetical';
   let lastSearchQuery = '';
   let activeTab = 'memories';
@@ -586,6 +591,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
         activeCategory: activeCategory,
         activeGraphCategories: Array.from(activeGraphCategories),
         activeLetterFilter: activeLetterFilter,
+        hideInactiveClients: hideInactiveClients,
         selectedFactId: selectedFactId,
         diarySearchQuery: diarySearchQuery,
         diaryMonthYear: diaryMonthYear,
@@ -611,6 +617,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
         if (state.activeCategory !== undefined) activeCategory = state.activeCategory;
         if (state.activeGraphCategories !== undefined) activeGraphCategories = new Set(state.activeGraphCategories);
         if (state.activeLetterFilter !== undefined) activeLetterFilter = state.activeLetterFilter;
+        if (state.hideInactiveClients !== undefined) hideInactiveClients = state.hideInactiveClients;
         if (state.selectedFactId !== undefined) selectedFactId = state.selectedFactId;
         
         if (state.diarySearchQuery !== undefined) diarySearchQuery = state.diarySearchQuery;
@@ -633,6 +640,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     loadMemories();
     loadDiary();
     loadWhoami();
+    renderHideInactiveBtn();
     initSSE();
     switchTab(activeTab);
   }
@@ -757,11 +765,28 @@ npm install @modelcontextprotocol/sdk</code></pre>
     try { const info = await api.get('whoami'); document.getElementById('user-badge').textContent = '👤 ' + info.user; } catch(_) {}
   }
 
+  function renderHideInactiveBtn() {
+    const btn = document.getElementById('hide-inactive-btn');
+    if (btn) btn.textContent = hideInactiveClients ? '👁️ Show inactive-client facts' : '🙈 Hide inactive-client facts';
+  }
+
+  async function toggleHideInactive() {
+    hideInactiveClients = !hideInactiveClients;
+    if (hideInactiveClients && Object.keys(clientActiveMap).length === 0) {
+      await loadClients();
+    }
+    renderHideInactiveBtn();
+    renderMemories();
+    saveSessionState();
+  }
+
   async function loadClients() {
     const el = document.getElementById('client-list');
     if (!el) return;
     try {
       const clients = await api.get('clients');
+      clientActiveMap = {};
+      clients.forEach(c => { clientActiveMap[c.id] = c.effectiveActive !== false; });
       if (!clients.length) { el.innerHTML = '<p class="empty">No clients yet — they are created automatically from meeting transcriptions.</p>'; return; }
       el.innerHTML = clients.map(c => {
         const on = c.effectiveActive !== false;
@@ -778,7 +803,8 @@ npm install @modelcontextprotocol/sdk</code></pre>
     try {
       await api.put('clients/' + id, {active});
       toast(active ? 'Client activated 📌' : 'Client deactivated 📌');
-      loadClients();
+      await loadClients();
+      renderMemories();
     } catch(e) { toast('⚠️ Could not update client'); }
   }
 
@@ -994,7 +1020,10 @@ npm install @modelcontextprotocol/sdk</code></pre>
       const matchQuery = !query || m.text.toLowerCase().includes(query) || mName.includes(query) || m.category.toLowerCase().includes(query);
       const firstChar = (m.name || m.text || '').trim()[0] || '';
       const matchLetter = activeLetterFilter === null || firstChar.toUpperCase() === activeLetterFilter;
-      return matchCat && matchQuery && matchLetter;
+      // Generic facts (no client) and unknown clients always pass; only facts
+      // whose client is known-inactive are hidden when the toggle is on.
+      const matchActive = !hideInactiveClients || !m.clientId || clientActiveMap[m.clientId] !== false;
+      return matchCat && matchQuery && matchLetter && matchActive;
     });
 
     const sortKey = m => (m.name || m.text || '').toLowerCase();
@@ -1734,14 +1763,19 @@ npm install @modelcontextprotocol/sdk</code></pre>
     }
   }
 
+  // Local YYYY-MM-DD (toISOString is UTC and shifts the day in UTC+x zones)
+  function localDateStr(d) {
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  }
+
   function formatDateDisplay(dateStr) {
     const d = new Date(dateStr);
     if (isNaN(d.getTime())) return dateStr;
     const today = new Date();
     const yesterday = new Date(today);
     yesterday.setDate(yesterday.getDate() - 1);
-    if (dateStr === today.toISOString().split('T')[0]) return 'Today';
-    if (dateStr === yesterday.toISOString().split('T')[0]) return 'Yesterday';
+    if (dateStr === localDateStr(today)) return 'Today';
+    if (dateStr === localDateStr(yesterday)) return 'Yesterday';
     return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' });
   }
 
@@ -1778,7 +1812,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
   function goToToday() {
     const now = new Date();
     diaryMonthYear = { year: now.getFullYear(), month: now.getMonth() + 1 };
-    selectedDiaryDate = now.toISOString().split('T')[0];
+    selectedDiaryDate = localDateStr(now);
     renderDiaryMonthPager();
     renderDiarySidebar();
     saveSessionState();
