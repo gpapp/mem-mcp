@@ -137,11 +137,14 @@ async def _migrate_user(user_id: str, neo4j_driver, qdrant):
         logger.info(f"migrate_client_context [{user_id}]: Context '{pname}' → {context_id}")
 
     # 4. Diary MENTIONS to Client-category facts → FOR_CLIENT on the diary entry
+    #    Only for entries that have no FOR_CLIENT link yet — existing manual/LLM
+    #    assignments must not be overwritten.
     with neo4j_driver.session() as s:
         for fact_id, (client_id, cname) in client_map.items():
             s.run(
                 """
                 MATCH (d:DiaryEntry {userId: $userId})-[:MENTIONS]->(cf:Fact {id: $factId, userId: $userId})
+                WHERE NOT (d)-[:FOR_CLIENT]->(:Client)
                 MERGE (c:Client {id: $clientId, userId: $userId})
                 MERGE (d)-[:FOR_CLIENT]->(c)
                 SET c.lastMentioned = datetime()
