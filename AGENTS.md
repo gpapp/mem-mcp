@@ -47,6 +47,7 @@ After completing any code changes:
 - `MEM_NEO4J_PASSWORD` (also mapped to `NEO_PASS` in docker-compose)
 - Embedder: pull `nomic-embed-text` into Ollama container (docker-compose uses `nomic-ea` by default)
 - Query LLM: pull `qwen3.5:0.8b` into Ollama container (used for search rewriting and diary keyword extraction)
+- Scope backfill LLM: `MEM_SCOPE_MODEL` (defaults to the query LLM) classifies unlinked facts/diary entries against existing clients on startup; `MEM_SCOPE_BACKFILL=0` disables it, `MEM_SCOPE_CONCURRENCY` (default 3) caps parallel classifications
 - User vault resolved from `Authorization: Basic` header or session cookie
 - `BASE_URL` must include `/mcp` prefix when behind nginx
 
@@ -54,6 +55,8 @@ After completing any code changes:
 
 On startup, the lifespan runs in this order:
 
+0. `migrate_client_context()` — Client-category facts → Client nodes, `WORKS_FOR` → `FOR_CLIENT`, Project facts → Context nodes (idempotent, skips migrated users)
+0b. `llm_backfill_scope()` — Ollama classifies every fact/diary WITHOUT a `FOR_CLIENT` link against existing clients/contexts and links matches (self-limiting; model can only pick existing names-or-null)
 1. `run_consistency_checks()` — Neo4j/Qdrant fact count mismatch, dangling MENTIONS, orphan categories, untitled facts (fact_manager.py, read-only)
 2. `run_diary_consistency_checks()` — diary entry count mismatch, dangling MENTIONS, untitled/bad-timestamp entries (diary_manager.py, read-only)
 3. `fix_diary_entries()` — sets `name = 'Untitled Diary Entry'` and/or `timestamp = now` on null/empty properties (diary_manager.py)

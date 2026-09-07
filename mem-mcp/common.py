@@ -37,6 +37,31 @@ if not logging.getLogger().handlers:
 logger = logging.getLogger("memory-vault")
 logging.getLogger("mcp").setLevel(logging.INFO)
 
+
+class _BenignScopeNotificationFilter(logging.Filter):
+    """Drop expected Neo4j UNRECOGNIZED notifications for optional scope schema.
+
+    The Client/Context labels and FOR_CLIENT/IN_CONTEXT relationship types only
+    materialize once the first such node/relationship is created (via migration
+    or client-scoped writes). OPTIONAL MATCH over not-yet-existing schema is
+    valid and simply matches nothing — the 01N50/01N51 warnings are noise until
+    then. Gated on both the status code and our identifiers so genuine schema
+    warnings for anything else still surface.
+    """
+    _SUPPRESSED = ("`Context`", "`Client`", "`IN_CONTEXT`", "`FOR_CLIENT`")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        if "01N50" in msg or "01N51" in msg:
+            return not any(s in msg for s in self._SUPPRESSED)
+        return True
+
+
+logging.getLogger("neo4j.notifications").addFilter(_BenignScopeNotificationFilter())
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -47,6 +72,12 @@ NEO4J_PASS     = os.getenv("MEM_NEO4J_PASSWORD",  "password")
 OLLAMA_URL      = os.getenv("MEM_LLM_URL",         os.getenv("MEM_EMBEDDER_URL", "http://ollama:11434"))
 EMBED_MODEL     = os.getenv("MEM_EMBEDDER_MODEL",  "nomic-embed-text")
 LLM_QUERY_MODEL = os.getenv("LLM_QUERY_MODEL",    "qwen3.5:0.8b")
+# Model used for server-side scope classification (client/context backfill).
+# Override with MEM_SCOPE_MODEL if a more capable model is available in Ollama.
+SCOPE_MODEL = os.getenv("MEM_SCOPE_MODEL", LLM_QUERY_MODEL)
+# Set MEM_SCOPE_BACKFILL=0 to skip the LLM scope backfill pass at startup.
+SCOPE_BACKFILL_ENABLED = os.getenv("MEM_SCOPE_BACKFILL", "1") == "1"
+SCOPE_BACKFILL_CONCURRENCY = int(os.getenv("MEM_SCOPE_CONCURRENCY", "3"))
 HTTP_TIMEOUT    = float(os.getenv("MEM_HTTP_TIMEOUT", "300.0"))
 BASE_URL       = os.getenv("BASE_URL",            "").rstrip("/")
 
