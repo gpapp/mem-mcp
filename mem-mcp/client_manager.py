@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from common import get_neo4j, logger
+from common import get_neo4j, get_qdrant, logger, COLLECTION_NAME
 
 # ---------------------------------------------------------------------------
 # Scope ranking tunables (shared by fact_manager and diary_manager)
@@ -195,6 +195,142 @@ async def db_set_client_active(client_id: str, active: bool, user_id: str) -> bo
         )
         rec = result.single()
         return bool(rec and rec["n"] > 0)
+
+
+async def db_rename_client(client_id: str, name: str, user_id: str) -> bool:
+    """Rename a Client node. Returns False if not found; raises ValueError on name collision.
+
+    Qdrant clientName drift self-heals via the boot diff-sync (_backfill_qdrant).
+    """
+    neo4j_driver = get_neo4j()
+    if not neo4j_driver:
+        raise RuntimeError("Neo4j not connected.")
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("Client name must not be empty.")
+    with neo4j_driver.session() as s:
+        collision = s.run(
+            """
+            MATCH (other:Client {userId: $userId})
+            WHERE toLower(other.name) = toLower($name) AND other.id <> $clientId
+            RETURN count(other) AS n
+            """,
+            userId=user_id, name=name, clientId=client_id
+        ).single()
+        if collision and collision["n"] > 0:
+            raise ValueError(f"Client name '{name}' already exists.")
+        rec = s.run(
+            """
+            MATCH (c:Client {id: $clientId, userId: $userId})
+            SET c.name = $name
+            RETURN count(c) AS n
+            """,
+            clientId=client_id, userId=user_id, name=name
+        ).single()
+        return bool(rec and rec["n"] > 0)
+
+
+async def db_rename_context(context_id: str, name: str, user_id: str) -> bool:
+    """Rename a Context node. Returns False if not found; raises ValueError on name collision.
+
+    Collision scope is the owning client. The node id stays stable (ids are only
+    derived from the name at creation time).
+    """
+    neo4j_driver = get_neo4j()
+    if not neo4j_driver:
+        raise RuntimeError("Neo4j not connected.")
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("Project name must not be empty.")
+    with neo4j_driver.session() as s:
+        owner = s.run(
+            "MATCH (ctx:Context {id: $contextId, userId: $userId}) RETURN ctx.clientId AS clientId",
+            contextId=context_id, userId=user_id
+        ).single()
+        if not owner:
+            return False
+        collision = s.run(
+            """
+            MATCH (other:Context {userId: $userId, clientId: $clientId})
+            WHERE toLower(other.name) = toLower($name) AND other.id <> $contextId
+            RETURN count(other) AS n
+            """,
+            userId=user_id, clientId=owner["clientId"], name=name, contextId=context_id
+        ).single()
+        if collision and collision["n"] > 0:
+            raise ValueError(f"Project name '{name}' already exists for this client.")
+        rec = s.run(
+            """
+            MATCH (ctx:Context {id: $contextId, userId: $userId})
+            SET ctx.name = $name
+            RETURN count(ctx) AS n
+            """,
+            contextId=context_id, userId=user_id, name=name
+        ).single()
+        return bool(rec and rec["n"] > 0)
+
+
+async def db_set_fact_scope(fact_id: str, client_id: Optional[str], context_id: Optional[str],
+                            user_id: str) -> Optional[dict]:
+    """Replace a Fact's client/project assignment (None clears that side).
+
+    Rewrites the FOR_CLIENT / IN_CONTEXT links and patches the Qdrant payload
+    immediately (the boot diff-sync self-heals any drift). Returns the new
+    scope dict, or None if the fact was not found. Raises ValueError on
+    unknown client/context ids.
+    """
+    neo4j_driver = get_neo4j()
+    if not neo4j_driver:
+        raise RuntimeError("Neo4j not connected.")
+    client = _resolve_client_by_id(client_id, user_id) if client_id else None
+    if client_id and not client:
+        raise ValueError(f"Unknown client '{client_id}'.")
+    ctx = _resolve_context_by_id(context_id, user_id) if context_id else None
+    if context_id and not ctx:
+        raise ValueError(f"Unknown project '{context_id}'.")
+    with neo4j_driver.session() as s:
+        found = s.run(
+            "MATCH (f:Fact {id: $factId, userId: $userId}) RETURN count(f) AS n",
+            factId=fact_id, userId=user_id
+        ).single()
+        if not found or found["n"] == 0:
+            return None
+        s.run(
+            "MATCH (f:Fact {id: $factId, userId: $userId})-[r:FOR_CLIENT]->(:Client) DELETE r",
+            factId=fact_id, userId=user_id
+        )
+        s.run(
+            "MATCH (f:Fact {id: $factId, userId: $userId})-[r:IN_CONTEXT]->(:Context) DELETE r",
+            factId=fact_id, userId=user_id
+        )
+    if client:
+        await link_fact_to_client(fact_id, client["id"], user_id)
+    if ctx:
+        await link_fact_to_context(fact_id, ctx["id"], user_id)
+    try:
+        qdrant = await get_qdrant()
+        if qdrant:
+            patch = {}
+            if client:
+                patch["clientId"] = client["id"]
+                patch["clientName"] = client["name"]
+            if ctx:
+                patch["contextId"] = ctx["id"]
+                patch["contextName"] = ctx["name"]
+            if patch:
+                await qdrant.set_payload(collection_name=COLLECTION_NAME, payload=patch, points=[fact_id])
+            drop = [k for k, present in (("clientId", client), ("clientName", client),
+                                         ("contextId", ctx), ("contextName", ctx)) if not present]
+            if drop:
+                await qdrant.delete_payload(collection_name=COLLECTION_NAME, keys=drop, points=[fact_id])
+    except Exception as e:
+        logger.warning(f"db_set_fact_scope: Qdrant payload patch failed for {fact_id}: {e}")
+    return {
+        "clientId": client["id"] if client else None,
+        "clientName": client["name"] if client else None,
+        "contextId": ctx["id"] if ctx else None,
+        "contextName": ctx["name"] if ctx else None,
+    }
 
 
 def infer_scope_from_text(text: str, user_id: str) -> tuple:

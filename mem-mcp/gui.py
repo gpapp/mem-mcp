@@ -380,18 +380,70 @@ async def api_list_clients(request: Request):
         raise HTTPException(status_code=503, detail=str(e))
 
 
-class ClientStatusUpdate(BaseModel):
-    active: bool
+class ClientUpdate(BaseModel):
+    active: Optional[bool] = None
+    name: Optional[str] = None
 
 
 @web_app.put("/api/clients/{client_id}", response_class=JSONResponse)
-async def api_set_client_status(client_id: str, request: Request, body: ClientStatusUpdate):
-    """Pin a client as active or inactive. Pinned status is never auto-overridden."""
+async def api_update_client(client_id: str, request: Request, body: ClientUpdate):
+    """Pin a client as active/inactive and/or rename it. Pinned status is never auto-overridden."""
     try:
-        found = await mem.db_set_client_active(client_id, body.active, _require_user(request))
-        if not found:
-            raise HTTPException(status_code=404, detail="Client not found or access denied.")
-        return {"id": client_id, "active": body.active, "pinned": True}
+        user_id = _require_user(request)
+        result = {"id": client_id}
+        if body.active is not None:
+            found = await mem.db_set_client_active(client_id, body.active, user_id)
+            if not found:
+                raise HTTPException(status_code=404, detail="Client not found or access denied.")
+            result.update({"active": body.active, "pinned": True})
+        if body.name is not None:
+            try:
+                renamed = await mem.db_rename_client(client_id, body.name, user_id)
+            except ValueError as e:
+                raise HTTPException(status_code=409, detail=str(e))
+            if not renamed:
+                raise HTTPException(status_code=404, detail="Client not found or access denied.")
+            result["name"] = body.name.strip()
+        return result
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+class ContextUpdate(BaseModel):
+    name: str
+
+
+@web_app.put("/api/contexts/{context_id}", response_class=JSONResponse)
+async def api_rename_context(context_id: str, request: Request, body: ContextUpdate):
+    """Rename a project (Context node) within its client."""
+    try:
+        try:
+            renamed = await mem.db_rename_context(context_id, body.name, _require_user(request))
+        except ValueError as e:
+            raise HTTPException(status_code=409, detail=str(e))
+        if not renamed:
+            raise HTTPException(status_code=404, detail="Project not found or access denied.")
+        return {"id": context_id, "name": body.name.strip()}
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+class ScopeUpdate(BaseModel):
+    clientId: Optional[str] = None
+    contextId: Optional[str] = None
+
+
+@web_app.put("/api/memories/{memory_id}/scope", response_class=JSONResponse)
+async def api_set_memory_scope(memory_id: str, request: Request, body: ScopeUpdate):
+    """Replace a fact's client/project assignment (null clears that side)."""
+    try:
+        try:
+            scope = await mem.db_set_fact_scope(memory_id, body.clientId, body.contextId, _require_user(request))
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        if scope is None:
+            raise HTTPException(status_code=404, detail="Memory not found or access denied.")
+        return {"id": memory_id, **scope}
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 

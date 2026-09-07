@@ -567,6 +567,13 @@ npm install @modelcontextprotocol/sdk</code></pre>
   let activeLetterFilter = null;
   let hideInactiveClients = false;
   let clientActiveMap = {};
+  let clientListCache = [];
+
+  // Shared scope predicate: generic facts (no client) and unknown clients
+  // always pass; only known-inactive clients are hidden when the toggle is on.
+  function memPassesScope(m) {
+    return !hideInactiveClients || !m.clientId || clientActiveMap[m.clientId] !== false;
+  }
   let lastSortOrder = 'alphabetical';
   let lastSearchQuery = '';
   let activeTab = 'memories';
@@ -787,13 +794,16 @@ npm install @modelcontextprotocol/sdk</code></pre>
       const clients = await api.get('clients');
       clientActiveMap = {};
       clients.forEach(c => { clientActiveMap[c.id] = c.effectiveActive !== false; });
+      clientListCache = clients;
       if (!clients.length) { el.innerHTML = '<p class="empty">No clients yet — they are created automatically from meeting transcriptions.</p>'; return; }
       el.innerHTML = clients.map(c => {
         const on = c.effectiveActive !== false;
         const pinned = c.statusPinned ? ' 📌' : '';
-        const ctx = (c.contexts || []).map(x => escHtml(x.name)).join(', ');
+        const ctxChips = (c.contexts || []).map(x =>
+          `<span class="tag-badge">📁 ${escHtml(x.name)} <button class="link-action-btn" onclick="renameContext('${x.id}')" name="Rename project">✏️</button></span>`
+        ).join(' ');
         return `<div class="sidebar-item" style="display:flex;align-items:center;gap:0.5rem;">`
-          + `<span style="flex:1;">${on ? '🟢' : '⚪'} <strong>${escHtml(c.name)}</strong>${pinned}${ctx ? ` <span style="color:var(--muted);font-size:0.85rem;">(${ctx})</span>` : ''}</span>`
+          + `<span style="flex:1;">${on ? '🟢' : '⚪'} <strong>${escHtml(c.name)}</strong>${pinned}<button class="link-action-btn" onclick="renameClient('${c.id}')" name="Rename client">✏️</button>${ctxChips ? `<br>${ctxChips}` : ''}</span>`
           + `<button class="btn btn-sm" onclick="toggleClient('${c.id}', ${on ? 'false' : 'true'})">${on ? 'Deactivate' : 'Activate'}</button></div>`;
       }).join('');
     } catch(e) { el.innerHTML = '<p class="empty">⚠️ Could not load clients.</p>'; }
@@ -806,6 +816,39 @@ npm install @modelcontextprotocol/sdk</code></pre>
       await loadClients();
       renderMemories();
     } catch(e) { toast('⚠️ Could not update client'); }
+  }
+
+  async function ensureClients() {
+    if (!clientListCache.length) { try { await loadClients(); } catch(_) {} }
+  }
+
+  async function renameClient(id) {
+    const c = (clientListCache || []).find(x => x.id === id);
+    const next = prompt('Rename client', c ? c.name : '');
+    if (next === null) return;
+    const name = next.trim();
+    if (!name || (c && name === c.name)) return;
+    try {
+      await api.put('clients/' + id, {name});
+      toast('✏️ Client renamed');
+      await loadClients();
+      loadMemories();
+    } catch(e) { toast(e && e.status === 409 ? '⚠️ That client name already exists' : '⚠️ Could not rename client'); }
+  }
+
+  async function renameContext(id) {
+    let current = '';
+    (clientListCache || []).forEach(c => (c.contexts || []).forEach(x => { if (x.id === id) current = x.name; }));
+    const next = prompt('Rename project', current);
+    if (next === null) return;
+    const name = next.trim();
+    if (!name || name === current) return;
+    try {
+      await api.put('contexts/' + id, {name});
+      toast('✏️ Project renamed');
+      await loadClients();
+      loadMemories();
+    } catch(e) { toast(e && e.status === 409 ? '⚠️ That project name already exists for this client' : '⚠️ Could not rename project'); }
   }
 
   let reclassifyTimer = null;
@@ -894,7 +937,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
   function renderCategorySidebar() {
     const el = document.getElementById('categories-sidebar');
     const counts = {};
-    memories.forEach(m => { counts[m.category] = (counts[m.category] || 0) + 1; });
+    memories.forEach(m => { if (memPassesScope(m)) counts[m.category] = (counts[m.category] || 0) + 1; });
     const categories = Object.keys(counts).sort();
     // Build chips HTML
     const chipsHtml = categories.map(cat => {
@@ -905,7 +948,8 @@ npm install @modelcontextprotocol/sdk</code></pre>
     // All chip
     const allActive = activeCategory === null;
     const allClass = 'chip' + (allActive ? ' active' : '');
-    const allChip = `<div class="${allClass}" onclick="setCategory(null)">All <span class="count">${memories.length}</span></div>`;
+    const totalVisible = memories.filter(memPassesScope).length;
+    const allChip = `<div class="${allClass}" onclick="setCategory(null)">All <span class="count">${totalVisible}</span></div>`;
     el.innerHTML = allChip + chipsHtml;
     // Update datalist for add form
     const datalist = document.getElementById('category-datalist');
@@ -1020,10 +1064,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
       const matchQuery = !query || m.text.toLowerCase().includes(query) || mName.includes(query) || m.category.toLowerCase().includes(query);
       const firstChar = (m.name || m.text || '').trim()[0] || '';
       const matchLetter = activeLetterFilter === null || firstChar.toUpperCase() === activeLetterFilter;
-      // Generic facts (no client) and unknown clients always pass; only facts
-      // whose client is known-inactive are hidden when the toggle is on.
-      const matchActive = !hideInactiveClients || !m.clientId || clientActiveMap[m.clientId] !== false;
-      return matchCat && matchQuery && matchLetter && matchActive;
+      return matchCat && matchQuery && matchLetter && memPassesScope(m);
     });
 
     const sortKey = m => (m.name || m.text || '').toLowerCase();
@@ -1189,6 +1230,20 @@ npm install @modelcontextprotocol/sdk</code></pre>
                 <input id="ep-tags" value="${escHtml(tags.join(', '))}">
               </div>
             </div>
+            <div class="fact-edit-row">
+              <div class="fact-edit-field">
+                <label for="ep-client">Client</label>
+                <select id="ep-client" onchange="onEpClientChange()">
+                  <option value="">— No client —</option>
+                  ${(m.clientId && !clientListCache.some(c => c.id === m.clientId)) ? `<option value="${m.clientId}" selected>⚠️ ${escHtml(m.clientName || m.clientId)}</option>` : ''}
+                  ${clientListCache.map(c => `<option value="${c.id}"${c.id === m.clientId ? ' selected' : ''}>${escHtml(c.name)}</option>`).join('')}
+                </select>
+              </div>
+              <div class="fact-edit-field">
+                <label for="ep-project">Project</label>
+                <select id="ep-project"></select>
+              </div>
+            </div>
             <div id="ep-meta-section" style="margin:.5rem 0;"></div>
             <div style="display:flex; gap:.5rem; justify-content:flex-end;">
               <button class="btn btn-ghost btn-sm" onclick="renderFactPane(memories.find(x=>x.id==='${m.id}'))">Cancel</button>
@@ -1197,6 +1252,8 @@ npm install @modelcontextprotocol/sdk</code></pre>
           </div>
         </div>`;
       document.getElementById('ep-cat').value = m.category;
+      document.getElementById('ep-client').value = m.clientId || '';
+      fillEpProjects(m.clientId, m.contextId);
       renderMetaEditor(m);
     } else {
       pane.innerHTML = `
@@ -1349,7 +1406,24 @@ npm install @modelcontextprotocol/sdk</code></pre>
     </div>`;
   }
 
-  function startFactEdit(id) {
+  function fillEpProjects(clientId, selectedCtx) {
+    const sel = document.getElementById('ep-project');
+    if (!sel) return;
+    const c = (clientListCache || []).find(x => x.id === (clientId || ''));
+    const ctxs = (c && c.contexts) || [];
+    const extra = (selectedCtx && !ctxs.some(x => x.id === selectedCtx))
+      ? `<option value="${selectedCtx}" selected>⚠️ assigned project</option>` : '';
+    sel.innerHTML = `<option value="">— No project —</option>` + extra + ctxs.map(x =>
+      `<option value="${x.id}"${x.id === (selectedCtx || '') ? ' selected' : ''}>${escHtml(x.name)}</option>`).join('');
+  }
+
+  function onEpClientChange() {
+    const c = document.getElementById('ep-client');
+    fillEpProjects(c ? c.value : '', '');
+  }
+
+  async function startFactEdit(id) {
+    await ensureClients();
     const m = memories.find(x => x.id === id);
     if (m) renderFactPane(m, true);
   }
@@ -1367,6 +1441,15 @@ npm install @modelcontextprotocol/sdk</code></pre>
       const updated = await api.put('memories/' + id, payload);
       const m = memories.find(x => x.id === id);
       if (m) { m.name = updated.name; m.text = updated.text; m.category = updated.category; m.metadata = updated.metadata; }
+      const epClient = document.getElementById('ep-client');
+      const epProject = document.getElementById('ep-project');
+      if (epClient && epProject) {
+        const scope = await api.put('memories/' + id + '/scope', {
+          clientId: epClient.value || null,
+          contextId: epProject.value || null
+        });
+        if (m) { m.clientId = scope.clientId; m.clientName = scope.clientName; m.contextId = scope.contextId; m.contextName = scope.contextName; }
+      }
       renderMemories();
       renderCategorySidebar();
       renderFactPane(memories.find(x => x.id === id));
