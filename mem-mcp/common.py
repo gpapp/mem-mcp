@@ -49,7 +49,10 @@ class _BenignScopeNotificationFilter(logging.Filter):
     scope match is likewise expected. Gated on both the status code and our
     identifiers so genuine schema warnings for anything else still surface.
     """
-    _SUPPRESSED = ("`Context`", "`Client`", "`IN_CONTEXT`", "`FOR_CLIENT`", "`HAS_CONTEXT`")
+    # Both backticked (notification descriptions) and colon-prefixed (raw query
+    # text, e.g. "(c:Client" / "[:HAS_CONTEXT]") forms are matched.
+    _SUPPRESSED = ("`Context`", "`Client`", "`IN_CONTEXT`", "`FOR_CLIENT`", "`HAS_CONTEXT`",
+                   ":Client", ":Context", ":IN_CONTEXT", ":FOR_CLIENT", ":HAS_CONTEXT")
 
     def filter(self, record: logging.LogRecord) -> bool:
         try:
