@@ -1515,6 +1515,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
             <button class="btn btn-ghost btn-sm" onclick="openInGraph('${m.id}')">🕸️ Graph</button>
             <button class="btn btn-ghost btn-sm" onclick="showOnMap('${m.id}')">📍 Map</button>
             <button class="btn btn-ghost btn-sm" onclick="togglePaneLinkForm('${m.id}')">🔗 Link</button>
+            <button class="btn btn-ghost btn-sm" onclick="copyFactMd(memories.find(x=>x.id==='${m.id}'))">📋 Copy MD</button>
             <button class="btn btn-danger btn-sm" onclick="deleteMemory('${m.id}')">🗑️ Delete</button>
           </div>
         </div>
@@ -1714,6 +1715,63 @@ npm install @modelcontextprotocol/sdk</code></pre>
   function togglePaneLinkForm(id) {
     const el = document.getElementById('pane-link-form-' + id);
     if (el) el.style.display = el.style.display === 'none' ? 'flex' : 'none';
+  }
+
+  async function copyToClipboard(text) {
+    try {
+      await navigator.clipboard.writeText(text);
+      toast('📋 Copied to clipboard');
+    } catch(e) {
+      // Fallback for older browsers
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+      toast('📋 Copied to clipboard');
+    }
+  }
+
+  function copyFactMd(m) {
+    const lines = [];
+    lines.push('# ' + (m.name || 'Unnamed'));
+    lines.push('');
+    if (m.category) lines.push('**Category:** ' + m.category);
+    if (m.clientName) lines.push('**Client:** ' + m.clientName);
+    if (m.contextName) lines.push('**Project:** ' + m.contextName);
+    if (m.category || m.clientName || m.contextName) lines.push('');
+    lines.push(m.text || '');
+    const meta = m.metadata || {};
+    const skipKeys = new Set(['tags', 'aliases']);
+    const metaRows = Object.entries(meta).filter(([k]) => !skipKeys.has(k));
+    if (metaRows.length) {
+      lines.push('');
+      lines.push('---');
+      metaRows.forEach(([k, v]) => lines.push('**' + k + ':** ' + v));
+    }
+    const tags = (m.metadata && m.metadata.tags) ? m.metadata.tags.split(',').map(t => t.trim()).filter(Boolean) : [];
+    if (tags.length) { lines.push(''); lines.push('Tags: ' + tags.map(t => '#' + t).join(' ')); }
+    copyToClipboard(lines.join('\n'));
+  }
+
+  function copyDiaryMd(entry) {
+    const lines = [];
+    lines.push('# ' + (entry.name || diaryEntryTitle(entry)));
+    lines.push('');
+    lines.push('**Date:** ' + (entry.timestamp || entry.date || ''));
+    if (entry.clientName) lines.push('**Client:** ' + entry.clientName);
+    if (entry.contextName) lines.push('**Project:** ' + entry.contextName);
+    lines.push('');
+    lines.push(entry.content || '');
+    const mentions = (entry.mentions || []);
+    if (mentions.length) {
+      lines.push('');
+      lines.push('---');
+      lines.push('**Linked facts:** ' + mentions.map(m => m.name || m.text || m.id).join(', '));
+    }
+    copyToClipboard(lines.join('\n'));
   }
 
   async function savePaneLink(id) {
@@ -2278,6 +2336,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
           <h2 style="margin:0; font-size:1.15rem;">${escHtml(diaryEntryTitle(entry))}</h2>
         </div>
         <div style="display:flex; gap:0.5rem; align-items:center; flex-shrink:0; margin-left:1rem;">
+          <button class="btn btn-ghost btn-sm" onclick="copyDiaryMd(diaryEntries.find(e=>e.id==='${entry.id}'))" style="padding:0.15rem 0.5rem; font-size:0.75rem;">📋</button>
           <button class="btn btn-ghost btn-sm" onclick="renderDiaryEditMode('${entry.id}')" style="padding:0.15rem 0.5rem; font-size:0.75rem;">✏️</button>
           <button class="btn btn-danger btn-sm" onclick="deleteDiaryEntry('${entry.id}')" style="padding:0.15rem 0.5rem; font-size:0.75rem;">🗑️</button>
         </div>
