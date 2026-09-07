@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from common import get_neo4j, get_qdrant, logger, COLLECTION_NAME
+from common import get_neo4j, get_qdrant, logger, COLLECTION_NAME, DIARY_COLLECTION
 
 # ---------------------------------------------------------------------------
 # Scope ranking tunables (shared by fact_manager and diary_manager)
@@ -331,6 +331,176 @@ async def db_set_fact_scope(fact_id: str, client_id: Optional[str], context_id: 
         "contextId": ctx["id"] if ctx else None,
         "contextName": ctx["name"] if ctx else None,
     }
+
+
+def _ts_str(ts):
+    return ts.iso_format() if ts is not None and hasattr(ts, "iso_format") else ts
+
+
+def _scope_items(user_id: str, match_clause: str, params: dict) -> Optional[dict]:
+    """Facts + diary entries linked via a FOR_CLIENT or IN_CONTEXT match.
+
+    match_clause binds (f)-[...]->(scope) and (d)-[...]->(scope); params supply
+    the scope identity. Returns None when the scope node does not exist.
+    """
+    neo4j_driver = get_neo4j()
+    if not neo4j_driver:
+        raise RuntimeError("Neo4j not connected.")
+    with neo4j_driver.session() as s:
+        exists = s.run(
+            f"MATCH (scope {params['label']} {{id: $scopeId, userId: $userId}}) RETURN count(scope) AS n",
+            scopeId=params["scopeId"], userId=user_id
+        ).single()
+        if not exists or exists["n"] == 0:
+            return None
+        fact_rows = list(s.run(
+            f"""
+            MATCH (f:Fact {{userId: $userId}})-[{params['rel']}]->(scope {params['label']} {{id: $scopeId, userId: $userId}})
+            OPTIONAL MATCH (f)-[:IN_CATEGORY]->(cat:Category)
+            OPTIONAL MATCH (f)-[:FOR_CLIENT]->(cl:Client)
+            OPTIONAL MATCH (f)-[:IN_CONTEXT]->(ctx:Context)
+            RETURN f.id AS id, f.name AS name, f.text AS text, cat.name AS category,
+                   f.timestamp AS timestamp, cl.id AS clientId, cl.name AS clientName,
+                   ctx.id AS contextId, ctx.name AS contextName
+            ORDER BY coalesce(f.name, f.text) ASC
+            """,
+            scopeId=params["scopeId"], userId=user_id
+        ))
+        diary_rows = list(s.run(
+            f"""
+            MATCH (d:DiaryEntry {{userId: $userId}})-[{params['rel']}]->(scope {params['label']} {{id: $scopeId, userId: $userId}})
+            RETURN d.id AS id, d.date AS date, d.name AS name, d.timestamp AS timestamp
+            ORDER BY d.date DESC, d.timestamp DESC
+            """,
+            scopeId=params["scopeId"], userId=user_id
+        ))
+    return {
+        "facts": [
+            {"id": r["id"], "name": r["name"], "text": r["text"], "category": r["category"],
+             "timestamp": _ts_str(r["timestamp"]), "clientId": r["clientId"],
+             "clientName": r["clientName"], "contextId": r["contextId"],
+             "contextName": r["contextName"]}
+            for r in fact_rows
+        ],
+        "diary": [
+            {"id": r["id"], "date": r["date"], "name": r.get("name") or "Unnamed Entry",
+             "timestamp": _ts_str(r["timestamp"])}
+            for r in diary_rows
+        ],
+    }
+
+
+def db_client_items(client_id: str, user_id: str) -> Optional[dict]:
+    """Facts + diary entries linked to a Client (None if unknown)."""
+    return _scope_items(user_id, "", {"label": ":Client", "rel": ":FOR_CLIENT", "scopeId": client_id})
+
+
+def db_context_items(context_id: str, user_id: str) -> Optional[dict]:
+    """Facts + diary entries linked to a Context (None if unknown)."""
+    return _scope_items(user_id, "", {"label": ":Context", "rel": ":IN_CONTEXT", "scopeId": context_id})
+
+
+async def _drop_scope_payload(collection: str, point_ids: list, keys: list):
+    """Best-effort Qdrant scope-key cleanup (the boot diff-sync self-heals any remainder)."""
+    if not point_ids or not keys:
+        return
+    try:
+        qdrant = await get_qdrant()
+        if qdrant:
+            await qdrant.delete_payload(collection_name=collection, keys=keys, points=point_ids)
+    except Exception as e:
+        logger.warning(f"scope Qdrant cleanup failed ({collection}): {e}")
+
+
+async def db_delete_client(client_id: str, user_id: str) -> bool:
+    """Delete a Client node with all its Contexts. Facts/diary entries keep
+    existing (links removed); their Qdrant scope keys are cleaned up."""
+    neo4j_driver = get_neo4j()
+    if not neo4j_driver:
+        raise RuntimeError("Neo4j not connected.")
+    with neo4j_driver.session() as s:
+        exists = s.run(
+            "MATCH (c:Client {id: $clientId, userId: $userId}) RETURN count(c) AS n",
+            clientId=client_id, userId=user_id
+        ).single()
+        if not exists or exists["n"] == 0:
+            return False
+        fact_ids = [r["id"] for r in s.run(
+            """
+            MATCH (f:Fact {userId: $userId})-[:FOR_CLIENT]->(c:Client {id: $clientId, userId: $userId})
+            RETURN f.id AS id
+            """,
+            clientId=client_id, userId=user_id
+        )]
+        diary_ids = [r["id"] for r in s.run(
+            """
+            MATCH (d:DiaryEntry {userId: $userId})-[:FOR_CLIENT]->(c:Client {id: $clientId, userId: $userId})
+            RETURN d.id AS id
+            """,
+            clientId=client_id, userId=user_id
+        )]
+        ctx_fact_ids = [r["id"] for r in s.run(
+            """
+            MATCH (f:Fact {userId: $userId})-[:IN_CONTEXT]->(ctx:Context {userId: $userId, clientId: $clientId})
+            RETURN f.id AS id
+            """,
+            clientId=client_id, userId=user_id
+        )]
+        ctx_diary_ids = [r["id"] for r in s.run(
+            """
+            MATCH (d:DiaryEntry {userId: $userId})-[:IN_CONTEXT]->(ctx:Context {userId: $userId, clientId: $clientId})
+            RETURN d.id AS id
+            """,
+            clientId=client_id, userId=user_id
+        )]
+        s.run(
+            """
+            MATCH (c:Client {id: $clientId, userId: $userId})
+            OPTIONAL MATCH (c)-[:HAS_CONTEXT]->(ctx:Context)
+            DETACH DELETE c, ctx
+            """,
+            clientId=client_id, userId=user_id
+        )
+    await _drop_scope_payload(COLLECTION_NAME, fact_ids, ["clientId", "clientName"])
+    await _drop_scope_payload(DIARY_COLLECTION, diary_ids, ["clientId", "clientName"])
+    await _drop_scope_payload(COLLECTION_NAME, ctx_fact_ids, ["contextId", "contextName"])
+    await _drop_scope_payload(DIARY_COLLECTION, ctx_diary_ids, ["contextId", "contextName"])
+    return True
+
+
+async def db_delete_context(context_id: str, user_id: str) -> bool:
+    """Delete a Context node. Linked facts/diary entries keep existing (unlinked)."""
+    neo4j_driver = get_neo4j()
+    if not neo4j_driver:
+        raise RuntimeError("Neo4j not connected.")
+    with neo4j_driver.session() as s:
+        exists = s.run(
+            "MATCH (ctx:Context {id: $contextId, userId: $userId}) RETURN count(ctx) AS n",
+            contextId=context_id, userId=user_id
+        ).single()
+        if not exists or exists["n"] == 0:
+            return False
+        fact_ids = [r["id"] for r in s.run(
+            """
+            MATCH (f:Fact {userId: $userId})-[:IN_CONTEXT]->(ctx:Context {id: $contextId, userId: $userId})
+            RETURN f.id AS id
+            """,
+            contextId=context_id, userId=user_id
+        )]
+        diary_ids = [r["id"] for r in s.run(
+            """
+            MATCH (d:DiaryEntry {userId: $userId})-[:IN_CONTEXT]->(ctx:Context {id: $contextId, userId: $userId})
+            RETURN d.id AS id
+            """,
+            contextId=context_id, userId=user_id
+        )]
+        s.run(
+            "MATCH (ctx:Context {id: $contextId, userId: $userId}) DETACH DELETE ctx",
+            contextId=context_id, userId=user_id
+        )
+    await _drop_scope_payload(COLLECTION_NAME, fact_ids, ["contextId", "contextName"])
+    await _drop_scope_payload(DIARY_COLLECTION, diary_ids, ["contextId", "contextName"])
+    return True
 
 
 def infer_scope_from_text(text: str, user_id: str) -> tuple:

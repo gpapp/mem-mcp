@@ -169,6 +169,34 @@
     .chips-container {
       display: flex; flex-wrap: wrap; gap: .4rem; padding: .5rem;
     }
+
+    /* ── Setup scope cards ── */
+    .scope-card {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+      margin-bottom: .6rem; overflow: hidden;
+    }
+    .scope-card-header {
+      display: flex; align-items: center; gap: .6rem;
+      padding: .55rem .75rem; cursor: pointer;
+    }
+    .scope-card-header:hover { background: var(--primary-light); }
+    .scope-card-name { flex: 1; font-weight: 600; font-size: .9rem; }
+    .scope-card-actions { display: flex; gap: .35rem; flex-shrink: 0; }
+    .scope-items-panel {
+      display: none; border-top: 1px solid var(--border);
+      padding: .5rem .75rem; max-height: 320px; overflow-y: auto; background: var(--bg);
+    }
+    .scope-items-panel.open { display: block; }
+    .scope-item-row {
+      display: flex; align-items: center; gap: .5rem;
+      font-size: .82rem; padding: .3rem 0; border-bottom: 1px solid var(--border);
+      cursor: pointer;
+    }
+    .scope-item-row:last-child { border-bottom: none; }
+    .scope-item-row:hover { color: var(--primary); }
+    .scope-item-type { font-size: .68rem; background: var(--bg); border: 1px solid var(--border);
+      border-radius: 3px; padding: .05rem .3rem; flex-shrink: 0; color: var(--muted); }
+    .scope-item-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .chip {
       padding: .4rem .8rem; border: 1px solid var(--border);
       border-radius: 12px; background: var(--bg); color: var(--muted);
@@ -519,11 +547,38 @@ npm install @modelcontextprotocol/sdk</code></pre>
     </div>
 
     <div style="margin-top: 2.5rem; padding-top: 1.5rem; border-top: 1px solid var(--border);">
-      <h3 style="margin-top:0;">🏢 Clients</h3>
-      <p style="font-size: 0.9rem; color: var(--muted); margin-bottom: 1rem;">
-        Inactive clients are deprioritized (not hidden) in unscoped search. Toggling pins the status — pinned clients are never auto-changed.
-      </p>
-      <div id="client-list"><p class="empty">Loading…</p></div>
+      <h3 style="margin-top:0;">🏢 Clients &amp; Projects</h3>
+
+      <!-- sub-tab bar -->
+      <div class="setup-subtabs" style="display:flex; gap:.5rem; margin-bottom:1rem;">
+        <button id="stab-clients" class="btn btn-sm btn-primary" onclick="switchSetupTab('clients')">🏢 Clients</button>
+        <button id="stab-projects" class="btn btn-sm btn-ghost" onclick="switchSetupTab('projects')">📁 Projects</button>
+      </div>
+
+      <!-- Clients panel -->
+      <div id="setup-panel-clients">
+        <p style="font-size:.85rem;color:var(--muted);margin-bottom:.75rem;">
+          Inactive clients are deprioritized in unscoped search. Toggle pins the status.
+        </p>
+        <div style="display:flex;gap:.5rem;margin-bottom:.75rem;">
+          <input id="new-client-name" type="text" placeholder="New client name…" style="max-width:240px;width:auto;flex:1;" onkeydown="if(event.key==='Enter') createClient()">
+          <button class="btn btn-primary btn-sm" onclick="createClient()">＋ Add Client</button>
+        </div>
+        <div id="client-list"><p class="empty">Loading…</p></div>
+      </div>
+
+      <!-- Projects panel (hidden by default) -->
+      <div id="setup-panel-projects" style="display:none;">
+        <p style="font-size:.85rem;color:var(--muted);margin-bottom:.75rem;">
+          Projects are scoped under a client. Select a client to create a new project.
+        </p>
+        <div style="display:flex;gap:.5rem;margin-bottom:.75rem;">
+          <select id="new-project-client" style="max-width:180px;width:auto;flex:1;"></select>
+          <input id="new-project-name" type="text" placeholder="New project name…" style="max-width:240px;width:auto;flex:1;" onkeydown="if(event.key==='Enter') createContext()">
+          <button class="btn btn-primary btn-sm" onclick="createContext()">＋ Add Project</button>
+        </div>
+        <div id="project-list"><p class="empty">Loading…</p></div>
+      </div>
     </div>
 
     <div style="margin-top: 2.5rem; padding-top: 1.5rem; border-top: 1px solid var(--border);">
@@ -788,6 +843,17 @@ npm install @modelcontextprotocol/sdk</code></pre>
     saveSessionState();
   }
 
+  let _activeSetupTab = 'clients';
+
+  function switchSetupTab(tab) {
+    _activeSetupTab = tab;
+    document.getElementById('setup-panel-clients').style.display = tab === 'clients' ? '' : 'none';
+    document.getElementById('setup-panel-projects').style.display = tab === 'projects' ? '' : 'none';
+    document.getElementById('stab-clients').className = 'btn btn-sm ' + (tab === 'clients' ? 'btn-primary' : 'btn-ghost');
+    document.getElementById('stab-projects').className = 'btn btn-sm ' + (tab === 'projects' ? 'btn-primary' : 'btn-ghost');
+    if (tab === 'projects') loadProjects();
+  }
+
   async function loadClients() {
     const el = document.getElementById('client-list');
     if (!el) return;
@@ -796,18 +862,155 @@ npm install @modelcontextprotocol/sdk</code></pre>
       clientActiveMap = {};
       clients.forEach(c => { clientActiveMap[c.id] = c.effectiveActive !== false; });
       clientListCache = clients;
-      if (!clients.length) { el.innerHTML = '<p class="empty">No clients yet — they are created automatically from meeting transcriptions.</p>'; return; }
-      el.innerHTML = clients.map(c => {
-        const on = c.effectiveActive !== false;
-        const pinned = c.statusPinned ? ' 📌' : '';
-        const ctxChips = (c.contexts || []).map(x =>
-          `<span class="tag-badge">📁 ${escHtml(x.name)} <button class="link-action-btn" onclick="renameContext('${x.id}')" name="Rename project">✏️</button></span>`
-        ).join(' ');
-        return `<div class="sidebar-item" style="display:flex;align-items:center;gap:0.5rem;">`
-          + `<span style="flex:1;">${on ? '🟢' : '⚪'} <strong>${escHtml(c.name)}</strong>${pinned}<button class="link-action-btn" onclick="renameClient('${c.id}')" name="Rename client">✏️</button>${ctxChips ? `<br>${ctxChips}` : ''}</span>`
-          + `<button class="btn btn-sm" onclick="toggleClient('${c.id}', ${on ? 'false' : 'true'})">${on ? 'Deactivate' : 'Activate'}</button></div>`;
-      }).join('');
+      // also repopulate the project-client selector
+      const sel = document.getElementById('new-project-client');
+      if (sel) {
+        sel.innerHTML = clients.map(c => `<option value="${c.id}">${escHtml(c.name)}</option>`).join('');
+      }
+      if (!clients.length) {
+        el.innerHTML = '<p class="empty">No clients yet — add one above or they are created automatically from meeting transcriptions.</p>';
+        return;
+      }
+      el.innerHTML = clients.map(c => _renderClientCard(c)).join('');
     } catch(e) { el.innerHTML = '<p class="empty">⚠️ Could not load clients.</p>'; }
+  }
+
+  function _renderClientCard(c) {
+    const on = c.effectiveActive !== false;
+    const pinned = c.statusPinned ? ' 📌' : '';
+    const ctxRows = (c.contexts || []).map(x => `
+      <div class="scope-card" style="margin:.3rem 0 0 1.2rem;">
+        <div class="scope-card-header" onclick="toggleScopeItems('ctx-${x.id}', 'context', '${x.id}')">
+          <span class="scope-card-name" style="font-size:.83rem;">📁 ${escHtml(x.name)}</span>
+          <div class="scope-card-actions" onclick="event.stopPropagation()">
+            <button class="btn btn-sm btn-ghost" onclick="renameContext('${x.id}')">✏️ Rename</button>
+            <button class="btn btn-sm btn-danger" onclick="deleteContext('${x.id}')">🗑️</button>
+          </div>
+        </div>
+        <div class="scope-items-panel" id="scope-items-ctx-${x.id}"></div>
+      </div>`).join('');
+    return `<div class="scope-card">
+      <div class="scope-card-header" onclick="toggleScopeItems('cli-${c.id}', 'client', '${c.id}')">
+        <span class="scope-card-name">${on ? '🟢' : '⚪'} ${escHtml(c.name)}${pinned}</span>
+        <div class="scope-card-actions" onclick="event.stopPropagation()">
+          <button class="btn btn-sm btn-ghost" onclick="toggleClient('${c.id}', ${on ? 'false' : 'true'})">${on ? 'Deactivate' : 'Activate'}</button>
+          <button class="btn btn-sm btn-ghost" onclick="renameClient('${c.id}')">✏️ Rename</button>
+          <button class="btn btn-sm btn-danger" onclick="deleteClient('${c.id}')">🗑️</button>
+        </div>
+      </div>
+      <div class="scope-items-panel" id="scope-items-cli-${c.id}"></div>
+      ${ctxRows}
+    </div>`;
+  }
+
+  async function loadProjects() {
+    const el = document.getElementById('project-list');
+    if (!el) return;
+    try {
+      const clients = clientListCache.length ? clientListCache : await api.get('clients');
+      if (!clientListCache.length) { clientListCache = clients; }
+      const allCtx = [];
+      clients.forEach(c => (c.contexts || []).forEach(x => allCtx.push({...x, clientName: c.name, clientId: c.id})));
+      if (!allCtx.length) { el.innerHTML = '<p class="empty">No projects yet.</p>'; return; }
+      el.innerHTML = allCtx.map(x => `
+        <div class="scope-card">
+          <div class="scope-card-header" onclick="toggleScopeItems('ctx-${x.id}', 'context', '${x.id}')">
+            <span class="scope-card-name">📁 ${escHtml(x.name)} <span style="font-size:.75rem;color:var(--muted);font-weight:400;">/ ${escHtml(x.clientName)}</span></span>
+            <div class="scope-card-actions" onclick="event.stopPropagation()">
+              <button class="btn btn-sm btn-ghost" onclick="renameContext('${x.id}')">✏️ Rename</button>
+              <button class="btn btn-sm btn-danger" onclick="deleteContext('${x.id}')">🗑️</button>
+            </div>
+          </div>
+          <div class="scope-items-panel" id="scope-items-ctx-${x.id}"></div>
+        </div>`).join('');
+    } catch(e) { el.innerHTML = '<p class="empty">⚠️ Could not load projects.</p>'; }
+  }
+
+  async function toggleScopeItems(panelKey, type, id) {
+    const panel = document.getElementById('scope-items-' + panelKey);
+    if (!panel) return;
+    if (panel.classList.contains('open')) { panel.classList.remove('open'); return; }
+    panel.classList.add('open');
+    if (panel.dataset.loaded) return;   // already fetched
+    panel.innerHTML = '<p style="padding:.4rem;font-size:.8rem;color:var(--muted);">Loading…</p>';
+    try {
+      const data = type === 'client'
+        ? await api.get('clients/' + id + '/items')
+        : await api.get('contexts/' + id + '/items');
+      panel.dataset.loaded = '1';
+      const rows = [];
+      (data.facts || []).forEach(f => rows.push({kind:'fact', id: f.id, name: f.name, cat: f.category}));
+      (data.diary || []).forEach(d => rows.push({kind:'diary', id: d.id, name: d.name, ts: d.timestamp}));
+      if (!rows.length) { panel.innerHTML = '<p style="padding:.4rem;font-size:.8rem;color:var(--muted);">No items linked yet.</p>'; return; }
+      panel.innerHTML = rows.map(r => {
+        if (r.kind === 'fact') {
+          return `<div class="scope-item-row" onclick="showFactInMemories('${r.id}')">
+            <span class="scope-item-type">${escHtml(r.cat || 'Fact')}</span>
+            <span class="scope-item-name">${escHtml(r.name || 'Unnamed')}</span>
+            <button class="btn btn-sm btn-ghost" style="padding:.1rem .4rem;font-size:.7rem;" onclick="event.stopPropagation(); startFactEditById('${r.id}')">✏️</button>
+          </div>`;
+        } else {
+          const label = r.ts ? r.ts.slice(0,10) : '';
+          return `<div class="scope-item-row" onclick="goToDiaryDate('${label}')">
+            <span class="scope-item-type">Diary</span>
+            <span class="scope-item-name">${escHtml(r.name || label)}</span>
+            <span style="font-size:.72rem;color:var(--muted);flex-shrink:0;">${label}</span>
+          </div>`;
+        }
+      }).join('');
+    } catch(e) { panel.innerHTML = '<p style="padding:.4rem;font-size:.8rem;color:var(--muted);">⚠️ Could not load items.</p>'; }
+  }
+
+  async function createClient() {
+    const inp = document.getElementById('new-client-name');
+    const name = (inp ? inp.value : '').trim();
+    if (!name) { toast('Enter a client name first'); return; }
+    try {
+      await api.post('clients', {name});
+      toast('✅ Client created');
+      if (inp) inp.value = '';
+      await loadClients();
+    } catch(e) { toast(e && e.status === 409 ? '⚠️ Client name already exists' : '⚠️ Could not create client'); }
+  }
+
+  async function createContext() {
+    const sel = document.getElementById('new-project-client');
+    const inp = document.getElementById('new-project-name');
+    const clientId = sel ? sel.value : '';
+    const name = (inp ? inp.value : '').trim();
+    if (!clientId) { toast('Select a client first'); return; }
+    if (!name) { toast('Enter a project name first'); return; }
+    try {
+      await api.post('contexts', {name, clientId});
+      toast('✅ Project created');
+      if (inp) inp.value = '';
+      await loadClients();
+      if (_activeSetupTab === 'projects') loadProjects();
+    } catch(e) { toast(e && e.status === 409 ? '⚠️ Project name already exists for this client' : '⚠️ Could not create project'); }
+  }
+
+  async function deleteClient(id) {
+    const c = (clientListCache || []).find(x => x.id === id);
+    if (!confirm(`Delete client "${c ? c.name : id}" and unlink all its facts and diary entries? The items themselves will not be deleted.`)) return;
+    try {
+      await api.delete('clients/' + id);
+      toast('🗑️ Client deleted');
+      await loadClients();
+      loadMemories();
+    } catch(e) { toast('⚠️ Could not delete client'); }
+  }
+
+  async function deleteContext(id) {
+    let name = '';
+    (clientListCache || []).forEach(c => (c.contexts || []).forEach(x => { if (x.id === id) name = x.name; }));
+    if (!confirm(`Delete project "${name || id}" and unlink all its facts and diary entries? The items themselves will not be deleted.`)) return;
+    try {
+      await api.delete('contexts/' + id);
+      toast('🗑️ Project deleted');
+      await loadClients();
+      if (_activeSetupTab === 'projects') loadProjects();
+      loadMemories();
+    } catch(e) { toast('⚠️ Could not delete project'); }
   }
 
   async function toggleClient(id, active) {
@@ -849,8 +1052,41 @@ npm install @modelcontextprotocol/sdk</code></pre>
       await api.put('contexts/' + id, {name});
       toast('✏️ Project renamed');
       await loadClients();
+      if (_activeSetupTab === 'projects') loadProjects();
       loadMemories();
     } catch(e) { toast(e && e.status === 409 ? '⚠️ That project name already exists for this client' : '⚠️ Could not rename project'); }
+  }
+
+  function showFactInMemories(id) {
+    // Navigate to Memories tab and select the fact
+    switchTab('memories');
+    selectFact(id);
+  }
+
+  async function startFactEditById(id) {
+    // Navigate to Memories tab, select and immediately open edit for the fact
+    switchTab('memories');
+    selectFact(id);
+    await startFactEdit(id);
+  }
+
+  function goToDiaryDate(dateStr) {
+    if (!dateStr) return;
+    switchTab('diary');
+    // Set the date filter to that date and navigate
+    setTimeout(() => {
+      selectedDiaryDate = dateStr;
+      // parse year/month from dateStr "YYYY-MM-DD"
+      const parts = dateStr.split('-');
+      if (parts.length >= 2) {
+        diaryMonthYear = { year: parseInt(parts[0]), month: parseInt(parts[1]) };
+      }
+      renderDiaryMonthPager();
+      renderDiarySidebar();
+      // auto-select first matching entry
+      const entry = diaryEntries.find(e => (e.date || (e.timestamp || '').slice(0,10)) === dateStr);
+      if (entry) selectDiaryEntry(entry.id);
+    }, 150);
   }
 
   let reclassifyTimer = null;

@@ -433,6 +433,92 @@ class ScopeUpdate(BaseModel):
     contextId: Optional[str] = None
 
 
+class ClientCreate(BaseModel):
+    name: str
+
+
+@web_app.post("/api/clients", response_class=JSONResponse, status_code=201)
+async def api_create_client(request: Request, body: ClientCreate):
+    """Manually create a client (normally they arise from transcriptions)."""
+    try:
+        name = (body.name or "").strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="Client name must not be empty.")
+        client_id = await mem.db_create_client(name, _require_user(request))
+        return {"id": client_id, "name": name}
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+class ContextCreate(BaseModel):
+    name: str
+    clientId: str
+
+
+@web_app.post("/api/contexts", response_class=JSONResponse, status_code=201)
+async def api_create_context(request: Request, body: ContextCreate):
+    """Manually create a project under a client."""
+    try:
+        user_id = _require_user(request)
+        name = (body.name or "").strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="Project name must not be empty.")
+        if not any(c["id"] == body.clientId for c in mem.db_list_clients(user_id)):
+            raise HTTPException(status_code=404, detail="Client not found or access denied.")
+        context_id = await mem.db_create_context(name, body.clientId, user_id)
+        return {"id": context_id, "name": name, "clientId": body.clientId}
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@web_app.get("/api/clients/{client_id}/items", response_class=JSONResponse)
+async def api_client_items(client_id: str, request: Request):
+    """Facts + diary entries linked to a client."""
+    try:
+        items = mem.db_client_items(client_id, _require_user(request))
+        if items is None:
+            raise HTTPException(status_code=404, detail="Client not found or access denied.")
+        return {"id": client_id, **items}
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@web_app.get("/api/contexts/{context_id}/items", response_class=JSONResponse)
+async def api_context_items(context_id: str, request: Request):
+    """Facts + diary entries linked to a project."""
+    try:
+        items = mem.db_context_items(context_id, _require_user(request))
+        if items is None:
+            raise HTTPException(status_code=404, detail="Project not found or access denied.")
+        return {"id": context_id, **items}
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@web_app.delete("/api/clients/{client_id}", response_class=JSONResponse)
+async def api_delete_client(client_id: str, request: Request):
+    """Delete a client with all its projects. Facts/diary entries keep existing (unlinked)."""
+    try:
+        deleted = await mem.db_delete_client(client_id, _require_user(request))
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Client not found or access denied.")
+        return {"id": client_id, "deleted": True}
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@web_app.delete("/api/contexts/{context_id}", response_class=JSONResponse)
+async def api_delete_context(context_id: str, request: Request):
+    """Delete a project. Linked facts/diary entries keep existing (unlinked)."""
+    try:
+        deleted = await mem.db_delete_context(context_id, _require_user(request))
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Project not found or access denied.")
+        return {"id": context_id, "deleted": True}
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
 @web_app.put("/api/memories/{memory_id}/scope", response_class=JSONResponse)
 async def api_set_memory_scope(memory_id: str, request: Request, body: ScopeUpdate):
     """Replace a fact's client/project assignment (null clears that side)."""
