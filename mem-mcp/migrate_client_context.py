@@ -4,6 +4,7 @@ Project-category facts → Context nodes. Idempotent (MERGE throughout).
 """
 
 import asyncio
+import hashlib
 import json
 import re
 from datetime import datetime, timezone
@@ -377,13 +378,42 @@ def _enriched_diary_text(item: dict, neo4j_driver, user_id: str) -> str:
     return "\n".join(p for p in parts if p)
 
 
+def _scope_signature(clients: list) -> str:
+    """Fingerprint of the client/context set — null verdicts are stamped with this.
+
+    Boot skips items already checked against the current signature, so permanently
+    generic items are classified once, but any client/context add/rename triggers
+    a retry. Full reclassification clears stamps, retrying everything.
+    """
+    parts = []
+    for c in sorted(clients, key=lambda x: x.get("name", "")):
+        ctxs = sorted(x.get("name", "") for x in c.get("contexts", []))
+        parts.append(c.get("name", "") + "|" + ",".join(ctxs))
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+
+
+def _stamp_scope_checked(node_id: str, label: str, user_id: str, neo4j_driver, scope_sig) -> None:
+    """Record a null verdict so boot won't reclassify this item until clients change."""
+    if neo4j_driver is None or not scope_sig:
+        return
+    try:
+        with neo4j_driver.session() as s:
+            s.run(
+                f"MATCH (n:{label} {{id: $id, userId: $userId}}) SET n.scopeCheckedSig = $sig",
+                id=node_id, userId=user_id, sig=scope_sig,
+            )
+    except Exception as exc:
+        logger.debug(f"[scope_backfill] scope-stamp failed for {node_id}: {exc}")
+
+
 async def _classify_and_link_fact(item: dict, clients: list, user_id: str, sem: asyncio.Semaphore,
-                                  neo4j_driver=None) -> bool:
+                                  neo4j_driver=None, scope_sig=None) -> bool:
     """Classify one fact and create FOR_CLIENT / IN_CONTEXT links. Returns True if linked."""
     async with sem:
         body = _enriched_fact_text(item, neo4j_driver, user_id)
         client_name, context_name = await _classify_scope(body, clients)
     if not client_name:
+        _stamp_scope_checked(item["id"], "Fact", user_id, neo4j_driver, scope_sig)
         return False
     c = db_resolve_client(client_name, user_id)
     if not c:
@@ -397,12 +427,13 @@ async def _classify_and_link_fact(item: dict, clients: list, user_id: str, sem: 
 
 
 async def _classify_and_link_diary(item: dict, clients: list, user_id: str, sem: asyncio.Semaphore,
-                                   neo4j_driver=None) -> bool:
+                                   neo4j_driver=None, scope_sig=None) -> bool:
     """Classify one diary entry and create FOR_CLIENT / IN_CONTEXT links. Returns True if linked."""
     async with sem:
         body = _enriched_diary_text(item, neo4j_driver, user_id)
         client_name, context_name = await _classify_scope(body, clients)
     if not client_name:
+        _stamp_scope_checked(item["id"], "DiaryEntry", user_id, neo4j_driver, scope_sig)
         return False
     c = db_resolve_client(client_name, user_id)
     if not c:
@@ -448,6 +479,7 @@ async def llm_backfill_scope():
         if not clients:
             logger.info(f"scope_backfill [{user_id}]: no clients, skipping")
             continue
+        sig = _scope_signature(clients)
 
         with neo4j_driver.session() as s:
             facts = list(s.run(
@@ -455,17 +487,19 @@ async def llm_backfill_scope():
                 MATCH (f:Fact {userId: $userId})
                 WHERE NOT (f)-[:FOR_CLIENT]->(:Client)
                   AND toLower(f.category) <> 'client'
+                  AND (f.scopeCheckedSig IS NULL OR f.scopeCheckedSig <> $sig)
                 RETURN f.id AS id, f.name AS name, f.text AS text, f.category AS category
                 """,
-                userId=user_id
+                userId=user_id, sig=sig
             ))
             diaries = list(s.run(
                 """
                 MATCH (d:DiaryEntry {userId: $userId})
                 WHERE NOT (d)-[:FOR_CLIENT]->(:Client)
+                  AND (d.scopeCheckedSig IS NULL OR d.scopeCheckedSig <> $sig)
                 RETURN d.id AS id, d.name AS name, d.content AS content, d.keywords AS keywords
                 """,
-                userId=user_id
+                userId=user_id, sig=sig
             ))
 
         if not facts and not diaries:
@@ -491,11 +525,11 @@ async def llm_backfill_scope():
             return ok
 
         await asyncio.gather(*[
-            _track(_classify_and_link_fact(dict(r), clients, user_id, sem, neo4j_driver))
+            _track(_classify_and_link_fact(dict(r), clients, user_id, sem, neo4j_driver, sig))
             for r in facts
         ])
         await asyncio.gather(*[
-            _track(_classify_and_link_diary(dict(r), clients, user_id, sem, neo4j_driver))
+            _track(_classify_and_link_diary(dict(r), clients, user_id, sem, neo4j_driver, sig))
             for r in diaries
         ])
 
@@ -578,10 +612,15 @@ def _utcnow() -> str:
 
 
 def clear_scope_links(node_id: str, user_id: str, neo4j_driver) -> None:
-    """Remove FOR_CLIENT / IN_CONTEXT links of one fact or diary node."""
+    """Reset scope state of one fact or diary node: links + checked signature."""
     with neo4j_driver.session() as s:
         s.run(
-            "MATCH (n {id: $id, userId: $userId})-[r:FOR_CLIENT|IN_CONTEXT]->() DELETE r",
+            """
+            MATCH (n {id: $id, userId: $userId})
+            OPTIONAL MATCH (n)-[r:FOR_CLIENT|IN_CONTEXT]->()
+            FOREACH (x IN CASE WHEN r IS NULL THEN [] ELSE [r] END | DELETE x)
+            REMOVE n.scopeCheckedSig
+            """,
             id=node_id, userId=user_id,
         )
 
@@ -624,6 +663,7 @@ async def _reclassify_all_scope(user_id: str, job: dict) -> None:
         if not clients:
             job.update(state="error", finished_at=_utcnow(), error="No clients defined")
             return
+        sig = _scope_signature(clients)
 
         with neo4j_driver.session() as s:
             facts = list(s.run(
@@ -656,9 +696,9 @@ async def _reclassify_all_scope(user_id: str, job: dict) -> None:
             # correctly leaves the item generic (unlinked).
             clear_scope_links(item["id"], user_id, neo4j_driver)
             if kind == "fact":
-                ok = await _classify_and_link_fact(item, clients, user_id, sem, neo4j_driver)
+                ok = await _classify_and_link_fact(item, clients, user_id, sem, neo4j_driver, sig)
             else:
-                ok = await _classify_and_link_diary(item, clients, user_id, sem, neo4j_driver)
+                ok = await _classify_and_link_diary(item, clients, user_id, sem, neo4j_driver, sig)
             job["done"] += 1
             if ok:
                 job["linked"] += 1
