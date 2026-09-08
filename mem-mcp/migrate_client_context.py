@@ -583,7 +583,9 @@ _PEOPLE_SYSTEM = (
     "You are a named-entity extractor. Extract the full names of every person "
     "explicitly mentioned in the text. "
     "Return ONLY a JSON array of strings, e.g. [\"Alice Smith\", \"Bob Jones\"]. "
-    "Return [] if no people are mentioned. Never add explanations."
+    "Return [] if no people are mentioned. Never add explanations. "
+    "IMPORTANT: ignore anything in parentheses — it is a role or description, not part of the name. "
+    "For example, 'Alice Smith (host)' → extract only 'Alice Smith'."
 )
 
 
