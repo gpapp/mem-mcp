@@ -238,10 +238,10 @@
     .diary-search-box input { width: 100%; padding: .4rem .6rem; border: 1px solid var(--border); border-radius: 6px;
                               background: var(--bg); color: var(--text); font-size: .85rem; box-sizing: border-box; outline: none; }
     .diary-search-box input:focus { border-color: var(--primary); }
-    .diary-month-pager { padding: .5rem .75rem; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; gap: .25rem; }
-    .diary-month-pager .btn-month { background: none; border: 1px solid var(--border); border-radius: 6px; cursor: pointer; padding: .25rem .5rem; font-size: .8rem; color: var(--text); line-height: 1; }
+    .diary-month-pager { padding: .3rem .5rem; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; gap: .15rem; overflow: hidden; }
+    .diary-month-pager .btn-month { background: none; border: 1px solid var(--border); border-radius: 6px; cursor: pointer; padding: .15rem .35rem; font-size: .75rem; color: var(--text); line-height: 1; flex-shrink: 0; }
     .diary-month-pager .btn-month:hover { background: var(--bg); }
-    .diary-month-label { font-weight: 700; font-size: .85rem; color: var(--text); white-space: nowrap; cursor: pointer; padding: .25rem .4rem; border-radius: 6px; border: 1px solid transparent; }
+    .diary-month-label { font-weight: 700; font-size: .78rem; color: var(--text); white-space: nowrap; cursor: pointer; padding: .15rem .3rem; border-radius: 6px; border: 1px solid transparent; flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; text-align: center; }
     .diary-month-label:hover { background: var(--bg); border-color: var(--border); }
     .diary-month-label.active { background: var(--primary); color: #fff; border-color: var(--primary); }
     .diary-month-dates { padding: .35rem .75rem; border-bottom: 1px solid var(--border); display: grid; grid-template-columns: repeat(7, 1fr); gap: .15rem; }
