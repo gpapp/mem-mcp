@@ -360,10 +360,12 @@
 </nav>
 
 <div class="tabs">
-  <button class="tab-btn active" onclick="switchTab('memories')">📝 Memories</button>
-  <button class="tab-btn" onclick="switchTab('diary')">📖 Diary</button>
-  <button class="tab-btn" onclick="switchTab('graph')">🕸️ Graph</button>
-  <button class="tab-btn" onclick="switchTab('setup')">🔌 Setup</button>
+  <button class="tab-btn active" data-tab="memories" onclick="switchTab('memories')">📝 Memories</button>
+  <button class="tab-btn" data-tab="diary" onclick="switchTab('diary')">📖 Diary</button>
+  <button class="tab-btn" data-tab="graph" onclick="switchTab('graph')">🕸️ Graph</button>
+  <button class="tab-btn" data-tab="clients" onclick="switchTab('clients')">🏢 Clients</button>
+  <button class="tab-btn" data-tab="projects" onclick="switchTab('projects')">📁 Projects</button>
+  <button class="tab-btn" data-tab="setup" onclick="switchTab('setup')">🔌 Setup</button>
   <div style="margin-left:auto; display:flex; align-items:center; padding-bottom:.25rem;">
     <select id="client-filter-select" class="form-control" style="font-size:.82rem; min-width:160px;" onchange="onClientFilterChange(this.value)">
       <option value="all">All clients</option>
@@ -507,7 +509,36 @@
   </div>
 </div><!-- /page-graph -->
 
-<!-- ═══ SETUP PAGE (Landing as Tab) ═══ -->
+<!-- ═══ CLIENTS PAGE ═══ -->
+<div id="page-clients" class="page">
+  <div class="card">
+    <h2 style="margin-top:0;">🏢 Clients</h2>
+    <p style="font-size:.85rem;color:var(--muted);margin-bottom:.75rem;">
+      Inactive clients are deprioritized in unscoped search. Toggle pins the status.
+    </p>
+    <div style="display:flex;gap:.5rem;margin-bottom:.75rem;">
+      <input id="new-client-name" type="text" placeholder="New client name…" style="max-width:240px;width:auto;flex:1;" onkeydown="if(event.key==='Enter') createClient()">
+      <button class="btn btn-primary btn-sm" onclick="createClient()">＋ Add Client</button>
+    </div>
+    <div id="client-list"><p class="empty">Loading…</p></div>
+  </div>
+</div>
+
+<div id="page-projects" class="page">
+  <div class="card">
+    <h2 style="margin-top:0;">📁 Projects</h2>
+    <p style="font-size:.85rem;color:var(--muted);margin-bottom:.75rem;">
+      Projects are scoped under a client. Select a client to create a new project.
+    </p>
+    <div style="display:flex;gap:.5rem;margin-bottom:.75rem;">
+      <select id="new-project-client" style="max-width:180px;width:auto;flex:1;"></select>
+      <input id="new-project-name" type="text" placeholder="New project name…" style="max-width:240px;width:auto;flex:1;" onkeydown="if(event.key==='Enter') createContext()">
+      <button class="btn btn-primary btn-sm" onclick="createContext()">＋ Add Project</button>
+    </div>
+    <div id="project-list"><p class="empty">Loading…</p></div>
+  </div>
+</div>
+
 <div id="page-setup" class="page">
   <div class="card">
     <h2 style="margin-top:0;">🔌 MCP Setup</h2>
@@ -547,41 +578,6 @@ npm install @modelcontextprotocol/sdk</code></pre>
           <pre style="margin-top: 0.5rem;"><code>claude mcp add memory-vault-local node mcp-bridge.mjs</code></pre>
         </li>
       </ol>
-    </div>
-
-    <div style="margin-top: 2.5rem; padding-top: 1.5rem; border-top: 1px solid var(--border);">
-      <h3 style="margin-top:0;">🏢 Clients &amp; Projects</h3>
-
-      <!-- sub-tab bar -->
-      <div class="setup-subtabs" style="display:flex; gap:.5rem; margin-bottom:1rem;">
-        <button id="stab-clients" class="btn btn-sm btn-primary" onclick="switchSetupTab('clients')">🏢 Clients</button>
-        <button id="stab-projects" class="btn btn-sm btn-ghost" onclick="switchSetupTab('projects')">📁 Projects</button>
-      </div>
-
-      <!-- Clients panel -->
-      <div id="setup-panel-clients">
-        <p style="font-size:.85rem;color:var(--muted);margin-bottom:.75rem;">
-          Inactive clients are deprioritized in unscoped search. Toggle pins the status.
-        </p>
-        <div style="display:flex;gap:.5rem;margin-bottom:.75rem;">
-          <input id="new-client-name" type="text" placeholder="New client name…" style="max-width:240px;width:auto;flex:1;" onkeydown="if(event.key==='Enter') createClient()">
-          <button class="btn btn-primary btn-sm" onclick="createClient()">＋ Add Client</button>
-        </div>
-        <div id="client-list"><p class="empty">Loading…</p></div>
-      </div>
-
-      <!-- Projects panel (hidden by default) -->
-      <div id="setup-panel-projects" style="display:none;">
-        <p style="font-size:.85rem;color:var(--muted);margin-bottom:.75rem;">
-          Projects are scoped under a client. Select a client to create a new project.
-        </p>
-        <div style="display:flex;gap:.5rem;margin-bottom:.75rem;">
-          <select id="new-project-client" style="max-width:180px;width:auto;flex:1;"></select>
-          <input id="new-project-name" type="text" placeholder="New project name…" style="max-width:240px;width:auto;flex:1;" onkeydown="if(event.key==='Enter') createContext()">
-          <button class="btn btn-primary btn-sm" onclick="createContext()">＋ Add Project</button>
-        </div>
-        <div id="project-list"><p class="empty">Loading…</p></div>
-      </div>
     </div>
 
     <div style="margin-top: 2.5rem; padding-top: 1.5rem; border-top: 1px solid var(--border);">
@@ -834,12 +830,14 @@ npm install @modelcontextprotocol/sdk</code></pre>
     document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
     document.getElementById('page-' + tab).classList.add('active');
     document.querySelectorAll('.tab-btn').forEach(b => {
-      if (b.textContent.toLowerCase().includes(tab.slice(0,3))) b.classList.add('active');
+      if (b.dataset.tab === tab) b.classList.add('active');
     });
     if (tab === 'memories' && !memories.length) loadMemories();
     if (tab === 'diary' && !diaryEntries.length) loadDiary();
     if (tab === 'graph' && !graphLoaded) loadGraph();
-    if (tab === 'setup') { loadClients(); loadReclassifyStatus(); }
+    if (tab === 'clients') loadClients();
+    if (tab === 'projects') { loadClients(); loadProjects(); }
+    if (tab === 'setup') loadReclassifyStatus();
     saveSessionState();
   }
 
@@ -881,16 +879,6 @@ npm install @modelcontextprotocol/sdk</code></pre>
     saveSessionState();
   }
 
-  let _activeSetupTab = 'clients';
-
-  function switchSetupTab(tab) {
-    _activeSetupTab = tab;
-    document.getElementById('setup-panel-clients').style.display = tab === 'clients' ? '' : 'none';
-    document.getElementById('setup-panel-projects').style.display = tab === 'projects' ? '' : 'none';
-    document.getElementById('stab-clients').className = 'btn btn-sm ' + (tab === 'clients' ? 'btn-primary' : 'btn-ghost');
-    document.getElementById('stab-projects').className = 'btn btn-sm ' + (tab === 'projects' ? 'btn-primary' : 'btn-ghost');
-    if (tab === 'projects') loadProjects();
-  }
 
   async function loadClients() {
     const el = document.getElementById('client-list');
@@ -1025,7 +1013,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
       toast('✅ Project created');
       if (inp) inp.value = '';
       await loadClients();
-      if (_activeSetupTab === 'projects') loadProjects();
+      if (activeTab === 'projects') loadProjects();
     } catch(e) { toast(e && e.status === 409 ? '⚠️ Project name already exists for this client' : '⚠️ Could not create project'); }
   }
 
@@ -1048,7 +1036,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
       await api.delete('contexts/' + id);
       toast('🗑️ Project deleted');
       await loadClients();
-      if (_activeSetupTab === 'projects') loadProjects();
+      if (activeTab === 'projects') loadProjects();
       await loadMemories();
     } catch(e) { toast('⚠️ Could not delete project'); }
   }
@@ -1100,7 +1088,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
       await api.put('contexts/' + id, {name});
       toast('✏️ Project renamed');
       await loadClients();
-      if (_activeSetupTab === 'projects') loadProjects();
+      if (activeTab === 'projects') loadProjects();
       await loadMemories();
     } catch(e) { toast(e && e.status === 409 ? '⚠️ That project name already exists for this client' : '⚠️ Could not rename project'); }
   }
