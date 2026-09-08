@@ -410,7 +410,7 @@ async def _classify_scope(item_text: str, clients: list) -> tuple:
     prompt = f"KNOWN CLIENTS:\n{scope_block}\n\nITEM:\n{text}"
 
     try:
-        raw = await get_llm_response(prompt, system=_SCOPE_SYSTEM, model=SCOPE_MODEL)
+        raw = await get_llm_response(prompt, system=_SCOPE_SYSTEM, model=SCOPE_MODEL, num_predict=80)
         raw = re.sub(r"```[a-z]*\n?", "", raw).strip()
         m = re.search(r"\{[^{}]*\}", raw, re.DOTALL)
         if not m:

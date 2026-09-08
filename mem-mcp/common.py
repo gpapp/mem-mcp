@@ -189,18 +189,22 @@ async def get_embedding(text: str) -> List[float]:
         return resp.json()["embedding"]
 
 
-async def get_llm_response(prompt: str, system: str = "", model: str = "") -> str:
+async def get_llm_response(prompt: str, system: str = "", model: str = "", num_predict: int = 0) -> str:
     """Call Ollama /api/chat and return the assistant's text response.
 
     Uses LLM_QUERY_MODEL (default: qwen3.5:0.8b) unless overridden by `model`.
     Times out after 60 s — intentionally short for interactive search calls.
     Strips <think>…</think> blocks produced by reasoning models (e.g. Qwen3).
+    Pass num_predict > 0 to cap/guarantee the output token budget.
     """
     resolved_model = model or LLM_QUERY_MODEL
     messages: list = []
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
+    options: dict = {"temperature": 0.0}
+    if num_predict > 0:
+        options["num_predict"] = num_predict
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(
             f"{OLLAMA_URL}/api/chat",
@@ -209,7 +213,7 @@ async def get_llm_response(prompt: str, system: str = "", model: str = "") -> st
                 "messages": messages,
                 "stream": False,
                 "think": False,          # disable chain-of-thought for Qwen3/thinking models
-                "options": {"temperature": 0.0},
+                "options": options,
             },
         )
         resp.raise_for_status()
