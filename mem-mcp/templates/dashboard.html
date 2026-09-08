@@ -1189,7 +1189,9 @@ npm install @modelcontextprotocol/sdk</code></pre>
         const job = await api.get('maintenance/reclassify');
         renderReclassify(job);
         running = !!job && job.state === 'running';
-        if (!running && job && job.state === 'done') loadMemories();
+        if (!running && job && job.state === 'done') {
+          await Promise.all([loadMemories(), loadDiary()]);
+        }
       } catch(_) { running = false; }
       if (!running && reclassifyTimer) { clearInterval(reclassifyTimer); reclassifyTimer = null; }
     };
