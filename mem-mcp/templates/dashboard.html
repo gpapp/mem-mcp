@@ -2767,7 +2767,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
         <button class="scope-chip scope-chip--client" onclick="_diaryPickClient(this,'${entry.id}')" title="Click to change client">🏢 ${entry.clientName ? escHtml(entry.clientName) + ((clientListCache.find(c=>c.id===entry.clientId)||{}).crossClient ? ' [cross]' : '') : '—'}</button>
         <button class="scope-chip scope-chip--project" onclick="_diaryPickProject(this,'${entry.id}')" title="Click to change project">📁 ${entry.contextName ? escHtml(entry.contextName) : '—'}</button>
         <span style="font-size:.75rem;color:var(--muted);margin-left:.25rem;">🔗</span>
-        ${(entry.relevantClients||[]).map(rc=>`<span class="scope-chip scope-chip--relevant">${escHtml(rc.name)}<button class="scope-chip-remove" onclick="_diaryRemoveRelevant('${entry.id}','${rc.id}')" title="Remove">×</button></span>`).join('')}
+        ${(entry.relevantClients||[]).filter(rc=>rc.id!==entry.clientId).map(rc=>`<span class="scope-chip scope-chip--relevant">${escHtml(rc.name)}<button class="scope-chip-remove" onclick="_diaryRemoveRelevant('${entry.id}','${rc.id}')" title="Remove">×</button></span>`).join('')}
         <button class="scope-chip scope-chip--add" onclick="_diaryAddRelevant(this,'${entry.id}')" title="Add relevant client">＋</button>
       </div>
       <div class="markdown-body">${marked.parse(entry.content || '')}</div>
