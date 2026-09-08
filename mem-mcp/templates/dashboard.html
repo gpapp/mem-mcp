@@ -328,6 +328,12 @@
     .context-menu-separator {
       height: 1px; background: var(--border); margin: 4px 0;
     }
+    .item-menu-btn {
+      background: none; border: 1px solid transparent; cursor: pointer;
+      font-size: 1rem; padding: .2rem .45rem; border-radius: 4px;
+      color: var(--muted); line-height: 1;
+    }
+    .item-menu-btn:hover { background: var(--bg); border-color: var(--border); color: var(--text); }
     .submenu {
       position: relative;
     }
@@ -745,7 +751,37 @@ npm install @modelcontextprotocol/sdk</code></pre>
           const idx = memories.findIndex(m => m.id === item.id);
           if (idx !== -1) memories[idx] = item;
           else memories.push(item);
-          
+
+          // Cascade: patch link target_name/target_text in all other facts that link to this item
+          for (const m of memories) {
+            if (m.id === item.id || !m.links) continue;
+            let dirty = false;
+            for (const lnk of m.links) {
+              if (lnk.target_id === item.id) {
+                lnk.target_name = item.name || item.text;
+                lnk.target_text = item.text;
+                dirty = true;
+              }
+            }
+            // Re-render the open fact pane if its links changed
+            if (dirty && selectedFactId === m.id) renderFactPane(m);
+          }
+
+          // Cascade: patch mention name/text in all diary entries that mention this fact
+          for (const de of diaryEntries) {
+            if (!de.mentions) continue;
+            let dirty = false;
+            for (const mn of de.mentions) {
+              if (mn.id === item.id) {
+                mn.name = item.name;
+                mn.text = item.text;
+                dirty = true;
+              }
+            }
+            // Re-render the open diary entry if its mentions changed
+            if (dirty && activeDiaryId === de.id) renderDiaryEntryView(de);
+          }
+
           if (graphLoaded && network) {
             graphData.nodes.update({
               id: item.id,
@@ -1540,18 +1576,16 @@ npm install @modelcontextprotocol/sdk</code></pre>
                 <span>📁 <strong>Project:</strong> ${m.contextName ? escHtml(m.contextName) : '—'}</span>
               </div>
             </div>
-            <button class="btn btn-ghost btn-sm" onclick="clearFactPane()" style="flex-shrink:0;" name="Close">✕</button>
+            <div style="display:flex; gap:.25rem; align-items:center; flex-shrink:0;">
+              <button class="item-menu-btn" title="Actions" onclick="_showFactMenu(this)">☰</button>
+              <button class="btn btn-ghost btn-sm" onclick="clearFactPane()" style="flex-shrink:0;" name="Close">✕</button>
+            </div>
           </div>
           <div class="fact-detail-body markdown-body" style="margin:.75rem 0;">${marked.parse(m.text)}</div>
           ${tags.length ? `<div class="memory-meta" style="margin-bottom:.75rem;">${tags.map(t => `<span class="tag-badge">#${escHtml(t)}</span>`).join('')}</div>` : ''}
           <div id="fact-detail-meta" style="margin-bottom:.75rem;"></div>
           <div class="fact-detail-actions">
-            <button class="btn btn-ghost btn-sm" onclick="startFactEdit('${m.id}')">✏️ Edit</button>
-            <button class="btn btn-ghost btn-sm" onclick="openInGraph('${m.id}')">🕸️ Graph</button>
-            <button class="btn btn-ghost btn-sm" onclick="showOnMap('${m.id}')">📍 Map</button>
             <button class="btn btn-ghost btn-sm" onclick="togglePaneLinkForm('${m.id}')">🔗 Link</button>
-            <button class="btn btn-ghost btn-sm" onclick="copyFactMd(memories.find(x=>x.id==='${m.id}'))">📋 Copy MD</button>
-            <button class="btn btn-danger btn-sm" onclick="deleteMemory('${m.id}')">🗑️ Delete</button>
           </div>
         </div>
         <div id="ep-link-section">
@@ -1716,6 +1750,94 @@ npm install @modelcontextprotocol/sdk</code></pre>
     await ensureClients();
     const m = memories.find(x => x.id === id);
     if (m) renderFactPane(m, true);
+  }
+
+  // Hamburger menu for the fact detail pane
+  let _factMenuId = null;
+  function _showFactMenu(anchorEl) {
+    if (!selectedFactId) return;
+    _factMenuId = selectedFactId;
+    showItemMenu(anchorEl, [
+      { icon: '✏️', label: 'Edit',            action: '_factMenuEdit' },
+      { icon: '🕸️', label: 'Show in Graph',   action: '_factMenuGraph' },
+      { icon: '📍', label: 'Show on Map',     action: '_factMenuMap' },
+      { icon: '📋', label: 'Copy MD',         action: '_factMenuCopyMd' },
+      { separator: true },
+      { icon: '🔄', label: 'Reload',          action: '_factMenuReload' },
+      { icon: '🔀', label: 'Reclassify scope', action: '_factMenuReclassify' },
+      { separator: true },
+      { icon: '🗑️', label: 'Delete',          action: '_factMenuDelete', danger: true },
+    ]);
+  }
+  function _factMenuEdit()       { if (_factMenuId) startFactEdit(_factMenuId); }
+  function _factMenuGraph()      { if (_factMenuId) openInGraph(_factMenuId); }
+  function _factMenuMap()        { if (_factMenuId) showOnMap(_factMenuId); }
+  function _factMenuCopyMd()     { if (_factMenuId) { const m = memories.find(x=>x.id===_factMenuId); if (m) copyFactMd(m); } }
+  function _factMenuDelete()     { if (_factMenuId) deleteMemory(_factMenuId); }
+  async function _factMenuReload() {
+    if (!_factMenuId) return;
+    try {
+      const item = await api.get(`memories/${_factMenuId}`);
+      const idx = memories.findIndex(m => m.id === item.id);
+      if (idx !== -1) memories[idx] = item; else memories.push(item);
+      if (selectedFactId === item.id) renderFactPane(item);
+      renderMemories(); renderCategorySidebar();
+      toast('🔄 Reloaded');
+    } catch(e) { toast('⚠️ Reload failed'); }
+  }
+  async function _factMenuReclassify() {
+    if (!_factMenuId) return;
+    toast('🔀 Reclassifying…');
+    try {
+      const item = await api.post(`memories/${_factMenuId}/reclassify`, {});
+      const idx = memories.findIndex(m => m.id === item.id);
+      if (idx !== -1) memories[idx] = item; else memories.push(item);
+      if (selectedFactId === item.id) renderFactPane(item);
+      renderMemories(); renderCategorySidebar();
+      toast('✅ Scope updated');
+    } catch(e) { toast('⚠️ Reclassify failed'); }
+  }
+
+  // --- Diary entry hamburger menu ---
+  let _diaryMenuId = null;
+  function _showDiaryMenu(anchorEl, entryId) {
+    _diaryMenuId = entryId || activeDiaryId;
+    if (!_diaryMenuId) return;
+    showItemMenu(anchorEl, [
+      { icon: '✏️', label: 'Edit',             action: '_diaryMenuEdit' },
+      { icon: '📋', label: 'Copy MD',          action: '_diaryMenuCopyMd' },
+      { separator: true },
+      { icon: '🔄', label: 'Reload',           action: '_diaryMenuReload' },
+      { icon: '🔀', label: 'Reclassify scope', action: '_diaryMenuReclassify' },
+      { separator: true },
+      { icon: '🗑️', label: 'Delete',           action: '_diaryMenuDelete', danger: true },
+    ]);
+  }
+  function _diaryMenuEdit()   { if (_diaryMenuId) renderDiaryEditMode(_diaryMenuId); }
+  function _diaryMenuCopyMd() { if (_diaryMenuId) { const e = diaryEntries.find(x=>x.id===_diaryMenuId); if (e) copyDiaryMd(e); } }
+  function _diaryMenuDelete() { if (_diaryMenuId) deleteDiaryEntry(_diaryMenuId); }
+  async function _diaryMenuReload() {
+    if (!_diaryMenuId) return;
+    try {
+      const entry = await api.get(`diary/${_diaryMenuId}`);
+      const idx = diaryEntries.findIndex(e => e.id === entry.id);
+      if (idx !== -1) diaryEntries[idx] = entry; else diaryEntries.unshift(entry);
+      if (activeDiaryId === entry.id) renderDiaryEntryView(entry);
+      renderDiarySidebar(); renderDiaryMonthPager();
+      toast('🔄 Reloaded');
+    } catch(e) { toast('⚠️ Reload failed'); }
+  }
+  async function _diaryMenuReclassify() {
+    if (!_diaryMenuId) return;
+    toast('🔀 Reclassifying…');
+    try {
+      const entry = await api.post(`diary/${_diaryMenuId}/reclassify`, {});
+      const idx = diaryEntries.findIndex(e => e.id === entry.id);
+      if (idx !== -1) diaryEntries[idx] = entry; else diaryEntries.unshift(entry);
+      if (activeDiaryId === entry.id) renderDiaryEntryView(entry);
+      renderDiarySidebar(); renderDiaryMonthPager();
+      toast('✅ Scope updated');
+    } catch(e) { toast('⚠️ Reclassify failed'); }
   }
 
   async function saveFactEdit(id) {
@@ -2371,9 +2493,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
           <h2 style="margin:0; font-size:1.15rem;">${escHtml(diaryEntryTitle(entry))}</h2>
         </div>
         <div style="display:flex; gap:0.5rem; align-items:center; flex-shrink:0; margin-left:1rem;">
-          <button class="btn btn-ghost btn-sm" onclick="copyDiaryMd(diaryEntries.find(e=>e.id==='${entry.id}'))" style="padding:0.15rem 0.5rem; font-size:0.75rem;">📋</button>
-          <button class="btn btn-ghost btn-sm" onclick="renderDiaryEditMode('${entry.id}')" style="padding:0.15rem 0.5rem; font-size:0.75rem;">✏️</button>
-          <button class="btn btn-danger btn-sm" onclick="deleteDiaryEntry('${entry.id}')" style="padding:0.15rem 0.5rem; font-size:0.75rem;">🗑️</button>
+          <button class="item-menu-btn" onclick="_showDiaryMenu(this, '${entry.id}')">☰</button>
         </div>
       </div>
       <div class="fact-detail-scope" style="margin-bottom:.75rem;">
@@ -2929,6 +3049,63 @@ let contextMenu = null;
     }
     document.removeEventListener('click', hideContextMenu, { capture: true });
     document.removeEventListener('contextmenu', hideContextMenu, { capture: true });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Generic item-level hamburger menu used by fact pane and diary view.
+  // items: [{icon, label, action, danger, separator}] — separator:true = divider
+  // ---------------------------------------------------------------------------
+  let _itemMenu = null;
+  function _hideItemMenu() {
+    if (_itemMenu) { _itemMenu.remove(); _itemMenu = null; }
+    document.removeEventListener('click', _hideItemMenu, { capture: true });
+  }
+
+  function showItemMenu(anchorEl, items) {
+    _hideItemMenu();
+    const rect = anchorEl.getBoundingClientRect();
+    const menu = document.createElement('div');
+    menu.className = 'context-menu';
+    menu.style.position = 'fixed';
+    menu.style.minWidth = '200px';
+
+    let html = '';
+    for (const item of items) {
+      if (item.separator) {
+        html += `<div class="context-menu-separator"></div>`;
+      } else {
+        const dangerStyle = item.danger ? 'color:var(--danger,#e53935);' : '';
+        html += `<div class="context-menu-item" style="${dangerStyle}" data-action="${escHtml(item.action)}">${item.icon ? item.icon + ' ' : ''}${escHtml(item.label)}</div>`;
+      }
+    }
+    menu.innerHTML = html;
+
+    document.body.appendChild(menu);
+
+    // Position: below anchor, right-aligned, flip up if near bottom
+    const mh = menu.offsetHeight || 220;
+    const mw = menu.offsetWidth  || 200;
+    let top = rect.bottom + 4;
+    let left = rect.right - mw;
+    if (top + mh > window.innerHeight - 8) top = rect.top - mh - 4;
+    if (left < 4) left = 4;
+    menu.style.top  = top  + 'px';
+    menu.style.left = left + 'px';
+
+    // Wire up clicks
+    menu.addEventListener('click', (e) => {
+      const el = e.target.closest('.context-menu-item');
+      if (!el) return;
+      _hideItemMenu();
+      const action = el.dataset.action;
+      const fn = window[action];
+      if (typeof fn === 'function') fn();
+    });
+
+    _itemMenu = menu;
+    setTimeout(() => {
+      document.addEventListener('click', _hideItemMenu, { capture: true });
+    }, 0);
   }
 
   async function goToFact(nodeId) {

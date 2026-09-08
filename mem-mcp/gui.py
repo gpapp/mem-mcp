@@ -29,7 +29,10 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 import memory as mem
-from migrate_client_context import start_reclassify_scope, get_reclassify_status
+from migrate_client_context import (
+    start_reclassify_scope, get_reclassify_status,
+    reclassify_single_fact, reclassify_single_diary,
+)
 from fastapi import Request, HTTPException, FastAPI
 from fastapi.responses import Response, JSONResponse, HTMLResponse, RedirectResponse
 from pydantic import BaseModel
@@ -228,6 +231,27 @@ async def api_get_memory(memory_id: str, request: Request):
         raise HTTPException(status_code=404, detail="Memory not found or access denied.")
     return m
 
+
+@web_app.post("/api/memories/{memory_id}/reclassify", response_class=JSONResponse)
+async def api_reclassify_memory(memory_id: str, request: Request):
+    """Re-run the Ollama scope classifier on a single fact and return the updated item."""
+    user_id = _require_user(request)
+    try:
+        await reclassify_single_fact(memory_id, user_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    # Re-fetch enriched item and emit SSE so other tabs update.
+    all_m = mem.db_list_memories(user_id)
+    m = next((x for x in all_m if x["id"] == memory_id), None)
+    if not m:
+        raise HTTPException(status_code=404, detail="Memory not found after reclassification.")
+    await mem.publish_db_event(user_id, "memory_changed", {"action": "update", "id": memory_id,
+                                                            "category": m.get("category"), "name": m.get("name")})
+    return m
+
+
 @web_app.get("/api/diary/search", response_class=JSONResponse)
 async def api_search_diary(request: Request, q: str = "", limit: int = 10, top_p: float = 0.4):
     """Search diary entries using vector similarity. Falls back to listing all if q is empty."""
@@ -249,6 +273,26 @@ async def api_get_diary_entry(entry_id: str, request: Request):
     e = next((x for x in all_e if x["id"] == entry_id), None)
     if not e:
         raise HTTPException(status_code=404, detail="Diary entry not found or access denied.")
+    return e
+
+
+@web_app.post("/api/diary/{entry_id}/reclassify", response_class=JSONResponse)
+async def api_reclassify_diary_entry(entry_id: str, request: Request):
+    """Re-run the Ollama scope classifier on a single diary entry and return the updated entry."""
+    user_id = _require_user(request)
+    try:
+        await reclassify_single_diary(entry_id, user_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    # Re-fetch and emit SSE so other tabs update.
+    all_e = mem.db_list_diary(user_id)
+    e = next((x for x in all_e if x["id"] == entry_id), None)
+    if not e:
+        raise HTTPException(status_code=404, detail="Diary entry not found after reclassification.")
+    await mem.publish_db_event(user_id, "diary_changed", {"action": "update", "id": entry_id,
+                                                          "date": e.get("date")})
     return e
 
 

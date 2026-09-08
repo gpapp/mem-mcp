@@ -919,3 +919,69 @@ async def _reclassify_all_scope(user_id: str, job: dict) -> None:
     except Exception as exc:
         logger.exception(f"reclassify [{user_id}]: failed: {exc}")
         job.update(state="error", finished_at=_utcnow(), error=str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Single-item reclassification — triggered from the UI hamburger menu.
+# Clears existing scope links, re-runs the enriched classifier, syncs Qdrant.
+# Returns True if the item was linked to a client, False if left unscoped.
+# ---------------------------------------------------------------------------
+
+async def reclassify_single_fact(item_id: str, user_id: str) -> bool:
+    """Clear and re-classify scope for a single fact. Returns True if linked."""
+    neo4j_driver = get_neo4j()
+    qdrant = await get_qdrant()
+    if not neo4j_driver or not qdrant:
+        raise RuntimeError("DB not available")
+
+    with neo4j_driver.session() as s:
+        rows = list(s.run(
+            "MATCH (f:Fact {id: $id, userId: $userId}) "
+            "RETURN f.id AS id, f.name AS name, f.text AS text, f.category AS category",
+            id=item_id, userId=user_id,
+        ))
+    if not rows:
+        raise ValueError(f"Fact {item_id!r} not found for user {user_id!r}")
+    item = dict(rows[0])
+
+    clients = db_list_clients(user_id)
+    if not clients:
+        return False
+
+    sig = _scope_signature(clients)
+    clear_scope_links(item_id, user_id, neo4j_driver)
+    sem = asyncio.Semaphore(1)
+    linked = await _classify_and_link_fact(item, clients, user_id, sem, neo4j_driver, sig)
+    await _backfill_qdrant(user_id, neo4j_driver, qdrant)
+    logger.info(f"reclassify_single_fact [{user_id}] {item_id}: linked={linked}")
+    return linked
+
+
+async def reclassify_single_diary(item_id: str, user_id: str) -> bool:
+    """Clear and re-classify scope for a single diary entry. Returns True if linked."""
+    neo4j_driver = get_neo4j()
+    qdrant = await get_qdrant()
+    if not neo4j_driver or not qdrant:
+        raise RuntimeError("DB not available")
+
+    with neo4j_driver.session() as s:
+        rows = list(s.run(
+            "MATCH (d:DiaryEntry {id: $id, userId: $userId}) "
+            "RETURN d.id AS id, d.name AS name, d.content AS content, d.keywords AS keywords",
+            id=item_id, userId=user_id,
+        ))
+    if not rows:
+        raise ValueError(f"DiaryEntry {item_id!r} not found for user {user_id!r}")
+    item = dict(rows[0])
+
+    clients = db_list_clients(user_id)
+    if not clients:
+        return False
+
+    sig = _scope_signature(clients)
+    clear_scope_links(item_id, user_id, neo4j_driver)
+    sem = asyncio.Semaphore(1)
+    linked = await _classify_and_link_diary(item, clients, user_id, sem, neo4j_driver, sig)
+    await _backfill_qdrant(user_id, neo4j_driver, qdrant)
+    logger.info(f"reclassify_single_diary [{user_id}] {item_id}: linked={linked}")
+    return linked
