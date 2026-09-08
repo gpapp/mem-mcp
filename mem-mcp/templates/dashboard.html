@@ -639,10 +639,14 @@ npm install @modelcontextprotocol/sdk</code></pre>
       // Generic facts (no client) always pass; only known-inactive clients are hidden.
       return !m.clientId || clientActiveMap[m.clientId] !== false;
     }
-    // Specific client selected — show items scoped to that client OR that mention it
-    // via a RELEVANT_TO association (cross-cutting diary entries).
+    // Specific client selected — show items whose primary client matches.
     if (m.clientId === clientFilter) return true;
-    if (Array.isArray(m.relevantClients) && m.relevantClients.some(rc => rc.id === clientFilter)) return true;
+    // Also show cross-client (RELEVANT_TO) entries, but only if the entry itself
+    // is marked crossClient or has no primary client (avoids active-client items
+    // bleeding into an inactive-client filter via a loose RELEVANT_TO link).
+    if (Array.isArray(m.relevantClients) && m.relevantClients.some(rc => rc.id === clientFilter)) {
+      if (m.crossClient || !m.clientId) return true;
+    }
     return false;
   }
   let lastSortOrder = 'alphabetical';
