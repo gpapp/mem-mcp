@@ -347,7 +347,7 @@ def _fast_diary_scope(item: dict, clients: list, neo4j_driver, user_id: str) -> 
                     """
                     MATCH (d:DiaryEntry {userId: $userId, id: $did})-[:MENTIONS]->(f:Fact)
                     MATCH (f)-[:FOR_CLIENT]->(cl:Client)
-                    WHERE NOT cl.crossClient = true
+                    WHERE NOT coalesce(cl.crossClient, false) = true
                     RETURN DISTINCT cl.id AS clientId, cl.name AS clientName
                     """,
                     userId=user_id, did=item["id"]
@@ -504,7 +504,7 @@ def _enriched_diary_text(item: dict, neo4j_driver, user_id: str) -> str:
                     MATCH (d:DiaryEntry {userId: $userId, id: $did})-[:MENTIONS]->(f:Fact)
                     OPTIONAL MATCH (f)-[:FOR_CLIENT]->(cl:Client)
                     RETURN DISTINCT f.name AS name, f.text AS body,
-                           cl.name AS clientName, cl.crossClient AS crossClient
+                           cl.name AS clientName, coalesce(cl.crossClient, false) AS crossClient
                     LIMIT 6
                     """,
                     userId=user_id, did=item["id"]
