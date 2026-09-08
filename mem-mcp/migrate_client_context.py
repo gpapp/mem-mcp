@@ -286,8 +286,65 @@ _SCOPE_SYSTEM = (
     "context must belong to the chosen client; "
     "return nulls when the item is generic/shared knowledge or matches no client. "
     "IMPORTANT: if the MENTIONS section lists facts that are already scoped to a specific client, "
-    "strongly prefer that client — it is the strongest signal available."
+    "strongly prefer that client — it is the strongest signal available. "
+    "IMPORTANT: if the item content contains an explicit '**Client:**' or 'Client:' header, "
+    "that declaration is authoritative — use it and do not override it with content keywords."
 )
+
+
+# ---------------------------------------------------------------------------
+# Fast (no-LLM) scope resolution for diary entries.
+# Returns (client_name, context_name) or (None, None) if no hard signal found.
+# ---------------------------------------------------------------------------
+_CLIENT_HEADER_RE = re.compile(
+    r"(?:^\*{0,2}Client\*{0,2}|^Client)\s*[:\-]\s*(.+)",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+def _fast_diary_scope(item: dict, clients: list, neo4j_driver, user_id: str) -> tuple:
+    """Return (client_name, None) when a hard deterministic signal is found.
+
+    Two signals checked in priority order:
+    1. All MENTIONS-linked facts that have a client agree on ONE client.
+    2. The diary content contains an explicit '**Client:** <name>' header line.
+
+    Returns (None, None) when no hard signal is present — caller falls back to LLM.
+    """
+    # Signal 1: unanimous MENTIONS client
+    if neo4j_driver is not None:
+        try:
+            with neo4j_driver.session() as s:
+                rows = list(s.run(
+                    """
+                    MATCH (d:DiaryEntry {userId: $userId, id: $did})-[:MENTIONS]->(f:Fact)
+                    MATCH (f)-[:FOR_CLIENT]->(cl:Client)
+                    RETURN DISTINCT cl.name AS clientName
+                    """,
+                    userId=user_id, did=item["id"]
+                ))
+            scoped_clients = [r["clientName"] for r in rows if r["clientName"]]
+            unique = set(scoped_clients)
+            if len(unique) == 1:
+                cname = unique.pop()
+                matched = next((c["name"] for c in clients if c["name"].lower() == cname.lower()), None)
+                if matched:
+                    logger.debug(f"[scope_fast] diary {item.get('id')}: unanimous MENTIONS → {matched}")
+                    return matched, None
+        except Exception as exc:
+            logger.debug(f"[scope_fast] MENTIONS lookup failed for {item.get('id')}: {exc}")
+
+    # Signal 2: explicit **Client:** header in content
+    content = item.get("content", "") or ""
+    m = _CLIENT_HEADER_RE.search(content)
+    if m:
+        raw = m.group(1).strip().rstrip("*").strip()
+        matched = next((c["name"] for c in clients if c["name"].lower() == raw.lower()), None)
+        if matched:
+            logger.debug(f"[scope_fast] diary {item.get('id')}: content header → {matched}")
+            return matched, None
+
+    return None, None
 
 
 async def _classify_scope(item_text: str, clients: list) -> tuple:
@@ -473,9 +530,12 @@ async def _classify_and_link_fact(item: dict, clients: list, user_id: str, sem: 
 async def _classify_and_link_diary(item: dict, clients: list, user_id: str, sem: asyncio.Semaphore,
                                    neo4j_driver=None, scope_sig=None) -> bool:
     """Classify one diary entry and create FOR_CLIENT / IN_CONTEXT links. Returns True if linked."""
-    async with sem:
-        body = _enriched_diary_text(item, neo4j_driver, user_id)
-        client_name, context_name = await _classify_scope(body, clients)
+    # Fast path: unanimous MENTIONS client or explicit **Client:** header — no LLM needed.
+    client_name, context_name = _fast_diary_scope(item, clients, neo4j_driver, user_id)
+    if not client_name:
+        async with sem:
+            body = _enriched_diary_text(item, neo4j_driver, user_id)
+            client_name, context_name = await _classify_scope(body, clients)
     if not client_name:
         _stamp_scope_checked(item["id"], "DiaryEntry", user_id, neo4j_driver, scope_sig)
         return False
