@@ -291,7 +291,12 @@ _SCOPE_SYSTEM = (
     "IMPORTANT: if the MENTIONS section lists facts that are already scoped to a specific client, "
     "strongly prefer that client — it is the strongest signal available. "
     "IMPORTANT: if the item content contains an explicit '**Client:**' or 'Client:' header, "
-    "that declaration is authoritative — use it and do not override it with content keywords."
+    "that declaration is authoritative — use it and do not override it with content keywords. "
+    "IMPORTANT: context (project) selection must be conservative — only assign a context when "
+    "the item content explicitly and directly relates to that specific project. "
+    "Do NOT assign a context simply because it is the only one available for the chosen client; "
+    "if the item is about the client in general or could belong to any of their projects, "
+    "return null for context."
 )
 
 
