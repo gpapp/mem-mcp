@@ -473,7 +473,7 @@ def _enriched_fact_text(item: dict, neo4j_driver, user_id: str) -> str:
                 rows = list(s.run(
                     """
                     MATCH (f:Fact {userId: $userId, id: $fid})-[r]-(n)
-                    WHERE n:Fact OR n:DiaryEntry
+                    WHERE n:Fact
                     RETURN DISTINCT type(r) AS rel, n.name AS name,
                            coalesce(n.text, n.content, '') AS body
                     LIMIT 6
