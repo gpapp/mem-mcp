@@ -32,7 +32,7 @@ from client_manager import (
     db_resolve_client, db_resolve_context,
     link_fact_to_client, link_fact_to_context,
     link_diary_to_client, link_diary_to_context,
-    db_set_client_active, db_rename_client, db_rename_context,
+    db_set_client_active, db_set_client_cross, db_rename_client, db_rename_context,
     db_set_fact_scope, db_set_diary_scope, db_client_items, db_context_items,
     db_delete_client, db_delete_context, db_get_client_status_map,
     infer_scope_from_text

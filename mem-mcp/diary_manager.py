@@ -532,14 +532,17 @@ def db_list_diary(user_id: str) -> list:
         result = s.run(
             """
             MATCH (d:DiaryEntry {userId: $userId})
-            OPTIONAL MATCH (d)-[:MENTIONS]->(f:Fact)
             OPTIONAL MATCH (d)-[:FOR_CLIENT]->(cl:Client)
             OPTIONAL MATCH (d)-[:IN_CONTEXT]->(ctx:Context)
+            WITH d, cl, ctx
+            OPTIONAL MATCH (d)-[:MENTIONS]->(f:Fact)
+            OPTIONAL MATCH (d)-[:RELEVANT_TO]->(rc:Client)
             RETURN d.id as id, d.date as date, d.content as content, d.timestamp as timestamp, d.name as name,
                    d.metadata as metadata, d.keywords as keywords,
                    cl.name as clientName, cl.id as clientId,
                    ctx.name as contextName, ctx.id as contextId,
-                   collect({id: f.id, text: f.text, name: f.name}) as mentions
+                   collect(DISTINCT {id: f.id, text: f.text, name: f.name}) as mentions,
+                   collect(DISTINCT {id: rc.id, name: rc.name}) as relevantClients
             ORDER BY d.date DESC, d.timestamp DESC
             """,
             userId=user_id,
@@ -558,6 +561,7 @@ def db_list_diary(user_id: str) -> list:
                 "clientId": r.get("clientId"),
                 "contextName": r.get("contextName"),
                 "contextId": r.get("contextId"),
+                "relevantClients": [rc for rc in r["relevantClients"] if rc.get("id")],
             } for r in result
         ]
 

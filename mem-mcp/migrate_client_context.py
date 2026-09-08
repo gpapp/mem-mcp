@@ -139,13 +139,16 @@ async def _migrate_user(user_id: str, neo4j_driver, qdrant):
     # 4. Diary MENTIONS to Client-category facts → FOR_CLIENT on the diary entry
     #    Only for entries that have no FOR_CLIENT link yet — existing manual/LLM
     #    assignments must not be overwritten.
+    #    crossClient nodes (e.g. "Colleagues") are excluded: they span multiple real
+    #    clients and should never drive primary diary scoping.
     with neo4j_driver.session() as s:
         for fact_id, (client_id, cname) in client_map.items():
             s.run(
                 """
                 MATCH (d:DiaryEntry {userId: $userId})-[:MENTIONS]->(cf:Fact {id: $factId, userId: $userId})
+                MATCH (c:Client {id: $clientId, userId: $userId})
                 WHERE NOT (d)-[:FOR_CLIENT]->(:Client)
-                MERGE (c:Client {id: $clientId, userId: $userId})
+                  AND NOT coalesce(c.crossClient, false) = true
                 MERGE (d)-[:FOR_CLIENT]->(c)
                 SET c.lastMentioned = datetime()
                 """,
@@ -302,16 +305,41 @@ _CLIENT_HEADER_RE = re.compile(
 )
 
 
+def _link_diary_relevant_to(diary_id: str, client_ids: list, user_id: str, neo4j_driver) -> None:
+    """Create RELEVANT_TO edges from a DiaryEntry to each Client in client_ids.
+
+    These are secondary associations: the diary entry is not *scoped to* these
+    clients (no FOR_CLIENT link) but mentions their facts/people prominently.
+    """
+    if not client_ids or neo4j_driver is None:
+        return
+    with neo4j_driver.session() as s:
+        for cid in client_ids:
+            s.run(
+                """
+                MATCH (d:DiaryEntry {id: $did, userId: $userId})
+                MATCH (c:Client {id: $clientId, userId: $userId})
+                MERGE (d)-[:RELEVANT_TO]->(c)
+                """,
+                did=diary_id, userId=user_id, clientId=cid
+            )
+
+
 def _fast_diary_scope(item: dict, clients: list, neo4j_driver, user_id: str) -> tuple:
     """Return (client_name, None) when a hard deterministic signal is found.
 
-    Two signals checked in priority order:
-    1. All MENTIONS-linked facts that have a client agree on ONE client.
+    Three signals checked in priority order:
+    1. All MENTIONS-linked facts that have a non-crossClient client agree on ONE client.
+       If they disagree (multiple distinct clients) → entry stays unscoped but RELEVANT_TO
+       edges are written for each mentioned client so diary filtering can still surface it.
     2. The diary content contains an explicit '**Client:** <name>' header line.
 
     Returns (None, None) when no hard signal is present — caller falls back to LLM.
     """
-    # Signal 1: unanimous MENTIONS client
+    # Build a set of crossClient client IDs so we can exclude them from voting
+    cross_client_ids = {c["id"] for c in clients if c.get("crossClient")}
+
+    # Signal 1: unanimous MENTIONS client (excluding crossClient facts)
     if neo4j_driver is not None:
         try:
             with neo4j_driver.session() as s:
@@ -319,18 +347,32 @@ def _fast_diary_scope(item: dict, clients: list, neo4j_driver, user_id: str) -> 
                     """
                     MATCH (d:DiaryEntry {userId: $userId, id: $did})-[:MENTIONS]->(f:Fact)
                     MATCH (f)-[:FOR_CLIENT]->(cl:Client)
-                    RETURN DISTINCT cl.name AS clientName
+                    WHERE NOT cl.crossClient = true
+                    RETURN DISTINCT cl.id AS clientId, cl.name AS clientName
                     """,
                     userId=user_id, did=item["id"]
                 ))
-            scoped_clients = [r["clientName"] for r in rows if r["clientName"]]
-            unique = set(scoped_clients)
-            if len(unique) == 1:
-                cname = unique.pop()
+            scoped = [(r["clientId"], r["clientName"]) for r in rows if r["clientName"]]
+            unique_ids = {cid for cid, _ in scoped}
+            if len(unique_ids) == 1:
+                cid, cname = scoped[0]
                 matched = next((c["name"] for c in clients if c["name"].lower() == cname.lower()), None)
                 if matched:
                     logger.debug(f"[scope_fast] diary {item.get('id')}: unanimous MENTIONS → {matched}")
                     return matched, None
+            elif len(unique_ids) > 1:
+                # Multi-client: leave unscoped but write RELEVANT_TO for each client
+                matched_ids = [
+                    c["id"] for cid, cname in scoped
+                    for c in clients if c["name"].lower() == cname.lower()
+                ]
+                matched_ids = list(dict.fromkeys(matched_ids))  # deduplicate, preserve order
+                _link_diary_relevant_to(item["id"], matched_ids, user_id, neo4j_driver)
+                logger.debug(
+                    f"[scope_fast] diary {item.get('id')}: multi-client MENTIONS "
+                    f"({len(unique_ids)} clients) → unscoped, RELEVANT_TO written"
+                )
+                return None, None
         except Exception as exc:
             logger.debug(f"[scope_fast] MENTIONS lookup failed for {item.get('id')}: {exc}")
 
@@ -461,7 +503,8 @@ def _enriched_diary_text(item: dict, neo4j_driver, user_id: str) -> str:
                     """
                     MATCH (d:DiaryEntry {userId: $userId, id: $did})-[:MENTIONS]->(f:Fact)
                     OPTIONAL MATCH (f)-[:FOR_CLIENT]->(cl:Client)
-                    RETURN DISTINCT f.name AS name, f.text AS body, cl.name AS clientName
+                    RETURN DISTINCT f.name AS name, f.text AS body,
+                           cl.name AS clientName, cl.crossClient AS crossClient
                     LIMIT 6
                     """,
                     userId=user_id, did=item["id"]
@@ -470,7 +513,7 @@ def _enriched_diary_text(item: dict, neo4j_driver, user_id: str) -> str:
                 m_lines = []
                 for r in rows:
                     line = f"- {r['name'] or 'Unnamed'}: {_snippet(r['body'])}"
-                    if r["clientName"]:
+                    if r["clientName"] and not r["crossClient"]:
                         line += f" [client: {r['clientName']}]"
                     m_lines.append(line)
                 parts.append("MENTIONS:\n" + "\n".join(m_lines))

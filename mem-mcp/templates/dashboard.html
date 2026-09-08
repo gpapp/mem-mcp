@@ -635,8 +635,11 @@ npm install @modelcontextprotocol/sdk</code></pre>
       // Generic facts (no client) always pass; only known-inactive clients are hidden.
       return !m.clientId || clientActiveMap[m.clientId] !== false;
     }
-    // Specific client selected — show only facts belonging to that client.
-    return m.clientId === clientFilter;
+    // Specific client selected — show items scoped to that client OR that mention it
+    // via a RELEVANT_TO association (cross-cutting diary entries).
+    if (m.clientId === clientFilter) return true;
+    if (Array.isArray(m.relevantClients) && m.relevantClients.some(rc => rc.id === clientFilter)) return true;
+    return false;
   }
   let lastSortOrder = 'alphabetical';
   let lastSearchQuery = '';
@@ -922,9 +925,10 @@ npm install @modelcontextprotocol/sdk</code></pre>
       </div>`).join('');
     return `<div class="scope-card">
       <div class="scope-card-header" onclick="toggleScopeItems('cli-${c.id}', 'client', '${c.id}')">
-        <span class="scope-card-name">${on ? '🟢' : '⚪'} ${escHtml(c.name)}${pinned}</span>
+        <span class="scope-card-name">${on ? '🟢' : '⚪'} ${escHtml(c.name)}${pinned}${c.crossClient ? ' <span title="Cross-client: facts from this client do not drive diary scoping" style="font-size:.75rem;color:var(--muted);">[cross]</span>' : ''}</span>
         <div class="scope-card-actions" onclick="event.stopPropagation()">
           <button class="btn btn-sm btn-ghost" onclick="toggleClient('${c.id}', ${on ? 'false' : 'true'})">${on ? 'Deactivate' : 'Activate'}</button>
+          <button class="btn btn-sm btn-ghost" onclick="toggleCrossClient('${c.id}', ${c.crossClient ? 'false' : 'true'})" title="Toggle cross-client flag">${c.crossClient ? 'Un-cross' : 'Cross-client'}</button>
           <button class="btn btn-sm btn-ghost" onclick="renameClient('${c.id}')">✏️ Rename</button>
           <button class="btn btn-sm btn-danger" onclick="deleteClient('${c.id}')">🗑️</button>
         </div>
@@ -1051,6 +1055,14 @@ npm install @modelcontextprotocol/sdk</code></pre>
       await loadClients();
       renderMemories();
       renderCategorySidebar();
+    } catch(e) { toast('⚠️ Could not update client'); }
+  }
+
+  async function toggleCrossClient(id, crossClient) {
+    try {
+      await api.put('clients/' + id, {crossClient});
+      toast(crossClient ? 'Marked as cross-client' : 'Cross-client flag removed');
+      await loadClients();
     } catch(e) { toast('⚠️ Could not update client'); }
   }
 

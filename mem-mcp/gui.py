@@ -383,11 +383,12 @@ async def api_list_clients(request: Request):
 class ClientUpdate(BaseModel):
     active: Optional[bool] = None
     name: Optional[str] = None
+    crossClient: Optional[bool] = None
 
 
 @web_app.put("/api/clients/{client_id}", response_class=JSONResponse)
 async def api_update_client(client_id: str, request: Request, body: ClientUpdate):
-    """Pin a client as active/inactive and/or rename it. Pinned status is never auto-overridden."""
+    """Pin a client as active/inactive, rename it, and/or toggle crossClient flag."""
     try:
         user_id = _require_user(request)
         result = {"id": client_id}
@@ -404,6 +405,11 @@ async def api_update_client(client_id: str, request: Request, body: ClientUpdate
             if not renamed:
                 raise HTTPException(status_code=404, detail="Client not found or access denied.")
             result["name"] = body.name.strip()
+        if body.crossClient is not None:
+            found = await mem.db_set_client_cross(client_id, body.crossClient, user_id)
+            if not found:
+                raise HTTPException(status_code=404, detail="Client not found or access denied.")
+            result["crossClient"] = body.crossClient
         return result
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))

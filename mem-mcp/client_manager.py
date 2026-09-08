@@ -123,6 +123,7 @@ def db_list_clients(user_id: str) -> list:
                 "name": c_node["name"],
                 "active": c_node.get("active", True),
                 "statusPinned": c_node.get("statusPinned", False),
+                "crossClient": bool(c_node.get("crossClient", False)),
                 "lastMentioned": c_node.get("lastMentioned").iso_format() if c_node.get("lastMentioned") and hasattr(c_node.get("lastMentioned"), "iso_format") else c_node.get("lastMentioned"),
                 "effectiveActive": _effective_active(dict(c_node)),
                 "contexts": contexts
@@ -197,6 +198,30 @@ async def db_set_client_active(client_id: str, active: bool, user_id: str) -> bo
         rec = result.single()
         return bool(rec and rec["n"] > 0)
 
+
+async def db_set_client_cross(client_id: str, cross: bool, user_id: str) -> bool:
+    """Set the crossClient flag on a Client node.
+
+    A cross-client is a pseudo-client (e.g. 'Colleagues') whose facts span
+    multiple real clients. Its facts are excluded from the unanimous-MENTIONS
+    fast-path and from step-4 migration so they never drive diary scoping.
+
+    Returns True if the client was found.
+    """
+    neo4j_driver = get_neo4j()
+    if not neo4j_driver:
+        raise RuntimeError("Neo4j not connected.")
+    with neo4j_driver.session() as s:
+        result = s.run(
+            """
+            MATCH (c:Client {id: $clientId, userId: $userId})
+            SET c.crossClient = $cross
+            RETURN count(c) AS n
+            """,
+            clientId=client_id, userId=user_id, cross=bool(cross)
+        )
+        rec = result.single()
+        return bool(rec and rec["n"] > 0)
 
 async def db_rename_client(client_id: str, name: str, user_id: str) -> bool:
     """Rename a Client node. Returns False if not found; raises ValueError on name collision.
