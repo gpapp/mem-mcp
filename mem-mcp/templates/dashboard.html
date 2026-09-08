@@ -241,7 +241,9 @@
     .diary-month-pager { padding: .5rem .75rem; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; gap: .25rem; }
     .diary-month-pager .btn-month { background: none; border: 1px solid var(--border); border-radius: 6px; cursor: pointer; padding: .25rem .5rem; font-size: .8rem; color: var(--text); line-height: 1; }
     .diary-month-pager .btn-month:hover { background: var(--bg); }
-    .diary-month-label { font-weight: 700; font-size: .85rem; color: var(--text); white-space: nowrap; }
+    .diary-month-label { font-weight: 700; font-size: .85rem; color: var(--text); white-space: nowrap; cursor: pointer; padding: .25rem .4rem; border-radius: 6px; border: 1px solid transparent; }
+    .diary-month-label:hover { background: var(--bg); border-color: var(--border); }
+    .diary-month-label.active { background: var(--primary); color: #fff; border-color: var(--primary); }
     .diary-month-dates { padding: .35rem .75rem; border-bottom: 1px solid var(--border); display: grid; grid-template-columns: repeat(7, 1fr); gap: .15rem; }
 
     .diary-month-dates .dow-row { display: contents; }
@@ -455,7 +457,7 @@
       </div>
       <div class="diary-month-pager">
         <button class="btn-month" onclick="prevMonth()">◀</button>
-        <span class="diary-month-label" id="diary-month-label"></span>
+        <span class="diary-month-label" id="diary-month-label" onclick="onDiaryMonthClick()"></span>
         <button class="btn-month" onclick="nextMonth()">▶</button>
         <button class="btn-month" onclick="goToToday()" title="Jump to today">📅</button>
       </div>
@@ -620,7 +622,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     fetch(`${apiBase}/auth/logout`, {method:'POST'}).then(() => window.location.href = "{{BASE_URL}}/");
   }
 
-  let memories = [], diaryEntries = [], activeDiaryId = null, selectedDiaryDate = null, diaryMonthYear = null, diarySearchQuery = '';
+  let memories = [], diaryEntries = [], activeDiaryId = null, selectedDiaryDate = null, selectedMonth = null, diaryMonthYear = null, diarySearchQuery = '';
   let graphLoaded = false;
   let activeGraphCategories = new Set();
   let activeCategory = null;
@@ -673,6 +675,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
         diarySearchQuery: diarySearchQuery,
         diaryMonthYear: diaryMonthYear,
         selectedDiaryDate: selectedDiaryDate,
+        selectedMonth: selectedMonth,
         activeDiaryId: activeDiaryId,
         isBuildMode: isBuildMode,
         buildGraphNodes: Array.from(buildGraphNodes)
@@ -702,6 +705,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
         if (state.diarySearchQuery !== undefined) diarySearchQuery = state.diarySearchQuery;
         if (state.diaryMonthYear !== undefined) diaryMonthYear = state.diaryMonthYear;
         if (state.selectedDiaryDate !== undefined) selectedDiaryDate = state.selectedDiaryDate;
+        if (state.selectedMonth !== undefined) selectedMonth = state.selectedMonth;
         if (state.activeDiaryId !== undefined) activeDiaryId = state.activeDiaryId;
 
         if (state.isBuildMode !== undefined) isBuildMode = state.isBuildMode;
@@ -2312,8 +2316,15 @@ npm install @modelcontextprotocol/sdk</code></pre>
 
   function renderDiarySearchResults(results, q) {
     const el = document.getElementById('diary-dates-list');
-    if (!results.length) { el.innerHTML = '<p class="empty" style="padding:.75rem 1rem; font-size:.85rem;">No results.</p>'; return; }
-    el.innerHTML = results.map(entry => {
+    // Enrich with clientId from local cache so memPassesScope can filter correctly.
+    const nameToId = {};
+    (clientListCache || []).forEach(c => { nameToId[c.name] = c.id; });
+    const filtered = results.filter(entry => {
+      if (entry.clientName && !entry.clientId) entry.clientId = nameToId[entry.clientName] || null;
+      return memPassesScope(entry);
+    });
+    if (!filtered.length) { el.innerHTML = '<p class="empty" style="padding:.75rem 1rem; font-size:.85rem;">No results.</p>'; return; }
+    el.innerHTML = filtered.map(entry => {
       const name = diaryEntryTitle(entry);
       const snippet = (entry.content || '').replace(/#+\s[^\n]*/g, '').replace(/\s+/g, ' ').trim().substring(0, 60);
       return `<div class="diary-date-item" onclick="selectDiaryEntry('${entry.id}')">
@@ -2351,11 +2362,15 @@ npm install @modelcontextprotocol/sdk</code></pre>
         return (matchesText || matchesDate) && memPassesScope(e);
       });
     } else {
-      const my = getDiaryMonthYear();
-      const monthPrefix = `${my.year}-${String(my.month).padStart(2, '0')}`;
-      filtered = diaryEntries.filter(e => e.date && e.date.startsWith(monthPrefix) && memPassesScope(e));
       if (selectedDiaryDate) {
-        filtered = filtered.filter(e => e.date === selectedDiaryDate);
+        // Day selected: show only entries for that date
+        filtered = diaryEntries.filter(e => e.date === selectedDiaryDate && memPassesScope(e));
+      } else if (selectedMonth) {
+        // Month selected: show all entries in that month
+        filtered = diaryEntries.filter(e => e.date && e.date.startsWith(selectedMonth) && memPassesScope(e));
+      } else {
+        // Nothing selected: show all entries across all months, reverse order
+        filtered = diaryEntries.filter(e => memPassesScope(e));
       }
     }
 
@@ -2445,6 +2460,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     if (my.month < 1) { my.month = 12; my.year -= 1; }
     diaryMonthYear = my;
     selectedDiaryDate = null;
+    selectedMonth = null;
     renderDiaryMonthPager();
     renderDiarySidebar();
     saveSessionState();
@@ -2456,6 +2472,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     if (my.month > 12) { my.month = 1; my.year += 1; }
     diaryMonthYear = my;
     selectedDiaryDate = null;
+    selectedMonth = null;
     renderDiaryMonthPager();
     renderDiarySidebar();
     saveSessionState();
@@ -2465,8 +2482,30 @@ npm install @modelcontextprotocol/sdk</code></pre>
     const now = new Date();
     diaryMonthYear = { year: now.getFullYear(), month: now.getMonth() + 1 };
     const todayStr = localDateStr(now);
-    // Only pin to today's date if there are actually entries on that date
-    selectedDiaryDate = diaryEntries.some(e => e.date === todayStr) ? todayStr : null;
+    const hasToday = diaryEntries.some(e => e.date === todayStr && memPassesScope(e));
+    if (hasToday) {
+      selectedDiaryDate = todayStr;
+      selectedMonth = null;
+    } else {
+      selectedDiaryDate = null;
+      selectedMonth = todayStr.substring(0, 7); // "YYYY-MM"
+    }
+    renderDiaryMonthPager();
+    renderDiarySidebar();
+    saveSessionState();
+  }
+
+  function onDiaryMonthClick() {
+    const my = getDiaryMonthYear();
+    const monthPrefix = `${my.year}-${String(my.month).padStart(2, '0')}`;
+    if (selectedMonth === monthPrefix) {
+      // Toggle off — deselect both month and day, show all entries
+      selectedMonth = null;
+      selectedDiaryDate = null;
+    } else {
+      selectedMonth = monthPrefix;
+      selectedDiaryDate = null;
+    }
     renderDiaryMonthPager();
     renderDiarySidebar();
     saveSessionState();
@@ -2474,9 +2513,13 @@ npm install @modelcontextprotocol/sdk</code></pre>
 
   function onDiaryDateClick(dateStr) {
     if (selectedDiaryDate === dateStr) {
+      // Deselect day but keep month selected
       selectedDiaryDate = null;
+      const my = getDiaryMonthYear();
+      selectedMonth = `${my.year}-${String(my.month).padStart(2, '0')}`;
     } else {
       selectedDiaryDate = dateStr;
+      selectedMonth = null;
     }
     renderDiaryMonthPager();
     renderDiarySidebar();
@@ -2486,7 +2529,9 @@ npm install @modelcontextprotocol/sdk</code></pre>
   function renderDiaryMonthPager() {
     const my = getDiaryMonthYear();
     const monthNames = ['January','February','March','April','May','June','July','August','September','October','November','December'];
-    document.getElementById('diary-month-label').textContent = `${monthNames[my.month - 1]} ${my.year}`;
+    const labelEl = document.getElementById('diary-month-label');
+    labelEl.textContent = `${monthNames[my.month - 1]} ${my.year}`;
+    labelEl.classList.toggle('active', selectedMonth !== null);
 
     const monthPrefix = `${my.year}-${String(my.month).padStart(2, '0')}`;
     const datesInMonth = [...new Set(
@@ -2529,6 +2574,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
       const parts = entry.date.split('-');
       diaryMonthYear = { year: parseInt(parts[0]), month: parseInt(parts[1]) };
       selectedDiaryDate = entry.date;
+      selectedMonth = null;
     }
     renderDiarySidebar();
     saveSessionState();
