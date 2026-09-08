@@ -2573,9 +2573,13 @@ npm install @modelcontextprotocol/sdk</code></pre>
     if (entry && entry.date) {
       const parts = entry.date.split('-');
       diaryMonthYear = { year: parseInt(parts[0]), month: parseInt(parts[1]) };
-      selectedDiaryDate = entry.date;
-      selectedMonth = null;
+      // Only update filter state if already in a filtered view; preserve all-entries state
+      if (selectedDiaryDate !== null || selectedMonth !== null) {
+        selectedDiaryDate = entry.date;
+        selectedMonth = null;
+      }
     }
+    renderDiaryMonthPager();
     renderDiarySidebar();
     saveSessionState();
 
