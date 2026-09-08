@@ -464,7 +464,7 @@ def db_get_neighborhood(fact_id: str, depth: int, rel_types: List[str], user_id:
         result = s.run(
             f"""
             MATCH (f:Fact {{id: $id, userId: $userId}})
-            MATCH path = (f)-[*1..{depth}]-(neighbor:Fact)
+            MATCH path = (f)-[{rel_filter}*1..{depth}]-(neighbor:Fact)
             WHERE neighbor.userId = $userId
             RETURN neighbor, labels(neighbor) as labels, relationships(path) as rels
             """,

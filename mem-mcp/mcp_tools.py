@@ -165,7 +165,9 @@ async def list_categories():
 @monitor_mcp_tool("link_facts", context_provider=_current_user)
 async def link_facts(sourceFactId: str, targetFactId: str, relationshipType: str, metadata: Optional[dict] = None):
     """
-    Create a bidirectional relationship between two facts or a fact and a diary entry.
+    Create a relationship between two facts or a fact and a diary entry.
+    Fact↔Fact links are bidirectional. DiaryEntry↔Fact links are always stored
+    as a unidirectional MENTIONS edge regardless of the relationshipType provided.
     IMPORTANT: Use the exact 'id' field returned by search_facts or diary_search_entries. 
     Do not use raw timestamp strings as IDs.
     """
@@ -180,7 +182,8 @@ async def link_facts(sourceFactId: str, targetFactId: str, relationshipType: str
 @monitor_mcp_tool("unlink_facts", context_provider=_current_user)
 async def unlink_facts(sourceFactId: str, targetFactId: str, relationshipType: Optional[str] = None):
     """
-    Remove a bidirectional relationship between two facts.
+    Remove a relationship between two facts or a fact and a diary entry.
+    Fact↔Fact removals are bidirectional. DiaryEntry↔Fact always removes the MENTIONS edge.
     Use the exact 'id' fields returned by the system.
     """
     try:
@@ -291,7 +294,8 @@ async def diary_search_entries(query: str, limit: int = 3, top_p: float = 0.4, c
       limit: max results (default 3)
       top_p: similarity threshold (default 0.4)
 
-    Returns list of entries with: id, timestamp, date, content, score, mentions.
+    Returns list of entries with: id, timestamp, date, name, content, score, mentions,
+    keywords, clientName, clientId, contextName, contextId, metadata.
     Use 'id' with diary_delete_entry or diary_save_entry to modify entries.
     """
     return await mem.db_search_diary(query, _current_user(), limit, top_p, client, context)
@@ -322,7 +326,7 @@ async def diary_delete_entry(entryId: str):
     
 @mcp.tool()
 @monitor_mcp_tool("find_duplicates", context_provider=_current_user)
-async def find_duplicates(category: str = "People", limit: int = 50, threshold: float = 0.75, max_cluster: int = 4, group_by: Optional[str] = "first_name"):
+async def find_duplicates(category: str = "People", limit: int = 50, threshold: float = 0.75, max_cluster: int = 4):
     """
     Find potential duplicate entries in memory by comparing embeddings similarity ranking.
     Returns grouped clusters of similar items for manual deduplication.
@@ -355,6 +359,8 @@ async def merge_facts(masterId: str, duplicateIds: List[str], mergedName: str, m
     mergedText should use Markdown formatting (bold field labels, bullet lists, etc.)
     to ensure readable, consistent output. For People facts: include Role, Company,
     Domain, and other stable information in a structured format.
+
+    Requires the Neo4j APOC plugin to be installed (used for dynamic relationship creation).
     """
     user = _current_user()
     await mem.db_update_memory(masterId, mergedName, mergedText, None, user)
