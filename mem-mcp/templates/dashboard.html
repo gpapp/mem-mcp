@@ -141,6 +141,23 @@
     .link-edit-form input { padding: .15rem .3rem; border: 1px solid #fde68a; border-radius: 3px; font-size: .7rem; width: 100px; }
     .link-edit-form button { background: none; border: none; cursor: pointer; padding: 0; font-size: .7rem; }
 
+    /* ── Diary scope chips (inline click-to-edit) ── */
+    .scope-chip { display: inline-flex; align-items: center; gap: .25rem; font-size: .78rem; font-weight: 600;
+      padding: .2rem .5rem; border-radius: 5px; border: 1px solid var(--border); background: var(--bg);
+      color: var(--text); cursor: pointer; line-height: 1.3; transition: border-color .12s, background .12s; }
+    .scope-chip:hover { border-color: var(--primary); background: var(--primary-light); color: var(--primary); }
+    .scope-chip--client { color: var(--muted); }
+    .scope-chip--client:hover { color: var(--primary); }
+    .scope-chip--project { color: var(--muted); }
+    .scope-chip--project:hover { color: var(--primary); }
+    .scope-chip--relevant { background: #fffbeb; border-color: #fde68a; color: #b45309; padding-right: .25rem; cursor: default; }
+    .scope-chip--relevant:hover { background: #fffbeb; border-color: #fcd34d; color: #b45309; }
+    .scope-chip-remove { background: none; border: none; cursor: pointer; font-size: .85rem; padding: 0 0 0 .2rem;
+      color: #b45309; opacity: .65; line-height: 1; }
+    .scope-chip-remove:hover { opacity: 1; }
+    .scope-chip--add { border-style: dashed; color: var(--muted); font-size: .82rem; padding: .15rem .4rem; }
+    .scope-chip--add:hover { border-color: var(--primary); color: var(--primary); background: var(--primary-light); }
+
     .markdown-body { background: transparent !important; color: var(--text); }
     .markdown-body p:last-child { margin-bottom: 0; }
     /* Task-list items: remove bullet, align checkbox with text */
@@ -2643,10 +2660,12 @@ npm install @modelcontextprotocol/sdk</code></pre>
           <button class="item-menu-btn" onclick="_showDiaryMenu(this, '${entry.id}')">☰</button>
         </div>
       </div>
-      <div class="fact-detail-scope" style="margin-bottom:.75rem;">
-        <span style="font-size:.8rem;color:var(--muted);">🏢 Client: <strong>${entry.clientName ? escHtml(entry.clientName) + ((clientListCache.find(c=>c.id===entry.clientId)||{}).crossClient ? ' <span title="Cross-client">[cross]</span>' : '') : '—'}</strong></span>
-        <span style="margin-left:1rem;font-size:.8rem;color:var(--muted);">📁 Project: <strong>${entry.contextName ? escHtml(entry.contextName) : '—'}</strong></span>
-        ${(entry.relevantClients||[]).length ? `<span style="margin-left:1rem;font-size:.8rem;color:var(--muted);">🔗 Also relevant: <strong>${(entry.relevantClients||[]).map(rc=>escHtml(rc.name)).join(', ')}</strong></span>` : ''}
+      <div class="fact-detail-scope diary-scope-row" id="diary-scope-row-${entry.id}" style="margin-bottom:.75rem; display:flex; flex-wrap:wrap; gap:.4rem; align-items:center;">
+        <button class="scope-chip scope-chip--client" onclick="_diaryPickClient(this,'${entry.id}')" title="Click to change client">🏢 ${entry.clientName ? escHtml(entry.clientName) + ((clientListCache.find(c=>c.id===entry.clientId)||{}).crossClient ? ' [cross]' : '') : '—'}</button>
+        <button class="scope-chip scope-chip--project" onclick="_diaryPickProject(this,'${entry.id}')" title="Click to change project">📁 ${entry.contextName ? escHtml(entry.contextName) : '—'}</button>
+        <span style="font-size:.75rem;color:var(--muted);margin-left:.25rem;">🔗</span>
+        ${(entry.relevantClients||[]).map(rc=>`<span class="scope-chip scope-chip--relevant">${escHtml(rc.name)}<button class="scope-chip-remove" onclick="_diaryRemoveRelevant('${entry.id}','${rc.id}')" title="Remove">×</button></span>`).join('')}
+        <button class="scope-chip scope-chip--add" onclick="_diaryAddRelevant(this,'${entry.id}')" title="Add relevant client">＋</button>
       </div>
       <div class="markdown-body">${marked.parse(entry.content || '')}</div>
       <div id="diary-detail-meta" style="margin-top:1rem;"></div>
@@ -2665,6 +2684,116 @@ npm install @modelcontextprotocol/sdk</code></pre>
         </div>
       </div>`;
   }
+
+  // ── Diary scope popup helpers ──────────────────────────────────────────────
+
+  // Generic scope popup: items = [{label, value, muted}]; onSelect(value) called on pick.
+  // Closes on outside click (reuses _hideItemMenu infrastructure).
+  function _showScopePopup(anchorEl, items, onSelect) {
+    _hideItemMenu();
+    const rect = anchorEl.getBoundingClientRect();
+    const menu = document.createElement('div');
+    menu.className = 'context-menu';
+    menu.style.minWidth = Math.max(rect.width, 180) + 'px';
+    menu.style.maxHeight = '280px';
+    menu.style.overflowY = 'auto';
+    let html = '';
+    for (const it of items) {
+      const mutedStyle = it.muted ? 'opacity:.6;font-style:italic;' : '';
+      html += `<div class="context-menu-item" style="${mutedStyle}" data-val="${escHtml(String(it.value ?? ''))}">${escHtml(it.label)}</div>`;
+    }
+    menu.innerHTML = html;
+    document.body.appendChild(menu);
+    const mh = menu.offsetHeight || 200;
+    const mw = menu.offsetWidth  || 180;
+    let top = rect.bottom + 4, left = rect.left;
+    if (top + mh > window.innerHeight - 8) top = rect.top - mh - 4;
+    if (left + mw > window.innerWidth  - 8) left = window.innerWidth - mw - 8;
+    if (left < 4) left = 4;
+    menu.style.top  = top  + 'px';
+    menu.style.left = left + 'px';
+    menu.addEventListener('click', e => {
+      const el = e.target.closest('.context-menu-item');
+      if (!el) return;
+      _hideItemMenu();
+      onSelect(el.dataset.val);
+    });
+    _itemMenu = menu;
+    setTimeout(() => document.addEventListener('click', _hideItemMenu, { capture: true }), 0);
+  }
+
+  async function _diaryPickClient(anchorEl, entryId) {
+    await ensureClients();
+    const entry = diaryEntries.find(e => e.id === entryId);
+    if (!entry) return;
+    const items = [
+      { label: '— No client —', value: '', muted: true },
+      ...clientListCache.map(c => ({ label: (c.effectiveActive !== false ? '🟢 ' : '⚪ ') + c.name + (c.crossClient ? ' [cross]' : ''), value: c.id }))
+    ];
+    _showScopePopup(anchorEl, items, async val => {
+      try {
+        const scope = await api.put('diary/' + entryId + '/scope', { clientId: val || null, contextId: null });
+        Object.assign(entry, { clientId: scope.clientId, clientName: scope.clientName, contextId: scope.contextId, contextName: scope.contextName });
+        renderDiaryEntryView(entry);
+        renderDiarySidebar();
+      } catch(e) { toast('❌ Could not update client'); }
+    });
+  }
+
+  async function _diaryPickProject(anchorEl, entryId) {
+    await ensureClients();
+    const entry = diaryEntries.find(e => e.id === entryId);
+    if (!entry) return;
+    const client = clientListCache.find(c => c.id === entry.clientId);
+    const ctxs = (client && client.contexts) || [];
+    if (!entry.clientId) { toast('Set a client first'); return; }
+    const items = [
+      { label: '— No project —', value: '', muted: true },
+      ...ctxs.map(x => ({ label: x.name, value: x.id }))
+    ];
+    _showScopePopup(anchorEl, items, async val => {
+      try {
+        const scope = await api.put('diary/' + entryId + '/scope', { clientId: entry.clientId, contextId: val || null });
+        Object.assign(entry, { clientId: scope.clientId, clientName: scope.clientName, contextId: scope.contextId, contextName: scope.contextName });
+        renderDiaryEntryView(entry);
+      } catch(e) { toast('❌ Could not update project'); }
+    });
+  }
+
+  async function _diaryAddRelevant(anchorEl, entryId) {
+    await ensureClients();
+    const entry = diaryEntries.find(e => e.id === entryId);
+    if (!entry) return;
+    const existing = new Set((entry.relevantClients || []).map(rc => rc.id));
+    // Exclude the primary client and already-added relevant ones
+    const candidates = clientListCache.filter(c => c.id !== entry.clientId && !existing.has(c.id));
+    if (!candidates.length) { toast('No other clients to add'); return; }
+    const items = candidates.map(c => ({ label: (c.effectiveActive !== false ? '🟢 ' : '⚪ ') + c.name + (c.crossClient ? ' [cross]' : ''), value: c.id }));
+    _showScopePopup(anchorEl, items, async val => {
+      try {
+        await api.post('diary/' + entryId + '/relevant', { clientId: val });
+        const added = clientListCache.find(c => c.id === val);
+        if (added) {
+          if (!entry.relevantClients) entry.relevantClients = [];
+          if (!entry.relevantClients.some(rc => rc.id === val))
+            entry.relevantClients.push({ id: added.id, name: added.name });
+        }
+        renderDiaryEntryView(entry);
+      } catch(e) { toast('❌ Could not add relevant client'); }
+    });
+  }
+
+  async function _diaryRemoveRelevant(entryId, clientId) {
+    const entry = diaryEntries.find(e => e.id === entryId);
+    if (!entry) return;
+    try {
+      await api.delete('diary/' + entryId + '/relevant/' + clientId);
+      if (entry.relevantClients) entry.relevantClients = entry.relevantClients.filter(rc => rc.id !== clientId);
+      renderDiaryEntryView(entry);
+    } catch(e) { toast('❌ Could not remove relevant client'); }
+  }
+
+  // ── End diary scope popup helpers ──────────────────────────────────────────
 
   async function renderDiaryEditMode(entryId) {
     await ensureClients();
