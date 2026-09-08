@@ -2459,8 +2459,6 @@ npm install @modelcontextprotocol/sdk</code></pre>
     my.month -= 1;
     if (my.month < 1) { my.month = 12; my.year -= 1; }
     diaryMonthYear = my;
-    selectedDiaryDate = null;
-    selectedMonth = null;
     renderDiaryMonthPager();
     renderDiarySidebar();
     saveSessionState();
@@ -2471,8 +2469,6 @@ npm install @modelcontextprotocol/sdk</code></pre>
     my.month += 1;
     if (my.month > 12) { my.month = 1; my.year += 1; }
     diaryMonthYear = my;
-    selectedDiaryDate = null;
-    selectedMonth = null;
     renderDiaryMonthPager();
     renderDiarySidebar();
     saveSessionState();
