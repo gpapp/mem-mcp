@@ -1517,7 +1517,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
                 <select id="ep-client" onchange="onEpClientChange()">
                   <option value="">— No client —</option>
                   ${(m.clientId && !clientListCache.some(c => c.id === m.clientId)) ? `<option value="${m.clientId}" selected>⚠️ ${escHtml(m.clientName || m.clientId)}</option>` : ''}
-                  ${clientListCache.map(c => `<option value="${c.id}"${c.id === m.clientId ? ' selected' : ''}>${escHtml(c.name)}</option>`).join('')}
+                  ${clientListCache.map(c => `<option value="${c.id}"${c.id === m.clientId ? ' selected' : ''}>${escHtml(c.name)}${c.crossClient ? ' [cross]' : ''}</option>`).join('')}
                 </select>
               </div>
               <div class="fact-edit-field">
@@ -1544,7 +1544,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
               <div class="fact-detail-name">${escHtml(m.name || 'Unnamed')}</div>
               <span class="fact-detail-cat">${escHtml(m.category)}</span>
               <div class="fact-detail-scope" style="display:flex; gap:1rem; margin-top:.35rem; font-size:.8rem; color:var(--muted);">
-                <span>🏢 <strong>Client:</strong> ${m.clientName ? escHtml(m.clientName) : '—'}</span>
+                <span>🏢 <strong>Client:</strong> ${m.clientName ? escHtml(m.clientName) + ((clientListCache.find(c=>c.id===m.clientId)||{}).crossClient ? ' <span title="Cross-client">[cross]</span>' : '') : '—'}</span>
                 <span>📁 <strong>Project:</strong> ${m.contextName ? escHtml(m.contextName) : '—'}</span>
               </div>
             </div>
@@ -2385,8 +2385,9 @@ npm install @modelcontextprotocol/sdk</code></pre>
         </div>
       </div>
       <div class="fact-detail-scope" style="margin-bottom:.75rem;">
-        <span style="font-size:.8rem;color:var(--muted);">🏢 Client: <strong>${entry.clientName ? escHtml(entry.clientName) : '—'}</strong></span>
+        <span style="font-size:.8rem;color:var(--muted);">🏢 Client: <strong>${entry.clientName ? escHtml(entry.clientName) + ((clientListCache.find(c=>c.id===entry.clientId)||{}).crossClient ? ' <span title="Cross-client">[cross]</span>' : '') : '—'}</strong></span>
         <span style="margin-left:1rem;font-size:.8rem;color:var(--muted);">📁 Project: <strong>${entry.contextName ? escHtml(entry.contextName) : '—'}</strong></span>
+        ${(entry.relevantClients||[]).length ? `<span style="margin-left:1rem;font-size:.8rem;color:var(--muted);">🔗 Also relevant: <strong>${(entry.relevantClients||[]).map(rc=>escHtml(rc.name)).join(', ')}</strong></span>` : ''}
       </div>
       <div class="markdown-body">${marked.parse(entry.content || '')}</div>
       <div id="diary-detail-meta" style="margin-top:1rem;"></div>
@@ -2441,7 +2442,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
             <label for="de-client" style="font-size:.75rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;display:block;margin-bottom:.2rem;">Client</label>
             <select id="de-client" onchange="onDeClientChange()" style="width:100%;padding:.35rem .5rem;border:1px solid var(--border);border-radius:6px;font-size:.85rem;">
               <option value="">— No client —</option>
-              ${(clientListCache||[]).map(c=>`<option value="${c.id}"${c.id===(entry.clientId||'')?'  selected':''}>${escHtml(c.name)}</option>`).join('')}
+              ${(clientListCache||[]).map(c=>`<option value="${c.id}"${c.id===(entry.clientId||'')?'  selected':''}>${escHtml(c.name)}${c.crossClient?' [cross]':''}</option>`).join('')}
             </select>
           </div>
           <div style="flex:1;min-width:120px;">
