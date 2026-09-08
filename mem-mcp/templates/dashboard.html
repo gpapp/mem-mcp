@@ -386,6 +386,29 @@
       background: var(--primary-light); color: var(--primary);
       font-size: .7rem; padding: 1px 5px; border-radius: 3px;
     }
+    /* ── Client filter custom dropdown ── */
+    .cf-wrap { position: relative; }
+    .cf-btn { display: flex; align-items: center; gap: .35rem; font-size: .82rem; font-weight: 500;
+      padding: .28rem .55rem; border: 1px solid var(--border); border-radius: 6px;
+      background: var(--bg); color: var(--text); cursor: pointer; white-space: nowrap;
+      max-width: 200px; overflow: hidden; text-overflow: ellipsis; }
+    .cf-btn:hover, .cf-btn.open { border-color: var(--primary); background: var(--primary-light); color: var(--primary); }
+    .cf-btn::after { content: '▾'; font-size: .7rem; flex-shrink: 0; }
+    .cf-panel { display: none; position: absolute; top: calc(100% + 4px); right: 0; z-index: 500;
+      background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+      box-shadow: 0 4px 14px rgba(0,0,0,.13); min-width: 220px; max-height: 340px;
+      overflow-y: auto; padding: 4px 0; }
+    .cf-panel.open { display: block; }
+    .cf-item { padding: 7px 12px; cursor: pointer; font-size: .84rem; display: flex; align-items: center;
+      gap: 7px; color: var(--text); white-space: nowrap; }
+    .cf-item:hover { background: var(--primary-light); color: var(--primary); }
+    .cf-item.active { background: var(--primary-light); color: var(--primary); font-weight: 600; }
+    .cf-item.active::before { content: '✓'; font-size: .75rem; margin-right: -3px; }
+    .cf-separator { height: 1px; background: var(--border); margin: 4px 0; }
+    .cf-ctx { padding: 5px 12px 5px 26px; font-size: .8rem; color: var(--muted); }
+    .cf-ctx:hover { background: var(--primary-light); color: var(--primary); }
+    .cf-ctx.active { background: var(--primary-light); color: var(--primary); font-weight: 600; }
+    .cf-ctx.active::before { content: '✓'; font-size: .7rem; margin-right: 4px; }
   </style>
 </head>
 <body onload="init()">
@@ -403,10 +426,10 @@
   <button class="tab-btn" data-tab="projects" onclick="switchTab('projects')">📁 Projects</button>
   <button class="tab-btn" data-tab="setup" onclick="switchTab('setup')">🔌 Setup</button>
   <div style="margin-left:auto; display:flex; align-items:center; padding-bottom:.25rem;">
-    <select id="client-filter-select" class="form-control" style="font-size:.82rem; min-width:160px;" onchange="onClientFilterChange(this.value)">
-      <option value="all">All clients</option>
-      <option value="active">Active clients only</option>
-    </select>
+    <div class="cf-wrap" id="cf-wrap">
+      <button class="cf-btn" id="cf-btn" onclick="_cfToggle(event)">All clients</button>
+      <div class="cf-panel" id="cf-panel"></div>
+    </div>
   </div>
 </div>
 
@@ -657,6 +680,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
   let activeLetterFilter = null;
   let hideInactiveClients = false;  // kept for session-state back-compat (mapped to clientFilter)
   let clientFilter = 'all';  // 'all' | 'active' | <clientId>
+  let contextFilter = null;  // null | <contextId> — only active when clientFilter is a clientId
   let clientActiveMap = {};
   let clientListCache = [];
 
@@ -667,15 +691,16 @@ npm install @modelcontextprotocol/sdk</code></pre>
       // Generic facts (no client) always pass; only known-inactive clients are hidden.
       return !m.clientId || clientActiveMap[m.clientId] !== false;
     }
-    // Specific client selected — show items whose primary client matches.
-    if (m.clientId === clientFilter) return true;
-    // Also show cross-client (RELEVANT_TO) entries, but only if the entry itself
-    // is marked crossClient or has no primary client (avoids active-client items
-    // bleeding into an inactive-client filter via a loose RELEVANT_TO link).
-    if (Array.isArray(m.relevantClients) && m.relevantClients.some(rc => rc.id === clientFilter)) {
-      if (m.crossClient || !m.clientId) return true;
-    }
-    return false;
+    // Specific client selected — check primary client match first.
+    const clientMatch = m.clientId === clientFilter;
+    // Cross-client (RELEVANT_TO) entries also pass when no contextFilter is set.
+    const relevantMatch = !contextFilter &&
+      Array.isArray(m.relevantClients) && m.relevantClients.some(rc => rc.id === clientFilter) &&
+      (m.crossClient || !m.clientId);
+    if (!clientMatch && !relevantMatch) return false;
+    // If a specific project (context) is selected, further filter by contextId.
+    if (contextFilter && m.contextId !== contextFilter) return false;
+    return true;
   }
   let lastSortOrder = 'alphabetical';
   let lastSearchQuery = '';
@@ -703,6 +728,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
         activeLetterFilter: activeLetterFilter,
         hideInactiveClients: clientFilter === 'active',  // back-compat
         clientFilter: clientFilter,
+        contextFilter: contextFilter,
         selectedFactId: selectedFactId,
         diarySearchQuery: diarySearchQuery,
         diaryMonthYear: diaryMonthYear,
@@ -732,6 +758,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
         if (state.clientFilter !== undefined) clientFilter = state.clientFilter;
         else if (state.hideInactiveClients !== undefined) clientFilter = state.hideInactiveClients ? 'active' : 'all';
         hideInactiveClients = clientFilter === 'active';  // back-compat
+        if (state.contextFilter !== undefined) contextFilter = state.contextFilter;
         if (state.selectedFactId !== undefined) selectedFactId = state.selectedFactId;
         
         if (state.diarySearchQuery !== undefined) diarySearchQuery = state.diarySearchQuery;
@@ -918,27 +945,102 @@ npm install @modelcontextprotocol/sdk</code></pre>
   }
 
   function renderClientFilterSelect() {
-    const sel = document.getElementById('client-filter-select');
-    if (!sel) return;
-    // Preserve existing non-client options (All / Active)
-    const clientOptions = clientListCache.map(c =>
-      `<option value="${escHtml(c.id)}">${c.effectiveActive !== false ? '🟢' : '⚪'} ${escHtml(c.name)}</option>`
-    ).join('');
-    sel.innerHTML =
-      `<option value="all">All clients</option>` +
-      `<option value="active">Active clients only</option>` +
-      (clientOptions ? `<optgroup label="──────────">${clientOptions}</optgroup>` : '');
-    sel.value = clientFilter;
+    // Alias kept so all existing callers still work; rebuilds the custom dropdown.
+    _cfRenderPanel();
+    _cfUpdateBtn();
   }
 
-  async function onClientFilterChange(value) {
-    clientFilter = value;
+  function _cfUpdateBtn() {
+    const btn = document.getElementById('cf-btn');
+    if (!btn) return;
+    if (clientFilter === 'all')    { btn.textContent = 'All clients'; btn.title = ''; }
+    else if (clientFilter === 'active') { btn.textContent = 'Active only'; btn.title = ''; }
+    else {
+      const c = clientListCache.find(x => x.id === clientFilter);
+      const cName = c ? c.name : clientFilter;
+      if (contextFilter) {
+        const ctx = (c && c.contexts || []).find(x => x.id === contextFilter);
+        btn.textContent = cName + ' › ' + (ctx ? ctx.name : contextFilter);
+        btn.title = cName + ' › ' + (ctx ? ctx.name : contextFilter);
+      } else {
+        btn.textContent = (c && c.effectiveActive !== false ? '🟢 ' : '⚪ ') + cName;
+        btn.title = cName;
+      }
+    }
+    // Re-append the caret (textContent wipes it, so we use innerHTML carefully)
+    btn.innerHTML = btn.textContent + ' <span style="font-size:.7rem;opacity:.7;">▾</span>';
+  }
+
+  function _cfRenderPanel() {
+    const panel = document.getElementById('cf-panel');
+    if (!panel) return;
+    let html = '';
+    const addItem = (val, ctxVal, label, isActive, indent) => {
+      const cls = 'cf-' + (indent ? 'ctx' : 'item') + (isActive ? ' active' : '');
+      html += `<div class="${cls}" data-val="${escHtml(val)}" data-ctx="${escHtml(ctxVal||'')}">${escHtml(label)}</div>`;
+    };
+    addItem('all',    '', 'All clients',         clientFilter === 'all', false);
+    addItem('active', '', 'Active clients only',  clientFilter === 'active', false);
+    if (clientListCache.length) {
+      html += '<div class="cf-separator"></div>';
+      for (const c of clientListCache) {
+        const isClientActive = c.effectiveActive !== false;
+        const clientSelected = clientFilter === c.id && !contextFilter;
+        addItem(c.id, '', (isClientActive ? '🟢 ' : '⚪ ') + c.name + (c.crossClient ? ' [cross]' : ''), clientSelected, false);
+        for (const ctx of (c.contexts || [])) {
+          const ctxSelected = clientFilter === c.id && contextFilter === ctx.id;
+          addItem(c.id, ctx.id, '📁 ' + ctx.name, ctxSelected, true);
+        }
+      }
+    }
+    panel.innerHTML = html;
+    panel.querySelectorAll('.cf-item, .cf-ctx').forEach(el => {
+      el.addEventListener('click', e => {
+        e.stopPropagation();
+        _cfClose();
+        _cfApply(el.dataset.val, el.dataset.ctx || null);
+      });
+    });
+  }
+
+  function _cfToggle(e) {
+    e.stopPropagation();
+    const panel = document.getElementById('cf-panel');
+    const btn   = document.getElementById('cf-btn');
+    const isOpen = panel.classList.contains('open');
+    if (isOpen) {
+      _cfClose();
+    } else {
+      _cfRenderPanel();
+      panel.classList.add('open');
+      btn.classList.add('open');
+      setTimeout(() => document.addEventListener('click', _cfClose, { capture: true }), 0);
+    }
+  }
+
+  function _cfClose() {
+    const panel = document.getElementById('cf-panel');
+    const btn   = document.getElementById('cf-btn');
+    if (panel) panel.classList.remove('open');
+    if (btn)   btn.classList.remove('open');
+    document.removeEventListener('click', _cfClose, { capture: true });
+  }
+
+  async function _cfApply(newClientFilter, newContextFilter) {
+    clientFilter   = newClientFilter;
+    contextFilter  = newContextFilter || null;
     hideInactiveClients = clientFilter === 'active';  // back-compat
+    _cfUpdateBtn();
     renderMemories();
     renderCategorySidebar();
     renderDiaryMonthPager();
     renderDiarySidebar();
     saveSessionState();
+  }
+
+  async function onClientFilterChange(value) {
+    // Legacy shim — still used by any remaining callers
+    await _cfApply(value, null);
   }
 
   async function toggleHideInactive() {
