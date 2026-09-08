@@ -290,6 +290,8 @@ _SCOPE_SYSTEM = (
     "return nulls when the item is generic/shared knowledge or matches no client. "
     "IMPORTANT: if the MENTIONS section lists facts that are already scoped to a specific client, "
     "strongly prefer that client — it is the strongest signal available. "
+    "IMPORTANT: if the RELATED section lists facts or people already scoped to a specific client "
+    "(shown as [client: X] tags), strongly prefer that client — it is a strong signal. "
     "IMPORTANT: if the item content contains an explicit '**Client:**' or 'Client:' header, "
     "that declaration is authoritative — use it and do not override it with content keywords. "
     "IMPORTANT: context (project) selection must be conservative — only assign a context when "
@@ -473,18 +475,22 @@ def _enriched_fact_text(item: dict, neo4j_driver, user_id: str) -> str:
                 rows = list(s.run(
                     """
                     MATCH (f:Fact {userId: $userId, id: $fid})-[r]-(n)
-                    WHERE n:Fact
+                    WHERE n:Fact OR n:People
+                    OPTIONAL MATCH (n)-[:FOR_CLIENT]->(cl:Client)
                     RETURN DISTINCT type(r) AS rel, n.name AS name,
-                           coalesce(n.text, n.content, '') AS body
+                           coalesce(n.text, n.content, '') AS body,
+                           cl.name AS clientName, coalesce(cl.crossClient, false) AS crossClient
                     LIMIT 6
                     """,
                     userId=user_id, fid=item["id"]
                 ))
             if rows:
-                rel_lines = [
-                    f"- [{r['rel']}] {r['name'] or 'Unnamed'}: {_snippet(r['body'])}"
-                    for r in rows
-                ]
+                rel_lines = []
+                for r in rows:
+                    line = f"- [{r['rel']}] {r['name'] or 'Unnamed'}: {_snippet(r['body'])}"
+                    if r["clientName"] and not r["crossClient"]:
+                        line += f" [client: {r['clientName']}]"
+                    rel_lines.append(line)
                 parts.append("RELATED:\n" + "\n".join(rel_lines))
         except Exception as exc:
             logger.debug(f"[scope_backfill] neighbor fetch failed for {item.get('id')}: {exc}")
