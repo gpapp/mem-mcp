@@ -10,7 +10,7 @@ import re
 from datetime import datetime, timezone
 
 from common import (
-    get_neo4j, get_qdrant, get_llm_response, logger,
+    get_neo4j, get_qdrant, get_llm_response, logger, publish_db_event,
     COLLECTION_NAME, DIARY_COLLECTION,
     SCOPE_MODEL, SCOPE_BACKFILL_ENABLED, SCOPE_BACKFILL_CONCURRENCY,
 )
@@ -913,6 +913,9 @@ async def _reclassify_all_scope(user_id: str, job: dict) -> None:
 
         job.update(state="done", finished_at=_utcnow())
         logger.info(f"reclassify [{user_id}]: done, {job['linked']}/{job['total']} linked to clients")
+        await publish_db_event(user_id, "reclassify_done", {
+            "total": job["total"], "linked": job["linked"], "unlinked": job["unlinked"]
+        })
     except Exception as exc:
         logger.exception(f"reclassify [{user_id}]: failed: {exc}")
         job.update(state="error", finished_at=_utcnow(), error=str(exc))

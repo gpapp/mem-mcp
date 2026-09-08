@@ -821,6 +821,11 @@ npm install @modelcontextprotocol/sdk</code></pre>
     eventSource.onerror = (err) => {
       console.warn("[SSE] Connection lost. EventSource will automatically reconnect.");
     };
+
+    eventSource.addEventListener('reclassify_done', async (e) => {
+      console.log("[SSE] Reclassify done, refreshing memories and diary...");
+      await Promise.all([loadMemories(), loadDiary()]);
+    });
   }
 
   function switchTab(tab) {
@@ -1189,9 +1194,6 @@ npm install @modelcontextprotocol/sdk</code></pre>
         const job = await api.get('maintenance/reclassify');
         renderReclassify(job);
         running = !!job && job.state === 'running';
-        if (!running && job && job.state === 'done') {
-          await Promise.all([loadMemories(), loadDiary()]);
-        }
       } catch(_) { running = false; }
       if (!running && reclassifyTimer) { clearInterval(reclassifyTimer); reclassifyTimer = null; }
     };
