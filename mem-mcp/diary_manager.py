@@ -61,6 +61,136 @@ async def extract_diary_keywords(name: str, content: str) -> list:
     return []
 
 
+# ---------------------------------------------------------------------------
+# People auto-linking: extract person names from diary content and create
+# MENTIONS edges to matching People facts (add-only, no removals).
+# ---------------------------------------------------------------------------
+_PEOPLE_EXTRACT_SYSTEM = (
+    "You are a named-entity extractor. Extract the full names of every person "
+    "explicitly mentioned in the text. "
+    "Return ONLY a JSON array of strings, e.g. [\"Alice Smith\", \"Bob Jones\"]. "
+    "Return [] if no people are mentioned. Never add explanations."
+)
+
+
+async def _extract_people_names(content: str) -> list:
+    """Return a list of person name strings extracted from diary content via LLM."""
+    snippet = content[:2000]
+    try:
+        raw = await get_llm_response(snippet, system=_PEOPLE_EXTRACT_SYSTEM, num_predict=200)
+        raw = re.sub(r"```[a-z]*\n?", "", raw).strip()
+        m = re.search(r"\[.*\]", raw, re.DOTALL)
+        if not m:
+            return []
+        names = json.loads(m.group())
+        if not isinstance(names, list):
+            return []
+        return [str(n).strip() for n in names if str(n).strip()]
+    except Exception as exc:
+        logger.debug(f"[extract_people_names] failed: {exc}")
+        return []
+
+
+async def find_people_candidates(entry_id: str, content: str, user_id: str) -> list:
+    """Extract person names from content and return matching People facts as candidates.
+
+    Returns a list of dicts: {id, name, text, already_linked}.
+    Does NOT create any edges.
+    """
+    neo4j_driver = get_neo4j()
+    if not neo4j_driver or not content:
+        return []
+    names = await _extract_people_names(content)
+    if not names:
+        return []
+    candidates = []
+    with neo4j_driver.session() as s:
+        for name in names:
+            rows = list(s.run(
+                """
+                MATCH (f:Fact {userId: $userId, category: 'People'})
+                WHERE toLower(f.name) = toLower($name)
+                OPTIONAL MATCH (d:DiaryEntry {id: $did, userId: $userId})-[:MENTIONS]->(f)
+                RETURN f.id AS id, f.name AS name, f.text AS text,
+                       (d IS NOT NULL) AS already_linked
+                """,
+                userId=user_id, name=name, did=entry_id
+            ))
+            for row in rows:
+                candidates.append({
+                    "id": row["id"],
+                    "name": row["name"],
+                    "text": (row["text"] or "")[:120],
+                    "already_linked": bool(row["already_linked"]),
+                })
+    # Deduplicate by fact id
+    seen = set()
+    unique = []
+    for c in candidates:
+        if c["id"] not in seen:
+            seen.add(c["id"])
+            unique.append(c)
+    return unique
+
+
+async def _auto_link_people(entry_id: str, content: str, user_id: str,
+                             fact_ids: Optional[list] = None) -> int:
+    """Link People facts to a diary entry via MENTIONS (add-only, no removals).
+
+    If fact_ids is provided, link exactly those facts (skipping LLM extraction).
+    Otherwise extract names from content and link all exact-match People facts.
+    Returns count of new edges created.
+    """
+    neo4j_driver = get_neo4j()
+    if not neo4j_driver:
+        return 0
+    if fact_ids is None:
+        # Auto mode: extract names then find matching fact IDs
+        if not content:
+            return 0
+        names = await _extract_people_names(content)
+        if not names:
+            return 0
+        created = 0
+        with neo4j_driver.session() as s:
+            for name in names:
+                result = s.run(
+                    """
+                    MATCH (d:DiaryEntry {id: $did, userId: $userId})
+                    MATCH (f:Fact {userId: $userId, category: 'People'})
+                    WHERE toLower(f.name) = toLower($name)
+                      AND NOT (d)-[:MENTIONS]->(f)
+                    MERGE (d)-[:MENTIONS]->(f)
+                    RETURN count(f) AS n
+                    """,
+                    did=entry_id, userId=user_id, name=name
+                )
+                row = result.single()
+                if row:
+                    created += row["n"]
+    else:
+        # Explicit mode: link only the given fact IDs
+        created = 0
+        with neo4j_driver.session() as s:
+            for fid in fact_ids:
+                result = s.run(
+                    """
+                    MATCH (d:DiaryEntry {id: $did, userId: $userId})
+                    MATCH (f:Fact {id: $fid, userId: $userId})
+                    WHERE NOT (d)-[:MENTIONS]->(f)
+                    MERGE (d)-[:MENTIONS]->(f)
+                    RETURN count(f) AS n
+                    """,
+                    did=entry_id, userId=user_id, fid=fid
+                )
+                row = result.single()
+                if row:
+                    created += row["n"]
+    if created:
+        logger.debug(f"[auto_link_people] diary {entry_id}: linked {created} new People fact(s)")
+    return created
+
+
 async def db_save_diary(content: str, user_id: str, timestamp: str, name: str, metadata: Optional[dict] = None, linked_facts: Optional[list] = None, client_id: Optional[str] = None, context_id: Optional[str] = None) -> str:
     """Upsert a diary entry keyed by user + timestamp. Returns the ISO timestamp string.
     Optional linked_facts is a list of fact IDs to create MENTIONS relationships.
@@ -175,6 +305,8 @@ async def db_save_diary(content: str, user_id: str, timestamp: str, name: str, m
         "date": entry_date,
         "timestamp": timestamp
     })
+    # Auto-link People facts mentioned by name (add-only, fire-and-forget)
+    await _auto_link_people(doc_id, content, user_id)
     return timestamp
 
 
@@ -409,6 +541,8 @@ async def db_update_diary(entry_id: str, user_id: str, content: Optional[str] = 
     )
 
     await publish_db_event(user_id, "diary_changed", {"action": "update", "id": entry_id, "date": entry_date})
+    # Auto-link People facts mentioned by name (add-only, fire-and-forget)
+    await _auto_link_people(entry_id, new_content, user_id)
     return True
 
 

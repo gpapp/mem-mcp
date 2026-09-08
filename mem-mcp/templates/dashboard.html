@@ -1804,13 +1804,14 @@ npm install @modelcontextprotocol/sdk</code></pre>
     _diaryMenuId = entryId || activeDiaryId;
     if (!_diaryMenuId) return;
     showItemMenu(anchorEl, [
-      { icon: '✏️', label: 'Edit',             action: '_diaryMenuEdit' },
-      { icon: '📋', label: 'Copy MD',          action: '_diaryMenuCopyMd' },
+      { icon: '✏️', label: 'Edit',                  action: '_diaryMenuEdit' },
+      { icon: '📋', label: 'Copy MD',               action: '_diaryMenuCopyMd' },
       { separator: true },
-      { icon: '🔄', label: 'Reload',           action: '_diaryMenuReload' },
-      { icon: '🔀', label: 'Reclassify scope', action: '_diaryMenuReclassify' },
+      { icon: '👥', label: 'Extract participants',  action: '_diaryMenuExtractPeople' },
+      { icon: '🔄', label: 'Reload',                action: '_diaryMenuReload' },
+      { icon: '🔀', label: 'Reclassify scope',      action: '_diaryMenuReclassify' },
       { separator: true },
-      { icon: '🗑️', label: 'Delete',           action: '_diaryMenuDelete', danger: true },
+      { icon: '🗑️', label: 'Delete',                action: '_diaryMenuDelete', danger: true },
     ]);
   }
   function _diaryMenuEdit()   { if (_diaryMenuId) renderDiaryEditMode(_diaryMenuId); }
@@ -1838,6 +1839,102 @@ npm install @modelcontextprotocol/sdk</code></pre>
       renderDiarySidebar(); renderDiaryMonthPager();
       toast('✅ Scope updated');
     } catch(e) { toast('⚠️ Reclassify failed'); }
+  }
+
+  // --- Extract participants modal ---
+  function _closePeopleModal() {
+    const el = document.getElementById('people-extract-modal');
+    if (el) el.remove();
+  }
+
+  async function _diaryMenuExtractPeople() {
+    if (!_diaryMenuId) return;
+    const entryId = _diaryMenuId;
+
+    // Show spinner modal immediately
+    _closePeopleModal();
+    const overlay = document.createElement('div');
+    overlay.id = 'people-extract-modal';
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:2000;display:flex;align-items:center;justify-content:center;';
+    overlay.innerHTML = `
+      <div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;
+                  padding:1.5rem 2rem;min-width:340px;max-width:540px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,.3);">
+        <div style="font-weight:700;font-size:1rem;margin-bottom:1rem;">👥 Extract participants</div>
+        <div id="pem-body" style="font-size:.875rem;color:var(--muted);">Extracting names…</div>
+        <div id="pem-footer" style="margin-top:1.2rem;display:flex;gap:.5rem;justify-content:flex-end;"></div>
+      </div>`;
+    overlay.addEventListener('click', e => { if (e.target === overlay) _closePeopleModal(); });
+    document.body.appendChild(overlay);
+
+    // Fetch candidates
+    let candidates;
+    try {
+      const result = await api.get(`diary/${entryId}/extract-people`);
+      candidates = result.candidates || [];
+    } catch(err) {
+      document.getElementById('pem-body').textContent = '⚠️ Extraction failed.';
+      document.getElementById('pem-footer').innerHTML =
+        `<button class="btn btn-ghost btn-sm" onclick="_closePeopleModal()">Close</button>`;
+      return;
+    }
+
+    if (!candidates.length) {
+      document.getElementById('pem-body').innerHTML =
+        '<span style="color:var(--muted);">No matching People facts found for names in this entry.</span>';
+      document.getElementById('pem-footer').innerHTML =
+        `<button class="btn btn-ghost btn-sm" onclick="_closePeopleModal()">Close</button>`;
+      return;
+    }
+
+    // Build checkbox table
+    const rows = candidates.map((c, i) => `
+      <tr style="border-bottom:1px solid var(--border);">
+        <td style="padding:.4rem .5rem;vertical-align:middle;">
+          <input type="checkbox" id="pem-cb-${i}" value="${escHtml(c.id)}"
+            ${c.already_linked ? 'disabled' : 'checked'}
+            style="cursor:${c.already_linked ? 'default' : 'pointer'};">
+        </td>
+        <td style="padding:.4rem .5rem;vertical-align:middle;font-weight:600;">
+          ${escHtml(c.name)}
+          ${c.already_linked ? '<span style="font-size:.7rem;color:var(--muted);margin-left:.3rem;">(already linked)</span>' : ''}
+        </td>
+        <td style="padding:.4rem .5rem;vertical-align:middle;color:var(--muted);font-size:.78rem;max-width:200px;">
+          ${escHtml(c.text || '')}
+        </td>
+      </tr>`).join('');
+
+    document.getElementById('pem-body').innerHTML = `
+      <table style="width:100%;border-collapse:collapse;">
+        <thead>
+          <tr style="font-size:.7rem;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);border-bottom:2px solid var(--border);">
+            <th style="padding:.3rem .5rem;width:2rem;"></th>
+            <th style="padding:.3rem .5rem;text-align:left;">Name</th>
+            <th style="padding:.3rem .5rem;text-align:left;">Summary</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+
+    document.getElementById('pem-footer').innerHTML = `
+      <button class="btn btn-ghost btn-sm" onclick="_closePeopleModal()">Cancel</button>
+      <button class="btn btn-primary btn-sm" onclick="_confirmPeopleLink('${entryId}', ${candidates.length})">Link selected</button>`;
+  }
+
+  async function _confirmPeopleLink(entryId, count) {
+    const selected = [];
+    for (let i = 0; i < count; i++) {
+      const cb = document.getElementById(`pem-cb-${i}`);
+      if (cb && cb.checked && !cb.disabled) selected.push(cb.value);
+    }
+    if (!selected.length) { toast('No items selected'); return; }
+    _closePeopleModal();
+    try {
+      const entry = await api.post(`diary/${entryId}/extract-people`, { fact_ids: selected });
+      const idx = diaryEntries.findIndex(e => e.id === entry.id);
+      if (idx !== -1) diaryEntries[idx] = entry; else diaryEntries.unshift(entry);
+      if (activeDiaryId === entry.id) renderDiaryEntryView(entry);
+      toast(`✅ Linked ${entry._linked || selected.length} participant(s)`);
+    } catch(e) { toast('⚠️ Linking failed'); }
   }
 
   async function saveFactEdit(id) {

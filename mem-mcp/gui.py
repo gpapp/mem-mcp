@@ -296,6 +296,47 @@ async def api_reclassify_diary_entry(entry_id: str, request: Request):
     return e
 
 
+@web_app.get("/api/diary/{entry_id}/extract-people", response_class=JSONResponse)
+async def api_extract_people_candidates(entry_id: str, request: Request):
+    """Extract person names from a diary entry and return matching People facts as candidates.
+
+    Returns [{id, name, text, already_linked}] — does NOT create any links.
+    """
+    user_id = _require_user(request)
+    all_e = mem.db_list_diary(user_id)
+    e = next((x for x in all_e if x["id"] == entry_id), None)
+    if not e:
+        raise HTTPException(status_code=404, detail="Diary entry not found.")
+    candidates = await mem.find_people_candidates(entry_id, e.get("content", ""), user_id)
+    return {"candidates": candidates}
+
+
+class PeopleLinkRequest(BaseModel):
+    fact_ids: list
+
+
+@web_app.post("/api/diary/{entry_id}/extract-people", response_class=JSONResponse)
+async def api_extract_people_diary(entry_id: str, body: PeopleLinkRequest, request: Request):
+    """Link the given fact IDs to a diary entry via MENTIONS (add-only). Returns the updated entry."""
+    user_id = _require_user(request)
+    if not body.fact_ids:
+        raise HTTPException(status_code=400, detail="fact_ids must not be empty.")
+    all_e = mem.db_list_diary(user_id)
+    e = next((x for x in all_e if x["id"] == entry_id), None)
+    if not e:
+        raise HTTPException(status_code=404, detail="Diary entry not found.")
+    created = await mem._auto_link_people(entry_id, e.get("content", ""), user_id,
+                                          fact_ids=body.fact_ids)
+    # Re-fetch so the response includes updated mentions
+    all_e = mem.db_list_diary(user_id)
+    e = next((x for x in all_e if x["id"] == entry_id), None)
+    if not e:
+        raise HTTPException(status_code=404, detail="Diary entry not found after linking.")
+    await mem.publish_db_event(user_id, "diary_changed", {"action": "update", "id": entry_id,
+                                                          "date": e.get("date")})
+    return {**e, "_linked": created}
+
+
 @web_app.delete("/api/diary/{entry_id}", response_class=JSONResponse)
 async def api_delete_diary_entry(entry_id: str, request: Request):
     """Delete a single diary entry by ID."""
