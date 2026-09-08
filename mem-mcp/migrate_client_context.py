@@ -575,9 +575,96 @@ async def _classify_and_link_fact(item: dict, clients: list, user_id: str, sem: 
     return True
 
 
+# ---------------------------------------------------------------------------
+# People extraction helper: extract person names from diary content and
+# link matching People facts via MENTIONS before scope classification.
+# ---------------------------------------------------------------------------
+_PEOPLE_SYSTEM = (
+    "You are a named-entity extractor. Extract the full names of every person "
+    "explicitly mentioned in the text. "
+    "Return ONLY a JSON array of strings, e.g. [\"Alice Smith\", \"Bob Jones\"]. "
+    "Return [] if no people are mentioned. Never add explanations."
+)
+
+
+async def _extract_people_names(content: str) -> list[str]:
+    """Return a list of person name strings mentioned in diary content.
+
+    Uses the scope LLM with a tight token budget. Returns [] on any failure.
+    """
+    snippet = content[:2000] if len(content) > 2000 else content
+    try:
+        raw = await get_llm_response(snippet, system=_PEOPLE_SYSTEM,
+                                     model=SCOPE_MODEL, num_predict=200)
+        raw = re.sub(r"```[a-z]*\n?", "", raw).strip()
+        m = re.search(r"\[.*\]", raw, re.DOTALL)
+        if not m:
+            return []
+        names = json.loads(m.group())
+        if isinstance(names, list):
+            return [str(n).strip() for n in names if str(n).strip()]
+        return []
+    except Exception as exc:
+        logger.debug(f"[people_extract] failed: {exc}")
+        return []
+
+
+def _link_missing_people(diary_id: str, names: list[str], user_id: str, neo4j_driver) -> int:
+    """For each name, find an exact-match (case-insensitive) People fact and MERGE a MENTIONS edge.
+
+    Only creates edges that do not already exist. Returns the count of new edges created.
+    """
+    if not names or neo4j_driver is None:
+        return 0
+    created = 0
+    with neo4j_driver.session() as s:
+        for name in names:
+            result = s.run(
+                """
+                MATCH (d:DiaryEntry {id: $did, userId: $userId})
+                MATCH (f:Fact {userId: $userId, category: 'People'})
+                WHERE toLower(f.name) = toLower($name)
+                  AND NOT (d)-[:MENTIONS]->(f)
+                MERGE (d)-[:MENTIONS]->(f)
+                RETURN count(f) AS n
+                """,
+                did=diary_id, userId=user_id, name=name
+            )
+            row = result.single()
+            if row:
+                created += row["n"]
+    if created:
+        logger.debug(f"[people_extract] diary {diary_id}: linked {created} new People fact(s)")
+    return created
+
+
+def _diary_has_mentions(diary_id: str, user_id: str, neo4j_driver) -> bool:
+    """Return True if the diary entry already has at least one MENTIONS edge."""
+    if neo4j_driver is None:
+        return False
+    try:
+        with neo4j_driver.session() as s:
+            row = s.run(
+                "MATCH (d:DiaryEntry {id: $did, userId: $userId})-[:MENTIONS]->() "
+                "RETURN count(*) AS n LIMIT 1",
+                did=diary_id, userId=user_id
+            ).single()
+            return bool(row and row["n"] > 0)
+    except Exception:
+        return False
+
+
 async def _classify_and_link_diary(item: dict, clients: list, user_id: str, sem: asyncio.Semaphore,
                                    neo4j_driver=None, scope_sig=None) -> bool:
     """Classify one diary entry and create FOR_CLIENT / IN_CONTEXT links. Returns True if linked."""
+    # If no MENTIONS links exist yet, attempt people-name extraction and linking first.
+    # This gives _fast_diary_scope a real signal (unanimous client from People facts).
+    if not _diary_has_mentions(item["id"], user_id, neo4j_driver):
+        async with sem:
+            names = await _extract_people_names(item.get("content", "") or "")
+        if names:
+            _link_missing_people(item["id"], names, user_id, neo4j_driver)
+
     # Fast path: unanimous MENTIONS client or explicit **Client:** header — no LLM needed.
     client_name, context_name = _fast_diary_scope(item, clients, neo4j_driver, user_id)
     if not client_name:
