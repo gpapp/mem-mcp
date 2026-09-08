@@ -157,17 +157,6 @@
     .scope-chip-remove:hover { opacity: 1; }
     .scope-chip--add { border-style: dashed; color: var(--muted); font-size: .82rem; padding: .15rem .4rem; }
     .scope-chip--add:hover { border-color: var(--primary); color: var(--primary); background: var(--primary-light); }
-    /* Multi-select popup */
-    .scope-multiselect { position: fixed; z-index: 9999; background: var(--surface); border: 1px solid var(--border);
-      border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,.15); padding: 4px 0; min-width: 200px;
-      max-height: 320px; display: flex; flex-direction: column; }
-    .scope-multiselect-list { overflow-y: auto; flex: 1; }
-    .scope-multiselect-item { padding: 7px 12px; cursor: pointer; font-size: .85rem; display: flex; align-items: center; gap: 8px; color: var(--text); }
-    .scope-multiselect-item:hover { background: var(--primary-light); }
-    .scope-multiselect-item input[type=checkbox] { accent-color: var(--primary); flex-shrink: 0; }
-    .scope-multiselect-footer { padding: 6px 8px; border-top: 1px solid var(--border); display: flex; justify-content: flex-end; gap: 4px; }
-    .scope-multiselect-footer button { padding: .25rem .65rem; font-size: .8rem; border-radius: 5px; border: 1px solid var(--border); cursor: pointer; background: var(--bg); color: var(--text); }
-    .scope-multiselect-footer button.primary { background: var(--primary); color: #fff; border-color: var(--primary); }
 
     .markdown-body { background: transparent !important; color: var(--text); }
     .markdown-body p:last-child { margin-bottom: 0; }
@@ -2831,36 +2820,6 @@ npm install @modelcontextprotocol/sdk</code></pre>
 
   // Multi-select popup with checkboxes + Confirm button.
   // items = [{label, value, checked}]; onConfirm(selectedValues[]) called on confirm.
-  function _showScopeMultiPopup(anchorEl, items, onConfirm) {
-    _hideItemMenu();
-    const rect = anchorEl.getBoundingClientRect();
-    const menu = document.createElement('div');
-    menu.className = 'scope-multiselect';
-    const listHtml = items.map((it, i) =>
-      `<label class="scope-multiselect-item">
-        <input type="checkbox" data-val="${escHtml(String(it.value))}"${it.checked ? ' checked' : ''}>
-        ${escHtml(it.label)}
-      </label>`
-    ).join('');
-    menu.innerHTML = `<div class="scope-multiselect-list">${listHtml}</div>
-      <div class="scope-multiselect-footer">
-        <button class="cancel-btn">Cancel</button>
-        <button class="primary confirm-btn">Confirm</button>
-      </div>`;
-    document.body.appendChild(menu);
-    _positionPopup(menu, rect);
-    menu.querySelector('.cancel-btn').addEventListener('click', () => _hideItemMenu());
-    menu.querySelector('.confirm-btn').addEventListener('click', () => {
-      const vals = [...menu.querySelectorAll('input[type=checkbox]:checked')].map(cb => cb.dataset.val);
-      _hideItemMenu();
-      onConfirm(vals);
-    });
-    // Prevent outside-click handler from firing on the popup itself
-    menu.addEventListener('click', e => e.stopPropagation());
-    _itemMenu = menu;
-    setTimeout(() => document.addEventListener('click', _hideItemMenu, { capture: true }), 0);
-  }
-
   function _positionPopup(menu, rect) {
     const mh = menu.offsetHeight || 240;
     const mw = menu.offsetWidth  || 200;
@@ -2929,37 +2888,23 @@ npm install @modelcontextprotocol/sdk</code></pre>
     const entry = diaryEntries.find(e => e.id === entryId);
     if (!entry) return;
     const existing = new Set((entry.relevantClients || []).map(rc => rc.id));
-    // Exclude the primary client from candidates
-    const candidates = clientListCache.filter(c => c.id !== entry.clientId);
-    if (!candidates.length) { toast('No other clients available'); return; }
+    // Exclude: primary client AND already-added relevant clients
+    const candidates = clientListCache.filter(c => c.id !== entry.clientId && !existing.has(c.id));
+    if (!candidates.length) { toast('No other clients to add'); return; }
     const items = candidates.map(c => ({
       label: (c.effectiveActive !== false ? '🟢 ' : '⚪ ') + c.name + (c.crossClient ? ' [cross]' : ''),
-      value: c.id,
-      checked: existing.has(c.id)
+      value: c.id
     }));
-    _showScopeMultiPopup(anchorEl, items, async selectedIds => {
-      const prev = new Set(existing);
-      const next = new Set(selectedIds);
-      // Add newly checked
-      for (const id of next) {
-        if (!prev.has(id)) {
-          try {
-            await api.post('diary/' + entryId + '/relevant', { clientId: id });
-            const c = clientListCache.find(x => x.id === id);
-            if (c) { if (!entry.relevantClients) entry.relevantClients = []; entry.relevantClients.push({ id: c.id, name: c.name }); }
-          } catch(_) {}
+    _showScopePopup(anchorEl, items, async val => {
+      try {
+        await api.post('diary/' + entryId + '/relevant', { clientId: val });
+        const c = clientListCache.find(x => x.id === val);
+        if (c) {
+          if (!entry.relevantClients) entry.relevantClients = [];
+          entry.relevantClients.push({ id: c.id, name: c.name });
         }
-      }
-      // Remove unchecked
-      for (const id of prev) {
-        if (!next.has(id)) {
-          try {
-            await api.delete('diary/' + entryId + '/relevant/' + id);
-            if (entry.relevantClients) entry.relevantClients = entry.relevantClients.filter(rc => rc.id !== id);
-          } catch(_) {}
-        }
-      }
-      renderDiaryEntryView(entry);
+        renderDiaryEntryView(entry);
+      } catch(e) { toast('❌ Could not add relevant client'); }
     });
   }
 
