@@ -396,6 +396,30 @@ async def api_unlink_diary_mention(entry_id: str, fact_id: str, request: Request
         raise HTTPException(status_code=503, detail=str(e))
 
 
+class DiaryRelevant(BaseModel):
+    clientId: str
+
+
+@web_app.post("/api/diary/{entry_id}/relevant", response_class=JSONResponse, status_code=201)
+async def api_add_diary_relevant(entry_id: str, request: Request, body: DiaryRelevant):
+    """Add a RELEVANT_TO link from a diary entry to a client."""
+    try:
+        await mem.db_add_diary_relevant(entry_id, body.clientId, _require_user(request))
+        return {"status": "linked"}
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@web_app.delete("/api/diary/{entry_id}/relevant/{client_id}", response_class=JSONResponse)
+async def api_remove_diary_relevant(entry_id: str, client_id: str, request: Request):
+    """Remove a RELEVANT_TO link from a diary entry to a client."""
+    try:
+        await mem.db_remove_diary_relevant(entry_id, client_id, _require_user(request))
+        return {"status": "unlinked"}
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
 @web_app.post("/api/memories", response_class=JSONResponse, status_code=201)
 async def api_create_memory(request: Request, body: MemoryCreate):
     try:

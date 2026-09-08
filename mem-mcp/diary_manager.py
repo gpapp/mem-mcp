@@ -582,6 +582,39 @@ async def db_unlink_diary_mention(entry_id: str, fact_id: str, user_id: str):
     await publish_db_event(user_id, "memory_changed", {"action": "update", "id": fact_id})
 
 
+async def db_add_diary_relevant(entry_id: str, client_id: str, user_id: str):
+    """Create a RELEVANT_TO relationship from a diary entry to a client."""
+    neo4j_driver = get_neo4j()
+    if not neo4j_driver:
+        raise RuntimeError("Neo4j not connected.")
+    with neo4j_driver.session() as s:
+        s.run(
+            """
+            MATCH (d:DiaryEntry {id: $entryId, userId: $userId})
+            MATCH (c:Client {id: $clientId, userId: $userId})
+            MERGE (d)-[:RELEVANT_TO]->(c)
+            """,
+            entryId=entry_id, clientId=client_id, userId=user_id
+        )
+    await publish_db_event(user_id, "diary_changed", {"action": "relevant_add", "id": entry_id})
+
+
+async def db_remove_diary_relevant(entry_id: str, client_id: str, user_id: str):
+    """Remove a RELEVANT_TO relationship from a diary entry to a client."""
+    neo4j_driver = get_neo4j()
+    if not neo4j_driver:
+        raise RuntimeError("Neo4j not connected.")
+    with neo4j_driver.session() as s:
+        s.run(
+            """
+            MATCH (d:DiaryEntry {id: $entryId, userId: $userId})-[r:RELEVANT_TO]->(c:Client {id: $clientId, userId: $userId})
+            DELETE r
+            """,
+            entryId=entry_id, clientId=client_id, userId=user_id
+        )
+    await publish_db_event(user_id, "diary_changed", {"action": "relevant_remove", "id": entry_id})
+
+
 async def db_delete_diary(entry_id: str, user_id: str) -> bool:
     """Delete a single diary entry by id. Returns True if the entry existed and was deleted."""
     qdrant = await get_qdrant()
