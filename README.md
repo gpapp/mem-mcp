@@ -85,10 +85,11 @@ User identity is resolved automatically from:
 ## Quick Start (Docker)
 
 1. **Configure secrets**: `cp .env.example .env` and set `MEM_NEO4J_PASSWORD`.
-2. **Launch**: `docker-compose up -d`
-3. **Initialize Embedder**: `docker exec ollama ollama pull nomic-embed-text`
-4. **Initialize Query LLM**: `docker exec ollama ollama pull qwen3.5:0.8b`
-5. **After code changes**: rebuild the image with `docker-compose up -d --build mem-mcp`
+2. **Launch (CPU)**: `docker-compose up -d`
+3. **Launch (GPU)**: `docker-compose -f docker-compose.yml -f docker-compose.gpu.yml up -d` (requires NVIDIA driver + NVIDIA Container Toolkit)
+4. **Initialize Embedder**: `docker exec ollama ollama pull nomic-embed-text`
+5. **Initialize Query LLM**: `docker exec ollama ollama pull qwen3.5:0.8b`
+6. **After code changes**: rebuild the image with `docker-compose up -d --build mem-mcp`
 
 Visit **http://localhost:8086/** for the interactive setup guide.
 

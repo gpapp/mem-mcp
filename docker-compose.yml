@@ -44,8 +44,6 @@ services:
       - OLLAMA_CONTEXT_LENGTH=16332
       - OLLAMA_FLASH_ATTENTION=True
       - OLLAMA_KV_CACHE_TYPE=q8_0
-    # If you have an NVIDIA GPU, add the deploy section here
-    # (Otherwise, it will run on CPU)
 
   mem-mcp:
     build: ./mem-mcp
