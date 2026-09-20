@@ -83,6 +83,8 @@ root_logger = logging.getLogger()
 root_logger.setLevel(LOG_LEVEL)
 if not root_logger.handlers:
     logging.basicConfig(level=LOG_LEVEL)
+for handler in root_logger.handlers:
+    handler.setLevel(LOG_LEVEL)
 
 if not any(isinstance(handler, RotatingFileHandler) and handler.name == "memory-vault-file"
            for handler in root_logger.handlers):
