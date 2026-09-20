@@ -49,6 +49,24 @@
     .page.active { display: block; }
     #page-memories { max-width: none; padding: .75rem 1rem; }
 
+    /* ── Deduplication Page ── */
+    .dedup-toolbar { display: flex; gap: .75rem; align-items: flex-end; flex-wrap: wrap; }
+    .dedup-toolbar > div { flex: 1 1 150px; }
+    .dedup-toolbar .btn { flex: 0 0 auto; }
+    .dedup-cluster { margin-top: 1rem; }
+    .dedup-cluster-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; margin-bottom: .9rem; }
+    .dedup-cluster-title { font-weight: 700; color: var(--text); }
+    .dedup-cluster-score { color: var(--muted); font-size: .8rem; white-space: nowrap; }
+    .dedup-records { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: .6rem; }
+    .dedup-record { border: 1px solid var(--border); border-radius: 7px; padding: .75rem; background: var(--bg); }
+    .dedup-record.master { border-color: var(--primary); background: var(--primary-light); }
+    .dedup-record-name { font-weight: 700; font-size: .88rem; margin-bottom: .35rem; }
+    .dedup-record-text { font-size: .8rem; line-height: 1.45; color: var(--muted); max-height: 110px; overflow: auto; white-space: pre-wrap; }
+    .dedup-record-scope { font-size: .7rem; color: var(--muted); margin-top: .5rem; }
+    .dedup-editor { display: grid; grid-template-columns: 1fr 2fr; gap: .75rem; margin-top: 1rem; }
+    .dedup-editor textarea { min-height: 130px; }
+    @media (max-width: 700px) { .dedup-editor { grid-template-columns: 1fr; } }
+
     /* ── Cards & forms ── */
     .card { background: var(--surface); border: 1px solid var(--border);
             border-radius: var(--radius); padding: 1.25rem; box-shadow: var(--shadow); }
@@ -413,6 +431,7 @@
 
 <div class="tabs">
   <button class="tab-btn active" data-tab="memories" onclick="switchTab('memories')">📝 Memories</button>
+  <button class="tab-btn" data-tab="deduplicate" onclick="switchTab('deduplicate')">🧹 Deduplicate</button>
   <button class="tab-btn" data-tab="diary" onclick="switchTab('diary')">📖 Diary</button>
   <button class="tab-btn" data-tab="graph" onclick="switchTab('graph')">🕸️ Graph</button>
   <button class="tab-btn" data-tab="clients" onclick="switchTab('clients')">🏢 Clients</button>
@@ -489,6 +508,33 @@
     </div>
 
   </div>
+</div>
+
+<!-- ═══ DEDUPLICATE PAGE ═══ -->
+<div id="page-deduplicate" class="page">
+  <div class="card">
+    <h2 style="margin-top:0;">🧹 Deduplicate memories</h2>
+    <p style="font-size:.85rem;color:var(--muted);margin-bottom:1rem;">
+      Find scope-compatible duplicate clusters, review every record, then confirm each merge manually.
+    </p>
+    <div class="dedup-toolbar">
+      <div>
+        <label for="dedup-category">Category</label>
+        <input id="dedup-category" value="People" placeholder="People">
+      </div>
+      <div>
+        <label for="dedup-threshold">Similarity threshold</label>
+        <input id="dedup-threshold" type="number" min="0" max="1" step=".05" value=".75">
+      </div>
+      <div>
+        <label for="dedup-max-cluster">Max cluster size</label>
+        <input id="dedup-max-cluster" type="number" min="2" max="20" step="1" value="4">
+      </div>
+      <button id="dedup-scan-btn" class="btn btn-primary" onclick="scanDuplicates()">🔎 Scan</button>
+    </div>
+    <div id="dedup-status" style="margin-top:.75rem;font-size:.85rem;color:var(--muted);"></div>
+  </div>
+  <div id="dedup-clusters"></div>
 </div>
 
 <!-- ═══ DIARY PAGE ═══ -->
@@ -924,6 +970,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
       if (b.dataset.tab === tab) b.classList.add('active');
     });
     if (tab === 'memories' && !memories.length) loadMemories();
+    if (tab === 'deduplicate' && !duplicateClusters.length) renderDuplicateEmptyState();
     if (tab === 'diary' && !diaryEntries.length) loadDiary();
     if (tab === 'graph' && !graphLoaded) loadGraph();
     if (tab === 'clients') loadClients();
@@ -3174,6 +3221,122 @@ npm install @modelcontextprotocol/sdk</code></pre>
       toast('📖 Saved'); 
       await loadDiary(); 
     } catch(e) { toast('❌ Error saving entry'); }
+  }
+
+  let duplicateClusters = [];
+
+  function renderDuplicateEmptyState(message = 'Run a scan to find possible duplicate memories.') {
+    const el = document.getElementById('dedup-clusters');
+    if (el) el.innerHTML = `<div class="card"><p class="empty" style="padding:1rem 0;">${escHtml(message)}</p></div>`;
+  }
+
+  async function scanDuplicates() {
+    const category = document.getElementById('dedup-category').value.trim() || 'People';
+    const threshold = Number(document.getElementById('dedup-threshold').value);
+    const maxCluster = Number(document.getElementById('dedup-max-cluster').value);
+    const btn = document.getElementById('dedup-scan-btn');
+    const status = document.getElementById('dedup-status');
+    if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1 || !Number.isInteger(maxCluster) || maxCluster < 2 || maxCluster > 20) {
+      toast('⚠️ Check the threshold and cluster size');
+      return;
+    }
+    btn.disabled = true;
+    status.textContent = 'Scanning duplicate candidates…';
+    try {
+      duplicateClusters = await api.get(`duplicates?category=${encodeURIComponent(category)}&threshold=${threshold}&max_cluster=${maxCluster}`);
+      status.textContent = duplicateClusters.length
+        ? `${duplicateClusters.length} cluster${duplicateClusters.length === 1 ? '' : 's'} found. Review each one before merging.`
+        : 'No duplicate clusters found for this category and threshold.';
+      renderDuplicateClusters();
+    } catch(e) {
+      status.textContent = 'Could not scan duplicate candidates.';
+      renderDuplicateEmptyState('⚠️ Duplicate scan failed.');
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  function duplicateRecord(id) {
+    return memories.find(m => m.id === id) || {id, name: 'Unavailable record', text: 'This record is no longer available.'};
+  }
+
+  function renderDuplicateClusters() {
+    const el = document.getElementById('dedup-clusters');
+    if (!el) return;
+    if (!duplicateClusters.length) { renderDuplicateEmptyState('No duplicate clusters found.'); return; }
+    el.innerHTML = duplicateClusters.map((cluster, index) => {
+      const ids = (cluster.members || []).map(m => m.id);
+      if (!cluster.masterId || !ids.includes(cluster.masterId)) cluster.masterId = ids[0];
+      const master = duplicateRecord(cluster.masterId);
+      if (cluster.editName === undefined) cluster.editName = master.name || '';
+      if (cluster.editText === undefined) cluster.editText = master.text || '';
+      const records = ids.map(id => {
+        const record = duplicateRecord(id);
+        const member = cluster.members.find(m => m.id === id) || {};
+        const isMaster = id === cluster.masterId;
+        const scope = [member.clientName, member.contextName].filter(Boolean).join(' / ');
+        return `<div class="dedup-record${isMaster ? ' master' : ''}">
+          <div style="display:flex;gap:.4rem;align-items:center;margin-bottom:.45rem;">
+            <input type="radio" name="dedup-master-${index}" value="${escHtml(id)}" ${isMaster ? 'checked' : ''} onchange="setDuplicateMaster(${index}, this.value)">
+            <span style="font-size:.7rem;color:var(--muted);">${isMaster ? 'MASTER' : 'candidate'}</span>
+          </div>
+          <div class="dedup-record-name">${escHtml(record.name || 'Unnamed')}</div>
+          <div class="dedup-record-text">${escHtml(record.text || '')}</div>
+          ${scope ? `<div class="dedup-record-scope">${escHtml(scope)}</div>` : ''}
+        </div>`;
+      }).join('');
+      return `<div class="card dedup-cluster">
+        <div class="dedup-cluster-header">
+          <div class="dedup-cluster-title">Cluster ${index + 1} <span style="font-weight:400;color:var(--muted);">· ${ids.length} records</span></div>
+          <div class="dedup-cluster-score">Average similarity: ${Number(cluster.avg_similarity || 0).toFixed(3)}</div>
+        </div>
+        <div class="dedup-records">${records}</div>
+        <div class="dedup-editor">
+          <div><label for="dedup-name-${index}">Merged title</label><input id="dedup-name-${index}" value="${escHtml(cluster.editName)}" oninput="updateDuplicateDraft(${index}, 'editName', this.value)"></div>
+          <div><label for="dedup-text-${index}">Merged memory</label><textarea id="dedup-text-${index}" oninput="updateDuplicateDraft(${index}, 'editText', this.value)">${escHtml(cluster.editText)}</textarea></div>
+        </div>
+        <div style="display:flex;justify-content:flex-end;margin-top:.75rem;">
+          <button class="btn btn-primary btn-sm" onclick="mergeDuplicateCluster(${index})">🔀 Merge reviewed cluster</button>
+        </div>
+      </div>`;
+    }).join('');
+  }
+
+  function setDuplicateMaster(index, id) {
+    const cluster = duplicateClusters[index];
+    if (!cluster) return;
+    cluster.masterId = id;
+    const record = duplicateRecord(id);
+    cluster.editName = record.name || '';
+    cluster.editText = record.text || '';
+    renderDuplicateClusters();
+  }
+
+  function updateDuplicateDraft(index, field, value) {
+    if (duplicateClusters[index]) duplicateClusters[index][field] = value;
+  }
+
+  async function mergeDuplicateCluster(index) {
+    const cluster = duplicateClusters[index];
+    if (!cluster) return;
+    const ids = (cluster.members || []).map(m => m.id);
+    const masterId = cluster.masterId || ids[0];
+    const duplicateIds = ids.filter(id => id !== masterId);
+    const mergedName = (cluster.editName || '').trim();
+    const mergedText = (cluster.editText || '').trim();
+    if (!masterId || !duplicateIds.length || !mergedName || !mergedText) {
+      toast('⚠️ Choose a master and provide merged title and content');
+      return;
+    }
+    if (!confirm(`Merge ${duplicateIds.length} record${duplicateIds.length === 1 ? '' : 's'} into “${mergedName}”? This deletes the duplicate records.`)) return;
+    try {
+      await api.post('duplicates/merge', {masterId, duplicateIds, mergedName, mergedText});
+      toast('✅ Cluster merged');
+      await loadMemories();
+      await scanDuplicates();
+    } catch(e) {
+      toast('⚠️ Merge failed. No automatic retry was attempted.');
+    }
   }
 
 

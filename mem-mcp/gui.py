@@ -38,6 +38,7 @@ from fastapi.responses import Response, JSONResponse, HTMLResponse, RedirectResp
 from pydantic import BaseModel
 from starlette.middleware.sessions import SessionMiddleware
 from memory import SESSION_SECRET, SESSION_MAX_AGE # Import from memory.py
+from matching_utils import execute_merge
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from sse_starlette.sse import EventSourceResponse
 web_app = FastAPI(title="Memory Vault GUI")
@@ -162,6 +163,13 @@ class MemoryLink(BaseModel):
     relType: str = "KNOWS"
 
 
+class MemoryMerge(BaseModel):
+    masterId: str
+    duplicateIds: list[str]
+    mergedName: str
+    mergedText: str
+
+
 # ---------------------------------------------------------------------------
 # User extraction (from request, not MCP context)
 # ---------------------------------------------------------------------------
@@ -215,6 +223,51 @@ async def api_list_memories(request: Request):
     """List all memories for the current user."""
     try:
         return mem.db_list_memories(_require_user(request))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@web_app.get("/api/duplicates", response_class=JSONResponse)
+async def api_find_duplicates(
+    request: Request,
+    category: str = "People",
+    limit: int = 50,
+    threshold: float = 0.75,
+    max_cluster: int = 4,
+):
+    """Find scope-compatible duplicate clusters for the current user."""
+    try:
+        if not 2 <= max_cluster <= 20:
+            raise HTTPException(status_code=400, detail="max_cluster must be between 2 and 20")
+        if not 0.0 <= threshold <= 1.0:
+            raise HTTPException(status_code=400, detail="threshold must be between 0 and 1")
+        return await mem.db_find_duplicates(
+            _require_user(request), category.strip() or "People", limit, threshold, max_cluster
+        )
+    except HTTPException:
+        raise
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@web_app.post("/api/duplicates/merge", response_class=JSONResponse)
+async def api_merge_duplicates(request: Request, body: MemoryMerge):
+    """Merge a manually reviewed duplicate cluster."""
+    try:
+        user_id = _require_user(request)
+        master_id, duplicate_ids = await execute_merge(
+            body.masterId,
+            body.duplicateIds,
+            body.mergedName,
+            body.mergedText,
+            user_id,
+            mem.db_get_fact_by_id,
+            mem.db_update_memory,
+            mem.db_merge_memories,
+        )
+        return {"masterId": master_id, "duplicateIds": duplicate_ids}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 

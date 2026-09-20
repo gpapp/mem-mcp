@@ -122,6 +122,14 @@ Search diary entries from the sidebar.
 - Clearing the input restores the full date history list
 - API endpoint: `GET /api/diary/search?q=<text>&limit=10&top_p=0.4`
 
+### Dashboard Deduplication
+The dashboard's **Deduplicate** tab provides a review-first merge workflow.
+
+- Scan a category with a configurable similarity threshold and maximum cluster size.
+- Review all candidate records, choose the master, and edit the merged title and text.
+- Merges require explicit confirmation and use the same ownership validation and recovery marker as the MCP `merge_facts` tool.
+- GUI endpoints: `GET /api/duplicates` and `POST /api/duplicates/merge`.
+
 ### Skills System
 Pluggable skill workflows loaded from Markdown files in `mem-mcp/skills/`.
 
