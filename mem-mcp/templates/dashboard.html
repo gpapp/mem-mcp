@@ -160,6 +160,9 @@
 
     .markdown-body { background: transparent !important; color: var(--text); }
     .markdown-body p:last-child { margin-bottom: 0; }
+    #people-extract-modal .markdown-body p { margin: 0 0 .35rem; }
+    #people-extract-modal .markdown-body ul,
+    #people-extract-modal .markdown-body ol { margin: .2rem 0 .35rem 1.1rem; padding: 0; }
     /* Task-list items: remove bullet, align checkbox with text */
     .markdown-body ul li:has(> input[type="checkbox"]) { list-style: none; margin-left: -1.4rem; display: flex; align-items: flex-start; gap: 0.6rem; margin-bottom: 0.4rem; width: 100%; }
     .markdown-body ul li > input[type="checkbox"] { margin-top: 0.3rem; flex-shrink: 0; accent-color: var(--primary); width: 1.1rem; height: 1.1rem; cursor: pointer; }
@@ -1985,7 +1988,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:2000;display:flex;align-items:center;justify-content:center;';
     overlay.innerHTML = `
       <div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;
-                  padding:1.5rem 2rem;min-width:340px;max-width:540px;width:90%;max-height:90vh;
+                  padding:1.5rem 2rem;min-width:340px;max-width:760px;width:94%;max-height:90vh;
                   display:flex;flex-direction:column;box-shadow:0 8px 32px rgba(0,0,0,.3);">
         <div style="font-weight:700;font-size:1rem;margin-bottom:1rem;">👥 Extract participants</div>
         <div id="pem-body" style="font-size:.875rem;color:var(--muted);overflow-y:auto;min-height:0;flex:1;">Extracting names…</div>
@@ -2026,8 +2029,8 @@ npm install @modelcontextprotocol/sdk</code></pre>
           ${escHtml(c.name)}
           ${c.already_linked ? '<span style="font-size:.7rem;color:var(--muted);margin-left:.3rem;">(already linked)</span>' : ''}
         </td>
-        <td style="padding:.4rem .5rem;vertical-align:middle;color:var(--muted);font-size:.78rem;max-width:200px;">
-          ${escHtml(c.text || '')}
+        <td style="padding:.4rem .5rem;vertical-align:top;color:var(--muted);font-size:.78rem;max-width:440px;">
+          <div class="markdown-body">${marked.parse(c.text || '')}</div>
         </td>
       </tr>`).join('');
 
