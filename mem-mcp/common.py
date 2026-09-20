@@ -249,7 +249,11 @@ async def ensure_ollama_models() -> None:
         raise RuntimeError(f"Ollama is not reachable at {OLLAMA_URL}")
 
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+        logger.warning(f"Ollama request: GET {OLLAMA_URL}/api/tags")
         response = await client.get(f"{OLLAMA_URL}/api/tags")
+        logger.warning(
+            f"Ollama response: GET /api/tags status={response.status_code} body={response.text}"
+        )
         response.raise_for_status()
         installed = {
             model.get("name")
@@ -259,14 +263,16 @@ async def ensure_ollama_models() -> None:
 
         for model in models:
             if model in installed:
-                logger.info(f"Ollama model ready: {model}")
+                logger.warning(f"Ollama result: model ready: {model}")
                 continue
 
             logger.warning(f"Ollama model missing; downloading: {model}")
+            pull_request = {"name": model, "stream": True}
+            logger.warning(f"Ollama request: POST {OLLAMA_URL}/api/pull body={pull_request}")
             async with client.stream(
                 "POST",
                 f"{OLLAMA_URL}/api/pull",
-                json={"name": model, "stream": True},
+                json=pull_request,
             ) as pull_response:
                 pull_response.raise_for_status()
                 last_status = ""
@@ -276,24 +282,31 @@ async def ensure_ollama_models() -> None:
                     update = json.loads(line)
                     status = update.get("status", "")
                     if status and status != last_status:
-                        logger.info(f"Ollama pull {model}: {status}")
+                        logger.warning(f"Ollama response: POST /api/pull model={model} update={update}")
                         last_status = status
                     if update.get("error"):
                         raise RuntimeError(f"Ollama failed to pull {model}: {update['error']}")
 
-            logger.info(f"Ollama model download complete: {model}")
+            logger.warning(f"Ollama result: model download complete: {model}")
 
 # ---------------------------------------------------------------------------
 # Embedding
 # ---------------------------------------------------------------------------
 async def get_embedding(text: str) -> List[float]:
+    request_body = {"model": EMBED_MODEL, "prompt": text}
+    logger.warning(f"Ollama request: POST {OLLAMA_URL}/api/embeddings body={request_body}")
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         resp = await client.post(
             f"{OLLAMA_URL}/api/embeddings",
-            json={"model": EMBED_MODEL, "prompt": text},
+            json=request_body,
+        )
+        logger.warning(
+            f"Ollama response: POST /api/embeddings status={resp.status_code} body={resp.text}"
         )
         resp.raise_for_status()
-        return resp.json()["embedding"]
+        embedding = resp.json()["embedding"]
+        logger.warning(f"Ollama result: embedding model={EMBED_MODEL} dimensions={len(embedding)}")
+        return embedding
 
 
 async def get_llm_response(prompt: str, system: str = "", model: str = "", num_predict: int = 0) -> str:
@@ -312,16 +325,21 @@ async def get_llm_response(prompt: str, system: str = "", model: str = "", num_p
     options: dict = {"temperature": 0.0}
     if num_predict > 0:
         options["num_predict"] = num_predict
+    request_body = {
+        "model": resolved_model,
+        "messages": messages,
+        "stream": False,
+        "think": False,
+        "options": options,
+    }
+    logger.warning(f"Ollama request: POST {OLLAMA_URL}/api/chat body={request_body}")
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(
             f"{OLLAMA_URL}/api/chat",
-            json={
-                "model": resolved_model,
-                "messages": messages,
-                "stream": False,
-                "think": False,          # disable chain-of-thought for Qwen3/thinking models
-                "options": options,
-            },
+            json=request_body,
+        )
+        logger.warning(
+            f"Ollama response: POST /api/chat status={resp.status_code} body={resp.text}"
         )
         if resp.is_error:
             detail = resp.text.strip()
@@ -334,6 +352,7 @@ async def get_llm_response(prompt: str, system: str = "", model: str = "", num_p
         # Strip any residual <think>…</think> blocks just in case
         import re as _re
         content = _re.sub(r"<think>.*?</think>", "", content, flags=_re.DOTALL).strip()
+        logger.warning(f"Ollama result: chat model={resolved_model} content={content}")
         return content
 
 # ---------------------------------------------------------------------------
