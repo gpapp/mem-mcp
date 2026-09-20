@@ -3,6 +3,11 @@ services:
     image: qdrant/qdrant:latest
     container_name: qdrant
     restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:6333/readyz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
              # No ports exposed to the host network for security
     networks:
       - memory-net
@@ -15,6 +20,11 @@ services:
     image: neo4j:5.26.0
     container_name: neo4j
     restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
     networks:
       - memory-net
     environment:
@@ -35,6 +45,11 @@ services:
     image: ollama/ollama:latest
     container_name: ollama
     restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:11434/api/tags || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
     volumes:
       - ./ollama_data:/root/.ollama
     networks:
@@ -49,9 +64,12 @@ services:
     build: ./mem-mcp
     container_name: mem-mcp
     depends_on:
-      - qdrant
-      - neo4j
-      - ollama
+      qdrant:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
     networks:
       - memory-net
     ports:

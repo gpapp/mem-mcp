@@ -187,7 +187,7 @@ async def get_qdrant() -> AsyncQdrantClient:
     global _qdrant, _db_initialized
     async with _db_lock:
         if _qdrant is None:
-            _qdrant = AsyncQdrantClient(url=QDRANT_URL)
+                    _qdrant = AsyncQdrantClient(url=QDRANT_URL, check_compatibility=False)
         
         if not _db_initialized:
             if wait_for_service(QDRANT_URL, "Qdrant"):
@@ -222,6 +222,9 @@ def get_neo4j():
                     s.run("OPTIONAL MATCH (a)-[:MENTIONS]->(b) RETURN 1 LIMIT 0")
             except Exception as e:
                 logger.error(f"Neo4j init error: {e}")
+                if _neo4j_driver is not None:
+                    _neo4j_driver.close()
+                _neo4j_driver = None
     return _neo4j_driver
 
 # ---------------------------------------------------------------------------
