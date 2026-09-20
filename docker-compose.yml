@@ -62,6 +62,7 @@ services:
       - LLM_QUERY_MODEL=${LLM_QUERY_MODEL}
       - MEM_SCOPE_MODEL=${MEM_SCOPE_MODEL}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - LOG_DIR=/app/logs
       - HTTPX_TIMEOUT=600.0
       - REQUESTS_TIMEOUT=600
 

@@ -7,10 +7,9 @@ import structlog
 from functools import wraps
 from typing import Any, Dict, Callable, Optional
 
-from common import LOG_LEVEL
+from common import LOG_DIR, LOG_LEVEL
 
 # Ensure logs directory exists
-LOG_DIR = "/app/logs"
 os.makedirs(LOG_DIR, exist_ok=True)
 LOG_FILE = os.path.join(LOG_DIR, "mcp_tools.log")
 

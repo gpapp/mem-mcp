@@ -14,8 +14,10 @@ import base64
 import httpx
 import numpy as np
 import asyncio
+import re
 from datetime import datetime
 from pathlib import Path
+from logging.handlers import RotatingFileHandler
 
 
 def _load_env_file() -> None:
@@ -44,6 +46,22 @@ _load_env_file()
 
 LOG_LEVEL_NAME = os.getenv("LOG_LEVEL") or "INFO"
 LOG_LEVEL = getattr(logging, LOG_LEVEL_NAME.upper(), logging.INFO)
+LOG_DIR = os.getenv("LOG_DIR") or str(Path(__file__).resolve().parent.parent / "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+
+class _StripAnsiFilter(logging.Filter):
+    _ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str):
+            record.msg = self._ANSI_ESCAPE.sub("", record.msg)
+        if record.args:
+            record.args = tuple(
+                self._ANSI_ESCAPE.sub("", arg) if isinstance(arg, str) else arg
+                for arg in record.args
+            )
+        return True
 
 # Session secret – must be set via environment (e.g., Docker). No fallback.
 SESSION_SECRET = os.getenv("MEM_SESSION_SECRET")
@@ -60,8 +78,24 @@ from neo4j import GraphDatabase
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
-if not logging.getLogger().handlers:
+root_logger = logging.getLogger()
+root_logger.setLevel(LOG_LEVEL)
+if not root_logger.handlers:
     logging.basicConfig(level=LOG_LEVEL)
+
+if not any(isinstance(handler, RotatingFileHandler) and handler.name == "memory-vault-file"
+           for handler in root_logger.handlers):
+    file_handler = RotatingFileHandler(
+        os.path.join(LOG_DIR, "memory-vault.log"),
+        maxBytes=10 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    file_handler.name = "memory-vault-file"
+    file_handler.setLevel(LOG_LEVEL)
+    file_handler.addFilter(_StripAnsiFilter())
+    file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    root_logger.addHandler(file_handler)
 
 logger = logging.getLogger("memory-vault")
 logger.setLevel(LOG_LEVEL)
