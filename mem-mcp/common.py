@@ -4,6 +4,7 @@ common.py – Shared configuration, logging, DB clients, and common helpers.
 
 from typing import Any, List, Optional
 import os
+import json
 import re
 import uuid
 import time
@@ -239,6 +240,48 @@ def wait_for_service(url: str, label: str, max_retries: int = 5) -> bool:
             time.sleep(2)
     logger.warning(f"{label} not reachable after {max_retries} retries")
     return False
+
+
+async def ensure_ollama_models() -> None:
+    """Ensure every configured Ollama model is available before startup work."""
+    models = list(dict.fromkeys((EMBED_MODEL, LLM_QUERY_MODEL, SCOPE_MODEL)))
+    if not wait_for_service(OLLAMA_URL, "Ollama"):
+        raise RuntimeError(f"Ollama is not reachable at {OLLAMA_URL}")
+
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+        response = await client.get(f"{OLLAMA_URL}/api/tags")
+        response.raise_for_status()
+        installed = {
+            model.get("name")
+            for model in response.json().get("models", [])
+            if model.get("name")
+        }
+
+        for model in models:
+            if model in installed:
+                logger.info(f"Ollama model ready: {model}")
+                continue
+
+            logger.warning(f"Ollama model missing; downloading: {model}")
+            async with client.stream(
+                "POST",
+                f"{OLLAMA_URL}/api/pull",
+                json={"name": model, "stream": True},
+            ) as pull_response:
+                pull_response.raise_for_status()
+                last_status = ""
+                async for line in pull_response.aiter_lines():
+                    if not line:
+                        continue
+                    update = json.loads(line)
+                    status = update.get("status", "")
+                    if status and status != last_status:
+                        logger.info(f"Ollama pull {model}: {status}")
+                        last_status = status
+                    if update.get("error"):
+                        raise RuntimeError(f"Ollama failed to pull {model}: {update['error']}")
+
+            logger.info(f"Ollama model download complete: {model}")
 
 # ---------------------------------------------------------------------------
 # Embedding

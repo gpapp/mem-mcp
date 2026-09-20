@@ -94,7 +94,7 @@ def log_mcp_interaction(
     if effective_error:
         log_payload["error"] = str(effective_error)
 
-    logger.info("tool_use_stats", **log_payload)
+    logger.warning("tool_use_stats", **log_payload)
 
 def monitor_mcp_tool(tool_name: str, context_provider: Optional[Callable] = None):
     """Decorator for async MCP tool handlers."""
