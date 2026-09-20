@@ -102,7 +102,7 @@ async def _extract_people_names(content: str) -> list:
 async def find_people_candidates(entry_id: str, content: str, user_id: str) -> list:
     """Extract person names from content and return matching People facts as candidates.
 
-    Returns a list of dicts: {id, name, text, already_linked}.
+    Returns a list of dicts: {id, name, text, score, already_linked}.
     Does NOT create any edges.
     """
     neo4j_driver = get_neo4j()
@@ -120,8 +120,8 @@ async def find_people_candidates(entry_id: str, content: str, user_id: str) -> l
             linked = s.run(
                     """
                     MATCH (f:Fact {id: $fid, userId: $userId})
-                    OPTIONAL MATCH (d:DiaryEntry {id: $did, userId: $userId})-[:MENTIONS]->(f)
-                    RETURN count(d) > 0 AS already_linked
+                    MATCH (d:DiaryEntry {id: $did, userId: $userId})
+                    RETURN EXISTS((d)-[:MENTIONS]->(f)) AS already_linked
                     """,
                     userId=user_id, did=entry_id, fid=person["id"],
             ).single()

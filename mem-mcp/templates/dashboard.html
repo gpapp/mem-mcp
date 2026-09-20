@@ -2029,6 +2029,9 @@ npm install @modelcontextprotocol/sdk</code></pre>
           ${escHtml(c.name)}
           ${c.already_linked ? '<span style="font-size:.7rem;color:var(--muted);margin-left:.3rem;">(already linked)</span>' : ''}
         </td>
+        <td style="padding:.4rem .5rem;vertical-align:middle;text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;">
+          ${Number(c.score || 0).toFixed(2)}
+        </td>
         <td style="padding:.4rem .5rem;vertical-align:top;color:var(--muted);font-size:.78rem;max-width:440px;">
           <div class="markdown-body">${marked.parse(c.text || '')}</div>
         </td>
@@ -2040,6 +2043,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
           <tr style="font-size:.7rem;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);border-bottom:2px solid var(--border);">
             <th style="padding:.3rem .5rem;width:2rem;"></th>
             <th style="padding:.3rem .5rem;text-align:left;">Name</th>
+            <th style="padding:.3rem .5rem;text-align:right;">Confidence factor</th>
             <th style="padding:.3rem .5rem;text-align:left;">Summary</th>
           </tr>
         </thead>

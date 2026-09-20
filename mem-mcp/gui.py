@@ -300,7 +300,7 @@ async def api_reclassify_diary_entry(entry_id: str, request: Request):
 async def api_extract_people_candidates(entry_id: str, request: Request):
     """Extract person names from a diary entry and return matching People facts as candidates.
 
-    Returns [{id, name, text, already_linked}] — does NOT create any links.
+    Returns [{id, name, text, score, already_linked}] — does NOT create any links.
     """
     user_id = _require_user(request)
     all_e = mem.db_list_diary(user_id)
