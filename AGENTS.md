@@ -45,7 +45,7 @@ After completing any code changes:
 ## Critical Config
 
 - `MEM_NEO4J_PASSWORD` (also mapped to `NEO_PASS` in docker-compose)
-- Embedder: pull `nomic-embed-text` into Ollama container (docker-compose uses `nomic-ea` by default)
+- Embedder: pull the configured `MEM_EMBEDDER_MODEL` into Ollama (defaults to `nomic-embed-text`)
 - Query LLM: pull `qwen3.5:0.8b` into Ollama container (used for search rewriting and diary keyword extraction)
 - Scope backfill LLM: `MEM_SCOPE_MODEL` (defaults to the query LLM) classifies unlinked facts/diary entries against existing clients on startup; `MEM_SCOPE_BACKFILL=0` disables it, `MEM_SCOPE_CONCURRENCY` (default 3) caps parallel classifications
 - User vault resolved from `Authorization: Basic` header or session cookie
