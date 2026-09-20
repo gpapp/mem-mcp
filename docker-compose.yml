@@ -58,9 +58,9 @@ services:
       - "127.0.0.1:8086:8080"      
     environment:
       - MEM_PROVIDER=ollama
-      - MEM_LLM_MODEL=phi4-mini
       - MEM_LLM_URL=http://ollama:11434
       - LLM_QUERY_MODEL=${LLM_QUERY_MODEL}
+      - MEM_SCOPE_MODEL=${MEM_SCOPE_MODEL}
       - HTTPX_TIMEOUT=600.0
       - REQUESTS_TIMEOUT=600
 
