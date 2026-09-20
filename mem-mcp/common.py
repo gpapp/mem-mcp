@@ -15,6 +15,32 @@ import httpx
 import numpy as np
 import asyncio
 from datetime import datetime
+from pathlib import Path
+
+
+def _load_env_file() -> None:
+    """Load the repository .env for direct local server launches.
+
+    Explicit process environment variables win over values in the file, which
+    keeps Docker Compose and production deployments authoritative.
+    """
+    candidates = [Path.cwd() / ".env", Path(__file__).resolve().parent.parent / ".env"]
+    env_path = next((path for path in candidates if path.is_file()), None)
+    if env_path is None:
+        return
+
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key:
+            os.environ.setdefault(key, value)
+
+
+_load_env_file()
 
 # Session secret – must be set via environment (e.g., Docker). No fallback.
 SESSION_SECRET = os.getenv("MEM_SESSION_SECRET")
@@ -75,10 +101,10 @@ NEO4J_USER     = os.getenv("MEM_NEO4J_USER",      "neo4j")
 NEO4J_PASS     = os.getenv("MEM_NEO4J_PASSWORD",  "password")
 OLLAMA_URL      = os.getenv("MEM_LLM_URL",         os.getenv("MEM_EMBEDDER_URL", "http://ollama:11434"))
 EMBED_MODEL     = os.getenv("MEM_EMBEDDER_MODEL",  "nomic-embed-text")
-LLM_QUERY_MODEL = os.getenv("LLM_QUERY_MODEL",    "qwen3.5:0.8b")
+LLM_QUERY_MODEL = os.getenv("LLM_QUERY_MODEL") or "qwen3.5:0.8b"
 # Model used for server-side scope classification (client/context backfill).
 # Override with MEM_SCOPE_MODEL if a more capable model is available in Ollama.
-SCOPE_MODEL = os.getenv("MEM_SCOPE_MODEL", LLM_QUERY_MODEL)
+SCOPE_MODEL = os.getenv("MEM_SCOPE_MODEL") or LLM_QUERY_MODEL
 # Set MEM_SCOPE_BACKFILL=0 to skip the LLM scope backfill pass at startup.
 SCOPE_BACKFILL_ENABLED = os.getenv("MEM_SCOPE_BACKFILL", "1") == "1"
 SCOPE_BACKFILL_CONCURRENCY = int(os.getenv("MEM_SCOPE_CONCURRENCY", "3"))
