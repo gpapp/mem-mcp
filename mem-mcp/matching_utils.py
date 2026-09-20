@@ -59,6 +59,20 @@ def combine_duplicate_signals(
     return 0.65 * vector_similarity + 0.35 * evidence_similarity
 
 
+def format_people_merge_text(role: object, company: object, domain: object, notes: object) -> str:
+    """Render a People merge draft using the stable Markdown schema."""
+    def value_or_placeholder(value: object) -> str:
+        text = str(value or "").strip()
+        return text or "Not specified"
+
+    return (
+        f"**Role:** {value_or_placeholder(role)}\n\n"
+        f"**Company:** {value_or_placeholder(company)}\n\n"
+        f"**Domain:** {value_or_placeholder(domain)}\n\n"
+        f"**Notes:** {value_or_placeholder(notes)}"
+    )
+
+
 async def execute_merge(
     master_id: str,
     duplicate_ids: list[str],

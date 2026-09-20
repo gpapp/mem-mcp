@@ -3,6 +3,7 @@ from matching_utils import (
     cluster_has_core,
     combine_duplicate_signals,
     execute_merge,
+    format_people_merge_text,
     people_match_allowed,
     resolve_people_candidates,
     scopes_compatible,
@@ -65,6 +66,15 @@ class MatchingRegressionTests(unittest.TestCase):
 
     def test_exact_duplicate_identity_remains_decisive(self):
         self.assertEqual(combine_duplicate_signals(0.5, 1.0, strong_identity=True), 1.0)
+
+    def test_people_merge_text_uses_fixed_markdown_sections(self):
+        self.assertEqual(
+            format_people_merge_text("Lead", "Acme", "Payments", "Owns Atlas"),
+            "**Role:** Lead\n\n**Company:** Acme\n\n**Domain:** Payments\n\n**Notes:** Owns Atlas",
+        )
+
+    def test_people_merge_text_fills_missing_sections(self):
+        self.assertIn("**Domain:** Not specified", format_people_merge_text("", None, "", ""))
 
     def test_merge_boundary_does_not_mutate_when_target_is_unresolved(self):
         calls = []
