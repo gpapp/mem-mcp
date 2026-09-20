@@ -139,7 +139,7 @@ async def find_people_candidates(entry_id: str, content: str, user_id: str) -> l
         if c["id"] not in seen:
             seen.add(c["id"])
             unique.append(c)
-    return unique
+    return sorted(unique, key=lambda c: (-c.get("score", 0), (c.get("name") or "").casefold()))
 
 
 async def _auto_link_people(entry_id: str, content: str, user_id: str,
