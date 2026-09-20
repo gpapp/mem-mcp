@@ -349,14 +349,18 @@ async def get_llm_response(prompt: str, system: str = "", model: str = "", num_p
         "think": False,
         "options": options,
     }
-    logger.warning(f"Ollama request: POST {OLLAMA_URL}/api/chat body={request_body}")
+    logger.warning(
+        f"Ollama request: POST {OLLAMA_URL}/api/chat model={resolved_model} "
+        f"prompt_chars={len(prompt)} system_chars={len(system)}"
+    )
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(
             f"{OLLAMA_URL}/api/chat",
             json=request_body,
         )
         logger.warning(
-            f"Ollama response: POST /api/chat status={resp.status_code} body={resp.text}"
+            f"Ollama response: POST /api/chat status={resp.status_code} "
+            f"response_chars={len(resp.text)}"
         )
         if resp.is_error:
             detail = resp.text.strip()
@@ -369,7 +373,9 @@ async def get_llm_response(prompt: str, system: str = "", model: str = "", num_p
         # Strip any residual <think>…</think> blocks just in case
         import re as _re
         content = _re.sub(r"<think>.*?</think>", "", content, flags=_re.DOTALL).strip()
-        logger.warning(f"Ollama result: chat model={resolved_model} content={content}")
+        logger.warning(
+            f"Ollama result: chat model={resolved_model} content_chars={len(content)}"
+        )
         return content
 
 # ---------------------------------------------------------------------------

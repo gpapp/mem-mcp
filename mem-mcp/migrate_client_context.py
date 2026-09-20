@@ -23,6 +23,7 @@ from client_manager import (
     link_fact_to_client, link_fact_to_context,
     link_diary_to_client, link_diary_to_context,
 )
+from matching_utils import resolve_people_candidates
 
 
 async def migrate_client_context():
@@ -476,8 +477,8 @@ def _enriched_fact_text(item: dict, neo4j_driver, user_id: str) -> str:
                 rows = list(s.run(
                     """
                     MATCH (f:Fact {userId: $userId, id: $fid})-[r]-(n)
-                    WHERE n:Fact OR n:People
-                    OPTIONAL MATCH (n)-[:FOR_CLIENT]->(cl:Client)
+                    WHERE (n:Fact OR n:People) AND n.userId = $userId
+                    OPTIONAL MATCH (n)-[:FOR_CLIENT]->(cl:Client {userId: $userId})
                     RETURN DISTINCT type(r) AS rel, n.name AS name,
                            coalesce(n.text, n.content, '') AS body,
                            cl.name AS clientName, coalesce(cl.crossClient, false) AS crossClient
@@ -514,7 +515,8 @@ def _enriched_diary_text(item: dict, neo4j_driver, user_id: str) -> str:
                 rows = list(s.run(
                     """
                     MATCH (d:DiaryEntry {userId: $userId, id: $did})-[:MENTIONS]->(f:Fact)
-                    OPTIONAL MATCH (f)-[:FOR_CLIENT]->(cl:Client)
+                    WHERE f.userId = $userId
+                    OPTIONAL MATCH (f)-[:FOR_CLIENT]->(cl:Client {userId: $userId})
                     RETURN DISTINCT f.name AS name, f.text AS body,
                            cl.name AS clientName, coalesce(cl.crossClient, false) AS crossClient
                     LIMIT 6
@@ -624,25 +626,37 @@ async def _extract_people_names(content: str) -> list[str]:
         return []
 
 
-async def _link_missing_people(diary_id: str, names: list[str], user_id: str, neo4j_driver) -> int:
-    """For each name, find an exact-match (case-insensitive) People fact and MERGE a MENTIONS edge.
-
-    Only creates edges that do not already exist. Returns the count of new edges created.
-    """
-    if not names or neo4j_driver is None:
+async def _link_missing_people(diary_id: str, names: list[str], user_id: str,
+                               neo4j_driver, content: str = "") -> int:
+    """Reconcile automatically detected People links for a diary entry."""
+    if neo4j_driver is None:
         return 0
     from fact_manager import db_find_people_matches
 
     people_matches = await db_find_people_matches(names, user_id)
+    people_matches = await resolve_people_candidates(
+        names, content, people_matches, get_llm_response
+    )
+    person_ids = [person["id"] for person in people_matches]
     created = 0
     with neo4j_driver.session() as s:
+        s.run(
+            """
+            MATCH (d:DiaryEntry {id: $did, userId: $userId})-[r:MENTIONS]->(f:Fact)
+            WHERE coalesce(r.source, 'manual') = 'auto'
+              AND NOT f.id IN $personIds
+            DELETE r
+            """,
+            did=diary_id, userId=user_id, personIds=person_ids,
+        )
         for person in people_matches:
             row = s.run(
                 """
                 MATCH (d:DiaryEntry {id: $did, userId: $userId})
                 MATCH (f:Fact {id: $fid, userId: $userId})
                 WHERE NOT (d)-[:MENTIONS]->(f)
-                MERGE (d)-[:MENTIONS]->(f)
+                MERGE (d)-[r:MENTIONS]->(f)
+                SET r.source = 'auto'
                 RETURN count(f) AS n
                 """,
                 did=diary_id, userId=user_id, fid=person["id"],
@@ -673,13 +687,13 @@ def _diary_has_mentions(diary_id: str, user_id: str, neo4j_driver) -> bool:
 async def _classify_and_link_diary(item: dict, clients: list, user_id: str, sem: asyncio.Semaphore,
                                    neo4j_driver=None, scope_sig=None) -> bool:
     """Classify one diary entry and create FOR_CLIENT / IN_CONTEXT links. Returns True if linked."""
-    # If no MENTIONS links exist yet, attempt people-name extraction and linking first.
-    # This gives _fast_diary_scope a real signal (unanimous client from People facts).
-    if not _diary_has_mentions(item["id"], user_id, neo4j_driver):
-        async with sem:
-            names = await _extract_people_names(item.get("content", "") or "")
-        if names:
-            await _link_missing_people(item["id"], names, user_id, neo4j_driver)
+    # Reconcile People links even when the entry already has mentions; edits can
+    # remove names or replace one person with another.
+    async with sem:
+        names = await _extract_people_names(item.get("content", "") or "")
+    await _link_missing_people(
+        item["id"], names, user_id, neo4j_driver, item.get("content", "") or ""
+    )
 
     # Fast path: unanimous MENTIONS client or explicit **Client:** header — no LLM needed.
     client_name, context_name = _fast_diary_scope(item, clients, neo4j_driver, user_id)

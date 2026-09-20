@@ -21,6 +21,13 @@ from client_manager import (
     infer_scope_from_text, db_get_client_status_map,
     INFERRED_SCOPE_BOOST, INACTIVE_PENALTY
 )
+from matching_utils import (
+    cluster_has_core,
+    combine_duplicate_signals,
+    people_match_allowed,
+    scopes_compatible,
+    validate_merge_ids,
+)
 
 # ---------------------------------------------------------------------------
 # People metadata extraction
@@ -532,7 +539,9 @@ def db_get_connections_by_type(fact_id: str, user_id: str) -> dict:
         return connections
 
 
-async def rewrite_search_query(query: str) -> list:
+async def rewrite_search_query(query: str, category: Optional[str] = None,
+                               client: Optional[str] = None,
+                               context: Optional[str] = None) -> list:
     """Use a tiny LLM to rewrite natural language into keyword search phrases.
 
     Returns a list of (keyword_string, weight) tuples.
@@ -543,26 +552,43 @@ async def rewrite_search_query(query: str) -> list:
     if len(q.split()) <= 2:
         return [(q, 1.0)]
 
+    filters = ", ".join(
+        value for value in (
+            f"category={category}" if category else "",
+            f"client={client}" if client else "",
+            f"context={context}" if context else "",
+        ) if value
+    ) or "none"
     system = (
         "You are a search query rewriter. Given a natural language query, "
         "extract 2-4 short keyword phrases optimised for vector similarity search. "
         "Return ONLY a JSON object with this exact structure: "
         "{\"keywords\": [\"phrase1\", \"phrase2\"]}. "
         "Rules: max 3 words per phrase, use nouns and proper nouns, "
-        "omit stop words, no questions, most specific terms first."
+        "omit stop words, no questions, most specific terms first. "
+        "Preserve names and terms that may be exact identifiers."
     )
+    prompt = f"SEARCH FILTERS: {filters}\nQUERY: {q}"
     try:
         import json as _json
-        raw = await get_llm_response(q, system=system)
+        raw = await get_llm_response(prompt, system=system)
         # Strip optional markdown code fences
         raw = re.sub(r"```[a-z]*\n?", "", raw).strip()
         json_match = re.search(r'\{[^{}]*"keywords"[^{}]*\}', raw, re.DOTALL)
         if json_match:
             data = _json.loads(json_match.group())
-            keywords = [kw.strip() for kw in data.get("keywords", []) if kw.strip()]
+            keywords = []
+            for keyword in data.get("keywords", []):
+                if not isinstance(keyword, str):
+                    continue
+                cleaned = keyword.strip()
+                if cleaned and len(cleaned.split()) <= 3 and cleaned.casefold() not in {
+                    q.casefold(), *(item.casefold() for item in keywords)
+                }:
+                    keywords.append(cleaned)
             if keywords:
                 logger.debug(f"[rewrite_search_query] '{q}' → {keywords}")
-                return [(kw, 1.0) for kw in keywords]
+                return [(q, 1.0)] + [(kw, 0.85) for kw in keywords[:4]]
     except Exception as exc:
         logger.warning(f"[rewrite_search_query] LLM rewrite failed, using heuristic: {type(exc).__name__}: {exc}")
 
@@ -833,7 +859,7 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
 
     # 2. Multi-query vector search
     # Use LLM rewrite for better semantic coverage on long queries
-    query_variants = await rewrite_search_query(query)
+    query_variants = await rewrite_search_query(query, category=category, client=client, context=context)
     fetch_limit = max(limit * 5, 50)
     
     # Collect all results from all query variants
@@ -931,7 +957,7 @@ async def db_find_people_matches(names: list[str], user_id: str, min_score: floa
             top_p=0.75,
         )
         for result in results:
-            if result.get("score", 0) < min_score or result.get("id") in seen_ids:
+            if result.get("id") in seen_ids or not people_match_allowed(name, result, min_score):
                 continue
             seen_ids.add(result["id"])
             matches.append(result)
@@ -1052,7 +1078,9 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
             """
             MATCH (f:Fact {userId: $userId})
             WHERE toLower(f.category) = toLower($category)
-            RETURN f
+            OPTIONAL MATCH (f)-[:FOR_CLIENT]->(cl:Client {userId: $userId})
+            OPTIONAL MATCH (f)-[:IN_CONTEXT]->(ctx:Context {userId: $userId})
+            RETURN f, cl.name AS clientName, ctx.name AS contextName
             ORDER BY f.timestamp DESC
             LIMIT $limit
             """,
@@ -1072,6 +1100,8 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
                 "text": f_node["text"],
                 "name": f_node.get("name"),
                 "category": f_node.get("category"),
+                "clientName": r["clientName"],
+                "contextName": r["contextName"],
                 "metadata": metadata
             })
 
@@ -1153,6 +1183,8 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
             "last_name": meta_last,
             "aliases": [normalize_name(a) for a in aliases_list],
             "name": item.get("name") or "",
+            "client_name": (item.get("clientName") or "").casefold(),
+            "context_name": (item.get("contextName") or "").casefold(),
             "metadata": meta,
         })
 
@@ -1175,7 +1207,14 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
             if norm_vec_j == 0:
                 continue
 
+            if not scopes_compatible(
+                {"clientName": p_i["client_name"], "contextName": p_i["context_name"]},
+                {"clientName": p_j["client_name"], "contextName": p_j["context_name"]},
+            ):
+                continue
+
             signals = []
+            strong_identity = False
 
             # Signal 1: Vector cosine similarity
             vec_sim = float(np.dot(vec_i, vec_j) / (norm_vec_i * norm_vec_j))
@@ -1184,10 +1223,12 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
             # Signal 2: Exact normalized-name match
             if p_i["norm_name"] and p_j["norm_name"] and p_i["norm_name"] == p_j["norm_name"]:
                 signals.append(1.0)
+                strong_identity = True
 
             # Signal 3: Email match
             if p_i["email"] and p_j["email"] and p_i["email"] == p_j["email"]:
                 signals.append(1.0)
+                strong_identity = True
 
             # Signal 4: first_name + last_name match
             if (p_i["first_name"] and p_i["last_name"]
@@ -1195,12 +1236,15 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
                     and p_i["first_name"] == p_j["first_name"]
                     and p_i["last_name"] == p_j["last_name"]):
                 signals.append(1.0)
+                strong_identity = True
 
             # Signal 5: Alias ↔ name match
             if p_j["norm_name"] and p_j["norm_name"] in p_i["aliases"]:
                 signals.append(0.95)
+                strong_identity = True
             if p_i["norm_name"] and p_i["norm_name"] in p_j["aliases"]:
                 signals.append(0.95)
+                strong_identity = True
 
             # Signal 5b: Fuzzy alias ↔ name match
             for ali in p_i["aliases"]:
@@ -1259,7 +1303,10 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
                 if full_ratio >= 0.8:
                     signals.append(min(0.95, full_ratio))
 
-            similarity = max(signals) if signals else vec_sim
+            evidence_similarity = max(signals[1:]) if len(signals) > 1 else vec_sim
+            similarity = combine_duplicate_signals(
+                vec_sim, evidence_similarity, strong_identity
+            )
             pair_scores[(i, j)] = similarity
 
     logger.info(f"[db_find_duplicates] Computed {len(pair_scores)} pairwise scores for {num_items} items")
@@ -1331,6 +1378,11 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
         else:
             final_clusters.extend(split_cluster(cluster, threshold))
 
+    final_clusters = [
+        cluster for cluster in final_clusters
+        if cluster_has_core(cluster, pair_scores, threshold)
+    ]
+
     logger.info(f"[db_find_duplicates] After splitting: {len(final_clusters)} clusters")
 
     # ── 6. Build output ────────────────────────────────────────────────────
@@ -1356,6 +1408,8 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
             member_info = {
                 "id": item["id"],
                 "name": item["name"],
+                "clientName": item.get("clientName"),
+                "contextName": item.get("contextName"),
                 "similarity": round(avg_item_sim, 4),
             }
             members.append(member_info)
@@ -1387,6 +1441,22 @@ async def db_merge_memories(master_id: str, duplicate_ids: List[str], user_id: s
     neo4j_driver = get_neo4j()
     if not qdrant or not neo4j_driver:
         raise RuntimeError("Database connections not established.")
+
+    duplicate_ids = validate_merge_ids(master_id, duplicate_ids)
+
+    with neo4j_driver.session() as s:
+        records = list(s.run(
+            """
+            MATCH (f:Fact {userId: $userId})
+            WHERE f.id = $masterId OR f.id IN $duplicateIds
+            RETURN f.id AS id
+            """,
+            userId=user_id, masterId=master_id, duplicateIds=duplicate_ids,
+        ))
+    found_ids = {record["id"] for record in records}
+    expected_ids = {master_id, *duplicate_ids}
+    if found_ids != expected_ids:
+        raise ValueError("master and duplicate IDs must all belong to the current user")
 
     with neo4j_driver.session() as s:
         # 1. Read relationships into memory from master
@@ -1441,7 +1511,7 @@ async def db_merge_memories(master_id: str, duplicate_ids: List[str], user_id: s
             s.run(
                 """
                 MATCH (master:Fact {id: $masterId, userId: $userId})
-                MATCH (target {id: $targetId})
+                MATCH (target {id: $targetId, userId: $userId})
                 CALL apoc.create.relationship(master, $relType, $props, target) YIELD rel
                 RETURN rel
                 """,
@@ -1454,7 +1524,7 @@ async def db_merge_memories(master_id: str, duplicate_ids: List[str], user_id: s
             s.run(
                 """
                 MATCH (master:Fact {id: $masterId, userId: $userId})
-                MATCH (source {id: $sourceId})
+                MATCH (source {id: $sourceId, userId: $userId})
                 CALL apoc.create.relationship(source, $relType, $props, master) YIELD rel
                 RETURN rel
                 """,
@@ -1486,12 +1556,33 @@ async def db_merge_memories(master_id: str, duplicate_ids: List[str], user_id: s
             """,
             duplicateIds=duplicate_ids, userId=user_id
         )
+        s.run(
+            """
+            MATCH (master:Fact {id: $masterId, userId: $userId})
+            SET master.pendingQdrantDeletes = $duplicateIds
+            """,
+            masterId=master_id, userId=user_id, duplicateIds=duplicate_ids
+        )
 
     # Delete duplicates from Qdrant
-    await qdrant.delete(
-        collection_name=COLLECTION_NAME,
-        points_selector=PointIdsList(points=duplicate_ids),
-    )
+    try:
+        await qdrant.delete(
+            collection_name=COLLECTION_NAME,
+            points_selector=PointIdsList(points=duplicate_ids),
+        )
+    except Exception:
+        logger.exception(
+            "Merge committed to Neo4j but Qdrant cleanup failed; "
+            "pendingQdrantDeletes will be retried by sync_orphans"
+        )
+        raise
+
+    with neo4j_driver.session() as s:
+        s.run(
+            "MATCH (master:Fact {id: $masterId, userId: $userId}) "
+            "REMOVE master.pendingQdrantDeletes",
+            masterId=master_id, userId=user_id
+        )
 
 
 
@@ -1904,11 +1995,39 @@ async def sync_orphans():
         # -----------------------------------------------------------------------
         with neo4j_driver.session() as s:
             facts = list(s.run(
-                "MATCH (f:Fact {userId: $userId}) RETURN f.id AS id, f.text AS text, f.name AS name",
+                "MATCH (f:Fact {userId: $userId}) "
+                "RETURN f.id AS id, f.text AS text, f.name AS name, "
+                "f.pendingQdrantDeletes AS pendingQdrantDeletes",
                 userId=user_id
             ))
         neo4j_fact_ids = {r["id"] for r in facts}
-        neo4j_fact_map = {r["id"]: {"text": r["text"], "name": r.get("name", "")} for r in facts}
+        neo4j_fact_map = {
+            r["id"]: {"text": r["text"], "name": r.get("name", "")}
+            for r in facts
+        }
+
+        for fact in facts:
+            pending_ids = fact.get("pendingQdrantDeletes") or []
+            if not pending_ids:
+                continue
+            try:
+                await qdrant.delete(
+                    collection_name=COLLECTION_NAME,
+                    points_selector=PointIdsList(points=pending_ids),
+                )
+            except Exception:
+                logger.exception(
+                    f"sync_orphans [{user_id}]: pending merge cleanup failed "
+                    f"for master {fact['id']}"
+                )
+                continue
+            with neo4j_driver.session() as s:
+                s.run(
+                    "MATCH (master:Fact {id: $masterId, userId: $userId}) "
+                    "REMOVE master.pendingQdrantDeletes",
+                    masterId=fact["id"], userId=user_id
+                )
+            total_deleted += len(pending_ids)
 
         # Scroll Qdrant fact collection
         qdrant_fact_ids = set()

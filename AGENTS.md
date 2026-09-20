@@ -25,6 +25,18 @@ After completing any code changes:
 3. If running in Docker, rebuild and restart: `docker-compose up -d --build mem-mcp` (or pull + rebuild on the target machine)
 4. **Do NOT attempt to access Docker or databases directly** — containers run on a remote machine; only use git to push changes (the ops team deploys)
 
+### Focused Tests
+
+The dependency-light regression suite covers matching, scope compatibility, duplicate scoring and clustering, merge validation, merge callback ordering, People candidate resolution, and LLM prompt contracts:
+
+```powershell
+Push-Location mem-mcp
+C:/tools/miniconda3/python.exe -m unittest -v test_matching_regressions.py
+Pop-Location
+```
+
+Run `git diff --check` after documentation or code edits. The suite uses pure helpers and fake callbacks so it does not require Neo4j, Qdrant, or Ollama.
+
 ## Architecture
 
 | Component | Port | Notes |
@@ -69,6 +81,15 @@ Encapsulation rule: diary persistence and consistency logic lives in `diary_mana
 - Qdrant not accessible from host—interact via app only
 - Long timeouts (600s) for LLM operations—don't timeout-hunt
 - Collection named `ea_memories` (hardcoded in memory.py)
+
+## Matching, Deduplication & Merge Safety
+
+- `matching_utils.py` is the dependency-light home for shared matching, scope, merge-validation, candidate-resolution, and duplicate-scoring helpers.
+- Duplicate candidates are filtered by compatible client/context scope. Exact identity evidence can be decisive; fuzzy evidence is blended with vector similarity and cannot override a weak vector by itself.
+- Clusters must contain a threshold-qualified core member, which prevents weak bridge-shaped transitive clusters from being presented as duplicates.
+- LLMs adjudicate bounded candidate sets and return validated IDs. They do not directly select arbitrary graph nodes or mutate storage.
+- `merge_facts` resolves every target for the current user before calling update or delete operations. The merge master records `pendingQdrantDeletes` after Neo4j deletion; `sync_orphans()` retries those deletions and clears the marker only after Qdrant accepts the cleanup.
+- Merge work remains cross-store rather than globally transactional. Keep the recovery marker and startup reconciliation path intact when changing merge behavior.
 
 ## Features
 

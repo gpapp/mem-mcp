@@ -15,6 +15,7 @@ from common import (
     get_qdrant, get_neo4j, logger, get_embedding, get_llm_response, publish_db_event,
     DIARY_COLLECTION, QDRANT_URL, clean_extracted_people_names
 )
+from matching_utils import resolve_people_candidates
 from client_manager import (
     link_diary_to_client, link_diary_to_context,
     _resolve_client_by_id, _resolve_context_by_id,
@@ -63,7 +64,7 @@ async def extract_diary_keywords(name: str, content: str) -> list:
 
 # ---------------------------------------------------------------------------
 # People auto-linking: extract person names from diary content and create
-# MENTIONS edges to matching People facts (add-only, no removals).
+# MENTIONS edges to matching People facts.
 # ---------------------------------------------------------------------------
 _PEOPLE_EXTRACT_SYSTEM = (
     "You are a named-entity extractor. Extract the full names of every person "
@@ -144,34 +145,44 @@ async def find_people_candidates(entry_id: str, content: str, user_id: str) -> l
 
 async def _auto_link_people(entry_id: str, content: str, user_id: str,
                              fact_ids: Optional[list] = None) -> int:
-    """Link People facts to a diary entry via MENTIONS (add-only, no removals).
+    """Reconcile automatically detected People links for a diary entry.
 
     If fact_ids is provided, link exactly those facts (skipping LLM extraction).
-    Otherwise extract names from content and link all exact-match People facts.
+    Otherwise extract names from content and link resolved People facts.
     Returns count of new edges created.
     """
     neo4j_driver = get_neo4j()
     if not neo4j_driver:
         return 0
     if fact_ids is None:
-        # Auto mode: extract names then find matching fact IDs
-        if not content:
-            return 0
-        names = await _extract_people_names(content)
-        if not names:
-            return 0
+        # Auto mode: extract names, resolve candidates, and remove stale auto links.
+        names = await _extract_people_names(content) if content else []
         created = 0
         from fact_manager import db_find_people_matches
 
         people_matches = await db_find_people_matches(names, user_id)
+        people_matches = await resolve_people_candidates(
+            names, content, people_matches, get_llm_response
+        )
+        person_ids = [person["id"] for person in people_matches]
         with neo4j_driver.session() as s:
+            s.run(
+                """
+                MATCH (d:DiaryEntry {id: $did, userId: $userId})-[r:MENTIONS]->(f:Fact)
+                WHERE coalesce(r.source, 'manual') = 'auto'
+                  AND NOT f.id IN $personIds
+                DELETE r
+                """,
+                did=entry_id, userId=user_id, personIds=person_ids,
+            )
             for person in people_matches:
                 result = s.run(
                         """
                         MATCH (d:DiaryEntry {id: $did, userId: $userId})
                         MATCH (f:Fact {id: $fid, userId: $userId})
                         WHERE NOT (d)-[:MENTIONS]->(f)
-                        MERGE (d)-[:MENTIONS]->(f)
+                        MERGE (d)-[r:MENTIONS]->(f)
+                        SET r.source = 'auto'
                         RETURN count(f) AS n
                         """,
                         did=entry_id, userId=user_id, fid=person["id"],
@@ -188,7 +199,8 @@ async def _auto_link_people(entry_id: str, content: str, user_id: str,
                     MATCH (d:DiaryEntry {id: $did, userId: $userId})
                     MATCH (f:Fact {id: $fid, userId: $userId})
                     WHERE NOT (d)-[:MENTIONS]->(f)
-                    MERGE (d)-[:MENTIONS]->(f)
+                    MERGE (d)-[r:MENTIONS]->(f)
+                    SET r.source = 'manual'
                     RETURN count(f) AS n
                     """,
                     did=entry_id, userId=user_id, fid=fid
@@ -298,7 +310,8 @@ async def db_save_diary(content: str, user_id: str, timestamp: str, name: str, m
                     """
                     MATCH (d:DiaryEntry {id: $id, userId: $userId})
                     MATCH (f:Fact) WHERE f.id IN $factIds
-                    MERGE (d)-[:MENTIONS]->(f)
+                    MERGE (d)-[r:MENTIONS]->(f)
+                    SET r.source = 'manual'
                     """,
                     id=doc_id, userId=user_id, factIds=linked_facts
                 )
@@ -336,7 +349,7 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
         raise RuntimeError("Database connections not established.")
 
     # 1. Rewrite query into keyword variants for better semantic coverage
-    query_variants = await rewrite_search_query(query)
+    query_variants = await rewrite_search_query(query, client=client, context=context)
     fetch_limit = max(limit * 4, 20)
     conditions = [FieldCondition(key="userId", match=MatchValue(value=user_id))]
     if client:
@@ -528,7 +541,8 @@ async def db_update_diary(entry_id: str, user_id: str, content: Optional[str] = 
                     """
                     MATCH (d:DiaryEntry {id: $id, userId: $userId})
                     MATCH (f:Fact) WHERE f.id IN $factIds
-                    MERGE (d)-[:MENTIONS]->(f)
+                    MERGE (d)-[r:MENTIONS]->(f)
+                    SET r.source = 'manual'
                     """,
                     id=entry_id, userId=user_id, factIds=linked_facts
                 )
@@ -566,7 +580,8 @@ async def db_link_diary_mention(entry_id: str, fact_id: str, user_id: str):
             """
             MATCH (d:DiaryEntry {id: $entryId, userId: $userId})
             MATCH (f:Fact {id: $factId, userId: $userId})
-            MERGE (d)-[:MENTIONS]->(f)
+            MERGE (d)-[r:MENTIONS]->(f)
+            SET r.source = 'manual'
             """,
             entryId=entry_id, factId=fact_id, userId=user_id
         )

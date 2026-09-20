@@ -17,6 +17,8 @@ mem-mcp/
 ├── mcp_skills.py          # MCP prompts and resource definitions for skills
 ├── mcp_logging.py         # MCP tool call logging/monitoring
 ├── gui.py                 # FastAPI web app: REST API, Landing Page, and Dashboard
+├── matching_utils.py      # Dependency-light matching, merge, and LLM candidate helpers
+├── test_matching_regressions.py  # Focused regression and fake-boundary tests
 ├── reindex_diary_keywords.py  # CLI tool to backfill keyword extraction for existing diary entries
 ├── requirements.txt
 └── Dockerfile
@@ -30,7 +32,9 @@ mem-mcp/
 - **Knowledge Patterns** — Automatically identifies recurring themes and associations via graph analysis.
 - **Diary** — Narrative entries with Markdown support, LLM-powered keyword extraction, and vector similarity search.
 - **Smart Search** — LLM query rewriting (qwen3.5:0.8b) decomposes natural language into keyword phrases; multi-query expansion merges results from multiple vector searches.
-- **Memory Deduplication** — Multi-signal similarity clustering (vector, name, alias, email) with guided merge workflow.
+- **Memory Deduplication** — Scope-aware multi-signal similarity clustering (vector, name, alias, email) with weighted fuzzy evidence, core-member filtering, and a guided merge workflow.
+- **LLM-Assisted Resolution** — LLMs review bounded People and duplicate candidates with diary, scope, metadata, and record context; returned IDs are validated before use.
+- **Recoverable Merges** — Neo4j/Qdrant merge cleanup records pending Qdrant deletions and retries them through startup orphan reconciliation when a store is temporarily unavailable.
 - **Skills System** — Pluggable skill workflows (e.g., `process-transcription`, `memory-deduplication`) loaded from Markdown files.
 - **Unified Web UI** — A modern, proxy-aware dashboard to manage memories, view diary history, and explore insights.
 - **Multi-user Isolation** — Secure per-user vaults based on Basic-Auth or proxy headers.
@@ -92,6 +96,18 @@ User identity is resolved automatically from:
 6. **After code changes**: rebuild the image with `docker-compose up -d --build mem-mcp`
 
 Visit **http://localhost:8086/** for the interactive setup guide.
+
+## Testing
+
+Run the focused dependency-light regression suite from the repository root:
+
+```powershell
+Push-Location mem-mcp
+C:/tools/miniconda3/python.exe -m unittest -v test_matching_regressions.py
+Pop-Location
+```
+
+The suite covers scope-aware duplicate matching, weighted scoring, bridge-cluster rejection, merge target ownership, merge mutation ordering, People candidate resolution, and LLM prompt contracts. It does not require the Docker services.
 
 ## Claude Desktop Setup
 
