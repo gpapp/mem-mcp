@@ -1408,8 +1408,11 @@ async def db_find_duplicates(user_id: str, category: str = "People", limit: int 
             member_info = {
                 "id": item["id"],
                 "name": item["name"],
+                "text": item["text"],
+                "category": item.get("category"),
                 "clientName": item.get("clientName"),
                 "contextName": item.get("contextName"),
+                "metadata": item.get("metadata") or {},
                 "similarity": round(avg_item_sim, 4),
             }
             members.append(member_info)

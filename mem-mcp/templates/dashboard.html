@@ -3257,8 +3257,16 @@ npm install @modelcontextprotocol/sdk</code></pre>
     }
   }
 
-  function duplicateRecord(id) {
-    return memories.find(m => m.id === id) || {id, name: 'Unavailable record', text: 'This record is no longer available.'};
+  function duplicateRecord(id, member = {}) {
+    const memory = memories.find(m => m.id === id);
+    if (memory) return memory;
+    return {
+      id,
+      name: member.name || 'Unnamed record',
+      text: member.text || 'Record details were not returned by the duplicate scan.',
+      category: member.category || 'Fact',
+      metadata: member.metadata || {}
+    };
   }
 
   function renderDuplicateClusters() {
@@ -3268,13 +3276,14 @@ npm install @modelcontextprotocol/sdk</code></pre>
     el.innerHTML = duplicateClusters.map((cluster, index) => {
       const ids = (cluster.members || []).map(m => m.id);
       if (!cluster.masterId || !ids.includes(cluster.masterId)) cluster.masterId = ids[0];
-      const master = duplicateRecord(cluster.masterId);
+      const masterMember = (cluster.members || []).find(m => m.id === cluster.masterId) || {};
+      const master = duplicateRecord(cluster.masterId, masterMember);
       if (cluster.selectedIds === undefined) cluster.selectedIds = [...ids];
       if (cluster.editName === undefined) cluster.editName = '';
       if (cluster.editText === undefined) cluster.editText = '';
       const records = ids.map(id => {
-        const record = duplicateRecord(id);
         const member = cluster.members.find(m => m.id === id) || {};
+        const record = duplicateRecord(id, member);
         const isMaster = id === cluster.masterId;
         const isSelected = cluster.selectedIds.includes(id);
         const scope = [member.clientName, member.contextName].filter(Boolean).join(' / ');
