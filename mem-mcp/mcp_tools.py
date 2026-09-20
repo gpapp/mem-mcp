@@ -358,9 +358,10 @@ async def merge_facts(masterId: str, duplicateIds: List[str], mergedName: str, m
     2. Moves all graph relationships from duplicates to the master.
     3. Deletes the duplicate nodes.
 
-    mergedText should use Markdown formatting (bold field labels, bullet lists, etc.)
-    to ensure readable, consistent output. For People facts: include Role, Company,
-    Domain, and other stable information in a structured format.
+    mergedText should use Markdown formatting (bold field labels, short paragraphs,
+    and bullets where appropriate) to preserve every detail without creating a wall
+    of text. For People facts: include Role, Company, Domain, and Notes; separate
+    distinct Notes topics with blank lines.
 
     Requires the Neo4j APOC plugin to be installed (used for dynamic relationship creation).
     """
