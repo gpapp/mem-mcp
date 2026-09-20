@@ -914,6 +914,30 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
     return final_list[:limit]
 
 
+async def db_find_people_matches(names: list[str], user_id: str, min_score: float = 1.2) -> list:
+    """Find high-confidence existing People facts for extracted names.
+
+    Uses the same scoring as search_facts, including semantic and fuzzy name
+    matching, but rejects weak results before they can create MENTIONS links.
+    """
+    matches = []
+    seen_ids = set()
+    for name in names:
+        results = await db_search_memories(
+            name,
+            user_id,
+            limit=3,
+            category="People",
+            top_p=0.75,
+        )
+        for result in results:
+            if result.get("score", 0) < min_score or result.get("id") in seen_ids:
+                continue
+            seen_ids.add(result["id"])
+            matches.append(result)
+    return matches
+
+
 def db_find_patterns(user_id: str) -> list:
     """Identify recurring patterns/themes in the graph."""
     neo4j_driver = get_neo4j()

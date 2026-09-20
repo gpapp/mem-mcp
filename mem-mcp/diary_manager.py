@@ -111,26 +111,27 @@ async def find_people_candidates(entry_id: str, content: str, user_id: str) -> l
     names = await _extract_people_names(content)
     if not names:
         return []
+    from fact_manager import db_find_people_matches
+
     candidates = []
+    people_matches = await db_find_people_matches(names, user_id)
     with neo4j_driver.session() as s:
-        for name in names:
-            rows = list(s.run(
-                """
-                MATCH (f:Fact {userId: $userId, category: 'People'})
-                WHERE toLower(f.name) = toLower($name)
-                OPTIONAL MATCH (d:DiaryEntry {id: $did, userId: $userId})-[:MENTIONS]->(f)
-                RETURN f.id AS id, f.name AS name, f.text AS text,
-                       (d IS NOT NULL) AS already_linked
-                """,
-                userId=user_id, name=name, did=entry_id
-            ))
-            for row in rows:
-                candidates.append({
-                    "id": row["id"],
-                    "name": row["name"],
-                    "text": (row["text"] or "")[:120],
-                    "already_linked": bool(row["already_linked"]),
-                })
+        for person in people_matches:
+            linked = s.run(
+                    """
+                    MATCH (f:Fact {id: $fid, userId: $userId})
+                    OPTIONAL MATCH (d:DiaryEntry {id: $did, userId: $userId})-[:MENTIONS]->(f)
+                    RETURN count(d) > 0 AS already_linked
+                    """,
+                    userId=user_id, did=entry_id, fid=person["id"],
+            ).single()
+            candidates.append({
+                "id": person["id"],
+                "name": person["name"],
+                "text": (person.get("text") or "")[:120],
+                "score": person.get("score", 0),
+                "already_linked": bool(linked and linked["already_linked"]),
+            })
     # Deduplicate by fact id
     seen = set()
     unique = []
@@ -160,22 +161,23 @@ async def _auto_link_people(entry_id: str, content: str, user_id: str,
         if not names:
             return 0
         created = 0
+        from fact_manager import db_find_people_matches
+
+        people_matches = await db_find_people_matches(names, user_id)
         with neo4j_driver.session() as s:
-            for name in names:
+            for person in people_matches:
                 result = s.run(
-                    """
-                    MATCH (d:DiaryEntry {id: $did, userId: $userId})
-                    MATCH (f:Fact {userId: $userId, category: 'People'})
-                    WHERE toLower(f.name) = toLower($name)
-                      AND NOT (d)-[:MENTIONS]->(f)
-                    MERGE (d)-[:MENTIONS]->(f)
-                    RETURN count(f) AS n
-                    """,
-                    did=entry_id, userId=user_id, name=name
-                )
-                row = result.single()
-                if row:
-                    created += row["n"]
+                        """
+                        MATCH (d:DiaryEntry {id: $did, userId: $userId})
+                        MATCH (f:Fact {id: $fid, userId: $userId})
+                        WHERE NOT (d)-[:MENTIONS]->(f)
+                        MERGE (d)-[:MENTIONS]->(f)
+                        RETURN count(f) AS n
+                        """,
+                        did=entry_id, userId=user_id, fid=person["id"],
+                ).single()
+                if result:
+                    created += result["n"]
     else:
         # Explicit mode: link only the given fact IDs
         created = 0
