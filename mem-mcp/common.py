@@ -289,6 +289,21 @@ async def ensure_ollama_models() -> None:
 
             logger.warning(f"Ollama result: model download complete: {model}")
 
+
+def clean_extracted_people_names(names: list) -> list[str]:
+    """Normalize extracted names and remove speaker placeholder labels."""
+    cleaned = []
+    seen = set()
+    for raw_name in names:
+        name = re.sub(r"\s+", " ", str(raw_name)).strip()
+        if not name or re.fullmatch(r"SPEAKER\s*#?\s*\d+", name, re.IGNORECASE):
+            continue
+        key = name.casefold()
+        if key not in seen:
+            seen.add(key)
+            cleaned.append(name)
+    return cleaned
+
 # ---------------------------------------------------------------------------
 # Embedding
 # ---------------------------------------------------------------------------

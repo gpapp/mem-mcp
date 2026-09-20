@@ -13,7 +13,7 @@ from qdrant_client.models import PointStruct, Filter, FieldCondition, MatchValue
 import re
 from common import (
     get_qdrant, get_neo4j, logger, get_embedding, get_llm_response, publish_db_event,
-    DIARY_COLLECTION, QDRANT_URL
+    DIARY_COLLECTION, QDRANT_URL, clean_extracted_people_names
 )
 from client_manager import (
     link_diary_to_client, link_diary_to_context,
@@ -70,6 +70,7 @@ _PEOPLE_EXTRACT_SYSTEM = (
     "explicitly mentioned in the text. "
     "Return ONLY a JSON array of strings, e.g. [\"Alice Smith\", \"Bob Jones\"]. "
     "Return [] if no people are mentioned. Never add explanations. "
+    "Ignore speaker labels such as SPEAKER1, SPEAKER 2, and SPEAKER#3; they are not names. "
     "IMPORTANT: ignore anything in parentheses — it is a role or description, not part of the name. "
     "For example, 'Alice Smith (host)' → extract only 'Alice Smith'."
 )
@@ -90,7 +91,7 @@ async def _extract_people_names(content: str) -> list:
         if not isinstance(names, list):
             logger.debug("[extract_people_names] model response JSON was not a list")
             return []
-        extracted = [str(n).strip() for n in names if str(n).strip()]
+        extracted = clean_extracted_people_names(names)
         logger.debug(f"[extract_people_names] completed (count={len(extracted)})")
         return extracted
     except Exception as exc:
