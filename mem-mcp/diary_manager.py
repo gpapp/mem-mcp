@@ -78,16 +78,21 @@ _PEOPLE_EXTRACT_SYSTEM = (
 async def _extract_people_names(content: str) -> list:
     """Return a list of person name strings extracted from diary content via LLM."""
     snippet = content[:2000]
+    logger.debug(f"[extract_people_names] started (content_len={len(content)})")
     try:
         raw = await get_llm_response(snippet, system=_PEOPLE_EXTRACT_SYSTEM, num_predict=200)
         raw = re.sub(r"```[a-z]*\n?", "", raw).strip()
         m = re.search(r"\[.*\]", raw, re.DOTALL)
         if not m:
+            logger.debug("[extract_people_names] model response contained no JSON array")
             return []
         names = json.loads(m.group())
         if not isinstance(names, list):
+            logger.debug("[extract_people_names] model response JSON was not a list")
             return []
-        return [str(n).strip() for n in names if str(n).strip()]
+        extracted = [str(n).strip() for n in names if str(n).strip()]
+        logger.debug(f"[extract_people_names] completed (count={len(extracted)})")
+        return extracted
     except Exception as exc:
         logger.debug(f"[extract_people_names] failed: {exc}")
         return []

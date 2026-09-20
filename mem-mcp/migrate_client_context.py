@@ -601,16 +601,21 @@ async def _extract_people_names(content: str) -> list[str]:
     Uses the scope LLM with a tight token budget. Returns [] on any failure.
     """
     snippet = content[:2000] if len(content) > 2000 else content
+    logger.debug(f"[people_extract] started (content_len={len(content)}, model={SCOPE_MODEL})")
     try:
         raw = await get_llm_response(snippet, system=_PEOPLE_SYSTEM,
                                      model=SCOPE_MODEL, num_predict=200)
         raw = re.sub(r"```[a-z]*\n?", "", raw).strip()
         m = re.search(r"\[.*\]", raw, re.DOTALL)
         if not m:
+            logger.debug("[people_extract] model response contained no JSON array")
             return []
         names = json.loads(m.group())
         if isinstance(names, list):
-            return [str(n).strip() for n in names if str(n).strip()]
+            extracted = [str(n).strip() for n in names if str(n).strip()]
+            logger.debug(f"[people_extract] completed (count={len(extracted)})")
+            return extracted
+        logger.debug("[people_extract] model response JSON was not a list")
         return []
     except Exception as exc:
         logger.debug(f"[people_extract] failed: {exc}")

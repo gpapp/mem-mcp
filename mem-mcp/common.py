@@ -280,7 +280,13 @@ async def get_llm_response(prompt: str, system: str = "", model: str = "", num_p
                 "options": options,
             },
         )
-        resp.raise_for_status()
+        if resp.is_error:
+            detail = resp.text.strip()
+            logger.error(
+                f"LLM request failed: status={resp.status_code}, model={resolved_model}, "
+                f"url={OLLAMA_URL}/api/chat, response={detail[:500]}"
+            )
+            resp.raise_for_status()
         content = resp.json()["message"]["content"]
         # Strip any residual <think>…</think> blocks just in case
         import re as _re
