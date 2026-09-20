@@ -36,6 +36,7 @@ mem-mcp/
 - **LLM-Assisted Resolution** — LLMs review bounded People and duplicate candidates with diary, scope, metadata, and record context; returned IDs are validated before use.
 - **Recoverable Merges** — Neo4j/Qdrant merge cleanup records pending Qdrant deletions and retries them through startup orphan reconciliation when a store is temporarily unavailable.
 - **Dashboard Deduplication** — The Deduplicate tab scans scope-compatible clusters, lets you select the records to merge, generates an editable consolidated draft with the LLM, and requires confirmation before merging.
+- **Dedicated Merge Model** — Dashboard merge drafts use `MEM_MERGE_MODEL` (default `gemma4:e2b`), while search and classification remain on the lightweight query model.
 - **Skills System** — Pluggable skill workflows (e.g., `process-transcription`, `memory-deduplication`) loaded from Markdown files.
 - **Unified Web UI** — A modern, proxy-aware dashboard to manage memories, view diary history, and explore insights.
 - **Multi-user Isolation** — Secure per-user vaults based on Basic-Auth or proxy headers.
@@ -94,7 +95,8 @@ User identity is resolved automatically from:
 3. **Launch (GPU)**: `docker-compose -f docker-compose.yml -f docker-compose.gpu.yml up -d` (requires NVIDIA driver + NVIDIA Container Toolkit)
 4. **Initialize Embedder**: `docker exec ollama ollama pull nomic-embed-text`
 5. **Initialize Query LLM**: `docker exec ollama ollama pull qwen3.5:0.8b`
-6. **After code changes**: rebuild the image with `docker-compose up -d --build mem-mcp`
+6. **Initialize Merge LLM**: `docker exec ollama ollama pull gemma4:e2b`
+7. **After code changes**: rebuild the image with `docker-compose up -d --build mem-mcp`
 
 Visit **http://localhost:8086/** for the interactive setup guide.
 

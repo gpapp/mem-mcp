@@ -334,7 +334,9 @@ async def api_generate_duplicate_draft(request: Request, body: MemoryMergeDraft)
         f"SELECTED RECORDS:\n{json.dumps(prompt_records, ensure_ascii=True, default=str)}"
     )
     try:
-        raw = await mem.get_llm_response(prompt, system=system, num_predict=900)
+        raw = await mem.get_llm_response(
+            prompt, system=system, model=mem.MERGE_MODEL, num_predict=900
+        )
         match = re.search(r"\{.*\}", raw or "", re.DOTALL)
         if not match:
             raise ValueError("LLM returned no JSON draft")

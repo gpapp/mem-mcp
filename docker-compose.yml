@@ -61,6 +61,7 @@ services:
       - MEM_LLM_URL=http://ollama:11434
       - LLM_QUERY_MODEL=${LLM_QUERY_MODEL}
       - MEM_SCOPE_MODEL=${MEM_SCOPE_MODEL}
+      - MEM_MERGE_MODEL=${MEM_MERGE_MODEL:-gemma4:e2b}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - LOG_DIR=/app/logs
       - HTTPX_TIMEOUT=600.0

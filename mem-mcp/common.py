@@ -143,6 +143,9 @@ NEO4J_PASS     = os.getenv("MEM_NEO4J_PASSWORD",  "password")
 OLLAMA_URL      = os.getenv("MEM_LLM_URL",         os.getenv("MEM_EMBEDDER_URL", "http://ollama:11434"))
 EMBED_MODEL     = os.getenv("MEM_EMBEDDER_MODEL",  "nomic-embed-text")
 LLM_QUERY_MODEL = os.getenv("LLM_QUERY_MODEL") or "qwen3.5:0.8b"
+# Model used for deliberate merge-draft generation. Keep search/classification
+# on the smaller query model unless an operator explicitly changes them.
+MERGE_MODEL = os.getenv("MEM_MERGE_MODEL") or "gemma4:e2b"
 # Model used for server-side scope classification (client/context backfill).
 # Override with MEM_SCOPE_MODEL if a more capable model is available in Ollama.
 SCOPE_MODEL = os.getenv("MEM_SCOPE_MODEL") or LLM_QUERY_MODEL
@@ -246,7 +249,7 @@ def wait_for_service(url: str, label: str, max_retries: int = 5) -> bool:
 
 async def ensure_ollama_models() -> None:
     """Ensure every configured Ollama model is available before startup work."""
-    models = list(dict.fromkeys((EMBED_MODEL, LLM_QUERY_MODEL, SCOPE_MODEL)))
+    models = list(dict.fromkeys((EMBED_MODEL, LLM_QUERY_MODEL, SCOPE_MODEL, MERGE_MODEL)))
     if not wait_for_service(OLLAMA_URL, "Ollama"):
         raise RuntimeError(f"Ollama is not reachable at {OLLAMA_URL}")
 

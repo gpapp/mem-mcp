@@ -11,6 +11,7 @@ cp .env.example .env
 docker-compose up -d
 docker exec ollama ollama pull nomic-embed-text
 docker exec ollama ollama pull qwen3.5:0.8b
+docker exec ollama ollama pull gemma4:e2b
 
 # Local dev (infra must be running)
 .\.venv\Scripts\Activate.ps1
@@ -59,6 +60,7 @@ Run `git diff --check` after documentation or code edits. The suite uses pure he
 - `MEM_NEO4J_PASSWORD` (also mapped to `NEO_PASS` in docker-compose)
 - Embedder: pull the configured `MEM_EMBEDDER_MODEL` into Ollama (defaults to `nomic-embed-text`)
 - Query LLM: pull `qwen3.5:0.8b` into Ollama container (used for search rewriting and diary keyword extraction)
+- Merge LLM: `MEM_MERGE_MODEL` defaults to `gemma4:e2b` and is used only for dashboard merge-draft generation; override it if the host GPU cannot run that model
 - Scope backfill LLM: `MEM_SCOPE_MODEL` (defaults to the query LLM) classifies unlinked facts/diary entries against existing clients on startup; `MEM_SCOPE_BACKFILL=0` disables it, `MEM_SCOPE_CONCURRENCY` (default 3) caps parallel classifications
 - User vault resolved from `Authorization: Basic` header or session cookie
 - `BASE_URL` must include `/mcp` prefix when behind nginx
