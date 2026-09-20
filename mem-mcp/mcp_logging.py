@@ -1,10 +1,13 @@
 import time
 import os
 import logging
+import re
 from logging.handlers import RotatingFileHandler
 import structlog
 from functools import wraps
 from typing import Any, Dict, Callable, Optional
+
+from common import LOG_LEVEL
 
 # Ensure logs directory exists
 LOG_DIR = "/app/logs"
@@ -13,12 +16,30 @@ LOG_FILE = os.path.join(LOG_DIR, "mcp_tools.log")
 
 # Configure standard logging handler for the file
 mcp_logger = logging.getLogger("mcp.memory")
-mcp_logger.setLevel(logging.INFO)
+mcp_logger.setLevel(LOG_LEVEL)
+
+
+class _StripAnsiFilter(logging.Filter):
+    """Keep terminal color escape sequences out of persistent log files."""
+
+    _ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str):
+            record.msg = self._ANSI_ESCAPE.sub("", record.msg)
+        if record.args:
+            record.args = tuple(
+                self._ANSI_ESCAPE.sub("", arg) if isinstance(arg, str) else arg
+                for arg in record.args
+            )
+        return True
 
 # Only add handlers if they haven't been added yet (prevents duplication on re-imports)
 if not any(isinstance(h, RotatingFileHandler) for h in mcp_logger.handlers):
     file_handler = RotatingFileHandler(LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=5)
     file_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(name)s %(message)s'))
+    file_handler.addFilter(_StripAnsiFilter())
+    file_handler.setLevel(LOG_LEVEL)
     mcp_logger.addHandler(file_handler)
 
 # Configure structlog to use the standard library logging so messages reach the file handler
@@ -28,7 +49,7 @@ structlog.configure(
         structlog.stdlib.add_logger_name,
         structlog.processors.TimeStamper(fmt="iso"),
         structlog.processors.format_exc_info,
-        structlog.processors.JSONRenderer() if os.getenv("LOG_JSON") else structlog.dev.ConsoleRenderer(),
+        structlog.processors.JSONRenderer() if os.getenv("LOG_JSON") else structlog.dev.ConsoleRenderer(colors=False),
     ],
     logger_factory=structlog.stdlib.LoggerFactory(),
     wrapper_class=structlog.stdlib.BoundLogger,

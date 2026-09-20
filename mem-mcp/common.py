@@ -42,6 +42,9 @@ def _load_env_file() -> None:
 
 _load_env_file()
 
+LOG_LEVEL_NAME = os.getenv("LOG_LEVEL") or "INFO"
+LOG_LEVEL = getattr(logging, LOG_LEVEL_NAME.upper(), logging.INFO)
+
 # Session secret – must be set via environment (e.g., Docker). No fallback.
 SESSION_SECRET = os.getenv("MEM_SESSION_SECRET")
 # SESSION_SECRET defined earlier with strict environment check
@@ -58,10 +61,11 @@ from neo4j import GraphDatabase
 # Logging
 # ---------------------------------------------------------------------------
 if not logging.getLogger().handlers:
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=LOG_LEVEL)
 
 logger = logging.getLogger("memory-vault")
-logging.getLogger("mcp").setLevel(logging.INFO)
+logger.setLevel(LOG_LEVEL)
+logging.getLogger("mcp").setLevel(LOG_LEVEL)
 
 
 class _BenignScopeNotificationFilter(logging.Filter):
