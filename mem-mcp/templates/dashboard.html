@@ -59,6 +59,7 @@
     .dedup-cluster-score { color: var(--muted); font-size: .8rem; white-space: nowrap; }
     .dedup-records { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: .6rem; }
     .dedup-record { border: 1px solid var(--border); border-radius: 7px; padding: .75rem; background: var(--bg); }
+    .dedup-record.unselected { opacity: .55; }
     .dedup-record.master { border-color: var(--primary); background: var(--primary-light); }
     .dedup-record-name { font-weight: 700; font-size: .88rem; margin-bottom: .35rem; }
     .dedup-record-text { font-size: .8rem; line-height: 1.45; color: var(--muted); max-height: 110px; overflow: auto; white-space: pre-wrap; }
@@ -3268,17 +3269,20 @@ npm install @modelcontextprotocol/sdk</code></pre>
       const ids = (cluster.members || []).map(m => m.id);
       if (!cluster.masterId || !ids.includes(cluster.masterId)) cluster.masterId = ids[0];
       const master = duplicateRecord(cluster.masterId);
-      if (cluster.editName === undefined) cluster.editName = master.name || '';
-      if (cluster.editText === undefined) cluster.editText = master.text || '';
+      if (cluster.selectedIds === undefined) cluster.selectedIds = [...ids];
+      if (cluster.editName === undefined) cluster.editName = '';
+      if (cluster.editText === undefined) cluster.editText = '';
       const records = ids.map(id => {
         const record = duplicateRecord(id);
         const member = cluster.members.find(m => m.id === id) || {};
         const isMaster = id === cluster.masterId;
+        const isSelected = cluster.selectedIds.includes(id);
         const scope = [member.clientName, member.contextName].filter(Boolean).join(' / ');
-        return `<div class="dedup-record${isMaster ? ' master' : ''}">
+        return `<div class="dedup-record${isMaster ? ' master' : ''}${isSelected ? '' : ' unselected'}">
           <div style="display:flex;gap:.4rem;align-items:center;margin-bottom:.45rem;">
+            <input type="checkbox" value="${escHtml(id)}" ${isSelected ? 'checked' : ''} onchange="toggleDuplicateRecord(${index}, '${escHtml(id)}', this.checked)">
             <input type="radio" name="dedup-master-${index}" value="${escHtml(id)}" ${isMaster ? 'checked' : ''} onchange="setDuplicateMaster(${index}, this.value)">
-            <span style="font-size:.7rem;color:var(--muted);">${isMaster ? 'MASTER' : 'candidate'}</span>
+            <span style="font-size:.7rem;color:var(--muted);">${isMaster ? 'MASTER' : 'candidate'}${isSelected ? '' : ' · excluded'}</span>
           </div>
           <div class="dedup-record-name">${escHtml(record.name || 'Unnamed')}</div>
           <div class="dedup-record-text">${escHtml(record.text || '')}</div>
@@ -3296,7 +3300,8 @@ npm install @modelcontextprotocol/sdk</code></pre>
           <div><label for="dedup-text-${index}">Merged memory</label><textarea id="dedup-text-${index}" oninput="updateDuplicateDraft(${index}, 'editText', this.value)">${escHtml(cluster.editText)}</textarea></div>
         </div>
         <div style="display:flex;justify-content:flex-end;margin-top:.75rem;">
-          <button class="btn btn-primary btn-sm" onclick="mergeDuplicateCluster(${index})">🔀 Merge reviewed cluster</button>
+          <button class="btn btn-ghost btn-sm" onclick="generateDuplicateDraft(${index})">✨ Generate merge draft</button>
+          <button class="btn btn-primary btn-sm" onclick="mergeDuplicateCluster(${index})" style="margin-left:.5rem;">🔀 Merge selected records</button>
         </div>
       </div>`;
     }).join('');
@@ -3307,9 +3312,38 @@ npm install @modelcontextprotocol/sdk</code></pre>
     if (!cluster) return;
     cluster.masterId = id;
     const record = duplicateRecord(id);
-    cluster.editName = record.name || '';
-    cluster.editText = record.text || '';
     renderDuplicateClusters();
+  }
+
+  function toggleDuplicateRecord(index, id, selected) {
+    const cluster = duplicateClusters[index];
+    if (!cluster) return;
+    const selectedIds = new Set(cluster.selectedIds || []);
+    if (selected) selectedIds.add(id); else selectedIds.delete(id);
+    if (cluster.masterId === id && !selected) {
+      const nextMaster = [...selectedIds][0];
+      if (nextMaster) cluster.masterId = nextMaster;
+    }
+    cluster.selectedIds = [...selectedIds];
+    renderDuplicateClusters();
+  }
+
+  async function generateDuplicateDraft(index) {
+    const cluster = duplicateClusters[index];
+    const factIds = cluster ? (cluster.selectedIds || []) : [];
+    if (factIds.length < 2) {
+      toast('⚠️ Select at least two records for the draft');
+      return;
+    }
+    try {
+      const draft = await api.post('duplicates/draft', {factIds});
+      cluster.editName = draft.mergedName;
+      cluster.editText = draft.mergedText;
+      renderDuplicateClusters();
+      toast('✨ Draft generated from selected records');
+    } catch(e) {
+      toast('⚠️ Could not generate merge draft');
+    }
   }
 
   function updateDuplicateDraft(index, field, value) {
@@ -3319,7 +3353,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
   async function mergeDuplicateCluster(index) {
     const cluster = duplicateClusters[index];
     if (!cluster) return;
-    const ids = (cluster.members || []).map(m => m.id);
+    const ids = cluster.selectedIds || [];
     const masterId = cluster.masterId || ids[0];
     const duplicateIds = ids.filter(id => id !== masterId);
     const mergedName = (cluster.editName || '').trim();
