@@ -500,6 +500,19 @@
                 <input id="new-tags" placeholder="tag1, tag2">
               </div>
             </div>
+            <div class="fact-edit-row">
+              <div class="fact-edit-field">
+                <label for="new-client">Client</label>
+                <select id="new-client" onchange="onNewClientChange()">
+                  <option value="">— No client —</option>
+                  ${clientListCache.map(c => `<option value="${c.id}">${escHtml(c.name)}${c.crossClient ? ' [cross]' : ''}</option>`).join('')}
+                </select>
+              </div>
+              <div class="fact-edit-field">
+                <label for="new-project">Project</label>
+                <select id="new-project"><option value="">— No project —</option></select>
+              </div>
+            </div>
             <div style="display:flex; justify-content:flex-end;">
               <button class="btn btn-primary" onclick="addMemory()">＋ Add Fact</button>
             </div>
@@ -1750,9 +1763,9 @@ npm install @modelcontextprotocol/sdk</code></pre>
             <div>
               <div class="fact-detail-name">${escHtml(m.name || 'Unnamed')}</div>
               <span class="fact-detail-cat">${escHtml(m.category)}</span>
-              <div class="fact-detail-scope" style="display:flex; gap:1rem; margin-top:.35rem; font-size:.8rem; color:var(--muted);">
-                <span>🏢 <strong>Client:</strong> ${m.clientName ? escHtml(m.clientName) + ((clientListCache.find(c=>c.id===m.clientId)||{}).crossClient ? ' <span title="Cross-client">[cross]</span>' : '') : '—'}</span>
-                <span>📁 <strong>Project:</strong> ${m.contextName ? escHtml(m.contextName) : '—'}</span>
+              <div class="fact-detail-scope diary-scope-row" style="display:flex; flex-wrap:wrap; gap:.4rem; margin-top:.35rem; align-items:center;">
+                <button class="scope-chip scope-chip--client" onclick="_factPickClient(this,'${m.id}')" title="Click to change client">🏢 ${m.clientName ? escHtml(m.clientName) + ((clientListCache.find(c=>c.id===m.clientId)||{}).crossClient ? ' [cross]' : '') : '—'}</button>
+                <button class="scope-chip scope-chip--project" onclick="_factPickProject(this,'${m.id}')" title="Click to change project">📁 ${m.contextName ? escHtml(m.contextName) : '—'}</button>
               </div>
             </div>
             <div style="display:flex; gap:.25rem; align-items:center; flex-shrink:0;">
@@ -1902,6 +1915,17 @@ npm install @modelcontextprotocol/sdk</code></pre>
       ? `<option value="${selectedCtx}" selected>⚠️ assigned project</option>` : '';
     sel.innerHTML = `<option value="">— No project —</option>` + extra + ctxs.map(x =>
       `<option value="${x.id}"${x.id === (selectedCtx || '') ? ' selected' : ''}>${escHtml(x.name)}</option>`).join('');
+  }
+  function fillNewProjects(clientId) {
+    const sel = document.getElementById('new-project');
+    if (!sel) return;
+    const client = (clientListCache || []).find(x => x.id === (clientId || ''));
+    sel.innerHTML = '<option value="">— No project —</option>' + ((client && client.contexts) || []).map(x =>
+      `<option value="${x.id}">${escHtml(x.name)}</option>`).join('');
+  }
+  function onNewClientChange() {
+    const client = document.getElementById('new-client');
+    fillNewProjects(client ? client.value : '');
   }
 
   function onEpClientChange() {
@@ -2917,6 +2941,42 @@ npm install @modelcontextprotocol/sdk</code></pre>
     });
   }
 
+  async function _factPickClient(anchorEl, factId) {
+    await ensureClients();
+    const fact = memories.find(m => m.id === factId);
+    if (!fact) return;
+    const items = [
+      { label: '— No client —', value: '', muted: true },
+      ...clientListCache.map(c => ({ label: (c.effectiveActive !== false ? '🟢 ' : '⚪ ') + c.name + (c.crossClient ? ' [cross]' : ''), value: c.id }))
+    ];
+    _showScopePopup(anchorEl, items, async val => {
+      try {
+        const scope = await api.put('memories/' + factId + '/scope', { clientId: val || null, contextId: null });
+        Object.assign(fact, scope);
+        renderMemories();
+        renderFactPane(fact);
+      } catch(e) { toast('❌ Could not update client'); }
+    });
+  }
+  async function _factPickProject(anchorEl, factId) {
+    await ensureClients();
+    const fact = memories.find(m => m.id === factId);
+    if (!fact) return;
+    if (!fact.clientId) { toast('Set a client first'); return; }
+    const client = clientListCache.find(c => c.id === fact.clientId);
+    const items = [
+      { label: '— No project —', value: '', muted: true },
+      ...((client && client.contexts) || []).map(x => ({ label: x.name, value: x.id }))
+    ];
+    _showScopePopup(anchorEl, items, async val => {
+      try {
+        const scope = await api.put('memories/' + factId + '/scope', { clientId: fact.clientId, contextId: val || null });
+        Object.assign(fact, scope);
+        renderFactPane(fact);
+      } catch(e) { toast('❌ Could not update project'); }
+    });
+  }
+
   async function _diaryPickProject(anchorEl, entryId) {
     await ensureClients();
     const entry = diaryEntries.find(e => e.id === entryId);
@@ -3105,11 +3165,14 @@ npm install @modelcontextprotocol/sdk</code></pre>
 
   async function saveDiaryEdit(entryId) {
     const name = document.getElementById('de-name').value.trim();
+    await ensureClients();
     const timestamp = document.getElementById('de-timestamp').value;
     const content = document.getElementById('de-content').value.trim();
+    const client = document.getElementById('new-client')?.value || '';
+    const context = document.getElementById('new-project')?.value || '';
     if (!name || !timestamp || !content) { toast('⚠️ Title, Date, and Content are required'); return; }
     const metadata = getDiaryMetaFromEditor();
-    const payload = {name, timestamp, content};
+      const m = await api.post('memories', {name, text, category: cat, tags, client, context});
     if (Object.keys(metadata).length) payload.metadata = metadata;
     try {
       const updated = await api.put('diary/' + entryId, payload);

@@ -573,7 +573,12 @@ async def api_create_memory(request: Request, body: MemoryCreate):
             cx = mem.db_resolve_context(body.context, client_id, user_id)
             context_id = cx["id"] if cx else await mem.db_create_context(body.context, client_id, user_id)
         doc_id = await mem.db_add_memory(body.text, body.category, user_id, metadata, name=body.name, client_id=client_id, context_id=context_id)
-        return {"id": doc_id, "text": body.text, "name": body.name, "category": body.category.strip().capitalize(), "metadata": metadata}
+        return {
+            "id": doc_id, "text": body.text, "name": body.name,
+            "category": body.category.strip().capitalize(), "metadata": metadata,
+            "clientId": client_id, "clientName": c["name"] if client_id and c else None,
+            "contextId": context_id, "contextName": cx["name"] if context_id and cx else None,
+        }
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
