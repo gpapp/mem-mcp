@@ -4,7 +4,7 @@ services:
     container_name: qdrant
     restart: always
     healthcheck:
-      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:6333/readyz || exit 1"]
+      test: ["CMD-SHELL", "curl --fail --silent --show-error http://localhost:6333/readyz >/dev/null || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -46,7 +46,7 @@ services:
     container_name: ollama
     restart: always
     healthcheck:
-      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:11434/api/tags || exit 1"]
+      test: ["CMD-SHELL", "curl --fail --silent --show-error http://localhost:11434/api/tags >/dev/null || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 30
