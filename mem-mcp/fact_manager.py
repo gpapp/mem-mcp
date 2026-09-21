@@ -39,7 +39,7 @@ def extract_people_metadata(name: Optional[str]) -> dict:
     n = name.strip()
     if not n:
         return {}
-    
+
     aliases = []
     if '(' in n and ')' in n:
         alias_start = n.index('(')
@@ -48,20 +48,20 @@ def extract_people_metadata(name: Optional[str]) -> dict:
         n = (n[:alias_start] + n[alias_end+1:]).strip()
         if alias:
             aliases.append(alias)
-    
+
     n = re.sub(r'\s+', ' ', n)
     parts = n.split()
-    
+
     meta = {}
     if len(parts) >= 2:
         meta["first_name"] = parts[0]
         meta["last_name"] = parts[-1]
     elif len(parts) == 1:
         meta["first_name"] = parts[0]
-    
+
     if aliases:
         meta["aliases"] = aliases
-    
+
     return meta
 
 # ---------------------------------------------------------------------------
@@ -154,7 +154,7 @@ async def db_update_memory(memory_id: str, name: Optional[str], text: Optional[s
     with neo4j_driver.session() as s:
         res = s.run("MATCH (f:Fact {id: $id, userId: $userId}) RETURN f", id=memory_id, userId=user_id)
         existing = res.single()
-        if not existing: 
+        if not existing:
             logger.warning(f"[db_update_memory] Memory {memory_id} not found")
             return False
         old_fact = existing["f"]
@@ -162,25 +162,25 @@ async def db_update_memory(memory_id: str, name: Optional[str], text: Optional[s
     new_text = text if text is not None else old_fact.get("text")
     new_name = name if name is not None else old_fact.get("name")
     new_cat  = category.strip().capitalize() if category else old_fact.get("category")
-    new_meta = metadata or {} 
+    new_meta = metadata or {}
     if new_cat.lower() == "people" and new_name:
         name_meta = extract_people_metadata(new_name)
         new_meta = {**name_meta, **new_meta}
-    
+
     logger.info(f"[db_update_memory] New values: name={new_name}, text_len={len(new_text) if new_text else 0}")
-    
+
     # Qdrant Update
     # Re-embed if text OR name changes
     embed_text = f"{new_name}: {new_text}" if new_name else new_text
     needs_embed = text is not None or name is not None
-    
+
     try:
         vector = await get_embedding(embed_text) if needs_embed else None
         logger.info(f"[db_update_memory] Embedding generated, vector_len={len(vector) if vector else 0}")
     except Exception as e:
         logger.error(f"[db_update_memory] Embedding failed: {e}")
         raise RuntimeError(f"Embedding failed: {e}")
-    
+
     # Prepare payload, converting Neo4j types to JSON-serializable ones
     payload = {}
     for k, v in dict(old_fact).items():
@@ -202,7 +202,7 @@ async def db_update_memory(memory_id: str, name: Optional[str], text: Optional[s
         payload["metadata"] = current_meta
 
     logger.info(f"[db_update_memory] Upserting to Qdrant, payload keys: {list(payload.keys())}")
-    
+
     await qdrant.upsert(
         collection_name=COLLECTION_NAME,
         points=[PointStruct(
@@ -289,7 +289,7 @@ async def db_delete_memory(memory_id: str, user_id: str) -> bool:
 
 async def db_link_facts(source_id: str, target_id: str, rel_type: str, metadata: dict, user_id: str):
     """Create a relationship between two nodes in Neo4j.
-    
+
     Handles:
     - Fact ↔ Fact → bidirectional REL_TYPE (existing behavior)
     - DiaryEntry → Fact → unidirectional MENTIONS
@@ -299,7 +299,7 @@ async def db_link_facts(source_id: str, target_id: str, rel_type: str, metadata:
         raise RuntimeError("Neo4j not connected.")
 
     rel_type = rel_type.upper().replace(" ", "_")
-    
+
     with neo4j_driver.session() as s:
         # Determine node labels
         a_label = s.run(
@@ -310,7 +310,7 @@ async def db_link_facts(source_id: str, target_id: str, rel_type: str, metadata:
             "MATCH (n {id: $id, userId: $userId}) RETURN head(labels(n)) AS label",
             id=target_id, userId=user_id
         ).single()
-        
+
         if not a_label or not b_label:
             raise RuntimeError(f"Cannot link: node not found (source={source_id}, target={target_id})")
 
@@ -371,7 +371,7 @@ async def db_link_facts(source_id: str, target_id: str, rel_type: str, metadata:
 
 async def db_unlink_facts(source_id: str, target_id: str, rel_type: str, user_id: str):
     """Remove a relationship between two nodes in Neo4j.
-    
+
     Handles Fact↔Fact and DiaryEntry↔Fact (MENTIONS).
     """
     neo4j_driver = get_neo4j()
@@ -379,7 +379,7 @@ async def db_unlink_facts(source_id: str, target_id: str, rel_type: str, user_id
         raise RuntimeError("Neo4j not connected.")
 
     rel_type = rel_type.upper().replace(" ", "_") if rel_type else None
-    
+
     with neo4j_driver.session() as s:
         a_label = s.run(
             "MATCH (n {id: $id, userId: $userId}) RETURN head(labels(n)) AS label",
@@ -524,7 +524,7 @@ def db_get_connections_by_type(fact_id: str, user_id: str) -> dict:
             """,
             id=fact_id, userId=user_id
         )
-        
+
         connections = {}
         for r in result:
             rel_type = r["rel_type"]
@@ -535,7 +535,7 @@ def db_get_connections_by_type(fact_id: str, user_id: str) -> dict:
                     "name": conn.get("name") or conn.get("text", "")[:50],
                     "category": conn.get("category", "General")
                 })
-        
+
         return connections
 
 
@@ -597,19 +597,19 @@ async def rewrite_search_query(query: str, category: Optional[str] = None,
 
 def _expand_query(query: str) -> list:
     """Generate multiple query variants for better semantic coverage.
-    
+
     For complex queries, decomposes into sub-queries and generates
     alternative phrasings. Returns list of (query_string, weight) tuples.
     """
     q = query.strip()
     words = q.split()
-    
+
     # Simple queries: just return as-is
     if len(words) <= 2:
         return [(q, 1.0)]
-    
+
     variants = [(q, 1.0)]  # Original query always included
-    
+
     # Question queries: extract the core concept
     if q.endswith("?"):
         # "who do I work with on AI projects" → "AI projects colleagues"
@@ -618,33 +618,33 @@ def _expand_query(query: str) -> list:
         content_words = [w for w in words if w.lower().rstrip("?") not in stop_words]
         if content_words:
             variants.append((" ".join(content_words), 0.9))
-    
+
     # Extract noun phrases (consecutive non-stop words)
     stop_words = {"i", "we", "my", "your", "our", "the", "a", "an", "is", "are", "was", "were", "do", "did", "does", "have", "has", "had", "will", "would", "could", "should", "may", "might", "can", "about", "with", "for", "from", "to", "on", "in", "at", "of", "and", "or", "not", "but", "that", "this", "these", "those", "it", "its"}
     content_words = [w for w in words if w.lower() not in stop_words]
-    
+
     if len(content_words) >= 2:
         # Full content words
         variants.append((" ".join(content_words), 0.85))
-        
+
         # Word pairs (sliding window)
         if len(content_words) >= 3:
             for i in range(len(content_words) - 1):
                 pair = f"{content_words[i]} {content_words[i+1]}"
                 variants.append((pair, 0.6))
-        
+
         # Individual important words (last resort)
         for w in content_words:
             if len(w) > 3:  # Skip very short words
                 variants.append((w, 0.4))
-    
+
     # Deduplicate by query string, keep highest weight
     seen = {}
     for q_str, weight in variants:
         key = q_str.lower().strip()
         if key not in seen or weight > seen[key]:
             seen[key] = weight
-    
+
     return [(k, v) for k, v in seen.items()]
 
 
@@ -658,7 +658,7 @@ async def _single_vector_search(qdrant, query: str, user_id: str, category: Opti
         conditions.append(FieldCondition(key="clientName", match=MatchValue(value=client.strip())))
     if context:
         conditions.append(FieldCondition(key="contextName", match=MatchValue(value=context.strip())))
-    
+
     filt = Filter(must=conditions)
     result = await qdrant.query_points(
         collection_name=COLLECTION_NAME,
@@ -754,10 +754,10 @@ def _boost_result_score(point, query_lower: str) -> float:
 
 async def db_search_memories(query: str, user_id: str, limit: int = 5, category: Optional[str] = None, top_p: float = 0.4, client: Optional[str] = None, context: Optional[str] = None) -> list:
     """Vector-similarity search with multi-query expansion and optional category filter.
-    
+
     For queries with 3+ words, generates multiple query variants and merges
     results to improve semantic coverage.
-    
+
     Optional client/context parameters filter results to specific client or context scope.
     """
     qdrant = await get_qdrant()
@@ -861,18 +861,18 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
     # Use LLM rewrite for better semantic coverage on long queries
     query_variants = await rewrite_search_query(query, category=category, client=client, context=context)
     fetch_limit = max(limit * 5, 50)
-    
+
     # Collect all results from all query variants
     all_vector_results = {}  # id -> best result across all variants
-    
+
     for variant_query, weight in query_variants:
         raw_points = await _single_vector_search(qdrant, variant_query, user_id, category, fetch_limit, top_p, client, context)
-        
+
         for r in raw_points:
             boosted_score = _boost_result_score(r, variant_query.lower())
             # Apply query variant weight
             weighted_score = boosted_score * weight
-            
+
             result_entry = {
                 "id": r.id,
                 "text": r.payload.get("text"),
@@ -884,11 +884,11 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
                 "contextName": r.payload.get("contextName"),
                 "metadata": r.payload.get("metadata", {})
             }
-            
+
             # Keep the best version of each result
             if r.id not in all_vector_results or weighted_score > all_vector_results[r.id]["score"]:
                 all_vector_results[r.id] = result_entry
-    
+
     results = list(all_vector_results.values())
 
     # Merge exact matches and vector results, deduplicating by ID
@@ -905,7 +905,7 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
     final_list = list(merged_results.values())
     if category:
         final_list = [r for r in final_list if r.get("category", "").lower() == category.lower()]
-    
+
     # Apply client/context scoring (names live top-level; fall back to metadata).
     # Explicit scope boosts; inferred scope is a weaker boost-only fallback;
     # inactive clients are penalized in unscoped (global) search only.
@@ -935,7 +935,7 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
             xname = r.get("contextName") or r.get("metadata", {}).get("contextName", "")
             if (xname or "").lower() == context.lower():
                 r["score"] += 0.3
-    
+
     final_list.sort(key=lambda x: x["score"], reverse=True)
     return final_list[:limit]
 
@@ -995,8 +995,10 @@ def db_list_memories(user_id: str) -> list:
             MATCH (c:Category)<-[:IN_CATEGORY]-(f:Fact {userId: $userId})
             OPTIONAL MATCH (f)-[:FOR_CLIENT]->(cl:Client)
             OPTIONAL MATCH (f)-[:IN_CONTEXT]->(ctx:Context)
+            OPTIONAL MATCH (f)-[:RELEVANT_TO]->(rc:Client)
             RETURN f, c.name as category, cl.name as clientName, cl.id as clientId,
                    ctx.name as contextName, ctx.id as contextId,
+                   collect(DISTINCT {id: rc.id, name: rc.name}) as relevantClients,
                    [(f)-[r]-(other {userId: $userId})
                     WHERE (other:Fact OR other:DiaryEntry)
                       AND type(r) <> 'IN_CATEGORY' AND type(r) <> 'KNOWS'
@@ -1021,7 +1023,7 @@ def db_list_memories(user_id: str) -> list:
             for k, v in f_node.items():
                 if k not in core_keys:
                     metadata[k] = v.iso_format() if hasattr(v, "iso_format") else v
-            
+
             # Scope lives top-level on the response (clientName/clientId/...);
             # it is intentionally NOT duplicated into metadata anymore.
 
@@ -1038,6 +1040,7 @@ def db_list_memories(user_id: str) -> list:
                 "clientId":    r["clientId"],
                 "contextName": r["contextName"],
                 "contextId":   r["contextId"],
+                "relevantClients": [rc for rc in r["relevantClients"] if rc.get("id")],
                 "metadata":  metadata,
                 "links":     links
             })
@@ -1612,11 +1615,11 @@ def db_get_graph(user_id: str) -> dict:
             """,
             userId=user_id
         )
-        
+
         node_map = {}
         edges = []
         edge_lookup = {}  # sig -> edge_dict for collapsing bidirectional links
-        
+
         for r in result:
             f = r["f"]
             if f["id"] not in node_map:
@@ -1626,14 +1629,14 @@ def db_get_graph(user_id: str) -> dict:
                     "name": f.get("name") or f["text"],
                     "group": f.get("category", "General")
                 }
-            
+
             m = r["m"]
             rel = r["rel_type"]
             if m and rel:
                 # Category nodes have 'name', Facts have 'id'
                 m_label = "Category" if "name" in m and "id" not in m else "Fact"
                 m_id = m.get("name") if m_label == "Category" else m.get("id")
-                
+
                 if m_id not in node_map:
                     if m_label == "Category":
                         node_map[m_id] = {
@@ -1649,7 +1652,7 @@ def db_get_graph(user_id: str) -> dict:
                             "name": m.get("name") or m["text"],
                             "group": m.get("category", "General")
                         }
-                
+
                 edge_sig = (f["id"], m_id, rel)
                 reverse_sig = (m_id, f["id"], rel)
 
@@ -1666,7 +1669,7 @@ def db_get_graph(user_id: str) -> dict:
                     }
                     edge_lookup[edge_sig] = new_edge
                     edges.append(new_edge)
-                
+
         # Add DiaryEntry nodes and MENTIONS edges
         diag_res = s.run(
             """

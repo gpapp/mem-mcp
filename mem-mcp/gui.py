@@ -75,7 +75,7 @@ def _check_session_auth(request: Request) -> str | None:
     session_pass = request.session.get("pass")
     if session_user and session_pass:
         return session_user
-    
+
     auth_header = request.headers.get("Authorization")
     if auth_header and auth_header.startswith("Basic "):
         try:
@@ -559,6 +559,30 @@ async def api_remove_diary_relevant(entry_id: str, client_id: str, request: Requ
         raise HTTPException(status_code=503, detail=str(e))
 
 
+class FactRelevant(BaseModel):
+    clientId: str
+
+
+@web_app.post("/api/memories/{memory_id}/relevant", response_class=JSONResponse, status_code=201)
+async def api_add_memory_relevant(memory_id: str, request: Request, body: FactRelevant):
+    """Add a RELEVANT_TO link from a fact to a client."""
+    try:
+        await mem.db_add_fact_relevant(memory_id, body.clientId, _require_user(request))
+        return {"status": "linked"}
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@web_app.delete("/api/memories/{memory_id}/relevant/{client_id}", response_class=JSONResponse)
+async def api_remove_memory_relevant(memory_id: str, client_id: str, request: Request):
+    """Remove a RELEVANT_TO link from a fact to a client."""
+    try:
+        await mem.db_remove_fact_relevant(memory_id, client_id, _require_user(request))
+        return {"status": "unlinked"}
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
 @web_app.post("/api/memories", response_class=JSONResponse, status_code=201)
 async def api_create_memory(request: Request, body: MemoryCreate):
     try:
@@ -870,14 +894,14 @@ async def api_focus_graph(request: Request, fact_id: str):
         fact = mem.db_get_fact_by_id(fact_id, user_id)
         if not fact:
             raise HTTPException(status_code=404, detail="Fact not found")
-        
+
         neighbors = mem.db_get_neighborhood(fact_id, depth=1, rel_types=None, user_id=user_id)
-        
+
         # Group connections by relationship type
         connections_by_type = {}
         edges = []
         nodes = []
-        
+
         # Add center node
         center = {
             "id": fact["id"],
@@ -885,10 +909,10 @@ async def api_focus_graph(request: Request, fact_id: str):
             "text": fact["text"],
             "category": fact.get("category", "General")
         }
-        
+
         # Track seen node IDs to avoid duplicates
         seen_nodes = {fact["id"]}
-        
+
         for neighbor in neighbors:
             nid = neighbor["id"]
             if nid not in seen_nodes:
@@ -898,7 +922,7 @@ async def api_focus_graph(request: Request, fact_id: str):
                     "name": neighbor.get("name", "")[:50] or neighbor.get("text", "")[:50],
                     "category": neighbor.get("category", "General")
                 })
-        
+
         return {
             "center": center,
             "nodes": nodes,
@@ -1009,7 +1033,7 @@ async def sse_events(request: Request):
 def _get_auth_context(request: Request):
     # Try session auth first, then Basic Auth header
     auth_user, auth_pass, auth_b64 = "unknown", "********", ""
-    
+
     session_user = request.session.get("user")
     session_pass = request.session.get("pass")
     if session_user and session_pass:
@@ -1025,14 +1049,14 @@ def _get_auth_context(request: Request):
                 if ":" in decoded:
                     auth_user, auth_pass = decoded.split(":", 1)
             except Exception: pass
-    
+
     # Intelligently calculate MCP_URL
     # If BASE_URL is https://hass.securemail.hu/mcp, we want the mcp_url to be https://hass.securemail.hu/mcp/mcp
     mcp_url = f"{mem.BASE_URL}/mcp"
-        
+
     return {
-        "AUTH_USER": auth_user, 
-        "AUTH_PASS": auth_pass, 
+        "AUTH_USER": auth_user,
+        "AUTH_PASS": auth_pass,
         "AUTH_BASE64": auth_b64,
         "MCP_URL": mcp_url
     }

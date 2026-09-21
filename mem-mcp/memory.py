@@ -15,6 +15,7 @@ from common import (
 
 from fact_manager import (
     extract_people_metadata, db_add_memory, db_update_memory, db_delete_memory,
+    db_add_fact_relevant, db_remove_fact_relevant,
     db_link_facts, db_unlink_facts, db_get_neighborhood, db_get_fact_by_id,
     db_get_connections_by_type, db_search_memories, db_find_patterns,
     db_list_memories, db_list_categories, db_find_duplicates, db_merge_memories,

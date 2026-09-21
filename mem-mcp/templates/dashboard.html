@@ -194,9 +194,9 @@
     .memories-list-col { width: 280px; flex-shrink: 0; display: flex; flex-direction: column; gap: .5rem; min-width: 0; }
     .memories-list-scroll { flex: 1; overflow-y: auto; }
     .memories-main { flex: 1; min-width: 0; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 1.25rem; overflow-y: auto; }
-    
-    .sidebar-item { 
-      padding: .6rem .8rem; cursor: pointer; border-radius: 6px; 
+
+    .sidebar-item {
+      padding: .6rem .8rem; cursor: pointer; border-radius: 6px;
       font-size: .88rem; color: var(--muted); transition: all .15s;
       display: flex; justify-content: space-between; align-items: center;
     }
@@ -247,7 +247,7 @@
     .search-input-wrapper { position: relative; flex: 1; }
     .search-input-wrapper i { position: absolute; left: .7rem; top: 50%; transform: translateY(-50%); color: var(--muted); }
     .search-input { padding-left: 1.2rem; }
-    
+
     .alphabet-filter {
       display: flex; flex-wrap: wrap; gap: 4px; margin: 0.75rem 0;
     }
@@ -261,7 +261,7 @@
     .alpha-btn.active { background: var(--primary); color: #fff; border-color: var(--primary); }
     .alpha-btn.disabled { opacity: 0.3; cursor: default; }
     .alpha-btn.disabled:hover { background: var(--bg); color: var(--muted); }
-    
+
     .sort-select { width: auto; font-size: .85rem; padding: .4rem .6rem; }
 
     /* ── Toast ── */
@@ -311,9 +311,9 @@
 
     /* ── Diary Layout ── */
     .diary-layout { display: flex; gap: 1.5rem; height: calc(100vh - 180px); min-height: 500px; }
-    .diary-sidebar { width: 220px; flex-shrink: 0; background: var(--surface); border: 1px solid var(--border); 
+    .diary-sidebar { width: 220px; flex-shrink: 0; background: var(--surface); border: 1px solid var(--border);
                      border-radius: var(--radius); overflow: hidden; display: flex; flex-direction: column; }
-    .diary-sidebar-header { padding: 1rem; border-bottom: 1px solid var(--border); font-weight: 700; font-size: .85rem; 
+    .diary-sidebar-header { padding: 1rem; border-bottom: 1px solid var(--border); font-weight: 700; font-size: .85rem;
                             text-transform: uppercase; color: var(--muted); display: flex; justify-content: space-between; align-items: center; }
     .diary-date-item { padding: .6rem 1rem; cursor: pointer; border-bottom: 1px solid var(--bg); transition: all .15s; }
     .diary-date-item:hover { background: var(--bg); color: var(--primary); }
@@ -324,9 +324,9 @@
     .lazy-sentinel { padding: .6rem 1rem; font-size: .8rem; color: var(--muted); text-align: center; }
     #diary-dates-list { flex: 1 1 0; overflow-y: auto; min-height: 0; }
     .diary-main { flex: 1; display: flex; flex-direction: column; gap: 1rem; overflow-y: auto; text-align: left; }
-    .diary-view-card, .diary-editor-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); 
+    .diary-view-card, .diary-editor-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
                                            padding: 1.5rem; box-shadow: var(--shadow); }
-    
+
     pre { background: #1f2937; color: #f3f4f6; padding: 1rem; border-radius: 8px; overflow-x: auto; font-size: .85rem; }
 
     /* ── Build Graph Mode ── */
@@ -813,7 +813,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
         hideInactiveClients = clientFilter === 'active';  // back-compat
         if (state.contextFilter !== undefined) contextFilter = state.contextFilter;
         if (state.selectedFactId !== undefined) selectedFactId = state.selectedFactId;
-        
+
         if (state.diarySearchQuery !== undefined) diarySearchQuery = state.diarySearchQuery;
         if (state.diaryMonthYear !== undefined) diaryMonthYear = state.diaryMonthYear;
         if (state.selectedDiaryDate !== undefined) selectedDiaryDate = state.selectedDiaryDate;
@@ -853,7 +853,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     eventSource.addEventListener('memory_changed', async (e) => {
       const data = JSON.parse(e.data);
       console.log("[SSE] Memory change received:", data);
-      
+
       if (data.action === 'delete') {
         memories = memories.filter(m => m.id !== data.id);
         if (graphLoaded && network) graphData.nodes.remove(data.id);
@@ -910,7 +910,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
           if (selectedFactId === item.id) renderFactPane(item);
         } catch(err) { console.error("Failed to fetch updated memory", err); }
       }
-      
+
       renderMemories();
       renderCategorySidebar();
       renderAlphabetFilter();
@@ -919,7 +919,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     eventSource.addEventListener('graph_changed', async (e) => {
       const data = JSON.parse(e.data);
       console.log("[SSE] Graph change received:", data);
-      
+
       // Refresh both source and target facts so link badges update on both sides
       for (const factId of [data.source_id, data.target_id].filter(Boolean)) {
         try {
@@ -1418,13 +1418,13 @@ npm install @modelcontextprotocol/sdk</code></pre>
   }
 
   async function loadMemories() {
-    try { 
-      memories = await api.get('memories'); 
+    try {
+      memories = await api.get('memories');
       document.getElementById('search-query').value = lastSearchQuery;
       document.getElementById('sort-order').value = lastSortOrder;
       const fdl = document.getElementById('fact-datalist-dropdown');
       if (fdl) fdl.innerHTML = memories.map(m => `<option value="${m.id}">${escHtml(m.name || (m.text||'').substring(0,30))}</option>`).join('');
-      renderMemories(); 
+      renderMemories();
       renderCategorySidebar();
       renderGraphCategorySidebar();
       renderAlphabetFilter();
@@ -1484,7 +1484,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
   function renderGraphCategorySidebar() {
     const el = document.getElementById('graph-categories-sidebar');
     if (!el) return;
-    
+
     const counts = {};
     memories.forEach(m => { counts[m.category] = (counts[m.category] || 0) + 1; });
     const categories = Object.keys(counts).sort();
@@ -1492,23 +1492,23 @@ npm install @modelcontextprotocol/sdk</code></pre>
         categories.push('Diary');
         counts['Diary'] = diaryEntries.length;
     }
-    
+
     if (activeGraphCategories.size === 0 && !activeGraphCategories.hasInit) {
         if (categories.includes('People')) activeGraphCategories.add('People');
         if (categories.includes('Client')) activeGraphCategories.add('Client');
         activeGraphCategories.hasInit = true;
     }
-    
+
     const chipsHtml = categories.map(cat => {
         const isActive = activeGraphCategories.has(cat);
         const className = 'chip' + (isActive ? ' active' : '');
         return `<div class="${className}" onclick="toggleGraphCategory('${cat.replace(/'/g, "\\'")}')">${cat} <span class="count">${counts[cat]}</span></div>`;
     }).join('');
-    
+
     const allActive = activeGraphCategories.size === 0;
     const allClass = 'chip' + (allActive ? ' active' : '');
     const allChip = `<div class="${allClass}" onclick="clearGraphCategoryFilter()">All</div>`;
-    
+
     el.innerHTML = allChip + chipsHtml;
   }
 
@@ -1523,14 +1523,14 @@ npm install @modelcontextprotocol/sdk</code></pre>
   function renderAlphabetFilter() {
     const el = document.getElementById('alphabet-filter');
     const letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('');
-    
+
     const usedLetters = new Set();
     memories.forEach(m => {
       const name = m.name || m.text || '';
       const first = name.trim()[0];
       if (first) usedLetters.add(first.toUpperCase());
     });
-    
+
     el.innerHTML = letters.map(letter => {
       const isUsed = usedLetters.has(letter);
       const isActive = activeLetterFilter === letter;
@@ -1745,6 +1745,17 @@ npm install @modelcontextprotocol/sdk</code></pre>
                 <select id="ep-project"></select>
               </div>
             </div>
+            <div class="fact-edit-field">
+              <label>Related clients</label>
+              <div style="display:flex; flex-wrap:wrap; gap:.35rem; align-items:center; margin-top:.35rem; min-height:2rem;">
+                ${(m.relevantClients || []).filter(rc => rc.id !== m.clientId).map(rc => `
+                  <span class="scope-chip scope-chip--relevant">${escHtml(rc.name)}
+                    <button class="scope-chip-remove" type="button" onclick="_factRemoveRelevant('${m.id}','${rc.id}')" title="Remove">×</button>
+                  </span>
+                `).join('') || '<span style="font-size:.8rem; color:var(--muted);">No related clients.</span>'}
+                <button class="scope-chip scope-chip--add" type="button" onclick="_factAddRelevant(this,'${m.id}')" title="Add related client">＋</button>
+              </div>
+            </div>
             <div id="ep-meta-section" style="margin:.5rem 0;"></div>
             <div style="display:flex; gap:.5rem; justify-content:flex-end;">
               <button class="btn btn-ghost btn-sm" onclick="renderFactPane(memories.find(x=>x.id==='${m.id}'))">Cancel</button>
@@ -1766,6 +1777,8 @@ npm install @modelcontextprotocol/sdk</code></pre>
               <div class="fact-detail-scope diary-scope-row" style="display:flex; flex-wrap:wrap; gap:.4rem; margin-top:.35rem; align-items:center;">
                 <button class="scope-chip scope-chip--client" onclick="_factPickClient(this,'${m.id}')" title="Click to change client">🏢 ${m.clientName ? escHtml(m.clientName) + ((clientListCache.find(c=>c.id===m.clientId)||{}).crossClient ? ' [cross]' : '') : '—'}</button>
                 <button class="scope-chip scope-chip--project" onclick="_factPickProject(this,'${m.id}')" title="Click to change project">📁 ${m.contextName ? escHtml(m.contextName) : '—'}</button>
+                ${(m.relevantClients || []).filter(rc => rc.id !== m.clientId).map(rc => `<span class="scope-chip scope-chip--relevant">${escHtml(rc.name)}<button class="scope-chip-remove" onclick="_factRemoveRelevant('${m.id}','${rc.id}')" title="Remove">×</button></span>`).join('')}
+                <button class="scope-chip scope-chip--add" onclick="_factAddRelevant(this,'${m.id}')" title="Add related client">＋</button>
               </div>
             </div>
             <div style="display:flex; gap:.25rem; align-items:center; flex-shrink:0;">
@@ -2252,7 +2265,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
   function showLinkEdit(badgeSource, badgeTarget, relType, targetLabel, apiSource, apiTarget) {
     const badge = document.getElementById('link-badge-' + badgeSource + '-' + badgeTarget);
     if (!badge) return;
-    
+
     badge.innerHTML = `
       <form class="link-edit-form" onsubmit="event.preventDefault(); saveLinkEdit('${apiSource}', '${apiTarget}', '${escHtml(relType)}')">
         <input id="edit-rel-${apiSource}-${apiTarget}" value="${escHtml(relType)}" placeholder="Relationship">
@@ -2266,7 +2279,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
   async function saveLinkEdit(apiSource, apiTarget, oldRelType) {
     const newRelType = document.getElementById('edit-rel-' + apiSource + '-' + apiTarget).value.trim();
     if (!newRelType) { toast('⚠️ Relationship type required'); return; }
-    
+
     try {
       await api.delete('memories/link', {sourceId: apiSource, targetId: apiTarget, relType: oldRelType});
       await api.post('memories/link', {sourceId: apiSource, targetId: apiTarget, relType: newRelType});
@@ -2326,7 +2339,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
   async function openInGraph(id) {
     switchTab('graph');
     if (!graphLoaded) await loadGraph();
-    
+
     // Wait for network to initialize and stabilize
     const waitForNetwork = () => {
       return new Promise(resolve => {
@@ -2340,7 +2353,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
         check();
       });
     };
-    
+
     await waitForNetwork();
     if (network) {
       network.focus(id, { scale: 1.5, animation: { duration: 1000, easingFunction: 'easeInOutQuad' } });
@@ -2977,6 +2990,42 @@ npm install @modelcontextprotocol/sdk</code></pre>
     });
   }
 
+  async function _factAddRelevant(anchorEl, factId) {
+    await ensureClients();
+    const fact = memories.find(m => m.id === factId);
+    if (!fact) return;
+    const existing = new Set((fact.relevantClients || []).map(rc => rc.id));
+    const candidates = clientListCache.filter(c => c.id !== fact.clientId && !existing.has(c.id));
+    if (!candidates.length) { toast('No other clients to add'); return; }
+    const items = candidates.map(c => ({
+      label: (c.effectiveActive !== false ? '🟢 ' : '⚪ ') + c.name + (c.crossClient ? ' [cross]' : ''),
+      value: c.id
+    }));
+    _showScopePopup(anchorEl, items, async val => {
+      try {
+        await api.post('memories/' + factId + '/relevant', { clientId: val });
+        const c = clientListCache.find(x => x.id === val);
+        if (c) {
+          if (!fact.relevantClients) fact.relevantClients = [];
+          fact.relevantClients.push({ id: c.id, name: c.name });
+        }
+        renderMemories();
+        renderFactPane(fact);
+      } catch(e) { toast('❌ Could not add related client'); }
+    });
+  }
+
+  async function _factRemoveRelevant(factId, clientId) {
+    const fact = memories.find(m => m.id === factId);
+    if (!fact) return;
+    try {
+      await api.delete('memories/' + factId + '/relevant/' + clientId);
+      if (fact.relevantClients) fact.relevantClients = fact.relevantClients.filter(rc => rc.id !== clientId);
+      renderMemories();
+      renderFactPane(fact);
+    } catch(e) { toast('❌ Could not remove related client'); }
+  }
+
   async function _diaryPickProject(anchorEl, entryId) {
     await ensureClients();
     const entry = diaryEntries.find(e => e.id === entryId);
@@ -3236,18 +3285,18 @@ npm install @modelcontextprotocol/sdk</code></pre>
     editEntry(dayEntries[0].id);
   }
 
-  function showDiaryEditor() { 
-    activeDiaryId = null; 
+  function showDiaryEditor() {
+    activeDiaryId = null;
     selectedDiaryDate = null;
     renderDiaryMonthPager();
-    renderDiarySidebar(); 
-    document.getElementById('diary-viewer').style.display = 'none'; 
+    renderDiarySidebar();
+    document.getElementById('diary-viewer').style.display = 'none';
     const ed = document.getElementById('diary-editor');
-    ed.style.display = 'block'; 
+    ed.style.display = 'block';
     document.getElementById('diary-id').value = '';
     document.getElementById('diary-name').value = '';
     document.getElementById('diary-timestamp').value = new Date().toISOString().slice(0, 16);
-    document.getElementById('diary-content').value = ''; 
+    document.getElementById('diary-content').value = '';
     saveSessionState();
   }
   function cancelDiaryEdit() { if (activeDiaryId) selectDiaryEntry(activeDiaryId); else if (diaryEntries.length) selectDiaryEntry(diaryEntries[0].id); else document.getElementById('diary-editor').style.display = 'none'; }
@@ -3281,10 +3330,10 @@ npm install @modelcontextprotocol/sdk</code></pre>
       return;
     }
 
-    try { 
-      await api.post('diary', {id, name, timestamp, content}); 
-      toast('📖 Saved'); 
-      await loadDiary(); 
+    try {
+      await api.post('diary', {id, name, timestamp, content});
+      toast('📖 Saved');
+      await loadDiary();
     } catch(e) { toast('❌ Error saving entry'); }
   }
 
@@ -3457,7 +3506,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
       const data = await api.get('graph');
       graphLoaded = true;
       container.innerHTML = '';
-      
+
       let nodesToKeep = new Set();
       const allActive = activeGraphCategories.size === 0;
 
@@ -3490,7 +3539,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
         font: { size: 12, face: 'Inter' },
         color: n.label === 'DiaryEntry' ? { background: '#fbbf24', border: '#b45309' } : undefined
       })));
-      
+
       const filteredEdges = data.edges.filter(e => nodesToKeep.has(e.from) && nodesToKeep.has(e.to));
       graphData.edges = new vis.DataSet(filteredEdges.map(e => ({
         from: e.from,
@@ -3501,7 +3550,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
         color: { color: '#e5e7eb', highlight: '#4f46e5' }
       })));
 
-      
+
       if (isBuildMode && buildGraphNodes.size > 0) {
         const filteredNodes = new vis.DataSet(
           data.nodes.filter(n => buildGraphNodes.has(n.id)).map(n => ({
@@ -3541,7 +3590,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
 
   function initNetwork(data) {
     const container = document.getElementById('graph-container');
-    
+
     const options = {
       nodes: { borderWidth: 1, shadow: true },
       edges: { width: 1, smooth: { type: 'continuous' } },
@@ -3552,7 +3601,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
       },
       interaction: { hover: true, tooltipDelay: 200 }
     };
-    
+
     network = new vis.Network(container, data, options);
 
     // Wait for physics to stabilize before allowing focus operations
@@ -3565,12 +3614,12 @@ npm install @modelcontextprotocol/sdk</code></pre>
         const nodeId = params.nodes[0];
         let isDiary = false;
         if (graphData && graphData.nodes) {
-          try { 
-            const nodeData = graphData.nodes.get(nodeId); 
+          try {
+            const nodeData = graphData.nodes.get(nodeId);
             if (nodeData && nodeData.label === 'DiaryEntry') isDiary = true;
           } catch(e) {}
         }
-        
+
         if (isDiary) {
           switchTab('diary');
           selectDiaryEntry(nodeId);
@@ -3588,7 +3637,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
       params.event.stopPropagation();
       if (params.nodes.length === 0) return;
       const nodeId = params.nodes[0];
-      
+
       // Use native event for positioning
       const nativeEvent = params.event.originalEvent || params.event;
       showContextMenu(nativeEvent, nodeId);
@@ -3597,12 +3646,12 @@ npm install @modelcontextprotocol/sdk</code></pre>
 
   function setGraphMode(mode) {
     isBuildMode = (mode === 'build');
-    
+
     document.getElementById('mode-full').classList.toggle('active', mode === 'full');
     document.getElementById('mode-build').classList.toggle('active', mode === 'build');
     document.getElementById('build-status').style.display = isBuildMode ? '' : 'none';
     document.getElementById('clear-build-btn').style.display = isBuildMode ? '' : 'none';
-    
+
     if (graphLoaded && graphData.nodes && graphData.edges) {
       rebuildNetwork();
     } else if (!graphLoaded) {
@@ -3616,13 +3665,13 @@ npm install @modelcontextprotocol/sdk</code></pre>
       network.destroy();
       network = null;
     }
-    
+
     if (isBuildMode && buildGraphNodes.size === 0) {
       const container = document.getElementById('graph-container');
       container.innerHTML = '<p class="empty" style="padding-top: 3rem;">Select a memory and click "📍 Show on map" to start building your graph.</p>';
       return;
     }
-    
+
     if (isBuildMode && buildGraphNodes.size > 0) {
       const fullData = { nodes: graphData.nodes, edges: graphData.edges };
       const filteredNodes = new vis.DataSet(
@@ -3678,10 +3727,10 @@ let contextMenu = null;
 
   function showContextMenu(event, nodeId) {
     hideContextMenu();
-    
+
     const x = event.clientX || event.pageX || 100;
     const y = event.clientY || event.pageY || 100;
-    
+
     // Find node data from graphData first, then memories as fallback
     let nodeData = null;
     if (graphData && graphData.nodes) {
@@ -3694,12 +3743,12 @@ let contextMenu = null;
       console.warn('[ContextMenu] Node not found:', nodeId);
       return;
     }
-    
+
     contextMenu = document.createElement('div');
     contextMenu.className = 'context-menu';
     contextMenu.style.left = Math.min(x, window.innerWidth - 200) + 'px';
     contextMenu.style.top = Math.min(y, window.innerHeight - 200) + 'px';
-    
+
     contextMenu.innerHTML = `
       <div class="context-menu-item" onclick="goToFact('${nodeId}')">📖 Go to fact</div>
       <div class="context-menu-separator"></div>
@@ -3708,10 +3757,10 @@ let contextMenu = null;
       <div class="context-menu-separator"></div>
       <div class="context-menu-item" onclick="removeNodeFromBuild('${nodeId}')">🗑️ Remove from map</div>
     `;
-    
+
     document.body.appendChild(contextMenu);
     currentContextNodeData = nodeData;
-    
+
     // Use capture to catch clicks outside the menu
     setTimeout(() => {
       document.addEventListener('click', hideContextMenu, { capture: true });
@@ -3794,12 +3843,12 @@ let contextMenu = null;
   async function addToBuildGraph(nodeId) {
     hideContextMenu();
     switchTab('graph');
-    
+
     // Force build mode if not already
     if (!isBuildMode) {
       setGraphMode('build');
     }
-    
+
     await showOnMap(nodeId);
   }
 
@@ -3809,11 +3858,11 @@ let contextMenu = null;
       openInGraph(id);
       return;
     }
-    
+
     if (!graphLoaded || !network) {
       await loadGraph();
     }
-    
+
     // Wait for network to be ready
     if (network && !network._stabilized) {
       await new Promise(resolve => {
@@ -3824,7 +3873,7 @@ let contextMenu = null;
         check();
       });
     }
-    
+
     if (buildGraphNodes.has(id)) {
       if (network) {
         network.focus(id, { scale: 1.5, animation: { duration: 1000, easingFunction: 'easeInOutQuad' } });
@@ -3833,12 +3882,12 @@ let contextMenu = null;
       toast('Node already on map');
       return;
     }
-    
+
     try {
       const focusData = await api.get('graph/focus/' + id);
-      
+
       buildGraphNodes.add(focusData.center.id);
-      
+
       const newNodes = [];
       for (const node of focusData.nodes) {
         if (!buildGraphNodes.has(node.id)) {
@@ -3854,9 +3903,9 @@ let contextMenu = null;
           });
         }
       }
-      
+
       const connData = await api.get('graph/connections/' + id);
-      
+
       for (const [relType, connections] of Object.entries(connData)) {
         for (const conn of connections) {
           if (!buildGraphNodes.has(conn.id)) {
@@ -3873,19 +3922,19 @@ let contextMenu = null;
           }
         }
       }
-      
+
       updateBuildStatus();
-      
+
       rebuildNetwork();
       saveSessionState();
-      
+
       setTimeout(() => {
         if (network) {
           network.focus(id, { scale: 1.5, animation: { duration: 1000, easingFunction: 'easeInOutQuad' } });
           network.selectNodes([id]);
         }
       }, 300);
-      
+
       toast('📍 Added to map');
     } catch(e) {
       toast('⚠️ Error loading node: ' + e.message);
@@ -3894,7 +3943,7 @@ let contextMenu = null;
 
   async function showAllConnected(nodeId) {
     hideContextMenu();
-    
+
     // Ensure network is ready
     if (!graphLoaded || !network) await loadGraph();
     if (network && !network._stabilized) {
@@ -3906,10 +3955,10 @@ let contextMenu = null;
         check();
       });
     }
-    
+
     try {
       const neighbors = await api.get('graph/neighbors/' + nodeId);
-      
+
       let addedCount = 0;
       for (const neighbor of neighbors) {
         if (!buildGraphNodes.has(neighbor.id)) {
@@ -3917,17 +3966,17 @@ let contextMenu = null;
           addedCount++;
         }
       }
-      
+
       updateBuildStatus();
       rebuildNetwork();
       saveSessionState();
-      
+
       setTimeout(() => {
         if (network) {
           network.focus(nodeId, { scale: 1.2, animation: { duration: 800, easingFunction: 'easeInOutQuad' } });
         }
       }, 500);
-      
+
       toast('🔗 Added ' + addedCount + ' connected node' + (addedCount !== 1 ? 's' : ''));
     } catch(e) {
       toast('⚠️ Error: ' + e.message);
@@ -3936,11 +3985,11 @@ let contextMenu = null;
 
   async function showConnectionType(nodeId, relType) {
     hideContextMenu();
-    
+
     try {
       const connections = await api.get('graph/connections/' + nodeId);
       const connList = connections[relType] || [];
-      
+
       let addedCount = 0;
       for (const conn of connList) {
         if (!buildGraphNodes.has(conn.id)) {
@@ -3948,17 +3997,17 @@ let contextMenu = null;
           addedCount++;
         }
       }
-      
+
       updateBuildStatus();
       rebuildNetwork();
       saveSessionState();
-      
+
       setTimeout(() => {
         if (network) {
           network.focus(nodeId, { scale: 1.2, animation: { duration: 800, easingFunction: 'easeInOutQuad' } });
         }
       }, 300);
-      
+
       toast(`🔗 Added ${addedCount} node${addedCount !== 1 ? 's' : ''} via ${relType}`);
     } catch(e) {
       toast('⚠️ Error: ' + e.message);
