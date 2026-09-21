@@ -287,6 +287,43 @@ async def db_delete_memory(memory_id: str, user_id: str) -> bool:
         return False
 
 
+async def db_add_fact_relevant(fact_id: str, client_id: str, user_id: str):
+    """Create a RELEVANT_TO relationship from a fact to a client."""
+    neo4j_driver = get_neo4j()
+    if not neo4j_driver:
+        raise RuntimeError("Neo4j not connected.")
+
+    with neo4j_driver.session() as s:
+        s.run(
+            """
+            MATCH (f:Fact {id: $factId, userId: $userId})
+            MATCH (c:Client {id: $clientId, userId: $userId})
+            MERGE (f)-[:RELEVANT_TO]->(c)
+            """,
+            factId=fact_id, clientId=client_id, userId=user_id,
+        )
+
+    await publish_db_event(user_id, "memory_changed", {"action": "relevant_add", "id": fact_id})
+
+
+async def db_remove_fact_relevant(fact_id: str, client_id: str, user_id: str):
+    """Remove a RELEVANT_TO relationship from a fact to a client."""
+    neo4j_driver = get_neo4j()
+    if not neo4j_driver:
+        raise RuntimeError("Neo4j not connected.")
+
+    with neo4j_driver.session() as s:
+        s.run(
+            """
+            MATCH (f:Fact {id: $factId, userId: $userId})-[r:RELEVANT_TO]->(c:Client {id: $clientId, userId: $userId})
+            DELETE r
+            """,
+            factId=fact_id, clientId=client_id, userId=user_id,
+        )
+
+    await publish_db_event(user_id, "memory_changed", {"action": "relevant_remove", "id": fact_id})
+
+
 async def db_link_facts(source_id: str, target_id: str, rel_type: str, metadata: dict, user_id: str):
     """Create a relationship between two nodes in Neo4j.
 
