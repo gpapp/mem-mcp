@@ -27,29 +27,26 @@ You are a multi-skilled assistant. To handle complex tasks, you should:
             return f.read()
 
     @mcp.prompt("process-transcription")
-    def prompt_process_transcription(transcription_text: str) -> str:
-        """Instructions for processing a transcription using the dedicated skill workflow."""
-        return f"""
-Please process the following meeting transcription according to the 'process-transcription' skill guidelines.
+    def prompt_process_transcription(transcription_text: str = "") -> str:
+        """Instructions for processing a transcription using the dedicated skill workflow.
 
-CORE TASKS:
-1. Extract Metadata (Date, Topic, Context, Original file path). Round the timestamp to the nearest 15 minutes.
-2. Identify Participants and their Roles.
-3. Extract Entities (People, Projects, Technologies, Decisions, Action Items).
-4. Entity Resolution: Search for existing people/projects before creating new facts. Consider possible aliases.
-5. Deduplication: Merge new information into existing facts using 'update_fact' instead of creating duplicates.
-6. Ambiguity & Aliases: If a name is ambiguous or confidence is low, STOP and ask the user for clarification. Create an 'aliases' dictionary with confidences for mispronunciations or first names, and add it to the metadata and markdown text.
-7. Save key facts and links.
-8. Use a **dedicated subagent** (task tool, subagent_type="general") to produce the structured summary in the exact format (## Participants, ## Context, ## Decisions, ## Actions, ## Notes, ## Keywords).
-9. Save the summary locally as 'YYYY-MM-DD hh-mm-ss Title.md' using the rounded timestamp.
-10. Log the summary in the diary using 'diary_save_entry' with:
-    - `timestamp` = meeting start time **rounded to the nearest 15 minutes** (:00, :15, :30, :45) — e.g. '2026-05-15T10:00:00'
-    - `metadata` = {{"original_file": "<path to transcription file>", "meeting_date": "<date>", "topic": "<topic>", "keywords": "<comma-separated list of extracted keywords>"}} — always include metadata and keywords when processing transcripts; it enables cross-referencing, transcript-source tracking, and automatic keyword rendering.
-    Re-saving with the same timestamp replaces the existing entry, so use the original timestamp to update rather than duplicate.
-11. PERFORMANCE: Batch multiple 'add_fact' and 'link_facts' calls into a single response for maximum efficiency.
-TRANSCRIPTION CONTENT:
-{transcription_text}
-"""
+        Defers to skills/process-transcription.md — the skill file is the single
+        source of truth for the workflow (timestamp ladder, reprocessing, format,
+        delegation rules). Passing a whole transcript as a prompt argument is
+        token-expensive; prefer reading the file locally and delegating extraction
+        to a subagent per the skill's contract.
+        """
+        body = transcription_text.strip()
+        return """
+Please process the meeting transcription according to the 'process-transcription' skill.
+
+1. Load the skill first: get_skill_workflow("process-transcription") (or resource skill://process-transcription) and follow it exactly — it is the single source of truth for timestamp resolution, transcript formats, smalltalk suppression, reprocessing rules, the diary format (## Participants, ## Context, ## Description, ## Decisions, ## Actions, ## Open Questions, ## Notes, ## Keywords), and the pre/post-save checklists.
+2. For a directory of transcripts, load skill "process-directory" instead and follow it.
+3. Run extraction in a subagent that returns only the digest — never bring the raw transcript into the main context (prefer reading the file over passing content here).
+4. Wait for the human gate (one consolidated question call) before any writes.
+
+TRANSCRIPTION CONTENT (prefer reading the file over passing content here):
+""" + (body if body else "(none passed — read the transcript file locally)")
 
     @mcp.resource("skill://memory-deduplication")
     def resource_skill_deduplication() -> str:
