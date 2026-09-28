@@ -231,6 +231,22 @@ a fact whose link was just deleted has to leave the filtered view immediately
 rather than on the next reclassify. `gui.py` forwards `clientId` / `contextId`
 on `/api/graph`, `/api/graph/neighbors/{id}` and `/api/graph/focus/{id}`.
 
+**Diary entries are scoped from their edges too.** `db_get_graph` reads a
+diary entry's client from the `clientId` property, but the `FOR_CLIENT` and
+`IN_CONTEXT` passes write it back over the top from the edge. The property is
+seeded first as a fallback, and the property and the edge are the same subject:
+`link_diary_to_client` in `client_manager.py` writes the edge, and
+`db_set_diary_scope` writes both. Scoping diary entries from the property alone
+put a reclassified entry in its previous client's graph until the next boot
+reconciled it, and because the passes matched `:Fact` only, a diary entry's
+scope edge produced no graph edge at all. The label test is
+`node_map[id]["label"] == "Fact"` rather than a label in Cypher, because both
+passes run after every node is in `node_map`. `diary_scope` holds a **list**,
+not a tuple — the edge passes assign into it by index, and a tuple raises
+`TypeError` on the first edge that disagrees with the property, which is exactly
+the case the fallback exists to handle. Guarded by `DiaryScopeSourceTests` and
+`DiaryScopeTests` in `test_graph_scope.py`.
+
 Client, Context and Category nodes are **always** kept under a scope filter. A
 graph that has been filtered to one client and then omits that client's node
 reads as "this client has no facts", which is worse than a slightly noisy graph.

@@ -1987,7 +1987,7 @@ def db_get_graph(user_id: str, client_id: str = "", context_id: str = "", limit:
         # so the filter below never has to trust a denormalised property.
         fact_clients = {}
         fact_contexts = {}
-        diary_scope = {}  # diary id -> (client_id, context_id)
+        diary_scope = {}  # diary id -> [client_id, context_id]
 
         for r in result:
             f = r["f"]
@@ -2059,7 +2059,11 @@ def db_get_graph(user_id: str, client_id: str = "", context_id: str = "", limit:
                     "name": d_node.get("title") or d_node.get("content", ""),
                     "group": "Diary"
                 }
-            diary_scope[d_id] = (d_node.get("clientId") or "", d_node.get("contextId") or "")
+            # Seeded from the properties and overwritten by the FOR_CLIENT /
+            # IN_CONTEXT passes below, which run later. The property is the
+            # classifier's denormalised copy of an edge it may not have
+            # written yet, so it is a fallback rather than the authority.
+            diary_scope[d_id] = [d_node.get("clientId") or "", d_node.get("contextId") or ""]
             f_node = dr["f"]
             rel = dr["rel_type"]
             if f_node and rel:
@@ -2082,9 +2086,9 @@ def db_get_graph(user_id: str, client_id: str = "", context_id: str = "", limit:
         client_res = s.run(
             """
             MATCH (c:Client {userId: $userId})
-            OPTIONAL MATCH (f:Fact)-[:FOR_CLIENT]->(c)
-            WHERE f.userId = $userId
-            RETURN c, f
+            OPTIONAL MATCH (n)-[:FOR_CLIENT]->(c)
+            WHERE (n:Fact OR n:DiaryEntry) AND n.userId = $userId
+            RETURN c, n
             """,
             userId=user_id
         )
@@ -2100,7 +2104,15 @@ def db_get_graph(user_id: str, client_id: str = "", context_id: str = "", limit:
                 }
             f_node = cr["f"]
             if f_node:
-                fact_clients.setdefault(f_node["id"], set()).add(c_id)
+                # Diary entries carry FOR_CLIENT too -- link_diary_to_client
+                # writes it -- and scoping them from the denormalised property
+                # instead of the edge is what put them in the wrong client.
+                scope_of = fact_clients if f_node.get("id") in node_map and \
+                    node_map[f_node["id"]]["label"] == "Fact" else None
+                if scope_of is not None:
+                    scope_of.setdefault(f_node["id"], set()).add(c_id)
+                else:
+                    diary_scope.setdefault(f_node["id"], ["", ""])[0] = c_id
                 edge_sig = (f_node["id"], c_id, "FOR_CLIENT")
                 reverse_sig = (c_id, f_node["id"], "FOR_CLIENT")
                 if reverse_sig not in edge_lookup and edge_sig not in edge_lookup:
@@ -2118,10 +2130,10 @@ def db_get_graph(user_id: str, client_id: str = "", context_id: str = "", limit:
         ctx_res = s.run(
             """
             MATCH (ctx:Context {userId: $userId})
-            OPTIONAL MATCH (f:Fact)-[:IN_CONTEXT]->(ctx)
-            WHERE f.userId = $userId
+            OPTIONAL MATCH (n)-[:IN_CONTEXT]->(ctx)
+            WHERE (n:Fact OR n:DiaryEntry) AND n.userId = $userId
             OPTIONAL MATCH (c:Client)-[:HAS_CONTEXT]->(ctx)
-            RETURN ctx, f, c
+            RETURN ctx, n, c
             """,
             userId=user_id
         )
@@ -2137,7 +2149,10 @@ def db_get_graph(user_id: str, client_id: str = "", context_id: str = "", limit:
                 }
             f_node = xrr["f"]
             if f_node:
-                fact_contexts.setdefault(f_node["id"], set()).add(ctx_id)
+                if f_node.get("id") in node_map and node_map[f_node["id"]]["label"] == "Fact":
+                    fact_contexts.setdefault(f_node["id"], set()).add(ctx_id)
+                else:
+                    diary_scope.setdefault(f_node["id"], ["", ""])[1] = ctx_id
                 edge_sig = (f_node["id"], ctx_id, "IN_CONTEXT")
                 reverse_sig = (ctx_id, f_node["id"], "IN_CONTEXT")
                 if reverse_sig not in edge_lookup and edge_sig not in edge_lookup:

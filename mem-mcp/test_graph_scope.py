@@ -11,6 +11,7 @@ error.
 
 import ast
 import os
+import re
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -233,6 +234,97 @@ class NeighborhoodScopeTests(unittest.TestCase):
         ]
         kept = {n["id"] for n in _filter_neighborhood_scope(nodes, "c1", "x1")}
         self.assertEqual(kept, {"c1", "x1"})
+
+
+class DiaryScopeSourceTests(unittest.TestCase):
+    """Diary scope must come from the edges, like every other record.
+
+    ``db_get_graph`` reads a fact's client from its ``FOR_CLIENT`` edge but used
+    to read a diary entry's from the denormalised ``clientId`` property. Those
+    are not the same thing: the property is the classifier's cached copy of an
+    edge it has not necessarily written yet, so a reclassified diary entry sat
+    in the previous client's graph until the next boot reconciled it. Worse,
+    the ``FOR_CLIENT``/``IN_CONTEXT`` passes matched ``:Fact`` only, so a diary
+    entry's scope edge produced no graph edge at all and the property was the
+    only scope it could ever have.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        with open(FACT_MANAGER, "r", encoding="utf-8") as handle:
+            cls.source = handle.read()
+        tree = ast.parse(cls.source)
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                    and node.name == "db_get_graph":
+                cls.body = ast.get_source_segment(cls.source, node)
+                break
+        else:
+            raise AssertionError("db_get_graph not found in fact_manager.py")
+
+    def test_the_scope_passes_cover_diary_entries(self):
+        """Both scope passes must match DiaryEntry, or its edges are invisible."""
+        for rel in ("FOR_CLIENT", "IN_CONTEXT"):
+            pattern = re.compile(
+                r"OPTIONAL MATCH \(n\)-\[:" + rel + r"\]->\(\w+\)\s*\n"
+                r"\s*WHERE \(n:Fact OR n:DiaryEntry\)",
+            )
+            self.assertTrue(
+                pattern.search(self.body),
+                f"the {rel} pass still matches :Fact only, so a diary entry's "
+                f"scope edge produces no graph edge and its scope can only be "
+                f"read from the stale property",
+            )
+
+    def test_diary_scope_is_seeded_from_the_property_and_overwritten_by_the_edges(self):
+        """The property seeds the dict; the edge passes must be able to replace it."""
+        self.assertTrue(
+            'diary_scope[d_id] = [d_node.get("clientId") or "", d_node.get("contextId") or ""]'
+            in self.body,
+            "diary_scope is no longer seeded from the DiaryEntry properties",
+        )
+        # A list, not a tuple: the edge passes assign into it by index, and a
+        # tuple would raise TypeError the first time an edge disagrees with the
+        # property -- which is precisely the case the fix exists for.
+        self.assertTrue(
+            'diary_scope.setdefault(f_node["id"], ["", ""])[0] = c_id' in self.body,
+            "the FOR_CLIENT pass no longer writes diary scope",
+        )
+        self.assertTrue(
+            'diary_scope.setdefault(f_node["id"], ["", ""])[1] = ctx_id' in self.body,
+            "the IN_CONTEXT pass no longer writes diary scope",
+        )
+
+
+class DiaryScopeTests(unittest.TestCase):
+    """A diary entry scopes through the same conjunctive rule as a fact."""
+
+    def scope(self, nodes, diary_scope, client_id="", context_id=""):
+        node_map = {n["id"]: n for n in nodes}
+        return _scope_and_cap_graph(
+            node_map, [], {}, {}, diary_scope, client_id, context_id, 0,
+        )
+
+    def test_a_diary_entry_scopes_through_its_own_client(self):
+        nodes = [diary("d1"), diary("d2"), client_node("c1", "Acme"), client_node("c2", "Other")]
+        result = self.scope(nodes, {"d1": ["c1", ""], "d2": ["c2", ""]}, client_id="c1")
+        self.assertIn("d1", ids(result))
+        self.assertNotIn("d2", ids(result))
+
+    def test_a_diary_entry_scopes_through_its_own_context(self):
+        nodes = [diary("d1"), diary("d2"), context_node("x1", "Atlas"), context_node("x2", "Hedron")]
+        result = self.scope(nodes, {"d1": ["", "x1"], "d2": ["", "x2"]}, context_id="x1")
+        self.assertIn("d1", ids(result))
+        self.assertNotIn("d2", ids(result))
+
+    def test_an_unscoped_diary_entry_is_dropped_under_a_scope(self):
+        result = self.scope([diary("d1")], {"d1": ["", ""]}, client_id="c1")
+        self.assertNotIn("d1", ids(result))
+
+    def test_a_diary_entry_missing_from_the_scope_map_is_dropped(self):
+        """No entry at all means unlinked, which is not the same as in-scope."""
+        result = self.scope([diary("d1")], {}, client_id="c1")
+        self.assertNotIn("d1", ids(result))
 
 
 if __name__ == "__main__":
