@@ -30,7 +30,8 @@ COMMON_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "common.py"
 GUI_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui.py")
 
 _FUNCTION = "get_llm_response"
-_ASSIGNMENTS = ("LLM_TIMEOUT", "LLM_CONNECT_TIMEOUT", "SEARCH_LLM_TIMEOUT")
+_HELPERS = ("_llm_excerpt",)
+_ASSIGNMENTS = ("LLM_TIMEOUT", "LLM_CONNECT_TIMEOUT", "SEARCH_LLM_TIMEOUT", "LLM_LOG_CHARS")
 
 
 # ---------------------------------------------------------------------------
@@ -110,7 +111,9 @@ def _load(recorder, responder, **overrides):
     chunks = []
     found = set()
     for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == _FUNCTION:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
+            node.name == _FUNCTION or node.name in _HELPERS
+        ):
             chunks.append(ast.get_source_segment(source, node))
             found.add(node.name)
         if isinstance(node, (ast.Assign, ast.AnnAssign)):
@@ -119,6 +122,9 @@ def _load(recorder, responder, **overrides):
                 chunks.append(ast.get_source_segment(source, node))
     if _FUNCTION not in found:
         raise AssertionError(f"common.py no longer defines {_FUNCTION}")
+    for name in _HELPERS:
+        if name not in found:
+            raise AssertionError(f"common.py no longer defines {name}")
 
     class FakeClient:
         def __init__(self, *a, **kw):
@@ -370,6 +376,115 @@ class HappyPathTests(unittest.TestCase):
             any("timeout_s=45" in w for w in self.rec.warnings),
             msg=f"no timeout_s in the request lines: {self.rec.warnings}",
         )
+
+
+class ContentLoggingTests(unittest.TestCase):
+    """The request and the answer must be recoverable from the log alone.
+
+    Only the character counts were logged, so a mis-scoped or hallucinating
+    answer could not be inspected after the fact — you had to reproduce the call
+    to see what the model had actually been shown and said. That is exactly the
+    question you want answered when a reclassify produces a wrong link.
+
+    Note this writes entry and meeting text to the log file, which is why
+    MEM_LLM_LOG_CHARS=0 turns it off and why the truncation is capped.
+    """
+
+    def setUp(self):
+        self.rec = Recorder()
+
+    def _excerpt(self, **overrides):
+        ns = _load(self.rec, _ok(), **overrides)
+        return ns["_llm_excerpt"]
+
+    # --- the excerpt helper -------------------------------------------------
+    def test_short_text_is_untouched(self):
+        ex = self._excerpt()
+        self.assertEqual(ex("hello"), "hello")
+
+    def test_a_prompt_that_fits_is_not_marked_as_truncated(self):
+        ex = self._excerpt()
+        self.assertNotIn("more chars", ex("a" * 1000))
+
+    def test_long_text_is_capped_at_the_budget(self):
+        ex = self._excerpt()
+        out = ex("a" * 5000)
+        self.assertTrue(out.startswith("a" * 1000))
+        self.assertIn("+4000 more chars", out)
+
+    def test_the_elision_marker_reports_the_total_length(self):
+        """The first question is always 'how much is there that I can't see'."""
+        ex = self._excerpt()
+        self.assertIn("+4000 more chars", ex("a" * 5000))
+
+    def test_newlines_are_escaped_so_one_event_stays_one_line(self):
+        ex = self._excerpt()
+        out = ex("line one\nline two\r\nline three\ttabbed")
+        self.assertNotIn("\n", out)
+        self.assertNotIn("\r", out)
+        self.assertIn("\\n", out)
+        self.assertIn("\\t", out)
+
+    def test_backslashes_are_escaped_before_the_whitespace_rules(self):
+        ex = self._excerpt()
+        self.assertEqual(ex("a\\b"), "a\\\\b")
+
+    def test_a_limit_of_zero_logs_sizes_only(self):
+        ex = self._excerpt(LLM_LOG_CHARS=0)
+        self.assertEqual(ex("secret content"), "")
+
+    def test_an_explicit_limit_overrides_the_default(self):
+        ex = self._excerpt()
+        self.assertTrue(ex("a" * 100, 10).startswith("a" * 10))
+        self.assertIn("+90 more chars", ex("a" * 100, 10))
+
+    # --- the content actually reaches the log line -------------------------
+    def test_the_prompt_reaches_the_log(self):
+        ns = _load(self.rec, _ok("x"))
+        asyncio.run(ns[_FUNCTION]("Find the client named Deutsche Bank."))
+        joined = " ".join(self.rec.warnings)
+        self.assertIn("Find the client named Deutsche Bank.", joined)
+
+    def test_the_system_prompt_reaches_the_log(self):
+        ns = _load(self.rec, _ok("x"))
+        asyncio.run(ns[_FUNCTION]("q", system="You are a scope classifier."))
+        joined = " ".join(self.rec.warnings)
+        self.assertIn("You are a scope classifier.", joined)
+
+    def test_the_answer_reaches_the_log(self):
+        ns = _load(self.rec, _ok('{"client": "Deutsche Bank (DB)"}'))
+        asyncio.run(ns[_FUNCTION]("q"))
+        self.assertTrue(
+            any("Deutsche Bank (DB)" in w for w in self.rec.warnings),
+            msg="the model's answer is not in the log, only its length",
+        )
+
+    def test_a_huge_prompt_does_not_land_in_the_log_unbounded(self):
+        """A 40k-char entry must not put 40k chars on every reclassify line."""
+        ns = _load(self.rec, _ok("x"))
+        asyncio.run(ns[_FUNCTION]("q" * 40000))
+        request_line = next(
+            w for w in self.rec.warnings if "Ollama request" in w
+        )
+        self.assertIn("+39000 more chars", request_line)
+        self.assertLess(len(request_line), 1400)
+
+    def test_every_logged_line_stays_single_line(self):
+        """One logical event, one line — otherwise grep reads fragments."""
+        ns = _load(self.rec, _ok("line one\nline two"))
+        asyncio.run(ns[_FUNCTION]("first\nsecond\nthird", system="sys\nprompt"))
+        for line in self.rec.warnings:
+            self.assertNotIn("\n", line, msg=f"embedded newline in: {line!r}")
+
+    def test_content_logging_can_be_switched_off_end_to_end(self):
+        ns = _load(self.rec, _ok("SENSITIVE ANSWER"), LLM_LOG_CHARS=0)
+        asyncio.run(ns[_FUNCTION]("SENSITIVE PROMPT"))
+        joined = " ".join(self.rec.warnings)
+        self.assertNotIn("SENSITIVE PROMPT", joined)
+        self.assertNotIn("SENSITIVE ANSWER", joined)
+        # the sizes are still there, which is the point of the knob
+        self.assertIn("prompt_chars=", joined)
+        self.assertIn("content_chars=", joined)
 
 
 # ---------------------------------------------------------------------------

@@ -234,6 +234,13 @@ LLM_TIMEOUT    = float(os.getenv("MEM_LLM_TIMEOUT", "300.0"))
 # the query is already good enough to search with. The background passes
 # (classification, extraction, merge drafts) get the full LLM_TIMEOUT instead.
 SEARCH_LLM_TIMEOUT = float(os.getenv("MEM_SEARCH_LLM_TIMEOUT", "45.0"))
+# How much of each prompt and answer is written to the chat log line. The whole
+# request and the whole answer used to be unrecoverable -- only the character
+# *counts* were logged, so a mis-scoped or hallucinating answer could not be
+# inspected after the fact without reproducing it. Set to 0 to log sizes only;
+# note that this writes meeting content and entry text to the log file, which is
+# worth knowing if the vault holds anything you would not want at rest there.
+LLM_LOG_CHARS = max(0, int(os.getenv("MEM_LLM_LOG_CHARS", "1000")))
 BASE_URL       = os.getenv("BASE_URL",            "").rstrip("/")
 
 COLLECTION_NAME  = "ea_memories"
@@ -628,6 +635,36 @@ async def get_embedding(text: str) -> List[float]:
     )
 
 
+def _llm_excerpt(text: str, limit: int = 0) -> str:
+    """Shorten text for a single log line, and flatten it to stay one line.
+
+    Prompts and model answers are both multi-line by nature, and a raw newline in
+    a RotatingFileHandler record makes one logical event span several lines — at
+    which point `grep` reports a truncated fragment as if it were the whole
+    message, and the line-oriented tooling reads timestamps that are not there.
+    So the excerpt escapes the whitespace it contains rather than emitting it.
+
+    The elision marker carries the *total* length, because the whole reason for
+    looking at this is a call that behaved unexpectedly and the first question
+    is always "how much was there that I cannot see".
+    """
+    budget = limit or LLM_LOG_CHARS
+    body = text if isinstance(text, str) else str(text)
+    if budget <= 0:
+        # Content logging turned off. Not "unlimited" -- an operator disabling
+        # this wants the sizes back, not every prompt written to disk forever.
+        return ""
+    if len(body) <= budget:
+        excerpt = body
+    else:
+        excerpt = body[:budget] + f"…+{len(body) - budget} more chars"
+    return (excerpt.replace("\\", "\\\\")
+                  .replace("\r\n", "\\n")
+                  .replace("\n", "\\n")
+                  .replace("\r", "\\r")
+                  .replace("\t", "\\t"))
+
+
 async def get_llm_response(prompt: str, system: str = "", model: str = "",
                            num_predict: int = 0, timeout: float = 0.0) -> str:
     """Call Ollama /api/chat and return the assistant's text response.
@@ -665,7 +702,8 @@ async def get_llm_response(prompt: str, system: str = "", model: str = "",
     url = f"{OLLAMA_URL}/api/chat"
     logger.warning(
         f"Ollama request: POST {OLLAMA_URL}/api/chat model={resolved_model} "
-        f"prompt_chars={len(prompt)} system_chars={len(system)} timeout_s={budget:g}"
+        f"prompt_chars={len(prompt)} system_chars={len(system)} timeout_s={budget:g} "
+        f"system={_llm_excerpt(system)} prompt={_llm_excerpt(prompt)}"
     )
     started = time.monotonic()
     try:
@@ -701,7 +739,7 @@ async def get_llm_response(prompt: str, system: str = "", model: str = "",
 
     logger.warning(
         f"Ollama response: POST /api/chat status={resp.status_code} "
-        f"response_chars={len(resp.text)}"
+        f"response_chars={len(resp.text)} body={_llm_excerpt(resp.text)}"
     )
     if resp.is_error:
         detail = resp.text.strip()
@@ -741,7 +779,8 @@ async def get_llm_response(prompt: str, system: str = "", model: str = "",
             f"nothing -- check `docker logs ollama` for memory pressure."
         )
     logger.warning(
-        f"Ollama result: chat model={resolved_model} content_chars={len(content)}"
+        f"Ollama result: chat model={resolved_model} content_chars={len(content)} "
+        f"content={_llm_excerpt(content)}"
     )
     return content
 
