@@ -74,11 +74,20 @@ class FakeHTTPError(Exception):
 
 
 class Recorder:
-    """Collects POSTs and the warnings the code under test logs."""
+    """Collects POSTs and the log records the code under test emits.
+
+    ``debugs``/``warnings``/``errors`` are kept apart on purpose, because the
+    levels are a contract, not cosmetics. Embedding is the high-volume path, so
+    per-attempt detail is DEBUG; an over-budget input is a WARNING because the
+    stored vector is then lossy; a terminal failure is an ERROR because it is the
+    only signal that write was refused.
+    """
 
     def __init__(self):
         self.posts = []
         self.warnings = []
+        self.debugs = []
+        self.errors = []
         self.slept = 0.0
 
 
@@ -145,11 +154,11 @@ def _load(recorder, responder, *, retries=None, backoff=0.0, max_chars=None):
         def warning(self, msg, *a, **kw):
             recorder.warnings.append(str(msg))
 
-        def debug(self, *a, **kw):
-            pass
+        def debug(self, msg, *a, **kw):
+            recorder.debugs.append(str(msg))
 
-        def error(self, *a, **kw):
-            pass
+        def error(self, msg, *a, **kw):
+            recorder.errors.append(str(msg))
 
     async def _sleep(seconds):
         recorder.slept += seconds
@@ -242,8 +251,8 @@ class EmbeddingCallTests(unittest.TestCase):
         self.assertEqual(vector, VEC)
         self.assertEqual(_paths(recorder), [LEGACY, LEGACY], "must retry the same route first")
 
-    def test_ollama_error_body_reaches_the_log(self):
-        """The whole point: a bare 500 told us nothing."""
+    def test_ollama_error_body_reaches_the_debug_log(self):
+        """A recovered failure still explains itself, at DEBUG not WARNING."""
         calls = {"n": 0}
 
         def responder(url, body, n):
@@ -254,9 +263,29 @@ class EmbeddingCallTests(unittest.TestCase):
 
         recorder, _, _ = self._run(responder, retries=1)
         self.assertTrue(
-            any("requires more system memory" in w for w in recorder.warnings),
-            f"Ollama's reason never reached the log: {recorder.warnings}",
+            any("requires more system memory" in d for d in recorder.debugs),
+            f"Ollama's reason never reached the debug log: {recorder.debugs}",
         )
+        self.assertEqual(recorder.warnings, [], "a recovered embed must not warn")
+
+    def test_per_attempt_detail_never_warns(self):
+        """Embedding is the high-volume path; it must not spam WARNING.
+
+        Production runs at LOG_LEVEL=WARNING, so a degraded Ollama would emit a
+        line per call and bury the chat traffic that level exists to surface.
+        """
+        calls = {"n": 0}
+
+        def responder(url, body, n):
+            calls["n"] += 1
+            if calls["n"] < 4:
+                return FakeResponse(503, {"error": "server busy"})
+            return _ok_for(url)
+
+        recorder, vector, err = self._run(responder, retries=2)
+        self.assertIsNone(err, err)
+        self.assertEqual(vector, VEC)
+        self.assertEqual(recorder.warnings, [], f"embedding warned: {recorder.warnings}")
 
     def test_transport_error_is_retried(self):
         calls = {"n": 0}
@@ -319,6 +348,22 @@ class EmbeddingCallTests(unittest.TestCase):
         message = str(err)
         self.assertIn("nomic-embed-text", message)
         self.assertIn("out of memory", message)
+
+    def test_total_failure_is_logged_once_as_an_error(self):
+        """ERROR, exactly once, and never a WARNING.
+
+        Both routes are tried, so a naive implementation would report the same
+        failure twice and a per-attempt implementation once per retry.
+        """
+        recorder, _, err = self._run(
+            lambda url, body, n: FakeResponse(500, {"error": "out of memory"}),
+            retries=2,
+        )
+        self.assertIsInstance(err, RuntimeError)
+        self.assertEqual(len(recorder.errors), 1, f"expected one error: {recorder.errors}")
+        self.assertIn("out of memory", recorder.errors[0])
+        self.assertIn("ollama pull", recorder.errors[0])
+        self.assertEqual(recorder.warnings, [], f"a failure must not warn: {recorder.warnings}")
 
     def test_malformed_success_body_does_not_raise_keyerror(self):
         _, _, err = self._run(
@@ -400,7 +445,10 @@ class OversizedInputTests(unittest.TestCase):
         self.assertIsNone(err, err)
         sent = recorder.posts[0][1]["prompt"]
         self.assertLessEqual(len(sent), 1000)
-        self.assertTrue(any("truncating" in w for w in recorder.warnings))
+        self.assertTrue(
+            any("truncating" in w for w in recorder.warnings),
+            f"an over-budget embed must warn: {recorder.warnings}",
+        )
 
     def test_truncation_keeps_head_and_tail(self):
         # A transcription puts the subject first and the conclusions last, and a

@@ -169,6 +169,20 @@ and retried. That case is never retried with backoff, because re-sending the
 same oversized text is what made the first two production failures take five
 requests each and still fail.
 
+### Log levels
+
+Embedding is the high-volume path, so it does not log at `WARNING` per call.
+At `LOG_LEVEL=WARNING` (the production setting) you get:
+
+- `WARNING` — the input was over budget and got truncated, which means the
+  stored vector is a lossy summary of a long record. Rare, and worth knowing.
+- `ERROR` — the embed failed. Logged once, with Ollama's own reason and the
+  `ollama pull` command to fix it. Nothing is written in this case.
+- `DEBUG` — every individual attempt and retry, if you turn the level down.
+
+`WARNING` otherwise belongs to the chat/LLM traffic, which is what you are
+usually looking for.
+
 ## Claude Desktop Setup
 
 Run this command to add the vault to your Claude configuration:

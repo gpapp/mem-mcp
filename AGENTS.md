@@ -28,11 +28,11 @@ After completing any code changes:
 
 ### Focused Tests
 
-The dependency-light regression suite covers matching, scope compatibility, scope-name and `Client:`-header resolution, duplicate scoring and clustering, merge validation, merge callback ordering, People candidate resolution, and LLM prompt contracts. A second suite covers the embedding retry/fallback logic; it lifts the real functions out of `common.py` with `ast.get_source_segment` because `common.py` cannot be imported without the DB drivers.
+The dependency-light regression suite covers matching, scope compatibility, scope-name and `Client:`-header resolution, duplicate scoring and clustering, merge validation, merge callback ordering, People candidate resolution, LLM prompt contracts, and the chunking split. Two more suites need no database either: `test_embedding_reliability.py` lifts the real functions out of `common.py` with `ast.get_source_segment`, and `test_cypher_safety.py` lints the Cypher in every module (see Gotchas for why).
 
 ```powershell
 Push-Location mem-mcp
-C:/tools/miniconda3/python.exe -m unittest -v test_matching_regressions.py test_embedding_reliability.py
+C:/tools/miniconda3/python.exe -m unittest -v test_matching_regressions.py test_embedding_reliability.py test_chunking.py test_cypher_safety.py
 Pop-Location
 ```
 
@@ -129,11 +129,12 @@ The scheduled backup is the one exception: it is vault-wide, so there is no sing
 
 - **Two routes, legacy first.** `("/api/embeddings", {"model","prompt"})` then `("/api/embed", {"model","input"})`. Both response shapes are accepted (`{"embedding": [...]}` and `{"embeddings": [[...]]}`). `ollama/ollama:latest` is unpinned in compose, so the surface can genuinely shift between deploys — a 404 on the legacy route drops straight through to the modern one instead of burning retries on a 404 that will never recover.
 - **Retry only what can recover.** `_EMBED_RETRY_STATUS` is `408/409/429/500/502/503/504`; backoff is `EMBED_RETRY_BACKOFF * attempt`. A `400`/`404` (missing model, bad request) is not retried on that route — it moves to the other route and then fails.
-- **Log the reason, not the status.** `_ollama_detail(resp)` prefers Ollama's own `{"error": ...}` body and falls back to the raw text. Without this, the traceback said `500` and nothing else.
+- **Log the reason, not the status.** `_ollama_detail(resp)` prefers Ollama's own `{"error": ...}` body and falls back to the raw text. Without this, the traceback said `500` and nothing else. The reason is carried in `last_detail` and surfaced once in the terminal error, not per attempt — see the logging policy below.
 - **An over-long input is a length error wearing a 500.** Ollama answers `the input length exceeds the context length` with HTTP 500, so it looks retryable and the loop re-sent the same oversized text five times before failing with a message that never mentioned length. `_is_input_too_long()` classifies it as deterministic: the remedy is a *smaller input*, not another attempt, so the text is halved and re-sent with no backoff. Do not reclassify these hints as transient — that is what made the second production incident take five requests and still fail.
 - **Truncation keeps head and tail.** `_truncate_for_embed()` cuts to `EMBED_MAX_CHARS` and keeps 75% from the front and the rest from the end, with the `\n...\n` marker counted *inside* the budget. A transcription puts the subject at the top and the conclusions at the bottom, and a search query is far more likely to match the tail. The marker being inside the budget is not cosmetic — measuring it showed a 1000-char budget producing 1005 chars, which defeats the point of a ceiling.
 - **The cache key stays the original text.** Truncation is a transport detail; keying the cache on the truncated form would let two different long facts that share a prefix collide, and a search query that truncated onto a stored fact's prefix would get that fact's vector back as its own answer.
 - **Final failure is a `RuntimeError`** naming the model and quoting the reason plus the `docker exec ollama ollama pull <model>` fix. Nothing upstream catches `httpx.HTTPStatusError`, so the exception type change is safe.
+- **The log level is a contract, not cosmetics.** Embedding is the high-volume path — one call per query variant per search, plus one per write — and production runs at `LOG_LEVEL=WARNING`. Per-attempt failures and retries are `DEBUG`; **input-too-long is `WARNING`** (rare, and it means the stored vector is lossy); **a failed embed is `ERROR`, logged once**, carrying Ollama's own reason and the `ollama pull` fix. `WARNING` is reserved for chat/LLM traffic. Emitting a `WARNING` per embed call buries the chat traffic that the level exists to surface. `test_embedding_reliability.py` asserts all three of these.
 - **A failed embedding never leaves a half-written record.** Every caller (`diary_manager`, `fact_manager`, `memory`) awaits `get_embedding()` *before* its `MERGE`/`insert`, so a raise means the write never happened — the user just gets an error, not a record with a missing vector.
 
 Tests for all of the above live in `mem-mcp/test_embedding_reliability.py`. `common.py` cannot be imported without the DB drivers, so that file lifts the real functions out of the source with `ast.get_source_segment` and execs them against stubs — it tests the shipping code, not a copy of it.
@@ -144,6 +145,7 @@ Tests for all of the above live in `mem-mcp/test_embedding_reliability.py`. `com
 - Long timeouts (600s) for LLM operations—don't timeout-hunt
 - Collection named `ea_memories` (hardcoded in memory.py)
 - **Validate `templates/dashboard.html` JS with `node --check` after any template edit.** `py_compile` and the Python suites structurally cannot see a JS syntax error, and one stray `await` in a non-async function took down the entire panel — `<body onload="init()">` reported `init is not defined` only as a downstream symptom of the script block failing to parse.
+- **Cypher cannot be parsed locally** — there is no Neo4j and no driver in this environment, so a syntax error ships to production and surfaces as `neo4j.exceptions.CypherSyntaxError` on first execution. `test_cypher_safety.py` exists because of this: it extracts every Cypher string constant and f-string fragment and lints `FOREACH (v IN <list> | ...)` for a variable referenced inside its own list. A `FOREACH (x IN ... ELSE [x] END | DELETE x)` is a parse error, not a runtime one, and it was the reason every full reclassify aborted on its first call. The suite also pins the scope-clear query's shape. Add to it when you add a query.
 
 ## Matching, Deduplication & Merge Safety
 

@@ -480,13 +480,23 @@ async def get_embedding(text: str) -> List[float]:
 
     The legacy /api/embeddings route is tried first and /api/embed second: the
     Ollama image is unpinned, and the older route is the one that goes away. A
-    failure that is plausibly transient is retried before it is surfaced, and
-    the Ollama error body is always logged — a bare 500 tells you nothing.
+    failure that is plausibly transient is retried before it is surfaced.
 
     Text longer than ``EMBED_MAX_CHARS`` is truncated to fit the embedder's
     context window, and if Ollama still reports the input as too long the text
     is halved and tried again. Ollama answers that case with a 500, so without
     this an oversized fact would be re-sent five times and then fail outright.
+
+    Logging policy, since embedding is the high-volume path (one call per query
+    variant per search, plus one per write) and production runs at
+    LOG_LEVEL=WARNING:
+
+      * per-attempt failures and retries — DEBUG. A degraded Ollama must not emit
+        a WARNING per call and bury the chat traffic that level exists for.
+      * input too long — WARNING. This is rare and it means the stored vector is
+        a lossy summary, which the operator needs to know about.
+      * embedding failed — ERROR, once, carrying Ollama's own error body and the
+        ``ollama pull`` fix. This is the only failure signal for this path.
     """
     key = (EMBED_MODEL, text)
     cached = _EMBEDDING_CACHE.get(key)
@@ -513,7 +523,7 @@ async def get_embedding(text: str) -> List[float]:
                 body[field] = work
                 if attempt:
                     delay = EMBED_RETRY_BACKOFF * attempt
-                    logger.warning(
+                    logger.debug(
                         f"Ollama embed retry {attempt}/{EMBED_RETRIES} on {endpoint} "
                         f"in {delay:.1f}s — {last_detail}"
                     )
@@ -522,7 +532,7 @@ async def get_embedding(text: str) -> List[float]:
                     vector, retryable, detail = await _embed_once(client, endpoint, body)
                 except httpx.HTTPError as exc:
                     last_detail = f"{type(exc).__name__}: {exc}"
-                    logger.warning(f"Ollama embed transport error on {endpoint}: {last_detail}")
+                    logger.debug(f"Ollama embed transport error on {endpoint}: {last_detail}")
                     attempt += 1
                     if attempt > EMBED_RETRIES:
                         break
@@ -547,7 +557,7 @@ async def get_embedding(text: str) -> List[float]:
                     )
                     work = shrunk
                     continue
-                logger.warning(
+                logger.debug(
                     f"Ollama embed failed on {endpoint} model={EMBED_MODEL} — {detail}"
                 )
                 if not retryable:
@@ -556,8 +566,16 @@ async def get_embedding(text: str) -> List[float]:
                 if attempt > EMBED_RETRIES:
                     break
 
+    # The one place a failed embed is reported. Every attempt above is DEBUG so a
+    # degraded Ollama cannot flood the log; the reason is carried forward and
+    # surfaced once, here, with the fix.
+    reason = last_detail or "no detail from Ollama"
+    logger.error(
+        f"Ollama embed failed for model {EMBED_MODEL!r} on both routes: {reason}. "
+        f"If the model is missing, run: docker exec ollama ollama pull {EMBED_MODEL}"
+    )
     raise RuntimeError(
-        f"Embedding failed for model {EMBED_MODEL!r}: {last_detail or 'no detail from Ollama'}. "
+        f"Embedding failed for model {EMBED_MODEL!r}: {reason}. "
         f"Confirm the Ollama container is healthy and the model is present "
         f"(docker exec ollama ollama pull {EMBED_MODEL})."
     )
