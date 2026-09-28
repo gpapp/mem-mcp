@@ -24,13 +24,21 @@ import unittest
 
 COMMON_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "common.py")
 
-_FUNCTIONS = ("_ollama_detail", "_embed_once", "get_embedding")
+_FUNCTIONS = (
+    "_ollama_detail",
+    "_embed_once",
+    "_is_input_too_long",
+    "_truncate_for_embed",
+    "get_embedding",
+)
 _ASSIGNMENTS = (
     "_EMBEDDING_CACHE",
     "EMBED_CACHE_MAX",
     "EMBED_RETRIES",
     "EMBED_RETRY_BACKOFF",
+    "EMBED_MAX_CHARS",
     "_EMBED_RETRY_STATUS",
+    "_EMBED_INPUT_ERRORS",
 )
 
 
@@ -74,7 +82,7 @@ class Recorder:
         self.slept = 0.0
 
 
-def _load(recorder, responder, *, retries=None, backoff=0.0):
+def _load(recorder, responder, *, retries=None, backoff=0.0, max_chars=None):
     """Exec the real embedding block against stubs. Returns a namespace."""
     with open(COMMON_PY, "r", encoding="utf-8") as handle:
         source = handle.read()
@@ -110,7 +118,10 @@ def _load(recorder, responder, *, retries=None, backoff=0.0):
             return False
 
         async def post(self, url, json=None):
-            recorder.posts.append((url, json))
+            # Copy the body. get_embedding reuses one dict across attempts and
+            # only overwrites the text field, so recording the reference would
+            # make every logged request show the final value and hide the shrink.
+            recorder.posts.append((url, dict(json) if json else json))
             result = responder(url, json, len(recorder.posts))
             if isinstance(result, Exception):
                 raise result
@@ -160,6 +171,8 @@ def _load(recorder, responder, *, retries=None, backoff=0.0):
     if retries is not None:
         namespace["EMBED_RETRIES"] = retries
     namespace["EMBED_RETRY_BACKOFF"] = backoff
+    if max_chars is not None:
+        namespace["EMBED_MAX_CHARS"] = max_chars
     return namespace
 
 
@@ -361,6 +374,102 @@ class EmbedDetailTests(unittest.TestCase):
 
     def test_empty_body_is_labelled(self):
         self.assertEqual(self._detail(FakeResponse(500, None, text="  ")), "(empty response body)")
+
+
+class OversizedInputTests(unittest.TestCase):
+    """Ollama answers an over-long input with a 500, not a 4xx.
+
+    That is what killed ``diary_save_entry`` in production a second time: the
+    retry loop dutifully re-sent the same oversized text five times, then failed
+    with a message that did not mention length at all. These pin the properties
+    that make the call succeed instead.
+    """
+
+    TOO_LONG = "the input length exceeds the context length"
+
+    def _run_text(self, text, responder, **kw):
+        recorder = Recorder()
+        ns = _load(recorder, responder, **kw)
+        try:
+            return recorder, ns, asyncio.run(ns["get_embedding"](text)), None
+        except Exception as exc:  # noqa: BLE001
+            return recorder, ns, None, exc
+
+    def test_text_over_the_budget_is_truncated_before_sending(self):
+        recorder, _, _, err = self._run_text("x" * 20000, _ok_for, max_chars=1000)
+        self.assertIsNone(err, err)
+        sent = recorder.posts[0][1]["prompt"]
+        self.assertLessEqual(len(sent), 1000)
+        self.assertTrue(any("truncating" in w for w in recorder.warnings))
+
+    def test_truncation_keeps_head_and_tail(self):
+        # A transcription puts the subject first and the conclusions last, and a
+        # search query is far more likely to match the tail.
+        text = "HEADMARKER" + ("-" * 5000) + "TAILMARKER"
+        recorder, _, _, err = self._run_text(text, _ok_for, max_chars=1000)
+        self.assertIsNone(err, err)
+        sent = recorder.posts[0][1]["prompt"]
+        self.assertIn("HEADMARKER", sent)
+        self.assertIn("TAILMARKER", sent)
+
+    def test_short_text_is_sent_verbatim(self):
+        recorder, _, _, err = self._run_text("a short note", _ok_for, max_chars=1000)
+        self.assertIsNone(err, err)
+        self.assertEqual(recorder.posts[0][1]["prompt"], "a short note")
+
+    def test_too_long_response_shrinks_the_input_and_succeeds(self):
+        """The budget is a guess at the real window, so the reply can disagree."""
+        def responder(url, body, n):
+            payload = body.get("prompt") or body.get("input") or ""
+            if len(payload) > 400:
+                return FakeResponse(500, {"error": self.TOO_LONG})
+            return _ok_for(url, body, n)
+
+        recorder, _, vector, err = self._run_text("y" * 3000, responder, max_chars=1000, retries=3)
+        self.assertIsNone(err, err)
+        self.assertEqual(vector, VEC)
+        sizes = [len(b.get("prompt") or b.get("input") or "") for _, b in recorder.posts]
+        self.assertTrue(sizes[0] > sizes[-1], f"input never shrank: {sizes}")
+
+    def test_too_long_does_not_spend_the_retry_budget(self):
+        """Re-sending the same bytes cannot clear a length error."""
+        recorder, _, _, err = self._run_text(
+            "z" * 5000, lambda url, body, n: FakeResponse(500, {"error": self.TOO_LONG}),
+            max_chars=1000, retries=2,
+        )
+        self.assertIsInstance(err, RuntimeError)
+        # A shrink loop, not a backoff loop: bounded by the halvings, and the
+        # two routes only add one more attempt each.
+        self.assertLessEqual(len(recorder.posts), 8, f"length error was retried: {len(recorder.posts)} posts")
+
+    def test_input_too_long_survives_the_retry_and_fallback_routes(self):
+        # The 500 would otherwise be read as retryable and burn the backoff.
+        recorder, _, _, err = self._run_text(
+            "w" * 5000, lambda url, body, n: FakeResponse(500, {"error": self.TOO_LONG}),
+            max_chars=1000, retries=1,
+        )
+        self.assertIsInstance(err, RuntimeError)
+        self.assertIn("exceeds the context length", str(err))
+        self.assertEqual(recorder.slept, 0.0, "a length error must not sleep between attempts")
+        self.assertEqual(_paths(recorder)[-1], MODERN, "should still try the other route")
+
+    def test_length_error_is_recognised_not_treated_as_transient(self):
+        ns = _load(Recorder(), _ok_for)
+        for detail in ("HTTP 500: the input length exceeds the context length", "maximum context"):
+            self.assertTrue(ns["_is_input_too_long"](detail), detail)
+        for detail in ("HTTP 500: out of memory", "HTTP 404: model not found", ""):
+            self.assertFalse(ns["_is_input_too_long"](detail), detail)
+
+    def test_cached_key_is_the_original_text_not_the_truncated_one(self):
+        # Otherwise a search whose query truncates onto a stored fact's prefix
+        # would return that fact's vector as its own answer.
+        recorder = Recorder()
+        ns = _load(recorder, _ok_for, max_chars=1000)
+        long_text = "q" * 20000
+        asyncio.run(ns["get_embedding"](long_text))
+        asyncio.run(ns["get_embedding"](long_text))
+        self.assertEqual(len(recorder.posts), 1, "the long text must still be cached")
+        self.assertIn(("nomic-embed-text", long_text), ns["_EMBEDDING_CACHE"])
 
 
 if __name__ == "__main__":

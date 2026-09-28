@@ -155,9 +155,19 @@ model and the reason Ollama gave, instead of a bare `500`.
 |---|---|---|
 | `MEM_EMBED_RETRIES` | `2` | Retries per route for a transient failure |
 | `MEM_EMBED_RETRY_BACKOFF` | `1.5` | Seconds multiplied by the attempt number |
+| `MEM_EMBED_MAX_CHARS` | `12000` | Character budget per embedding |
 
 A missing model is not retried — the error tells you to run
 `docker exec ollama ollama pull <model>`.
+
+Ollama serves embedding models with a smaller context window than the model
+advertises, so a long fact or diary entry can exceed it — and Ollama reports
+that as a `500`, not a `413`. Text over the budget is truncated before sending
+(the beginning and the end are kept, since that is where the subject and the
+conclusions live), and if Ollama still rejects the length the input is halved
+and retried. That case is never retried with backoff, because re-sending the
+same oversized text is what made the first two production failures take five
+requests each and still fail.
 
 ## Claude Desktop Setup
 

@@ -386,10 +386,27 @@ _EMBEDDING_CACHE: dict = {}
 EMBED_CACHE_MAX = 2048
 EMBED_RETRIES = max(0, int(os.getenv("MEM_EMBED_RETRIES", "2")))
 EMBED_RETRY_BACKOFF = float(os.getenv("MEM_EMBED_RETRY_BACKOFF", "1.5"))
+# Character budget for one embedding. Ollama serves embedding models with a
+# smaller window than the model advertises (num_ctx defaults to 2048-4096
+# regardless of the model's real 8192), so a long fact or diary entry can blow
+# the limit while looking modest on screen. 12000 chars is ~3000 tokens of
+# English and fits the common default window; it is only a first guess, and the
+# shrink ladder below adapts if the real window is smaller. Raise it if your
+# model genuinely has room, lower it if you see 500s in the log.
+EMBED_MAX_CHARS = max(500, int(os.getenv("MEM_EMBED_MAX_CHARS", "12000")))
 # Statuses worth a second attempt. A 5xx from Ollama is usually a cold model
 # load or two requests racing to load the same model, both of which clear.
 # 4xx is not retried: a bad model name or a missing route will not fix itself.
 _EMBED_RETRY_STATUS = frozenset({408, 409, 429, 500, 502, 503, 504})
+# Deterministic failures dressed as a 500. The same bytes will fail the same way
+# forever, so these are never retried on the same input — the remedy is a
+# smaller input, not another attempt.
+_EMBED_INPUT_ERRORS = (
+    "exceeds the context length",
+    "context length",
+    "input is too long",
+    "maximum context",
+)
 
 
 def _ollama_detail(resp) -> str:
@@ -431,6 +448,29 @@ async def _embed_once(client, endpoint: str, body: dict) -> tuple:
     return None, False, f"no embedding in response (keys: {sorted(payload)[:6]})"
 
 
+def _is_input_too_long(detail: str) -> bool:
+    """True when Ollama rejected the text itself, not the request."""
+    lowered = (detail or "").lower()
+    return any(hint in lowered for hint in _EMBED_INPUT_ERRORS)
+
+
+def _truncate_for_embed(text: str) -> str:
+    """Cut to the char budget, keeping the head and tail.
+
+    Head-only truncation is the usual choice, but a long transcription puts the
+    subject at the top and the conclusions at the bottom, and the tail is what a
+    search query is most likely to match. Both ends are kept.
+    """
+    if len(text) <= EMBED_MAX_CHARS:
+        return text
+    # The separator is part of the budget, not an extra on top of it: the point
+    # of a ceiling is that the result is guaranteed to fit.
+    marker = "\n...\n"
+    room = EMBED_MAX_CHARS - len(marker)
+    head = int(room * 0.75)
+    return f"{text[:head]}{marker}{text[-(room - head):]}"
+
+
 async def get_embedding(text: str) -> List[float]:
     """Embed text via Ollama, memoizing results for the process lifetime.
 
@@ -442,20 +482,35 @@ async def get_embedding(text: str) -> List[float]:
     Ollama image is unpinned, and the older route is the one that goes away. A
     failure that is plausibly transient is retried before it is surfaced, and
     the Ollama error body is always logged — a bare 500 tells you nothing.
+
+    Text longer than ``EMBED_MAX_CHARS`` is truncated to fit the embedder's
+    context window, and if Ollama still reports the input as too long the text
+    is halved and tried again. Ollama answers that case with a 500, so without
+    this an oversized fact would be re-sent five times and then fail outright.
     """
     key = (EMBED_MODEL, text)
     cached = _EMBEDDING_CACHE.get(key)
     if cached is not None:
         return cached
 
+    if len(text) > EMBED_MAX_CHARS:
+        logger.warning(
+            f"Embedding {EMBED_MODEL}: input is {len(text)} chars, over the "
+            f"{EMBED_MAX_CHARS} budget — truncating (head and tail kept)"
+        )
+    work = _truncate_for_embed(text)
+
     endpoints = (
-        ("/api/embeddings", {"model": EMBED_MODEL, "prompt": text}),
-        ("/api/embed", {"model": EMBED_MODEL, "input": text}),
+        ("/api/embeddings", {"model": EMBED_MODEL, "prompt": None}),
+        ("/api/embed", {"model": EMBED_MODEL, "input": None}),
     )
     last_detail = ""
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         for endpoint, body in endpoints:
-            for attempt in range(EMBED_RETRIES + 1):
+            field = "prompt" if "prompt" in body else "input"
+            attempt = 0
+            while True:
+                body[field] = work
                 if attempt:
                     delay = EMBED_RETRY_BACKOFF * attempt
                     logger.warning(
@@ -468,6 +523,9 @@ async def get_embedding(text: str) -> List[float]:
                 except httpx.HTTPError as exc:
                     last_detail = f"{type(exc).__name__}: {exc}"
                     logger.warning(f"Ollama embed transport error on {endpoint}: {last_detail}")
+                    attempt += 1
+                    if attempt > EMBED_RETRIES:
+                        break
                     continue
                 if vector is not None:
                     logger.debug(f"Ollama result: embedding model={EMBED_MODEL} dimensions={len(vector)}")
@@ -476,11 +534,27 @@ async def get_embedding(text: str) -> List[float]:
                     _EMBEDDING_CACHE[key] = vector
                     return vector
                 last_detail = detail
+                if _is_input_too_long(detail):
+                    # Deterministic. Re-sending the same bytes cannot help, and
+                    # the budget is only an estimate of the real window — halve
+                    # and retry immediately, without spending a backoff.
+                    shrunk = work[:len(work) // 2]
+                    if len(shrunk) < 200 or shrunk == work:
+                        break  # already tiny; something else is wrong
+                    logger.warning(
+                        f"Ollama embed input too long on {endpoint} "
+                        f"({len(work)} chars) — retrying with {len(shrunk)}"
+                    )
+                    work = shrunk
+                    continue
                 logger.warning(
                     f"Ollama embed failed on {endpoint} model={EMBED_MODEL} — {detail}"
                 )
                 if not retryable:
                     break  # this route will not do better; try the other one
+                attempt += 1
+                if attempt > EMBED_RETRIES:
+                    break
 
     raise RuntimeError(
         f"Embedding failed for model {EMBED_MODEL!r}: {last_detail or 'no detail from Ollama'}. "
