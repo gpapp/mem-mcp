@@ -28,15 +28,15 @@ After completing any code changes:
 
 ### Focused Tests
 
-The dependency-light regression suite covers matching, scope compatibility, scope-name and `Client:`-header resolution, duplicate scoring and clustering, merge validation, merge callback ordering, People candidate resolution, and LLM prompt contracts:
+The dependency-light regression suite covers matching, scope compatibility, scope-name and `Client:`-header resolution, duplicate scoring and clustering, merge validation, merge callback ordering, People candidate resolution, and LLM prompt contracts. A second suite covers the embedding retry/fallback logic; it lifts the real functions out of `common.py` with `ast.get_source_segment` because `common.py` cannot be imported without the DB drivers.
 
 ```powershell
 Push-Location mem-mcp
-C:/tools/miniconda3/python.exe -m unittest -v test_matching_regressions.py
+C:/tools/miniconda3/python.exe -m unittest -v test_matching_regressions.py test_embedding_reliability.py
 Pop-Location
 ```
 
-Run `git diff --check` after documentation or code edits. The suite uses pure helpers and fake callbacks so it does not require Neo4j, Qdrant, or Ollama.
+Run `git -c core.whitespace=cr-at-eol diff --check` after documentation or code edits (the `cr-at-eol` avoids false positives on the CRLF files). The suites use pure helpers and fake callbacks so they do not require Neo4j, Qdrant, or Ollama.
 
 ### Image Build
 
@@ -67,6 +67,7 @@ Run `git diff --check` after documentation or code edits. The suite uses pure he
 - Merge LLM: `MEM_MERGE_MODEL` defaults to `gemma4:e2b` and is used only for dashboard merge-draft generation; override it if the host GPU cannot run that model
 - Scope backfill LLM: `MEM_SCOPE_MODEL` (defaults to the query LLM) classifies unlinked facts/diary entries against existing clients on startup; `MEM_SCOPE_BACKFILL=0` disables it, `MEM_SCOPE_CONCURRENCY` (default 3) caps parallel classifications
 - Backups: `MEM_BACKUP_ENABLED` (default 1), `MEM_BACKUP_HOUR` / `MEM_BACKUP_MINUTES` (local server time, default 03:00), `MEM_BACKUP_KEEP` (default 14), `MEM_BACKUP_DIR` (default `<dirname LOG_DIR>/backup`)
+- Embedding retries: `MEM_EMBED_RETRIES` (default 2) and `MEM_EMBED_RETRY_BACKOFF` (default 1.5, in seconds) — see "Embedding Reliability"
 - User vault resolved from `Authorization: Basic` header or session cookie
 - `BASE_URL` must include `/mcp` prefix when behind nginx
 
@@ -122,11 +123,24 @@ Do not reintroduce byte-exact name matching, per-item synchronous clears, or a s
 
 The scheduled backup is the one exception: it is vault-wide, so there is no single user whose lock it could take. `scheduled_backup_loop()` calls `active_maintenance()` first and defers by `_RETRY_SECONDS` if any user holds the lock. Keep it that way — calling `run_backup()` directly from the scheduler would snapshot a graph mid-reclassify.
 
+## Embedding Reliability
+
+`get_embedding()` in `common.py` is the single choke point for every vector write, and Ollama fails it more often than the rest of the stack: a model still loading, a GPU under memory pressure, or a busy container behind a rolling restart. A bare `raise_for_status()` turns any of those into a `httpx.HTTPStatusError` whose only text is `500 Internal Server Error` — the operator learns nothing about whether the model is missing, the host is OOM, or the route moved.
+
+- **Two routes, legacy first.** `("/api/embeddings", {"model","prompt"})` then `("/api/embed", {"model","input"})`. Both response shapes are accepted (`{"embedding": [...]}` and `{"embeddings": [[...]]}`). `ollama/ollama:latest` is unpinned in compose, so the surface can genuinely shift between deploys — a 404 on the legacy route drops straight through to the modern one instead of burning retries on a 404 that will never recover.
+- **Retry only what can recover.** `_EMBED_RETRY_STATUS` is `408/409/429/500/502/503/504`; backoff is `EMBED_RETRY_BACKOFF * attempt`. A `400`/`404` (missing model, bad request) is not retried on that route — it moves to the other route and then fails.
+- **Log the reason, not the status.** `_ollama_detail(resp)` prefers Ollama's own `{"error": ...}` body and falls back to the raw text. Without this, the traceback said `500` and nothing else.
+- **Final failure is a `RuntimeError`** naming the model and quoting the reason plus the `docker exec ollama ollama pull <model>` fix. Nothing upstream catches `httpx.HTTPStatusError`, so the exception type change is safe.
+- **A failed embedding never leaves a half-written record.** Every caller (`diary_manager`, `fact_manager`, `memory`) awaits `get_embedding()` *before* its `MERGE`/`insert`, so a raise means the write never happened — the user just gets an error, not a record with a missing vector.
+
+Tests for all of the above live in `mem-mcp/test_embedding_reliability.py`. `common.py` cannot be imported without the DB drivers, so that file lifts the real functions out of the source with `ast.get_source_segment` and execs them against stubs — it tests the shipping code, not a copy of it.
+
 ## Gotchas
 
 - Qdrant not accessible from host—interact via app only
 - Long timeouts (600s) for LLM operations—don't timeout-hunt
 - Collection named `ea_memories` (hardcoded in memory.py)
+- **Validate `templates/dashboard.html` JS with `node --check` after any template edit.** `py_compile` and the Python suites structurally cannot see a JS syntax error, and one stray `await` in a non-async function took down the entire panel — `<body onload="init()">` reported `init is not defined` only as a downstream symptom of the script block failing to parse.
 
 ## Matching, Deduplication & Merge Safety
 

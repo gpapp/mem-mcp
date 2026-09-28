@@ -108,11 +108,11 @@ Run the focused dependency-light regression suite from the repository root:
 
 ```powershell
 Push-Location mem-mcp
-C:/tools/miniconda3/python.exe -m unittest -v test_matching_regressions.py
+C:/tools/miniconda3/python.exe -m unittest -v test_matching_regressions.py test_embedding_reliability.py
 Pop-Location
 ```
 
-The suite covers scope-aware duplicate matching, weighted scoring, bridge-cluster rejection, merge target ownership, merge mutation ordering, People candidate resolution, scope-name and `Client:`-header resolution, and LLM prompt contracts. It does not require the Docker services.
+The suites cover scope-aware duplicate matching, weighted scoring, bridge-cluster rejection, merge target ownership, merge mutation ordering, People candidate resolution, scope-name and `Client:`-header resolution, LLM prompt contracts, and the embedding retry/fallback behaviour. They do not require the Docker services.
 
 ## Backups
 
@@ -139,6 +139,25 @@ Schedule and retention are controlled in `.env`:
 Savepoints are copies, not a live mirror — if the host disk is lost, they are
 lost with it. Copy `mem-mcp-data/backup/` off the machine if you need a
 disaster-recovery copy.
+
+## Embedding Reliability
+
+Every fact and diary entry is embedded through a single choke point. Ollama is
+flakier than the rest of the stack — a model still loading, a GPU under memory
+pressure, a container mid-restart — so the client retries transient failures and
+tries both the legacy `/api/embeddings` and the modern `/api/embed` route.
+
+If it still cannot embed, the save is rejected **before** anything is written, so
+a failed embedding never leaves a record without a vector. The error names the
+model and the reason Ollama gave, instead of a bare `500`.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MEM_EMBED_RETRIES` | `2` | Retries per route for a transient failure |
+| `MEM_EMBED_RETRY_BACKOFF` | `1.5` | Seconds multiplied by the attempt number |
+
+A missing model is not retried — the error tells you to run
+`docker exec ollama ollama pull <model>`.
 
 ## Claude Desktop Setup
 

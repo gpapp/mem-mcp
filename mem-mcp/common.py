@@ -384,6 +384,52 @@ def clean_extracted_people_names(names: list) -> list[str]:
 # ---------------------------------------------------------------------------
 _EMBEDDING_CACHE: dict = {}
 EMBED_CACHE_MAX = 2048
+EMBED_RETRIES = max(0, int(os.getenv("MEM_EMBED_RETRIES", "2")))
+EMBED_RETRY_BACKOFF = float(os.getenv("MEM_EMBED_RETRY_BACKOFF", "1.5"))
+# Statuses worth a second attempt. A 5xx from Ollama is usually a cold model
+# load or two requests racing to load the same model, both of which clear.
+# 4xx is not retried: a bad model name or a missing route will not fix itself.
+_EMBED_RETRY_STATUS = frozenset({408, 409, 429, 500, 502, 503, 504})
+
+
+def _ollama_detail(resp) -> str:
+    """Pull the reason out of an Ollama error body.
+
+    Ollama answers 500 with {"error": "..."} and that string is the only thing
+    that distinguishes "model not pulled" from "out of memory" from "route
+    removed". Without it the traceback shows a status code and nothing else.
+    """
+    text = (getattr(resp, "text", "") or "").strip()
+    if not text:
+        return "(empty response body)"
+    try:
+        payload = resp.json()
+    except ValueError:
+        return text[:500]
+    if isinstance(payload, dict) and payload.get("error"):
+        return str(payload["error"])[:500]
+    return text[:500]
+
+
+async def _embed_once(client, endpoint: str, body: dict) -> tuple:
+    """One embed call. Returns (vector, retryable, detail)."""
+    resp = await client.post(f"{OLLAMA_URL}{endpoint}", json=body)
+    if resp.is_error:
+        return None, resp.status_code in _EMBED_RETRY_STATUS, f"HTTP {resp.status_code}: {_ollama_detail(resp)}"
+    try:
+        payload = resp.json()
+    except ValueError:
+        return None, False, f"non-JSON response: {(resp.text or '')[:200]}"
+    # /api/embed answers {"embeddings": [[...]]}; /api/embeddings answers
+    # {"embedding": [...]}. Accept either so a server-side switch is invisible.
+    vectors = payload.get("embeddings")
+    if isinstance(vectors, list) and vectors and isinstance(vectors[0], list):
+        return vectors[0], False, ""
+    single = payload.get("embedding")
+    if isinstance(single, list) and single:
+        return single, False, ""
+    return None, False, f"no embedding in response (keys: {sorted(payload)[:6]})"
+
 
 async def get_embedding(text: str) -> List[float]:
     """Embed text via Ollama, memoizing results for the process lifetime.
@@ -391,26 +437,56 @@ async def get_embedding(text: str) -> List[float]:
     Embeddings are deterministic per (model, text), and a single search fans out
     to one Ollama round trip per query variant. The cache collapses repeats across
     variants, repeats within a request, and repeat searches by the agent.
+
+    The legacy /api/embeddings route is tried first and /api/embed second: the
+    Ollama image is unpinned, and the older route is the one that goes away. A
+    failure that is plausibly transient is retried before it is surfaced, and
+    the Ollama error body is always logged — a bare 500 tells you nothing.
     """
     key = (EMBED_MODEL, text)
     cached = _EMBEDDING_CACHE.get(key)
     if cached is not None:
         return cached
 
-    request_body = {"model": EMBED_MODEL, "prompt": text}
-    logger.debug(f"Ollama request: POST {OLLAMA_URL}/api/embeddings model={EMBED_MODEL} chars={len(text)}")
+    endpoints = (
+        ("/api/embeddings", {"model": EMBED_MODEL, "prompt": text}),
+        ("/api/embed", {"model": EMBED_MODEL, "input": text}),
+    )
+    last_detail = ""
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        resp = await client.post(
-            f"{OLLAMA_URL}/api/embeddings",
-            json=request_body,
-        )
-        resp.raise_for_status()
-        embedding = resp.json()["embedding"]
-    logger.debug(f"Ollama result: embedding model={EMBED_MODEL} dimensions={len(embedding)}")
-    if len(_EMBEDDING_CACHE) >= EMBED_CACHE_MAX:
-        _EMBEDDING_CACHE.pop(next(iter(_EMBEDDING_CACHE)))
-    _EMBEDDING_CACHE[key] = embedding
-    return embedding
+        for endpoint, body in endpoints:
+            for attempt in range(EMBED_RETRIES + 1):
+                if attempt:
+                    delay = EMBED_RETRY_BACKOFF * attempt
+                    logger.warning(
+                        f"Ollama embed retry {attempt}/{EMBED_RETRIES} on {endpoint} "
+                        f"in {delay:.1f}s — {last_detail}"
+                    )
+                    await asyncio.sleep(delay)
+                try:
+                    vector, retryable, detail = await _embed_once(client, endpoint, body)
+                except httpx.HTTPError as exc:
+                    last_detail = f"{type(exc).__name__}: {exc}"
+                    logger.warning(f"Ollama embed transport error on {endpoint}: {last_detail}")
+                    continue
+                if vector is not None:
+                    logger.debug(f"Ollama result: embedding model={EMBED_MODEL} dimensions={len(vector)}")
+                    if len(_EMBEDDING_CACHE) >= EMBED_CACHE_MAX:
+                        _EMBEDDING_CACHE.pop(next(iter(_EMBEDDING_CACHE)))
+                    _EMBEDDING_CACHE[key] = vector
+                    return vector
+                last_detail = detail
+                logger.warning(
+                    f"Ollama embed failed on {endpoint} model={EMBED_MODEL} — {detail}"
+                )
+                if not retryable:
+                    break  # this route will not do better; try the other one
+
+    raise RuntimeError(
+        f"Embedding failed for model {EMBED_MODEL!r}: {last_detail or 'no detail from Ollama'}. "
+        f"Confirm the Ollama container is healthy and the model is present "
+        f"(docker exec ollama ollama pull {EMBED_MODEL})."
+    )
 
 
 async def get_llm_response(prompt: str, system: str = "", model: str = "", num_predict: int = 0) -> str:
