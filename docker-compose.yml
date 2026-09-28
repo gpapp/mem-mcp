@@ -94,6 +94,47 @@ services:
       - HTTPX_TIMEOUT=600.0
       - REQUESTS_TIMEOUT=600
 
+      # LLM chat timeouts. Compose only passes what is listed here, so a knob
+      # documented in .env.example but absent from this block is unreachable and
+      # permanently stuck at its code default -- which is how MEM_LLM_TIMEOUT
+      # looked configurable and was not. Defaults are repeated deliberately so
+      # the effective value is visible in one place. See AGENTS.md
+      # "LLM Chat Reliability".
+      - MEM_LLM_TIMEOUT=${MEM_LLM_TIMEOUT:-300}
+      - MEM_LLM_CONNECT_TIMEOUT=${MEM_LLM_CONNECT_TIMEOUT:-10}
+      - MEM_SEARCH_LLM_TIMEOUT=${MEM_SEARCH_LLM_TIMEOUT:-45}
+      - MEM_LLM_LOG_CHARS=${MEM_LLM_LOG_CHARS:-1000}
+
+      # Embedding budget and retries. EMBED_MAX_CHARS must stay in step with
+      # chunking.EMBED_CEILING, which reads the same variable.
+      - MEM_EMBED_RETRIES=${MEM_EMBED_RETRIES:-2}
+      - MEM_EMBED_RETRY_BACKOFF=${MEM_EMBED_RETRY_BACKOFF:-1.5}
+      - MEM_EMBED_MAX_CHARS=${MEM_EMBED_MAX_CHARS:-8000}
+
+      # Long records (chunking) and the startup re-chunking pass.
+      - MEM_CHUNK_CHARS=${MEM_CHUNK_CHARS:-3000}
+      - MEM_CHUNK_MAX=${MEM_CHUNK_MAX:-16}
+      - MEM_CHUNK_OVERLAP=${MEM_CHUNK_OVERLAP:-200}
+      - MEM_CHUNK_FETCH_MULTIPLIER=${MEM_CHUNK_FETCH_MULTIPLIER:-3}
+      - MEM_RECHUNK_ENABLED=${MEM_RECHUNK_ENABLED:-1}
+      - MEM_RECHUNK_LIMIT=${MEM_RECHUNK_LIMIT:-200}
+      - MEM_RECHUNK_CONCURRENCY=${MEM_RECHUNK_CONCURRENCY:-2}
+
+      # Text windowing. One LLM call per window, so the window size is a
+      # recall/cost trade-off; the count is deliberately never capped.
+      - MEM_SCOPE_TEXT_WINDOW=${MEM_SCOPE_TEXT_WINDOW:-6000}
+      - MEM_SCOPE_TEXT_OVERLAP=${MEM_SCOPE_TEXT_OVERLAP:-600}
+      - MEM_PEOPLE_WINDOW=${MEM_PEOPLE_WINDOW:-6000}
+      - MEM_PEOPLE_OVERLAP=${MEM_PEOPLE_OVERLAP:-600}
+      - MEM_PEOPLE_RESOLVE_WINDOW=${MEM_PEOPLE_RESOLVE_WINDOW:-6000}
+      - MEM_PEOPLE_RESOLVE_OVERLAP=${MEM_PEOPLE_RESOLVE_OVERLAP:-600}
+      - MEM_KEYWORD_WINDOW=${MEM_KEYWORD_WINDOW:-8000}
+      - MEM_KEYWORD_OVERLAP=${MEM_KEYWORD_OVERLAP:-500}
+      - MEM_KEYWORD_LIMIT=${MEM_KEYWORD_LIMIT:-20}
+
+      # Graph response cap.
+      - MEM_GRAPH_MAX_NODES=${MEM_GRAPH_MAX_NODES:-600}
+
       - MEM_EMBEDDER_PROVIDER=ollama
       - MEM_EMBEDDER_MODEL=${MEM_EMBEDDER_MODEL:-nomic-embed-text}
       - MEM_EMBEDDER_URL=http://ollama:11434
