@@ -472,6 +472,19 @@
       .diary-sidebar { max-height: 40vh; overflow-y: auto; }
       .memories-main { padding: .85rem; }
 
+      /* .diary-main needs BOTH halves of this, and the second one is the
+         one that bites. Stacked, it is a flex item in a column whose height
+         is auto, and it carries `flex: 1` -- a zero flex-basis. A pane that
+         is still a scroll container is sized from its flex basis, so the
+         auto-height parent resolves against zero and the entries render
+         into a box with no height: the diary simply looks empty. Setting
+         overflow-y: visible lets the content back into the intrinsic size,
+         and flex: 0 0 auto stops the zero basis from being re-applied.
+
+         .memories-main has the same `flex: 1` and only needed the overflow
+         line above; fixing one pane is not evidence the other is fine. */
+      .diary-main { flex: 0 0 auto; overflow-y: visible; }
+
       /* Chip rows run sideways rather than stacking into a tall rail. */
       .chips-container { flex-direction: row !important; flex-wrap: nowrap; overflow-x: auto; }
 

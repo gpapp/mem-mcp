@@ -86,6 +86,88 @@ def _assert_declares(case, block_map, selector, declaration, why):
     )
 
 
+class StackedPaneVisibilityTests(unittest.TestCase):
+    """A stacked pane that stays a scroll container collapses to nothing.
+
+    Both detail panes are `flex: 1` -- a zero flex-basis -- and both live
+    inside a layout that becomes a column of `height: auto` below the
+    breakpoint. A pane that is still `overflow-y: auto` is sized from that
+    zero basis, so the auto-height parent resolves against zero and the
+    content renders into a box with no height. There is no error and no
+    overflow to see: the diary simply looks empty on a phone.
+
+    This is not hypothetical. The memories pane was released and the diary
+    pane was not, so fixing one said nothing about the other -- and the diary
+    pane is the one that shipped broken.
+    """
+
+    _PANES = (".memories-main", ".diary-main")
+
+    def setUp(self):
+        self.tablet = _declarations(_media_block(900))
+
+    def test_no_detail_pane_stays_a_scroll_container(self):
+        for selector in self._PANES:
+            with self.subTest(selector=selector):
+                merged = _decls(self.tablet, selector)
+                # Assert presence first. _decls returns "" for an absent
+                # selector, and every assertNotIn below would pass vacuously
+                # on it -- which is exactly what happened when the diary
+                # release line was deleted to test this guard.
+                self.assertTrue(
+                    merged.strip(),
+                    f"{selector} is not restated below the breakpoint at all, "
+                    f"so it keeps its full-width scroll container",
+                )
+                self.assertNotIn(
+                    "overflow-y: auto", merged,
+                    f"{selector} keeps its own scroll below the breakpoint, so "
+                    f"a zero flex-basis in a height:auto column collapses it; got: {merged.strip()!r}",
+                )
+
+    def test_no_detail_pane_keeps_a_zero_flex_basis(self):
+        # flex: 1 and flex: 1 1 0% both mean basis 0. flex: 0 0 auto is the
+        # only form that lets the pane contribute its content height.
+        for selector in self._PANES:
+            with self.subTest(selector=selector):
+                merged = _decls(self.tablet, selector)
+                self.assertTrue(merged.strip(), f"{selector} is not restated")
+                for zero_basis in ("flex: 1;", "flex: 1 1 0;", "flex: 1 1 0%"):
+                    self.assertNotIn(
+                        zero_basis, merged,
+                        f"{selector} re-applies a zero flex-basis below the "
+                        f"breakpoint; got: {merged.strip()!r}",
+                    )
+
+    def test_every_base_pane_that_is_flex_one_is_released(self):
+        """Belt and braces: derive the panes from the stylesheet, not a list.
+
+        A hardcoded list of panes is a list that goes stale the moment a tab
+        is added. This reads which panes are `flex: 1` at full width and
+        requires each one to be released in the mobile block.
+        """
+        css = _strip_comments(CSS)
+        base = _declarations(css)
+        # _declarations maps a selector to a LIST of declaration blocks, so
+        # test membership with the joining helper rather than `in`, which
+        # would be an exact-element list test and silently never match.
+        flexed = {
+            selector for selector in base
+            if "flex: 1;" in _decls(base, selector) and selector.endswith("-main")
+        }
+        self.assertTrue(
+            flexed, "no *-main pane is flex: 1 any more -- update this test"
+        )
+        for selector in sorted(flexed):
+            with self.subTest(selector=selector):
+                merged = _decls(self.tablet, selector)
+                self.assertTrue(
+                    merged.strip(),
+                    f"{selector} is a full-width flex: 1 pane but the mobile "
+                    f"block never mentions it",
+                )
+
+
 class LayoutInlineStyleTests(unittest.TestCase):
     """An inline style beats a stylesheet rule of any specificity."""
 
