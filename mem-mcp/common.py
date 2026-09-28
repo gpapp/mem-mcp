@@ -220,6 +220,20 @@ SCOPE_MODEL = os.getenv("MEM_SCOPE_MODEL") or LLM_QUERY_MODEL
 SCOPE_BACKFILL_ENABLED = os.getenv("MEM_SCOPE_BACKFILL", "1") == "1"
 SCOPE_BACKFILL_CONCURRENCY = int(os.getenv("MEM_SCOPE_CONCURRENCY", "3"))
 HTTP_TIMEOUT    = float(os.getenv("MEM_HTTP_TIMEOUT", "300.0"))
+# Read timeout for a single Ollama /api/chat call. This is deliberately its own
+# knob rather than reusing HTTP_TIMEOUT: a chat is the one call that can take
+# minutes of wall clock, because it is CPU inference on a small model with no
+# GPU, and it scales with the prompt. The old hardcoded 60s cut reclassification
+# off mid-window -- one window's LLM call was measured taking 46s for a 4420-char
+# prompt, so a merely slow host turned into a 503 with nothing logged. Connect
+# stays short so a genuinely dead Ollama fails fast instead of burning 5 minutes.
+LLM_CONNECT_TIMEOUT = float(os.getenv("MEM_LLM_CONNECT_TIMEOUT", "10.0"))
+LLM_TIMEOUT    = float(os.getenv("MEM_LLM_TIMEOUT", "300.0"))
+# The search-rewrite call sits between the user and their results, so it keeps a
+# short budget: a rewrite that takes two minutes is worse than no rewrite, because
+# the query is already good enough to search with. The background passes
+# (classification, extraction, merge drafts) get the full LLM_TIMEOUT instead.
+SEARCH_LLM_TIMEOUT = float(os.getenv("MEM_SEARCH_LLM_TIMEOUT", "45.0"))
 BASE_URL       = os.getenv("BASE_URL",            "").rstrip("/")
 
 COLLECTION_NAME  = "ea_memories"
@@ -614,13 +628,23 @@ async def get_embedding(text: str) -> List[float]:
     )
 
 
-async def get_llm_response(prompt: str, system: str = "", model: str = "", num_predict: int = 0) -> str:
+async def get_llm_response(prompt: str, system: str = "", model: str = "",
+                           num_predict: int = 0, timeout: float = 0.0) -> str:
     """Call Ollama /api/chat and return the assistant's text response.
 
     Uses LLM_QUERY_MODEL (default: qwen3.5:0.8b) unless overridden by `model`.
-    Times out after 60 s — intentionally short for interactive search calls.
+    Read timeout is LLM_TIMEOUT (MEM_LLM_TIMEOUT, default 300 s); pass `timeout`
+    to shorten it for a call that sits in front of a user waiting on it.
     Strips <think>…</think> blocks produced by reasoning models (e.g. Qwen3).
     Pass num_predict > 0 to cap/guarantee the output token budget.
+
+    Every failure mode is logged with the model, the prompt size and the elapsed
+    time, and the ones that mean "no answer is possible" raise RuntimeError
+    naming the remedy. A bare httpx exception propagating out of here is what
+    made a slow host look like a dead service: the WARNING request line was
+    written, the response line never was, and nothing in between explained the
+    gap. An *empty* answer is logged but still returned, because callers have
+    deliberate fallbacks for it.
     """
     resolved_model = model or LLM_QUERY_MODEL
     messages: list = []
@@ -637,34 +661,89 @@ async def get_llm_response(prompt: str, system: str = "", model: str = "", num_p
         "think": False,
         "options": options,
     }
+    budget = timeout or LLM_TIMEOUT
+    url = f"{OLLAMA_URL}/api/chat"
     logger.warning(
         f"Ollama request: POST {OLLAMA_URL}/api/chat model={resolved_model} "
-        f"prompt_chars={len(prompt)} system_chars={len(system)}"
+        f"prompt_chars={len(prompt)} system_chars={len(system)} timeout_s={budget:g}"
     )
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(
-            f"{OLLAMA_URL}/api/chat",
-            json=request_body,
+    started = time.monotonic()
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(budget, connect=LLM_CONNECT_TIMEOUT)
+        ) as client:
+            resp = await client.post(url, json=request_body)
+    except httpx.TimeoutException as exc:
+        elapsed = time.monotonic() - started
+        logger.error(
+            f"LLM timeout after {elapsed:.1f}s: model={resolved_model}, "
+            f"url={url}, prompt_chars={len(prompt)}, budget_s={budget:g} ({type(exc).__name__}). "
+            f"Ollama answered nothing. Raise MEM_LLM_TIMEOUT if the prompt is simply "
+            f"long for this host; a prompt this slow usually means the model is running "
+            f"on CPU with no GPU available."
         )
-        logger.warning(
-            f"Ollama response: POST /api/chat status={resp.status_code} "
-            f"response_chars={len(resp.text)}"
+        raise RuntimeError(
+            f"LLM call to {resolved_model!r} timed out after {elapsed:.1f}s "
+            f"(prompt {len(prompt)} chars, budget {budget:g}s). Ollama is reachable but "
+            f"did not finish generating — raise MEM_LLM_TIMEOUT, or lower "
+            f"MEM_SCOPE_TEXT_WINDOW / MEM_PEOPLE_WINDOW if the model is too slow for them."
+        ) from exc
+    except httpx.HTTPError as exc:
+        logger.error(
+            f"LLM transport error: model={resolved_model}, url={url}, "
+            f"prompt_chars={len(prompt)}: {type(exc).__name__}: {exc}"
         )
-        if resp.is_error:
-            detail = resp.text.strip()
-            logger.error(
-                f"LLM request failed: status={resp.status_code}, model={resolved_model}, "
-                f"url={OLLAMA_URL}/api/chat, response={detail[:500]}"
-            )
-            resp.raise_for_status()
+        raise RuntimeError(
+            f"Could not reach Ollama for model {resolved_model!r} at {url}: {exc}. "
+            f"Check the ollama container is healthy and the model is present "
+            f"(docker exec ollama ollama pull {resolved_model})."
+        ) from exc
+
+    logger.warning(
+        f"Ollama response: POST /api/chat status={resp.status_code} "
+        f"response_chars={len(resp.text)}"
+    )
+    if resp.is_error:
+        detail = resp.text.strip()
+        logger.error(
+            f"LLM request failed: status={resp.status_code}, model={resolved_model}, "
+            f"url={url}, response={detail[:500]}"
+        )
+        raise RuntimeError(
+            f"Ollama returned HTTP {resp.status_code} for model {resolved_model!r}: "
+            f"{detail[:500]}"
+        )
+    try:
         content = resp.json()["message"]["content"]
-        # Strip any residual <think>…</think> blocks just in case
-        import re as _re
-        content = _re.sub(r"<think>.*?</think>", "", content, flags=_re.DOTALL).strip()
-        logger.warning(
-            f"Ollama result: chat model={resolved_model} content_chars={len(content)}"
+    except (ValueError, KeyError, TypeError) as exc:
+        logger.error(
+            f"LLM response was not a chat message: model={resolved_model}, "
+            f"status={resp.status_code}, body={resp.text[:200]}"
         )
-        return content
+        raise RuntimeError(
+            f"Ollama returned an unreadable body for model {resolved_model!r} "
+            f"(HTTP {resp.status_code}): {exc}"
+        ) from exc
+    # Strip any residual <think>…</think> blocks just in case
+    import re as _re
+    content = _re.sub(r"<think>.*?</think>", "", content, flags=_re.DOTALL).strip()
+    if not content:
+        # Logged hard, but still returned as "". A model that loaded and produced
+        # nothing is the signature of a host with no memory for it, and it used
+        # to be completely invisible -- the caller fell back to the raw query or
+        # to no keywords and the vault just quietly got worse. Callers have
+        # deliberate fallbacks for an empty answer; breaking those would turn a
+        # degraded search into a failed request.
+        logger.error(
+            f"LLM returned no content: model={resolved_model}, "
+            f"prompt_chars={len(prompt)}, response_chars={len(resp.text)}, "
+            f"elapsed_s={time.monotonic() - started:.1f}. The model answered with "
+            f"nothing -- check `docker logs ollama` for memory pressure."
+        )
+    logger.warning(
+        f"Ollama result: chat model={resolved_model} content_chars={len(content)}"
+    )
+    return content
 
 # ---------------------------------------------------------------------------
 # User extraction

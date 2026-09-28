@@ -196,6 +196,22 @@ def _require_user(request: Request) -> str:
     return user
 
 
+def _service_unavailable(exc: Exception) -> HTTPException:
+    """Log a RuntimeError that is about to become a 503, and build the response.
+
+    The detail string is the only thing that says *why* — "Another maintenance
+    operation is running" and "Ollama timed out" are completely different
+    problems for whoever reads the log, and both used to be discarded on the way
+    out of the handler. A 503 in the access log with no reason anywhere else is
+    indistinguishable from the service being down, which is how a reclassify
+    timeout came to be read as an out-of-memory crash.
+    """
+    logging.getLogger("memory-vault").error(
+        f"api 503: {type(exc).__name__}: {exc}", exc_info=exc
+    )
+    return HTTPException(status_code=503, detail=str(exc))
+
+
 @web_app.put("/api/memories/{memory_id}", response_class=JSONResponse)
 async def api_update_memory(memory_id: str, request: Request, body: MemoryUpdate):
     try:
@@ -221,7 +237,7 @@ async def api_update_memory(memory_id: str, request: Request, body: MemoryUpdate
                 await mem.link_fact_to_context(memory_id, context_id, user_id)
         return {"id": memory_id, "name": body.name, "text": body.text, "category": (body.category.strip().capitalize() if body.category else "General"), "metadata": metadata}
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
 
 
 @web_app.get("/api/memories", response_class=JSONResponse)
@@ -230,7 +246,7 @@ async def api_list_memories(request: Request):
     try:
         return mem.db_list_memories(_require_user(request))
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
 
 
 @web_app.get("/api/duplicates", response_class=JSONResponse)
@@ -253,7 +269,7 @@ async def api_find_duplicates(
     except HTTPException:
         raise
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
 
 
 @web_app.post("/api/duplicates/merge", response_class=JSONResponse)
@@ -275,7 +291,7 @@ async def api_merge_duplicates(request: Request, body: MemoryMerge):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
 
 
 @web_app.post("/api/duplicates/draft", response_class=JSONResponse)
@@ -356,7 +372,7 @@ async def api_generate_duplicate_draft(request: Request, body: MemoryMergeDraft)
     except (ValueError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=502, detail=f"Could not generate merge draft: {exc}")
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
 
 
 @web_app.get("/api/memories/{memory_id}", response_class=JSONResponse)
@@ -381,7 +397,7 @@ async def api_reclassify_memory(memory_id: str, request: Request):
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
     # Re-fetch enriched item and emit SSE so other tabs update.
     all_m = mem.db_list_memories(user_id)
     m = next((x for x in all_m if x["id"] == memory_id), None)
@@ -401,7 +417,7 @@ async def api_search_diary(request: Request, q: str = "", limit: int = 10, top_p
             return await mem.db_list_diary(user_id)
         return await mem.db_search_diary(q.strip(), user_id, limit=limit, top_p=top_p)
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
 
 
 @web_app.get("/api/diary/{entry_id}", response_class=JSONResponse)
@@ -425,7 +441,7 @@ async def api_reclassify_diary_entry(entry_id: str, request: Request):
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
     # Re-fetch and emit SSE so other tabs update.
     all_e = mem.db_list_diary(user_id)
     e = next((x for x in all_e if x["id"] == entry_id), None)
@@ -486,7 +502,7 @@ async def api_delete_diary_entry(entry_id: str, request: Request):
             raise HTTPException(status_code=404, detail="Diary entry not found or access denied.")
         return {"deleted": entry_id}
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
 
 
 class DiaryCreate(BaseModel):
@@ -513,7 +529,7 @@ async def api_update_diary_entry(entry_id: str, request: Request, body: DiaryCre
             raise HTTPException(status_code=404, detail="Diary entry not found or access denied.")
         return {"id": entry_id, "content": body.content, "name": body.name, "timestamp": body.timestamp, "metadata": body.metadata}
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
 
 
 @web_app.post("/api/diary/{entry_id}/link", response_class=JSONResponse, status_code=201)
@@ -523,7 +539,7 @@ async def api_link_diary_mention(entry_id: str, request: Request, body: DiaryLin
         await mem.db_link_diary_mention(entry_id, body.factId, _require_user(request))
         return {"status": "linked"}
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
 
 
 @web_app.delete("/api/diary/{entry_id}/link/{fact_id}", response_class=JSONResponse)
@@ -533,7 +549,7 @@ async def api_unlink_diary_mention(entry_id: str, fact_id: str, request: Request
         await mem.db_unlink_diary_mention(entry_id, fact_id, _require_user(request))
         return {"status": "unlinked"}
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
 
 
 class DiaryRelevant(BaseModel):
@@ -547,7 +563,7 @@ async def api_add_diary_relevant(entry_id: str, request: Request, body: DiaryRel
         await mem.db_add_diary_relevant(entry_id, body.clientId, _require_user(request))
         return {"status": "linked"}
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
 
 
 @web_app.delete("/api/diary/{entry_id}/relevant/{client_id}", response_class=JSONResponse)
@@ -557,7 +573,7 @@ async def api_remove_diary_relevant(entry_id: str, client_id: str, request: Requ
         await mem.db_remove_diary_relevant(entry_id, client_id, _require_user(request))
         return {"status": "unlinked"}
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
 
 
 class FactRelevant(BaseModel):
@@ -571,7 +587,7 @@ async def api_add_memory_relevant(memory_id: str, request: Request, body: FactRe
         await mem.db_add_fact_relevant(memory_id, body.clientId, _require_user(request))
         return {"status": "linked"}
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
 
 
 @web_app.delete("/api/memories/{memory_id}/relevant/{client_id}", response_class=JSONResponse)
@@ -581,7 +597,7 @@ async def api_remove_memory_relevant(memory_id: str, client_id: str, request: Re
         await mem.db_remove_fact_relevant(memory_id, client_id, _require_user(request))
         return {"status": "unlinked"}
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
 
 
 @web_app.post("/api/memories", response_class=JSONResponse, status_code=201)
@@ -605,7 +621,7 @@ async def api_create_memory(request: Request, body: MemoryCreate):
             "contextId": context_id, "contextName": cx["name"] if context_id and cx else None,
         }
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
 
 
 @web_app.post("/api/memories/link", response_class=JSONResponse, status_code=201)
@@ -614,7 +630,7 @@ async def api_link_memory(request: Request, body: MemoryLink):
         await mem.db_link_facts(body.sourceId, body.targetId, body.relType, {}, _require_user(request))
         return {"status": "linked"}
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
 
 
 class MemoryUnlink(BaseModel):
@@ -629,7 +645,7 @@ async def api_unlink_memory(request: Request, body: MemoryUnlink):
         await mem.db_unlink_facts(body.sourceId, body.targetId, body.relType or "", _require_user(request))
         return {"status": "unlinked"}
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
 
 
 @web_app.delete("/api/memories/{memory_id}", response_class=JSONResponse)
@@ -638,7 +654,7 @@ async def api_delete_memory(memory_id: str, request: Request):
         await mem.db_delete_memory(memory_id, _require_user(request))
         return {"deleted": memory_id}
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
 
 
 @web_app.get("/api/categories", response_class=JSONResponse)
@@ -646,7 +662,7 @@ async def api_list_categories(request: Request):
     try:
         return mem.db_list_categories(_require_user(request))
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
 
 
 @web_app.get("/api/clients", response_class=JSONResponse)
@@ -655,7 +671,7 @@ async def api_list_clients(request: Request):
     try:
         return mem.db_list_clients(_require_user(request))
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
 
 
 class ClientUpdate(BaseModel):
@@ -690,7 +706,7 @@ async def api_update_client(client_id: str, request: Request, body: ClientUpdate
             result["crossClient"] = body.crossClient
         return result
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
 
 
 class ContextUpdate(BaseModel):
@@ -709,7 +725,7 @@ async def api_rename_context(context_id: str, request: Request, body: ContextUpd
             raise HTTPException(status_code=404, detail="Project not found or access denied.")
         return {"id": context_id, "name": body.name.strip()}
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
 
 
 class ScopeUpdate(BaseModel):
@@ -731,7 +747,7 @@ async def api_create_client(request: Request, body: ClientCreate):
         client_id = await mem.db_create_client(name, _require_user(request))
         return {"id": client_id, "name": name}
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
 
 
 class ContextCreate(BaseModel):
@@ -752,7 +768,7 @@ async def api_create_context(request: Request, body: ContextCreate):
         context_id = await mem.db_create_context(name, body.clientId, user_id)
         return {"id": context_id, "name": name, "clientId": body.clientId}
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
 
 
 @web_app.get("/api/clients/{client_id}/items", response_class=JSONResponse)
@@ -764,7 +780,7 @@ async def api_client_items(client_id: str, request: Request):
             raise HTTPException(status_code=404, detail="Client not found or access denied.")
         return {"id": client_id, **items}
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
 
 
 @web_app.get("/api/contexts/{context_id}/items", response_class=JSONResponse)
@@ -776,7 +792,7 @@ async def api_context_items(context_id: str, request: Request):
             raise HTTPException(status_code=404, detail="Project not found or access denied.")
         return {"id": context_id, **items}
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
 
 
 @web_app.delete("/api/clients/{client_id}", response_class=JSONResponse)
@@ -788,7 +804,7 @@ async def api_delete_client(client_id: str, request: Request):
             raise HTTPException(status_code=404, detail="Client not found or access denied.")
         return {"id": client_id, "deleted": True}
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
 
 
 @web_app.delete("/api/contexts/{context_id}", response_class=JSONResponse)
@@ -800,7 +816,7 @@ async def api_delete_context(context_id: str, request: Request):
             raise HTTPException(status_code=404, detail="Project not found or access denied.")
         return {"id": context_id, "deleted": True}
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
 
 
 @web_app.put("/api/memories/{memory_id}/scope", response_class=JSONResponse)
@@ -815,7 +831,7 @@ async def api_set_memory_scope(memory_id: str, request: Request, body: ScopeUpda
             raise HTTPException(status_code=404, detail="Memory not found or access denied.")
         return {"id": memory_id, **scope}
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
 
 
 @web_app.put("/api/diary/{entry_id}/scope", response_class=JSONResponse)
@@ -830,7 +846,7 @@ async def api_set_diary_scope(entry_id: str, request: Request, body: ScopeUpdate
             raise HTTPException(status_code=404, detail="Diary entry not found or access denied.")
         return {"id": entry_id, **scope}
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
 
 
 @web_app.post("/api/maintenance/reclassify", response_class=JSONResponse)
@@ -847,7 +863,7 @@ async def api_start_reclassify(request: Request):
     except HTTPException:
         raise
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
 
 
 @web_app.get("/api/maintenance/reclassify", response_class=JSONResponse)
@@ -856,7 +872,7 @@ async def api_reclassify_status(request: Request):
     try:
         return get_reclassify_status(_require_user(request))
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
 
 
 # ---------------------------------------------------------------------------
@@ -892,7 +908,7 @@ async def api_run_backup(request: Request):
     except HTTPException:
         raise
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
 
 
 @web_app.post("/api/backup/restore/{savepoint_id}", response_class=JSONResponse)
@@ -911,7 +927,7 @@ async def api_run_restore(savepoint_id: str, request: Request):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
 
 
 @web_app.get("/api/backup/status", response_class=JSONResponse)
@@ -920,7 +936,7 @@ async def api_backup_status(request: Request):
     try:
         return get_backup_status(_require_user(request))
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
 
 
 @web_app.get("/api/diary", response_class=JSONResponse)
@@ -928,7 +944,7 @@ async def api_list_diary(request: Request):
     try:
         return mem.db_list_diary(_require_user(request))
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
 
 
 @web_app.get("/api/insights", response_class=JSONResponse)
@@ -936,7 +952,7 @@ async def api_get_insights(request: Request):
     try:
         return mem.db_find_patterns(_require_user(request))
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
 
 
 @web_app.get("/api/graph", response_class=JSONResponse)
@@ -955,7 +971,7 @@ async def api_get_graph(request: Request, clientId: str = "", contextId: str = "
             limit=limit,
         )
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
 
 
 @web_app.get("/api/graph/neighbors/{fact_id}", response_class=JSONResponse)
@@ -972,7 +988,7 @@ async def api_get_neighbors(request: Request, fact_id: str, clientId: str = "", 
             client_id=clientId, context_id=contextId,
         )
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
 
 
 @web_app.get("/api/graph/focus/{fact_id}", response_class=JSONResponse)
@@ -1023,7 +1039,7 @@ async def api_focus_graph(request: Request, fact_id: str, clientId: str = "", co
     except HTTPException:
         raise
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
 
 
 @web_app.get("/api/graph/connections/{fact_id}", response_class=JSONResponse)
@@ -1031,7 +1047,7 @@ async def api_get_connections(request: Request, fact_id: str):
     try:
         return mem.db_get_connections_by_type(fact_id, _require_user(request))
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
 
 
 @web_app.post("/api/diary", response_class=JSONResponse, status_code=201)
@@ -1058,7 +1074,7 @@ async def api_save_diary(request: Request, body: DiaryCreate):
         entry_ts = await mem.db_save_diary(body.content, user_id, body.timestamp, body.name, linked_facts=body.linked_facts, metadata=body.metadata, client_id=client_id, context_id=context_id)
         return {"timestamp": entry_ts, "content": body.content, "name": body.name, "metadata": body.metadata}
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _service_unavailable(e)
 
 class LoginRequest(BaseModel):
     username: str
