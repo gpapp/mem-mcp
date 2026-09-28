@@ -28,7 +28,7 @@ After completing any code changes:
 
 ### Focused Tests
 
-The dependency-light regression suite covers matching, scope compatibility, scope-name and `Client:`-header resolution, duplicate scoring and clustering, merge validation, merge callback ordering, People candidate resolution, LLM prompt contracts, and the chunking split. Two more suites need no database either: `test_embedding_reliability.py` lifts the real functions out of `common.py` with `ast.get_source_segment`, and `test_cypher_safety.py` lints the Cypher in every module (see Gotchas for why). `test_backup_compression.py` uses the same `ast` lift for the snapshot compression helpers, since `backup.py` also cannot be imported without `httpx`. `test_people_extraction.py` lifts `people_extract_windows` out of `diary_manager.py` for the same reason. `test_graph_scope.py` lifts the graph scoping and cap policy out of `fact_manager.py` the same way. `test_mobile_layout.py` reads `templates/dashboard.html` and asserts the properties of the responsive stylesheet — no browser is available here, so it cannot check that the page looks right, only that the things a regression would silently undo are still in place.
+The dependency-light regression suite covers matching, scope compatibility, scope-name and `Client:`-header resolution, duplicate scoring and clustering, merge validation, merge callback ordering, People candidate resolution, LLM prompt contracts, and the chunking split. Two more suites need no database either: `test_embedding_reliability.py` lifts the real functions out of `common.py` with `ast.get_source_segment`, and `test_cypher_safety.py` lints the Cypher in every module (see Gotchas for why). `test_backup_compression.py` uses the same `ast` lift for the snapshot compression helpers, since `backup.py` also cannot be imported without `httpx`. `test_people_extraction.py` lifts `people_extract_windows` and the whole of `extract_diary_keywords` out of `diary_manager.py` for the same reason, and *calls* the keyword extractor against a stub LLM rather than only reading its source. `test_graph_scope.py` lifts the graph scoping and cap policy out of `fact_manager.py` the same way. `test_mobile_layout.py` reads `templates/dashboard.html` and asserts the properties of the responsive stylesheet — no browser is available here, so it cannot check that the page looks right, only that the things a regression would silently undo are still in place.
 
 **A test of a helper is not a test of its call site.** `OllamaModelMatchTests` covers `_ollama_model_matches` directly, and re-injecting the old `if model in installed` into `ensure_ollama_models` left all of them green — the download bug lived in the caller. There is now a tenth test that asserts the call site, for the same reason `WriteOrderingGuardTests` exists. Whenever a bug is a wrong call rather than a wrong function, pin the call.
 
@@ -203,7 +203,9 @@ Tests for all of the above live in `mem-mcp/test_embedding_reliability.py`. `com
 - Qdrant not accessible from host—interact via app only
 - Long timeouts (600s) for LLM operations—don't timeout-hunt
 - Collection named `ea_memories` (hardcoded in memory.py)
-- **A substring guard on source is not a guard, and it will pass on the bug.** `ScopeClassificationInputTests` forbids a text prefix slice like `item_text[:1500]`. Written as `assertNotIn("item_text[:", source)` it matched the *docstring I had just written*, which quotes the very slice it forbids — so the guard reported green on the file that contains the bug. It also failed to bite when the bug was genuinely re-injected, because I had checked `slice.lower` when `text[:N]` slices the **upper** bound. A blanket "no numeric prefix slice" rule then failed on the legitimate `kws[:10]`, a deliberate cap on a keyword list. What actually works is an `ast` walk for a `Slice` with `lower is None` and a numeric `upper`, applied only to names in a declared set of text carriers — docstrings are `ast.Constant` and cannot trip it. Related: `assertNotIn` over a whole 2500-line file makes unittest echo the entire file into the failure output; use `assertFalse(needle in src, msg)`.
+- **A substring guard on source is not a guard, and it will pass on the bug.** `ScopeClassificationInputTests` forbids a text prefix slice like `item_text[:1500]`. Written as `assertNotIn("item_text[:", source)` it matched the *docstring I had just written*, which quotes the very slice it forbids — so the guard reported green on the file that contains the bug. It also failed to bite when the bug was genuinely re-injected, because I had checked `slice.lower` when `text[:N]` slices the **upper** bound. A blanket "no numeric prefix slice" rule then failed on the legitimate `kws[:10]`, a deliberate cap on a keyword list. What actually works is an `ast` walk for a `Slice` with `lower is None` and a numeric `upper`, applied only to names in a declared set of text carriers — docstrings are `ast.Constant` and cannot trip it. Related: `assertNotIn` over a whole 2500-line file makes unittest echo the entire file into the failure output; use `assertFalse(needle in src, msg)`. The same applies to `assertIn` over a single *function* — `ResolverInputTests` dumps kilobytes of source unless it uses `assertTrue(needle in segment, msg)`.
+- **A "guard verified to bite" claim is only true when the failure is the assertion.** My first reinjection of the keyword slice was written at 4-space indent into an 8-space block, so the file raised `IndentationError` and all 38 tests errored — which looks identical to "the guard caught it" in a summary, and proved nothing. Always `ast.parse` the injected file before running the suite, and check the failure names the assertion.
+- **These files are not all one line-ending, and a round-trip rewrite will churn them.** `test_matching_regressions.py` is CRLF except for 26 bare-LF lines left by an earlier scripted splice, so a decode → edit → re-encode pass cannot be used on it. The safe forms are the `edit` tool, or a **byte-level insertion** at the tail. Detect with `raw.count(b'\r\n') == raw.count(b'\n')`; if that is false, insert, do not rewrite. And `open(p, 'wb')` truncates *before* the write — one failed write wiped a whole test suite and it came back with `git checkout`.
 - **Validate `templates/dashboard.html` JS with `node --check` after any template edit.** `py_compile` and the Python suites structurally cannot see a JS syntax error, and one stray `await` in a non-async function took down the entire panel — `<body onload="init()">` reported `init is not defined` only as a downstream symptom of the script block failing to parse.
 - **Cypher cannot be parsed locally** — there is no Neo4j and no driver in this environment, so a syntax error ships to production and surfaces as `neo4j.exceptions.CypherSyntaxError` on first execution. `test_cypher_safety.py` exists because of this: it extracts every Cypher string constant and f-string fragment and lints `FOREACH (v IN <list> | ...)` for a variable referenced inside its own list. A `FOREACH (x IN ... ELSE [x] END | DELETE x)` is a parse error, not a runtime one, and it was the reason every full reclassify aborted on its first call. The suite also pins the scope-clear query's shape. Add to it when you add a query.
   - **Every desktop scroll pane here is a flex item with a zero flex basis**, and the mobile block has to release *all* of them, not the one you happen to be looking at. `flex: 1` (and `flex: 1 1 0` with an explicit `min-height: 0` on `#diary-dates-list`) is basis 0. Stacked, the parent column is `height: auto`, a scroll container is sized from that basis, the parent resolves against zero, and the content renders into a box with no height — no error, nothing to scroll, the tab just looks empty. The fix needs **both** halves, `flex: 0 0 auto` *and* `overflow-y: visible`; either alone reproduces it. This bit twice, one level apart: the memories pane was released and `.diary-main` was not, then `.diary-main` was released and `#diary-dates-list` — the date/search-results list, not a detail pane — was not, so searching returned nothing visible while the entries pane looked fine. The sidebars then become the bounded scroll region (`max-height` + `overflow-y: auto`), giving one scroll area per sidebar rather than a nested one. `test_mobile_layout.py::StackedPaneVisibilityTests` derives the whole class from the stylesheet — any full-width selector that declares vertical scrolling *and* a zero flex basis — so a new tab cannot silently repeat this. The same test class is the worked example of **assert presence before asserting a negative**: an earlier version only checked that `overflow-y: auto` was *absent*, and `_decls` returns `""` for a missing selector, so deleting the rule outright made it pass.
@@ -395,16 +397,66 @@ Pluggable skill workflows loaded from Markdown files in `mem-mcp/skills/`.
 ### Diary Keyword Extraction
 Every diary save/update triggers automatic keyword extraction via the query LLM (`qwen3.5:0.8b`).
 
-- Up to 10 keywords extracted per entry, stored in both Qdrant payload and Neo4j node
+- Keywords are extracted **per window over the whole entry** and the union is capped at `KEYWORD_LIMIT` (20, `MEM_KEYWORD_LIMIT`), stored in both Qdrant payload and Neo4j node
 - Keywords boost vector search relevance in `diary_search_entries`
 - Backfill existing entries: `python mem-mcp/reindex_diary_keywords.py -u <user_id>`
 - CLI options: `-f/--force` (re-extract even if keywords exist), `-d/--dry-run`, `-c/--concurrency` (default 3)
+
+**The union is capped; the window count is not.** `KEYWORD_LIMIT` bounds what a
+long entry can add, and the truncation keeps the *front* of the list because each
+window's prompt asks for the most important keywords first. `KEYWORD_EXTRACT_WARN_WINDOWS`
+(6) only warns about LLM cost — capping the window count would reintroduce the
+silent tail-drop the windowing exists to prevent.
+
+**The 10-keyword cap was per window, not per entry.** Do not reintroduce a slice
+of the *entry* to keep the prompt fast: the old `text[:1500]` meant a 40k
+transcription got keywords describing its opening, so a query about anything in
+the last thirty pages scored as though the entry had never mentioned it. That is
+a silent loss — the boost is simply absent, with no error to explain it. The
+entry name is prepended to **every** window, not just the first: a window from the
+middle of a long entry has no other way to know which entry it belongs to.
+`KeywordWindowTests` asserts on the prompt that reached the model, because a
+call-count assertion cannot tell the two implementations apart — both make calls.
+
+### People Candidate Resolution
+
+`resolve_people_candidates()` in `matching_utils.py` binds extracted names to
+People records, and it now runs **once per window** of the entry too, unioning
+the accepted bindings. It used to send `(content or '')[:2500]`, and this is the
+sharpest form of the truncation defect class: the prompt's job is to
+disambiguate, so a person discussed on page three had no supporting context and
+the model either declined to bind the mention or — worse — bound it to a
+different, similarly-named candidate who *was* in the opening. That writes a
+**wrong `MENTIONS` edge**, which is a false statement, not a recall loss.
+
+Two properties of this function are load-bearing:
+
+- **The merge is a plain union, and deliberately so.** The candidate set is
+  already filtered by `people_match_allowed` and does not vary by window, and
+  the original code discarded the LLM's confidence value and kept only accepted
+  ids. So there is no cross-window confidence strategy to get right. If a
+  confidence value is ever *kept* for ranking, the merge has to grow one.
+- **The 0.8 gate applies in every window.** A thin window is not a weaker gate.
+  Note `bool` is an `int` subclass, so `confidence >= 0.8` accepts `True` unless
+  it is excluded explicitly — the code does.
+
+`matching_utils.py` keeps **zero app imports** (`os`, `re`, `json`, `difflib`
+only) so it can be imported without the DB drivers and tested directly. Do not
+add a `logger` from `common` for the per-window failure paths: a failed window
+is skipped silently, as the whole call used to be, and the union means the
+surviving windows still apply. `ResolverInputTests` pins the import set.
+
+Because the resolver is pure and importable, its tests **call** it rather than
+reading its source. That is the reason it is worth testing behaviourally: a
+truncation is invisible to a call-count assertion, so the tests have to inspect
+what the prompt actually contained and which bindings survived it.
+
 
 ### Diary People Extraction
 
 Diary people extraction runs the **whole entry**, in overlapping windows, not a prefix. `_extract_people_names()` in `diary_manager.py` iterates `people_extract_windows(content)` and unions the results.
 
-The prefix form is the one to avoid. It sent `content[:2000]`, so on a 40k-char transcription every person named after character 2000 was silently missed — no error, just a missing `MENTIONS` edge nobody was looking for. Keyword extraction (above) already ran on the full content, so the two paths disagreed on what "the entry" means.
+The prefix form is the one to avoid. It sent `content[:2000]`, so on a 40k-char transcription every person named after character 2000 was silently missed — no error, just a missing `MENTIONS` edge nobody was looking for. Keyword extraction (above) now windows the same way, so the two paths agree on what "the entry" means.
 
 - `people_extract_windows(content, window=0, overlap=0)` is pure and unit-tested (`test_people_extraction.py`): blank → `[]`, a doc that fits the window → one element (short entries cost what they always did), otherwise `body[i:i+size] for i in range(0, len(body), size - overlap)`.
 - The overlap exists because a name straddling a boundary is cut in half, and both halves then look like garbage to the extractor. `step` is clamped to `size - 1` so a degenerate overlap cannot make the loop non-terminating.

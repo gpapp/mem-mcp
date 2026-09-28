@@ -1,4 +1,8 @@
-"""Tests for the diary people-extraction windowing in diary_manager.py.
+"""Tests for the diary LLM-extraction windowing in diary_manager.py.
+
+Covers both extractors that read a diary entry: person *names* and search
+*keywords*. They had the same defect in the same shape -- a prefix slice --
+and were fixed the same way, so they are guarded together here.
 
 diary_manager cannot be imported without the DB drivers, so the function under
 test is lifted out of the source with ``ast.get_source_segment`` and exec'd
@@ -12,6 +16,8 @@ missing MENTIONS edge that nobody was looking for.
 """
 
 import ast
+import asyncio
+import json
 import os
 import re
 import sys
@@ -20,12 +26,13 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from chunking import normalize_text
+from matching_utils import text_windows
 
 DIARY_MANAGER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "diary_manager.py")
 
 
-def _lift(name, **overrides):
-    """Exec one top-level function out of diary_manager.py with stubs."""
+def _segment(name):
+    """The source of one top-level function in diary_manager.py."""
     with open(DIARY_MANAGER, "r", encoding="utf-8") as handle:
         source = handle.read()
     tree = ast.parse(source)
@@ -34,11 +41,60 @@ def _lift(name, **overrides):
         for node in ast.walk(tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name
     )
-    segment = ast.get_source_segment(source, target)
-    namespace = {"normalize_text": normalize_text, "os": os}
+    return source, tree, target, ast.get_source_segment(source, target)
+
+
+class _Recorder:
+    """Collects everything the lifted code would have logged."""
+
+    def __init__(self):
+        self.warnings = []
+        self.debugs = []
+
+    def warning(self, message, *a, **k):
+        self.warnings.append(str(message))
+
+    def debug(self, message, *a, **k):
+        self.debugs.append(str(message))
+
+    def __getattr__(self, _name):  # info/error/... must not explode
+        return lambda *a, **k: None
+
+
+def _lift(name, **overrides):
+    """Exec one top-level function out of diary_manager.py with stubs."""
+    _source, _tree, _target, segment = _segment(name)
+    namespace = {"normalize_text": normalize_text, "os": os, "re": re, "json": json}
     namespace.update(overrides)
     exec(segment, namespace)  # noqa: S102 - executing our own source
     return namespace[name]
+
+
+def _lift_keyword_extractor(llm, recorder=None, **overrides):
+    """Lift ``extract_diary_keywords`` with everything it touches in scope.
+
+    Behavioural rather than source-level on purpose. The defect it replaced was
+    a slice, and a slice is invisible to a call-count assertion: the old code
+    also made exactly one call, it just sent a different argument. Only a test
+    that inspects what was actually sent can tell the two apart.
+    """
+    recorder = recorder or _Recorder()
+    clean = _lift("_clean_keywords")
+    namespace = {
+        "text_windows": text_windows,
+        "KEYWORD_EXTRACT_WINDOW": 6000,
+        "KEYWORD_EXTRACT_OVERLAP": 600,
+        "KEYWORD_EXTRACT_WARN_WINDOWS": 6,
+        "KEYWORD_LIMIT": 20,
+        "logger": recorder,
+        "get_llm_response": llm,
+        "_clean_keywords": clean,
+        "_KEYWORD_EXTRACT_SYSTEM": "stub system prompt",
+        "re": re,
+        "json": json,
+    }
+    namespace.update(overrides)
+    return _lift("extract_diary_keywords", **namespace)
 
 
 class PeopleWindowTests(unittest.TestCase):
@@ -197,6 +253,190 @@ class ExtractLoopTests(unittest.TestCase):
 
     def test_the_old_whole_entry_debug_line_records_the_window_count(self):
         self.assertRegex(self.body, r"windows=\{len\(windows\)\}")
+
+
+# ---------------------------------------------------------------------------
+# Diary keyword extraction
+# ---------------------------------------------------------------------------
+class KeywordCleanTests(unittest.TestCase):
+    """The dedupe/ordering helper, called directly.
+
+    Order is load-bearing: each window's prompt asks for the *most important*
+    keywords first, so truncating the union to the limit keeps the best ones
+    rather than an arbitrary slice of a set.
+    """
+
+    def setUp(self):
+        self.clean = _lift("_clean_keywords")
+
+    def test_it_lowercases_and_strips(self):
+        self.assertEqual(
+            self.clean(["  Atlas Migration ", "HEDRON", "acme corp"]),
+            ["atlas migration", "hedron", "acme corp"],
+        )
+
+    def test_dedupe_is_case_insensitive(self):
+        self.assertEqual(self.clean(["Atlas", "atlas", "ATLAS", " atlas "]), ["atlas"])
+
+    def test_order_is_first_seen(self):
+        self.assertEqual(self.clean(["c", "a", "b", "a"]), ["c", "a", "b"])
+
+    def test_blanks_and_non_strings_are_dropped(self):
+        self.assertEqual(self.clean(["a", "", "   ", None, 7, [], {}, "b"]), ["a", "b"])
+
+    def test_none_and_empty_input_yield_nothing(self):
+        self.assertEqual(self.clean(None), [])
+        self.assertEqual(self.clean([]), [])
+
+    def test_the_limit_keeps_the_front_of_the_list(self):
+        self.assertEqual(self.clean(list("abcdefghij"), limit=3), ["a", "b", "c"])
+
+    def test_no_limit_means_no_truncation(self):
+        self.assertEqual(len(self.clean([f"k{i}" for i in range(50)])), 50)
+
+
+class KeywordWindowTests(unittest.TestCase):
+    """Keywords must come from the whole entry, not its first 1500 characters.
+
+    The old code sent ``text[:1500]``, so on a 40k transcription the keywords
+    described its opening. A query about anything in the last thirty pages then
+    scored as though the entry had never mentioned it -- the boost simply was not
+    there, with no error anywhere to explain the missing relevance.
+    """
+
+    def setUp(self):
+        self.prompts = []
+        self.recorder = _Recorder()
+        # 12k chars of non-repetitive content -> three 6k windows.
+        self.body = "".join(f"paragraph {i:06d}. " for i in range(800))
+        self.marker = "HEDRON-ATLAS-PILOT"
+
+    def _extractor(self, responder, **overrides):
+        async def llm(prompt, system=None, num_predict=None):
+            self.prompts.append(prompt)
+            return responder(prompt, len(self.prompts))
+
+        return _lift_keyword_extractor(llm, self.recorder, **overrides)
+
+    @staticmethod
+    def _reply(*keywords):
+        return json.dumps({"keywords": list(keywords)})
+
+    def test_a_short_entry_still_costs_exactly_one_call(self):
+        extract = self._extractor(lambda p, n: self._reply("atlas"))
+        out = asyncio.run(extract("Tuesday", "Alice called Bob about the migration."))
+        self.assertEqual(len(self.prompts), 1)
+        self.assertEqual(out, ["atlas"])
+
+    def test_every_window_is_sent_to_the_model(self):
+        extract = self._extractor(lambda p, n: self._reply())
+        asyncio.run(extract("Tuesday", self.body))
+        self.assertEqual(len(self.prompts), 3, f"got {len(self.prompts)} prompts")
+
+    def test_the_prompt_carries_text_past_the_old_1500_char_cut(self):
+        """The defect itself, stated as an assertion."""
+        body = ("padding. " * 200) + self.marker + " " + ("tail. " * 400)
+
+        def responder(prompt, _n):
+            return self._reply("atlas-pilot") if self.marker in prompt else self._reply()
+
+        extract = self._extractor(responder)
+        out = asyncio.run(extract("Tuesday", body))
+        self.assertIn(
+            "atlas-pilot", out, "a keyword visible only late in the entry was lost"
+        )
+
+    def test_keywords_from_several_windows_are_unioned(self):
+        def responder(_p, n):
+            return self._reply(f"kw{n}")
+
+        extract = self._extractor(responder)
+        out = asyncio.run(extract("Tuesday", self.body))
+        self.assertEqual(out, ["kw1", "kw2", "kw3"])
+
+    def test_a_keyword_found_in_two_windows_appears_once(self):
+        extract = self._extractor(lambda p, n: self._reply("atlas", "atlas"))
+        out = asyncio.run(extract("Tuesday", self.body))
+        self.assertEqual(out, ["atlas"])
+
+    def test_the_entry_name_reaches_every_window(self):
+        """A window from the middle has no other way to know which entry it is."""
+        extract = self._extractor(lambda p, n: self._reply())
+        asyncio.run(extract("Weekly retro", self.body))
+        self.assertEqual(len(self.prompts), 3)
+        for prompt in self.prompts:
+            self.assertIn("Weekly retro", prompt)
+
+    def test_one_failing_window_does_not_discard_the_others(self):
+        def responder(_p, n):
+            if n == 2:
+                raise RuntimeError("ollama timeout")
+            return self._reply(f"kw{n}")
+
+        extract = self._extractor(responder)
+        out = asyncio.run(extract("Tuesday", self.body))
+        self.assertEqual(out, ["kw1", "kw3"])
+
+    def test_an_unparseable_window_is_skipped(self):
+        def responder(_p, n):
+            return "sorry, I cannot help" if n == 1 else self._reply("kw2")
+
+        extract = self._extractor(responder)
+        self.assertEqual(asyncio.run(extract("Tuesday", self.body)), ["kw2"])
+
+    def test_a_fenced_reply_is_still_parsed(self):
+        extract = self._extractor(lambda p, n: "```json\n" + self._reply("atlas") + "\n```")
+        self.assertEqual(asyncio.run(extract("Tuesday", "short entry")), ["atlas"])
+
+    def test_the_union_is_capped_but_keeps_the_front(self):
+        extract = self._extractor(lambda p, n: self._reply("a", "b", "c"), KEYWORD_LIMIT=2)
+        self.assertEqual(asyncio.run(extract("Tuesday", "short")), ["a", "b"])
+
+    def test_a_very_long_entry_warns_instead_of_truncating(self):
+        """A cap on the window count would restore the silent tail-drop."""
+        body = "word " * 60000
+        extract = self._extractor(lambda p, n: self._reply("kw"))
+        asyncio.run(extract("Tuesday", body))
+        self.assertTrue(
+            any("MEM_KEYWORD_WINDOW" in w for w in self.recorder.warnings),
+            f"expected a cost warning, got {self.recorder.warnings}",
+        )
+
+    def test_no_error_leaves_a_save_blocked(self):
+        """The contract: keyword extraction is best-effort and returns []."""
+
+        async def llm(prompt, system=None, num_predict=None):
+            raise RuntimeError("ollama down")
+
+        extract = _lift_keyword_extractor(llm, self.recorder)
+        self.assertEqual(asyncio.run(extract("Tuesday", "some content")), [])
+
+
+class KeywordSourceTests(unittest.TestCase):
+    """Two assertions about the call site rather than the behaviour.
+
+    The behavioural tests above would all still pass if the old truncation were
+    reintroduced *alongside* the window loop, so pin the shape too.
+    """
+
+    def setUp(self):
+        _source, _tree, _target, self.body = _segment("extract_diary_keywords")
+
+    def test_the_1500_char_slice_is_gone(self):
+        self.assertFalse("text[:1500]" in self.body, "the silent 1500-char truncation is back")
+
+    def test_windows_are_not_sliced_to_a_cap(self):
+        self.assertNotRegex(
+            self.body, r"windows\[:\s*\d+\s*\]", "windows must not be sliced to a cap"
+        )
+
+    def test_the_window_helper_is_actually_used(self):
+        # assertTrue rather than assertIn: the haystack is a whole function and
+        # assertIn echoes both operands into the report.
+        self.assertTrue(
+            "text_windows(content, KEYWORD_EXTRACT_WINDOW, KEYWORD_EXTRACT_OVERLAP)" in self.body,
+            "extract_diary_keywords no longer windows the content",
+        )
 
 
 if __name__ == "__main__":

@@ -1,3 +1,6 @@
+import asyncio
+import json
+import os
 import unittest
 from matching_utils import (
     EVIDENCE_ALIAS,
@@ -10,6 +13,8 @@ from matching_utils import (
     EVIDENCE_SURNAME_STRONG,
     IDENTITY_STRENGTH,
     MIN_MATCH_CONFIDENCE,
+    PEOPLE_RESOLVE_OVERLAP,
+    PEOPLE_RESOLVE_WINDOW,
     VECTOR_CEIL,
     VECTOR_FLOOR,
     cluster_has_core,
@@ -574,6 +579,221 @@ class ScopeClassificationInputTests(unittest.TestCase):
     def test_the_windowing_helper_is_actually_used(self):
         self.assertFalse("from matching_utils import" not in self.source, "import block missing")
         self.assertEqual(self.source.count("text_windows("), 2)
+
+
+# ---------------------------------------------------------------------------
+# People candidate resolution
+# ---------------------------------------------------------------------------
+class PeopleResolverWindowTests(unittest.TestCase):
+    """The resolver must see the whole entry, and a bad window must be survivable.
+
+    ``resolve_people_candidates`` is pure and dependency-light, so unlike most of
+    the reclassify path these call the shipping function rather than reading its
+    source. That is the reason it is worth testing behaviourally: the truncation
+    it replaced (``(content or '')[:2500]``) could not be caught by a call-count
+    assertion, because the old code also made exactly one call. What changed was
+    *what that call contained*, so the test has to inspect the prompt and which
+    bindings survive it.
+    """
+
+    # Two windows at the shipped 6000/600 defaults. 300 lines is ~9.9k chars,
+    # which is past one window and short of the 10.8k that would make three.
+    BODY = "".join(f"line {i:06d} of the transcript. " for i in range(300))
+
+    def setUp(self):
+        self.candidates = [
+            {"id": "c1", "name": "Alice Smith", "text": "met at the conference"},
+            {"id": "c2", "name": "Bob Jones", "text": "owns the account"},
+        ]
+        # Self-checking fixture: derive the window count instead of hardcoding
+        # it, so a change to the tunables fails here with a clear message
+        # rather than as a baffling "3 != 2" in three unrelated tests.
+        self.window_count = len(
+            text_windows(self.BODY, PEOPLE_RESOLVE_WINDOW, PEOPLE_RESOLVE_OVERLAP)
+        )
+        if self.window_count != 2:
+            self.fail(
+                f"fixture assumption broken: BODY yields {self.window_count} windows, "
+                f"not 2 (len={len(self.BODY)}, window={PEOPLE_RESOLVE_WINDOW}, "
+                f"overlap={PEOPLE_RESOLVE_OVERLAP})"
+            )
+
+    def _run(self, responder, names=None, content=None, candidates=None):
+        """Drive the resolver with a scripted llm_call. Returns (result, prompts)."""
+        prompts = []
+
+        async def llm_call(prompt, system=None, num_predict=None):
+            prompts.append(prompt)
+            return responder(prompt, len(prompts))
+
+        result = asyncio.run(resolve_people_candidates(
+            ["Alice Smith"] if names is None else names,
+            self.BODY if content is None else content,
+            self.candidates if candidates is None else candidates,
+            llm_call,
+        ))
+        return result, prompts
+
+    @staticmethod
+    def _matches(*pairs):
+        return json.dumps({"matches": [{"fact_id": i, "confidence": c} for i, c in pairs]})
+
+    def test_a_short_entry_still_costs_exactly_one_call(self):
+        """Windowing must not tax the common case."""
+        _, prompts = self._run(lambda p, n: self._matches(("c1", 0.9)), content="Alice called Bob.")
+        self.assertEqual(len(prompts), 1)
+
+    def test_every_window_is_sent_to_the_model(self):
+        _, prompts = self._run(lambda p, n: self._matches())
+        self.assertEqual(len(prompts), self.window_count)
+
+    def test_the_prompt_carries_text_past_the_old_2500_char_cut(self):
+        """The defect itself: a binding supported only by the tail was lost."""
+        marker = "PILOT-AGREED-BY-HEDRON-IN-THE-LAST-PAGE"
+        body = ("padding. " * 400) + marker + " " + ("tail. " * 200)
+
+        def responder(prompt, _n):
+            return self._matches(("c2", 0.95)) if marker in prompt else self._matches()
+
+        result, _ = self._run(responder, names=["Bob Jones"], content=body)
+        self.assertEqual([c["id"] for c in result], ["c2"])
+
+    def test_bindings_from_several_windows_are_unioned(self):
+        def responder(_prompt, n):
+            return self._matches(("c1", 0.95)) if n == 1 else self._matches(("c2", 0.9))
+
+        result, _ = self._run(responder)
+        self.assertEqual(sorted(c["id"] for c in result), ["c1", "c2"])
+
+    def test_a_candidate_bound_twice_appears_once(self):
+        def responder(_prompt, _n):
+            return self._matches(("c1", 0.95), ("c1", 0.99))
+
+        result, _ = self._run(responder)
+        self.assertEqual([c["id"] for c in result], ["c1"])
+
+    def test_one_failing_window_does_not_discard_the_others(self):
+        def responder(_prompt, n):
+            if n == 1:
+                raise RuntimeError("ollama timeout")
+            return self._matches(("c1", 0.9))
+
+        result, _ = self._run(responder)
+        self.assertEqual([c["id"] for c in result], ["c1"])
+
+    def test_the_confidence_gate_still_applies_in_every_window(self):
+        """A thin window must not become a weaker gate."""
+        def responder(_prompt, _n):
+            return self._matches(("c1", 0.79))
+
+        result, prompts = self._run(responder)
+        self.assertEqual(len(prompts), self.window_count)
+        self.assertEqual(result, [])
+
+    def test_a_boolean_confidence_does_not_clear_the_gate(self):
+        """bool is an int subclass, so ``True >= 0.8`` was reachable."""
+        result, _ = self._run(lambda p, n: '{"matches":[{"fact_id":"c1","confidence":true}]}')
+        self.assertEqual(result, [])
+
+    def test_an_unknown_candidate_id_is_never_returned(self):
+        """A hallucinated id must not become a MENTIONS edge."""
+        result, _ = self._run(lambda p, n: self._matches(("not-a-candidate", 1.0)))
+        self.assertEqual(result, [])
+
+    def test_blank_content_binds_nothing_and_costs_nothing(self):
+        """There is no evidence at all, so any binding would be a guess."""
+        _, prompts = self._run(lambda p, n: self._matches(("c1", 1.0)), content="   ")
+        self.assertEqual(prompts, [])
+
+    def test_a_single_candidate_still_short_circuits_without_the_model(self):
+        only = [{"id": "c1", "name": "Alice Smith", "text": "", "metadata": {}}]
+        result, prompts = self._run(
+            lambda p, n: self._matches(), names=["Alice Smith"], candidates=only
+        )
+        self.assertEqual(prompts, [], "the exact-identity fast path must not call the LLM")
+        self.assertEqual([c["id"] for c in result], ["c1"])
+
+    def test_an_unparseable_reply_in_one_window_is_skipped(self):
+        def responder(_prompt, n):
+            return "not json at all" if n == 1 else self._matches(("c1", 0.9))
+
+        result, _ = self._run(responder)
+        self.assertEqual([c["id"] for c in result], ["c1"])
+
+
+class ResolverInputTests(unittest.TestCase):
+    """No prompt in matching_utils may be handed a prefix of the entry.
+
+    Same AST walk as ScopeClassificationInputTests, for the same reason: the old
+    ``(content or '')[:2500]`` is quoted in the function's own docstring, so a
+    substring guard would fail on the explanation of the bug rather than on the
+    bug. Docstrings are ``ast.Constant`` and cannot trip an AST walk.
+    """
+
+    CARRIERS = ("content", "text", "body")
+
+    def setUp(self):
+        import ast
+        import os
+
+        path = os.path.join(os.path.dirname(__file__), "matching_utils.py")
+        with open(path, "r", encoding="utf-8", newline="") as handle:
+            self.source = handle.read()
+        self.slices = []
+        for node in ast.walk(ast.parse(self.source)):
+            if not (isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice)):
+                continue
+            if node.slice.lower is not None or node.slice.upper is None:
+                continue
+            if not (isinstance(node.slice.upper, ast.Constant)
+                    and isinstance(node.slice.upper.value, int)):
+                continue
+            name = node.value.id if isinstance(node.value, ast.Name) else None
+            if name in self.CARRIERS:
+                self.slices.append((node.lineno, name, node.slice.upper.value))
+
+    def test_no_entry_text_is_sliced_to_a_prefix(self):
+        self.assertEqual(
+            self.slices, [],
+            f"a text prefix slice reappeared in matching_utils: {self.slices}",
+        )
+
+    def test_the_windowed_resolver_is_the_one_in_use(self):
+        """Pin the call, not just the helper: the slice could come back
+        alongside a windowed call that nothing actually reaches."""
+        segment = self.source[self.source.index("async def resolve_people_candidates"):]
+        # assertTrue rather than assertIn: the haystack here is a whole
+        # function, and assertIn echoes both operands, so a failure dumps
+        # kilobytes of source into the report.
+        for needle in (
+            "text_windows(content, PEOPLE_RESOLVE_WINDOW, PEOPLE_RESOLVE_OVERLAP)",
+            "for window in windows:",
+            "DIARY CONTEXT: {window}",
+        ):
+            self.assertTrue(
+                needle in segment,
+                f"resolve_people_candidates no longer contains {needle!r}",
+            )
+
+    def test_matching_utils_still_imports_without_the_app(self):
+        """It gains ``import os`` for the tunables; it must gain nothing else.
+
+        Every test that imports matching_utils directly relies on this, and so
+        does the module's stated design: it is the dependency-light home for the
+        shared helpers precisely so it can be unit-tested without DB drivers.
+        """
+        import ast
+
+        imported = set()
+        for node in ast.walk(ast.parse(self.source)):
+            if isinstance(node, ast.Import):
+                imported.update(a.name.split(".")[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                imported.add((node.module or "").split(".")[0])
+        self.assertEqual(
+            imported, {"os", "re", "json", "difflib"},
+            f"matching_utils gained a dependency: {sorted(imported)}",
+        )
 
 
 if __name__ == "__main__":

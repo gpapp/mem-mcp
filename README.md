@@ -113,7 +113,7 @@ C:/tools/miniconda3/python.exe -m unittest -v test_matching_regressions.py test_
 Pop-Location
 ```
 
-The suites cover scope-aware duplicate matching, weighted scoring, bridge-cluster rejection, merge target ownership, merge mutation ordering, People candidate resolution, scope-name and `Client:`-header resolution, LLM prompt contracts, the chunking split, embedding retry/fallback behaviour, the Cypher written in each module, snapshot compression, and diary people-extraction windowing. They do not require the Docker services.
+The suites cover scope-aware duplicate matching, weighted scoring, bridge-cluster rejection, merge target ownership, merge mutation ordering, People candidate resolution, scope-name and `Client:`-header resolution, LLM prompt contracts, the chunking split, embedding retry/fallback behaviour, the Cypher written in each module, snapshot compression, and the diary people/keyword extraction windowing. They do not require the Docker services.
 
 ## Backups
 

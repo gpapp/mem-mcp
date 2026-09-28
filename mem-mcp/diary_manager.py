@@ -16,7 +16,7 @@ from common import (
     get_qdrant, get_neo4j, logger, get_embedding, get_llm_response, publish_db_event,
     DIARY_COLLECTION, QDRANT_URL, clean_extracted_people_names
 )
-from matching_utils import resolve_people_candidates
+from matching_utils import resolve_people_candidates, text_windows
 from chunking import (
     CHUNK_FETCH_MULTIPLIER,
     build_chunk_payloads,
@@ -108,35 +108,92 @@ async def _delete_diary_chunks(entry_id: str) -> None:
         )
 
 
+_KEYWORD_EXTRACT_SYSTEM = (
+    "You are a keyword extractor. Given a diary entry, extract the most important "
+    "searchable keywords and short phrases (people, places, projects, topics, events). "
+    "Return ONLY a JSON object: {\"keywords\": [\"kw1\", \"kw2\", ...]}. "
+    "Max 10 items, lowercase, 1-3 words each, no generic words like 'meeting' or 'today'."
+)
+
+# The old implementation sent text[:1500], so a 40k transcription got keywords
+# from its opening only and a query about anything in the last thirty pages
+# scored as though the entry had never mentioned it. The window is a budget, not
+# a slice that could cut the only mention of a project in half.
+KEYWORD_EXTRACT_WINDOW = max(1000, int(os.getenv("MEM_KEYWORD_WINDOW", "8000")))
+KEYWORD_EXTRACT_OVERLAP = max(0, min(1000, int(os.getenv("MEM_KEYWORD_OVERLAP", "500"))))
+# A warning about cost, deliberately not a limit: a cap would reintroduce the
+# exact silent tail-drop the windowing replaced.
+KEYWORD_EXTRACT_WARN_WINDOWS = 6
+# Cap on the union. Keywords are a *boost* (any match adds a fixed amount and
+# then breaks), so a longer list widens recall and slightly widens the set of
+# things that can spuriously match. Bounded so the payload stays small -- it is
+# duplicated onto every chunk of the entry.
+KEYWORD_LIMIT = max(5, int(os.getenv("MEM_KEYWORD_LIMIT", "20")))
+
+
+def _clean_keywords(values, limit: int = 0) -> list:
+    """Lowercase, strip, dedupe case-insensitively, keep first-seen order.
+
+    Order matters: the per-window prompt is asked for the *most important*
+    keywords first, so truncating to the limit keeps the best ones rather than
+    an arbitrary slice of a set.
+    """
+    seen = set()
+    out = []
+    for value in values or []:
+        if not isinstance(value, str):
+            continue
+        keyword = value.strip().lower()
+        if not keyword or keyword in seen:
+            continue
+        seen.add(keyword)
+        out.append(keyword)
+    return out[:limit] if limit else out
+
+
 async def extract_diary_keywords(name: str, content: str) -> list:
     """Use the query LLM to extract searchable keywords from a diary entry.
 
-    Returns a list of lowercase keyword strings (max ~10).
+    Runs once per window (see text_windows) and unions the results, so keywords
+    come from the whole entry rather than its first paragraph.
+
+    Returns a list of lowercase keyword strings, capped at KEYWORD_LIMIT.
     Falls back to an empty list on any error so saves are never blocked.
     """
-    text = f"{name}\n{content}" if name else content
-    # Truncate to keep the prompt fast on a tiny model
-    if len(text) > 1500:
-        text = text[:1500] + "…"
-
-    system = (
-        "You are a keyword extractor. Given a diary entry, extract the most important "
-        "searchable keywords and short phrases (people, places, projects, topics, events). "
-        "Return ONLY a JSON object: {\"keywords\": [\"kw1\", \"kw2\", ...]}. "
-        "Max 10 items, lowercase, 1-3 words each, no generic words like 'meeting' or 'today'."
+    windows = text_windows(content, KEYWORD_EXTRACT_WINDOW, KEYWORD_EXTRACT_OVERLAP)
+    logger.debug(
+        f"[extract_diary_keywords] started (content_len={len(content)}, windows={len(windows)})"
     )
-    try:
-        raw = await get_llm_response(text, system=system)
-        raw = re.sub(r"```[a-z]*\n?", "", raw).strip()
-        json_match = re.search(r'\{[^{}]*"keywords"[^{}]*\}', raw, re.DOTALL)
-        if json_match:
+    if len(windows) > KEYWORD_EXTRACT_WARN_WINDOWS:
+        logger.warning(
+            f"[extract_diary_keywords] entry is {len(content)} chars, so keyword extraction "
+            f"runs {len(windows)} times — raise MEM_KEYWORD_WINDOW to trade recall for cost"
+        )
+    found = []
+    for index, window in enumerate(windows):
+        # The entry name goes on every window, not just the first: a window from
+        # the middle of a long entry has no other way to know which entry it is
+        # a fragment of, and the name is one of the better keywords anyway.
+        text = f"{name}\n{window}" if name else window
+        try:
+            raw = await get_llm_response(text, system=_KEYWORD_EXTRACT_SYSTEM)
+            raw = re.sub(r"```[a-z]*\n?", "", raw).strip()
+            json_match = re.search(r'\{[^{}]*"keywords"[^{}]*\}', raw, re.DOTALL)
+            if not json_match:
+                logger.debug(
+                    f"[extract_diary_keywords] window {index + 1}/{len(windows)} had no JSON object"
+                )
+                continue
             data = json.loads(json_match.group())
-            kws = [k.strip().lower() for k in data.get("keywords", []) if k.strip()]
-            logger.debug(f"[extract_diary_keywords] extracted: {kws}")
-            return kws[:10]
-    except Exception as exc:
-        logger.warning(f"[extract_diary_keywords] failed: {type(exc).__name__}: {exc}")
-    return []
+            found.extend(_clean_keywords(data.get("keywords", [])))
+        except Exception as exc:
+            # One bad window must not discard the keywords the others found.
+            logger.debug(
+                f"[extract_diary_keywords] window {index + 1}/{len(windows)} failed: {exc}"
+            )
+    keywords = _clean_keywords(found, KEYWORD_LIMIT)
+    logger.debug(f"[extract_diary_keywords] extracted: {keywords}")
+    return keywords
 
 
 # ---------------------------------------------------------------------------

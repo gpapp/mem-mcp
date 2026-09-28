@@ -1,3 +1,4 @@
+import os
 import re
 import json
 import difflib
@@ -510,9 +511,43 @@ def people_match_allowed(query: str, result: dict, min_score: float = MIN_MATCH_
     return evidence in IDENTITY_EVIDENCE
 
 
+# Deliberately separate from MEM_PEOPLE_*: that pair is the diary *save* path
+# (diary_manager); this pair is the reclassify path (migrate_client_context).
+PEOPLE_RESOLVE_WINDOW = max(1000, int(os.getenv("MEM_PEOPLE_RESOLVE_WINDOW", "6000")))
+PEOPLE_RESOLVE_OVERLAP = max(0, min(1000, int(os.getenv("MEM_PEOPLE_RESOLVE_OVERLAP", "600"))))
+# A warning about cost, not a limit. Capping the window count would restore the
+# exact silent tail-drop the windowing replaced.
+PEOPLE_RESOLVE_WARN_WINDOWS = 6
+
+# The confidence the model must report for a binding to be accepted. Named so
+# the per-window merge and the single-window behaviour cannot drift apart.
+PEOPLE_RESOLVE_MIN_CONFIDENCE = 0.8
+
+
 async def resolve_people_candidates(names: list[str], content: str,
                                     candidates: list[dict], llm_call) -> list[dict]:
-    """Use the LLM to choose among already validated People candidates."""
+    """Use the LLM to choose among already validated People candidates.
+
+    Runs once per window of ``content`` and unions the accepted bindings.
+
+    The prompt used to carry ``(content or '')[:2500]``. This is the reclassify
+    path, which makes it the sharpest form of the truncation defect: a person
+    discussed on page three had no supporting context in the prompt, so the
+    model either declined to bind the mention or -- worse -- bound it to a
+    different candidate with a similar name who *was* in the opening. That
+    writes a wrong MENTIONS edge, which is a false statement rather than a
+    recall loss.
+
+    The candidate set is already filtered by ``people_match_allowed`` and does
+    not vary by window, so the merge is a plain union: the confidence gate is
+    applied per window and accepted candidate ids are deduped afterwards. There
+    is no cross-window confidence strategy to get wrong, because the original
+    code discarded the confidence value and kept only accepted ids.
+
+    This module keeps zero app imports so it can be imported without the DB
+    drivers, so there is no logger here. A window that fails is skipped, as the
+    whole call used to be; the union means the surviving windows still apply.
+    """
     if not candidates:
         return []
 
@@ -544,28 +579,36 @@ async def resolve_people_candidates(names: list[str], content: str,
         "Return ONLY JSON: {\"matches\":[{\"fact_id\":\"<candidate id>\", "
         "\"confidence\":0.0}]}. Return an empty list when ambiguous or unmatched."
     )
-    prompt = (
-        f"EXTRACTED NAMES: {json.dumps(names, ensure_ascii=True)}\n"
-        f"DIARY CONTEXT: {(content or '')[:2500]}\n"
-        f"CANDIDATES: {json.dumps(records, ensure_ascii=True)}"
-    )
-    try:
-        raw = await llm_call(prompt, system=system, num_predict=300)
-        match = re.search(r"\{.*\}", raw, re.DOTALL)
-        if not match:
-            return []
-        data = json.loads(match.group())
-        selected = data.get("matches")
-        if not isinstance(selected, list):
-            return []
-        accepted = []
-        for selection in selected:
-            if not isinstance(selection, dict):
+    windows = text_windows(content, PEOPLE_RESOLVE_WINDOW, PEOPLE_RESOLVE_OVERLAP)
+    accepted_ids: list = []
+    for window in windows:
+        prompt = (
+            f"EXTRACTED NAMES: {json.dumps(names, ensure_ascii=True)}\n"
+            f"DIARY CONTEXT: {window}\n"
+            f"CANDIDATES: {json.dumps(records, ensure_ascii=True)}"
+        )
+        try:
+            raw = await llm_call(prompt, system=system, num_predict=300)
+            match = re.search(r"\{.*\}", raw, re.DOTALL)
+            if not match:
                 continue
-            fact_id = str(selection.get("fact_id") or "")
-            confidence = selection.get("confidence")
-            if fact_id in candidate_by_id and isinstance(confidence, (int, float)) and confidence >= 0.8:
-                accepted.append(candidate_by_id[fact_id])
-        return accepted
-    except Exception:
-        return []
+            data = json.loads(match.group())
+            selected = data.get("matches")
+            if not isinstance(selected, list):
+                continue
+            for selection in selected:
+                if not isinstance(selection, dict):
+                    continue
+                fact_id = str(selection.get("fact_id") or "")
+                confidence = selection.get("confidence")
+                # bool is an int subclass, and True would clear a 0.8 gate.
+                if (fact_id in candidate_by_id
+                        and isinstance(confidence, (int, float))
+                        and not isinstance(confidence, bool)
+                        and confidence >= PEOPLE_RESOLVE_MIN_CONFIDENCE
+                        and fact_id not in accepted_ids):
+                    accepted_ids.append(fact_id)
+        except Exception:
+            # One bad window must not discard the bindings the other windows made.
+            continue
+    return [candidate_by_id[fact_id] for fact_id in accepted_ids]
