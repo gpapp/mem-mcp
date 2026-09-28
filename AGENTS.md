@@ -90,6 +90,16 @@ On startup, the lifespan runs in this order:
 
 Encapsulation rule: diary persistence and consistency logic lives in `diary_manager.py`, not `fact_manager.py`. The server calls both independently.
 
+**A count mismatch logged at steps 1–2 is not data loss.** The checks run *before*
+`sync_orphans()`, so by construction they report the work step 4 is about to do.
+Production log on a normal boot: `Diary count mismatch — Neo4j: 447, Qdrant: 371`
+followed by 76 `in Neo4j only` entries, which are then re-embedded. Read the
+mismatch as "step 4 has that many to repair", and the number of `Ollama embed
+input too long` lines immediately after it as the ones that cost a retry. It
+only becomes a real problem if the same mismatch appears on *every* boot with
+the same count, which means step 4 is failing — check for a `sync_orphans` error
+below it.
+
 ## Scope Reclassification Reliability
 
 The full reclassify (`POST /api/maintenance/reclassify`) and the single-item paths rewrite every `FOR_CLIENT` link. The fixes below each address a way that used to silently produce wrong or missing scope.
@@ -158,6 +168,7 @@ Existing long records are converted with `python mem-mcp/reindex_chunks.py --dry
 - **Log the reason, not the status.** `_ollama_detail(resp)` prefers Ollama's own `{"error": ...}` body and falls back to the raw text. Without this, the traceback said `500` and nothing else. The reason is carried in `last_detail` and surfaced once in the terminal error, not per attempt — see the logging policy below.
 - **An over-long input is a length error wearing a 500.** Ollama answers `the input length exceeds the context length` with HTTP 500, so it looks retryable and the loop re-sent the same oversized text five times before failing with a message that never mentioned length. `_is_input_too_long()` classifies it as deterministic: the remedy is a *smaller input*, not another attempt, so the text is halved and re-sent with no backoff. Do not reclassify these hints as transient — that is what made the second production incident take five requests and still fail.
 - **Truncation keeps head and tail.** `_truncate_for_embed()` cuts to `EMBED_MAX_CHARS` and keeps 75% from the front and the rest from the end, with the `\n...\n` marker counted *inside* the budget. A transcription puts the subject at the top and the conclusions at the bottom, and a search query is far more likely to match the tail. The marker being inside the budget is not cosmetic — measuring it showed a 1000-char budget producing 1005 chars, which defeats the point of a ceiling.
+- **`EMBED_MAX_CHARS` is a budget, not the model's actual ceiling.** Ollama enforces a real token limit below it, so a record that passes the budget check can still be rejected as too long. Production log: an 11189-char input was refused under the default 12000 budget and only succeeded at 5594. That is the designed path, not a fault — the halving costs one wasted round trip and then succeeds. But if the log is full of these, lower `MEM_EMBED_MAX_CHARS` to match the embedder rather than leaving every long record to pay a rejected request first. The two log lines to compare are `input is N chars, over the 12000 budget — truncating` (budget hit) and `Ollama embed input too long on /api/embeddings (N chars) — retrying with` (the real ceiling is below N).
 - **The cache key stays the original text.** Truncation is a transport detail; keying the cache on the truncated form would let two different long facts that share a prefix collide, and a search query that truncated onto a stored fact's prefix would get that fact's vector back as its own answer.
 - **Final failure is a `RuntimeError`** naming the model and quoting the reason plus the `docker exec ollama ollama pull <model>` fix. Nothing upstream catches `httpx.HTTPStatusError`, so the exception type change is safe.
 - **A tag is part of the model's name, and `MEM_EMBEDDER_MODEL` usually omits it.** Ollama reports `nomic-embed-text:latest` in `/api/tags`, so `model in installed` never matched and `ensure_ollama_models` re-pulled a 274MB embedder on every boot (23 times in the week it was found). `_ollama_model_matches()` treats a tagless name as satisfied by `:latest` or `:any`, while a name that *does* carry a tag must still match that tag or `:latest` — `qwen3.5:0.8b` must never be satisfied by an installed `qwen3.5:2b`, or the vault is silently embedded with a different model than configured.
@@ -214,11 +225,17 @@ Build your own focused subgraph starting from any memory.
 2. In **Memories** or **Diary** tab, open a record's menu and choose **🕸️ Show in Graph**
    (the `📍 Show on map` button on a memory card does the same thing)
 3. Node appears centered with its connections
-4. **Right-click** any node for context menu:
+4. **Right-click** any node for context menu (long-press on touch):
    - **Go to fact** → navigate to memory details
-   - **Show all connected** → add all direct neighbors
-   - **Show connection → [verb]** → add nodes by specific relationship type
+   - **Show on map** → add this node and its connections
+   - **Show all connected** → add every direct neighbour
+   - **Remove from map** → drop the node again
 5. Click **🗑️ Clear** to reset the build graph
+
+There is no "add by relationship type" item. `showConnectionType()` and the
+`.submenu` stylesheet block are dead code — the function has no callers and no
+markup references it. Do not document it as a feature without also wiring it
+up.
 
 The graph obeys the **same client / project selection as the memory list**. Two
 filters exist and they are independent:
