@@ -377,8 +377,8 @@ _SCOPE_SYSTEM = (
     "You are a scope classifier. Given a memory item and a list of known clients "
     "(each with its contexts), decide which single client the item belongs to, "
     "and optionally which context within that client. "
-    "Return ONLY a JSON object: {\"client\": \"<exact client name or null>\", "
-    "\"context\": \"<exact context name or null>\", "
+    "Return ONLY a JSON object: {\"client\": \"<exact client name, or null>\", "
+    "\"context\": \"<exact context name, or null>\", "
     "\"related\": [\"<other client name the item is also genuinely about>\"]}. "
     "Rules: use exact names from the list, never invent names; "
     "context must belong to the chosen client; "
@@ -394,17 +394,28 @@ _SCOPE_SYSTEM = (
     "system, product or engagement is plainly about another, choose the "
     "organisation the work is for. The beneficiary, not the presenter. "
     "IMPORTANT: the MENTIONS and RELATED sections describe the PEOPLE and FACTS "
-    "the item refers to; a [client: X] tag on one of them tells you who that "
-    "person or that fact is scoped to, NOT who the item is about. It is a "
-    "tie-breaker for a genuinely ambiguous item, never the strongest signal — "
-    "otherwise every meeting staffed by a contractor's employees inherits that "
-    "contractor as its client. "
+    "the item refers to; a client tag on one of them tells you who that "
+    "person or that fact is scoped to, NOT who the item is about. An "
+    "[own client: X] tag is a named person's own employer and is the weakest "
+    "evidence in the prompt: a consultancy's own staff attend or run meetings "
+    "about a different organisation's systems every week, so their employer is "
+    "almost never the client for the work. It is a tie-breaker for a genuinely "
+    "ambiguous item, never the strongest signal. "
+    "IMPORTANT: a null value is a real, correct, expected answer — not a failure "
+    "and not something to avoid. Most items name no client and most name no "
+    "project, so nulls are the common case; return one whenever the evidence "
+    "does not actually point somewhere. Never fill a field to avoid leaving it "
+    "empty, because a null is recoverable and a guess is stamped. "
     "IMPORTANT: context (project) selection must be conservative — only assign a context when "
     "the item content explicitly and directly relates to that specific project. "
     "Do NOT assign a context simply because it is the only one available for the chosen client; "
     "if the item is about the client in general or could belong to any of their projects, "
     "return null for context. The order contexts are listed in is not a ranking — "
-    "never pick one because it comes first. "
+    "never pick one because it comes first. If the item names no project at all, "
+    "null is the only correct answer. "
+    "IMPORTANT: a client listed as '(no contexts)' is a normal, valid choice, not "
+    "a dead end. Do not prefer a client merely because it can supply a context "
+    "name that the other option cannot. "
     "Put a client in \"related\" when the item is genuinely about that client too "
     "(it is a second subject, or a system that client owns and this item discusses). "
     "Do not put the chosen client in \"related\", and do not put a client there "
@@ -789,6 +800,25 @@ def _capture_scope_snapshot(user_id: str, neo4j_driver) -> dict:
     return snapshot
 
 
+def _scope_tag(is_person: bool, client_name: str) -> str:
+    """Render a neighbour's scope tag, labelled so it cannot be read as the subject's.
+
+    Both forms are *evidence about a neighbour*, never about the item. A
+    `People` neighbour is a person, so its tag is their own employer -- which is
+    how a handover meeting run by two of a consultancy's architects was filed
+    under that consultancy.
+
+    The earlier form was a bare `[client: EPAM]` on every line, and it was the
+    single most concrete token in the prompt: the item's own text named no
+    client at all, so the model took the only client name it could see. Telling
+    the model in prose that the tag is "NOT who the item is about" did not fix
+    it -- a 2b model reads the tag, not the instruction -- so the tag now says
+    what it is in its own text. Both forms remain machine-readable by
+    `client_tags_in_text`, which is what feeds the RELEVANT_TO union.
+    """
+    return f" [own client: {client_name}]" if is_person else f" [client: {client_name}]"
+
+
 def _enriched_fact_text(item: dict, neo4j_driver, user_id: str, scope_snapshot=None) -> str:
     parts = []
     if item.get("name"):
@@ -806,7 +836,8 @@ def _enriched_fact_text(item: dict, neo4j_driver, user_id: str, scope_snapshot=N
                     OPTIONAL MATCH (n)-[:FOR_CLIENT]->(cl:Client {userId: $userId})
                     RETURN DISTINCT type(r) AS rel, n.id AS nid, n.name AS name,
                            coalesce(n.text, n.content, '') AS body,
-                           cl.name AS clientName, coalesce(cl.crossClient, false) AS crossClient
+                           cl.name AS clientName, coalesce(cl.crossClient, false) AS crossClient,
+                           'People' IN labels(n) AS isPerson
                     LIMIT 6
                     """,
                     userId=user_id, fid=item["id"]
@@ -819,7 +850,7 @@ def _enriched_fact_text(item: dict, neo4j_driver, user_id: str, scope_snapshot=N
                     # sees the scope the graph had before this run started.
                     client_name = (scope_snapshot or {}).get(r["nid"]) or r["clientName"]
                     if client_name and not r["crossClient"]:
-                        line += f" [client: {client_name}]"
+                        line += _scope_tag(r["isPerson"], client_name)
                     rel_lines.append(line)
                 parts.append("RELATED:\n" + "\n".join(rel_lines))
         except Exception as exc:
@@ -846,7 +877,8 @@ def _enriched_diary_text(item: dict, neo4j_driver, user_id: str, scope_snapshot=
                     WHERE f.userId = $userId
                     OPTIONAL MATCH (f)-[:FOR_CLIENT]->(cl:Client {userId: $userId})
                     RETURN DISTINCT f.id AS fid, f.name AS name, f.text AS body,
-                           cl.name AS clientName, coalesce(cl.crossClient, false) AS crossClient
+                           cl.name AS clientName, coalesce(cl.crossClient, false) AS crossClient,
+                           'People' IN labels(f) AS isPerson
                     LIMIT 6
                     """,
                     userId=user_id, did=item["id"]
@@ -858,7 +890,7 @@ def _enriched_diary_text(item: dict, neo4j_driver, user_id: str, scope_snapshot=
                     # Prefer the pre-cleared snapshot — see _capture_scope_snapshot.
                     client_name = (scope_snapshot or {}).get(r["fid"]) or r["clientName"]
                     if client_name and not r["crossClient"]:
-                        line += f" [client: {client_name}]"
+                        line += _scope_tag(r["isPerson"], client_name)
                     m_lines.append(line)
                 parts.append("MENTIONS:\n" + "\n".join(m_lines))
         except Exception as exc:

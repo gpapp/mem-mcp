@@ -1052,5 +1052,135 @@ class RelatedLinkWiringTests(unittest.TestCase):
         self.assertIn("except Exception", body)
         self.assertIn("logger.warning", body)
 
+
+
+class OwnClientTagTests(unittest.TestCase):
+    """A person's own employer must be labelled as such in the prompt text.
+
+    The bare `[client: EPAM]` tag was the single most concrete token in the
+    classifier prompt for a diary entry whose own text named no client at all,
+    so the model took it. Telling the model in prose that the tag meant
+    something else did not help -- it read the tag, not the instruction. The
+    tag now states its own meaning, and these tests pin both halves: the
+    rendering, and the parser that still has to read it for the RELEVANT_TO
+    union.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import ast
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "migrate_client_context.py")
+        with open(path, "r", encoding="utf-8") as handle:
+            source = handle.read()
+        tree = ast.parse(source)
+        for node in tree.body:
+            if getattr(node, "name", None) == "_scope_tag":
+                namespace = {}
+                exec(ast.get_source_segment(source, node), namespace)
+                cls.scope_tag = staticmethod(namespace["_scope_tag"])
+                return
+        raise AssertionError("migrate_client_context no longer defines _scope_tag")
+
+    def test_a_person_tag_says_own_client(self):
+        self.assertEqual(
+            self.scope_tag(True, "EPAM"), " [own client: EPAM]"
+        )
+
+    def test_a_fact_tag_still_says_plain_client(self):
+        self.assertEqual(
+            self.scope_tag(False, "Deutsche Bank (DB)"),
+            " [client: Deutsche Bank (DB)]",
+        )
+
+    def test_the_two_forms_are_distinguishable(self):
+        """If both rendered identically the relabelling would achieve nothing."""
+        self.assertNotEqual(
+            self.scope_tag(True, "EPAM"), self.scope_tag(False, "EPAM")
+        )
+
+    def test_both_forms_still_parse_for_the_related_union(self):
+        """Relabelling must not silently break RELEVANT_TO.
+
+        The tag is retained precisely because a person's employer is good
+        evidence for a *secondary* link. If the parser stopped reading the new
+        form, the feature would look like it worked and quietly write nothing.
+        """
+        self.assertEqual(
+            client_tags_in_text("- Oleg: architect [own client: EPAM]"), ["EPAM"]
+        )
+        self.assertEqual(
+            client_tags_in_text("- Diligent [client: SAP SE]"), ["SAP SE"]
+        )
+
+    def test_the_own_tag_never_names_the_item_itself(self):
+        """The word 'own' must be in the rendered tag, not only in the prompt."""
+        self.assertIn("own client", self.scope_tag(True, "X"))
+
+
+class NullableScopePromptTests(unittest.TestCase):
+    """The user-facing ask: empty has to be a real option, not a failure.
+
+    A 4420-char handover meeting about another organisation's SAP estate came
+    back `{"client": "EPAM", "context": "PPC"}` and was stamped, when the entry
+    named no client and no project anywhere. SAP SE -- the client whose name the
+    text actually contains -- was left out of the client field entirely.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import ast
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "migrate_client_context.py")
+        with open(path, "r", encoding="utf-8") as handle:
+            source = handle.read()
+        tree = ast.parse(source)
+        for node in tree.body:
+            # _SCOPE_SYSTEM is a module-level Assign, so the name lives on
+            # a target, not on the node itself. A getattr(node, "name")
+            # lookup finds nothing and the guard below would misreport this
+            # as the constant having been deleted.
+            targets = getattr(node, "targets", [])
+            names = [t.id for t in targets if isinstance(t, ast.Name)]
+            if "_SCOPE_SYSTEM" in names:
+                cls.prompt = ast.literal_eval(node.value)
+                return
+        raise AssertionError("migrate_client_context no longer defines _SCOPE_SYSTEM")
+
+    def test_a_null_answer_is_described_as_correct_and_expected(self):
+        self.assertTrue(
+            "null value is a real, correct, expected answer" in self.prompt,
+            msg="the prompt must say that empty is a real answer, so the model "
+                "does not treat it as something to avoid",
+        )
+
+    def test_it_says_never_fill_a_field_to_avoid_leaving_it_empty(self):
+        self.assertTrue(
+            "Never fill a field to avoid leaving it empty" in self.prompt,
+            msg="the observed failure was a field filled to avoid an empty one",
+        )
+
+    def test_a_client_with_no_contexts_is_not_a_dead_end(self):
+        self.assertTrue(
+            "(no contexts)' is a normal, valid choice" in self.prompt,
+            msg="SAP SE has no contexts and EPAM has three; without this the "
+                "model picks whichever client can supply a context name",
+        )
+
+    def test_the_own_client_tag_is_described_as_the_weakest_evidence(self):
+        self.assertTrue(
+            "[own client: X]" in self.prompt
+            and "weakest" in self.prompt,
+            msg="the prompt must name the new tag form, or the model matches a "
+                "literal it has never seen against a stale rule about [client: X]",
+        )
+
+    def test_the_stale_tag_rule_is_gone(self):
+        self.assertFalse(
+            "a [client: X] tag on one of them" in self.prompt,
+            msg="the old rule described only the plain form; leaving it invites "
+                "the model to read the plain form as the strong one",
+        )
+
 if __name__ == "__main__":
     unittest.main()

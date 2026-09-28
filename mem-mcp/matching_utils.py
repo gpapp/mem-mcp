@@ -278,11 +278,23 @@ def text_windows(content, window=0, overlap=0):
 # with the client it is currently scoped to, e.g. "- Gergely Papp: ..." ending
 # "[client: EPAM]". That tag describes the *person or fact*, never the item
 # being classified.
-_CLIENT_TAG_RES = re.compile(r"\[client:\s*([^\]\r\n]+?)\s*\]")
+_CLIENT_TAG_RES = re.compile(r"\[(?:own\s+client|client):\s*([^\]\r\n]+?)\s*\]")
 
 
 def client_tags_in_text(text) -> list:
-    """Every ``[client: X]`` tag in the enriched text, in first-seen order.
+    """Every scope tag in the enriched text, in first-seen order.
+
+    Two forms are accepted, both produced by ``migrate_client_context._scope_tag``:
+    ``[client: X]`` on a neighbouring Fact (that Fact's current scope) and
+    ``[own client: X]`` on a ``People`` node (that *person's* employer).
+
+    The second form is the one that matters. A People tag is the individual's
+    own client and never the item's subject, and relabelling it is what stops
+    a handover meeting run by two of a consultancy's architects from being
+    filed under that consultancy. Relabelling it did not stop it being *useful*
+    evidence here: this is exactly the right signal for a RELEVANT_TO link,
+    which is why the tag is kept at all.
+
 
     Read this as "which clients appear in this item's neighbourhood", *not* as
     "who is this item for". The two were conflated until a handover meeting
