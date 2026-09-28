@@ -209,6 +209,31 @@ def _scope_first_token_match(raw: str, raw_tokens: frozenset, candidates: list) 
     return starts[0]
 
 
+def context_named_in_text(context_name: object, item_text: str) -> bool:
+    """True when the item's own words actually name this project.
+
+    The scope classifier is reliable about the CLIENT and unreliable about the
+    CONTEXT: asked for both, it fills both. Measured on a 4160-char handover
+    entry whose text names no project at all, it answered "PPC" -- the first of
+    EPAM's three -- in every one of six prompt variants, including one that
+    listed an explicit "(undefined)" option first and told it to prefer that.
+    The system prompt demonstrably reaches the model (without it, or with an
+    unrelated one, it stops returning JSON at all), so this is not a
+    comprehension failure: it is a bias to complete the field.
+
+    So the pairing is checked here instead, where it is a fact. A project the
+    item never mentions is not the item's project. The comparison is on
+    normalized tokens, so "DB AI Adoption" matches a body that says "db ai
+    adoption" or "DB-AI-Adoption", and a project whose name is an ordinary
+    word ("IT", "Rollout") still needs that word to actually appear.
+    """
+    tokens = _scope_tokens(context_name)
+    if not tokens:
+        return False
+    body_tokens = _scope_tokens(item_text or "")
+    return bool(tokens) and tokens.issubset(body_tokens)
+
+
 def resolve_scope_name(raw: object, names: object,
                        threshold: float = SCOPE_NAME_FUZZY_FLOOR) -> tuple:
     """Resolve a model- or header-produced scope name to a canonical stored name.

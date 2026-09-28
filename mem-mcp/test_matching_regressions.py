@@ -40,6 +40,7 @@ from matching_utils import (
     SCOPE_EVIDENCE_TOKENS,
     client_header_value,
     client_tags_in_text,
+    context_named_in_text,
     resolve_scope_name,
 )
 
@@ -930,6 +931,11 @@ class ScopePromptTests(unittest.TestCase):
                 isinstance(t, ast.Name) and t.id == "_SCOPE_SYSTEM" for t in targets
             ):
                 cls.system = ast.get_source_segment(cls.source, node)
+                # The source is a chain of adjacent string literals, so a
+                # sentence is split across them and a substring test over the
+                # source cannot see a phrase that IS present. Assert prose
+                # against the assembled prompt instead.
+                cls.prompt = ast.literal_eval(node.value)
                 return
         raise AssertionError("_SCOPE_SYSTEM is missing from migrate_client_context.py")
 
@@ -940,15 +946,29 @@ class ScopePromptTests(unittest.TestCase):
             msg="the prompt still says a neighbour's scope tag overrides the text",
         )
 
-    def test_a_participants_employer_is_not_the_client(self):
-        self.assertIn("employer is not the client", self.system)
+    def test_being_named_on_an_item_is_not_evidence_against_being_its_client(self):
+        """A rule that reads "a participant's employer is not the client" pushed
+        the SAP RAM/GRC handover away from EPAM, which is the correct client: the
+        two named Enterprise Architects are EPAM's own staff working on EPAM's
+        own engagement. The rule was written from a wrong guess about which
+        client the item belonged to, and then generalised into the prompt.
+        """
+        self.assertTrue(
+            "IS the client" in self.prompt
+            and "not evidence against being its client" in self.prompt,
+            msg="an item about an organisation's own people and work has that "
+                "organisation as its client",
+        )
 
-    def test_it_says_to_judge_by_the_beneficiary_not_the_presenter(self):
+    def test_the_supposedly_harmful_rule_is_gone(self):
+        self.assertFalse(
+            "employer is not the client" in self.prompt,
+            msg="this rule is actively wrong for internal items; it was reverted "
+                "once already",
+        )
+
+    def test_it_still_says_to_decide_by_what_the_work_is_for(self):
         self.assertIn("what the work is FOR", self.system)
-        self.assertIn("presenter", self.system)
-
-    def test_a_tag_is_described_as_evidence_about_the_person(self):
-        self.assertIn("NOT who the item is about", self.system)
 
     def test_the_related_field_is_part_of_the_contract(self):
         self.assertIn('\\"related\\"', self.system)
@@ -1229,12 +1249,17 @@ class NullableScopePromptTests(unittest.TestCase):
                 "production; the client list must render absence by omission",
         )
 
-    def test_the_own_client_tag_is_described_as_the_weakest_evidence(self):
+    def test_the_own_client_tag_is_read_as_who_that_person_is(self):
+        """A tag is the person's employer, which is evidence FOR the client when
+        the item is that employer's own work -- not the weakest signal in the
+        prompt. The two Enterprise Architects on the SAP RAM/GRC entry carry no
+        tag at all (they have no FOR_CLIENT edge), so this rule was never even
+        reached for that item, while the "weakest evidence" wording it replaced
+        was suppressing the correct answer on internal items."""
         self.assertTrue(
-            "[own client: X]" in self.prompt
-            and "weakest" in self.prompt,
-            msg="the prompt must name the new tag form, or the model matches a "
-                "literal it has never seen against a stale rule about [client: X]",
+            "WHO THAT PERSON IS" in self.prompt,
+            msg="the prompt must still name the [own client: X] form and say what "
+                "it denotes, or the model matches a literal it has never seen",
         )
 
     def test_the_stale_tag_rule_is_gone(self):
@@ -1243,6 +1268,54 @@ class NullableScopePromptTests(unittest.TestCase):
             msg="the old rule described only the plain form; leaving it invites "
                 "the model to read the plain form as the strong one",
         )
+
+class ContextNamedInTextTests(unittest.TestCase):
+    """A project the item never names is not the item's project.
+
+    Behavioural rather than a source check: matching_utils imports locally, and
+    the defect this replaces was six prompt variants failing to stop the model
+    picking a project off the client's list. What matters is which names survive
+    a real body, not how the prompt is worded.
+    """
+
+    BODY = (
+        "SAP RAM vs GRC Handover with Oleg\r\n"
+        "## Participants\r\n"
+        "- Gergely Papp: Enterprise Architect at EPAM (4 years at EPAM).\r\n"
+        "- Oleg Tolstashov: Enterprise Architect, Company/Team: EPAM Systems.\r\n"
+        "## Description\r\n"
+        "- SAP RAM implementation for tax compliance paused, awaiting green light.\r\n"
+        "- Diligent introduction as an alternative.\r\n"
+    )
+
+    def test_none_of_epams_projects_are_named_by_this_item(self):
+        for project in ("PPC", "MBAG", "MUFG"):
+            self.assertFalse(
+                context_named_in_text(project, self.BODY),
+                msg=f"{project!r} does not appear in the entry, so the model picked "
+                    f"it off the client list rather than out of the text",
+            )
+
+    def test_a_project_the_item_does_name_is_kept(self):
+        body = "Kickoff for the MBAG migration, covering the SAP RAM blockers."
+        self.assertTrue(context_named_in_text("MBAG", body))
+
+    def test_matching_is_case_and_punctuation_insensitive(self):
+        self.assertTrue(context_named_in_text("db ai adoption",
+                                              "we started DB AI Adoption last week"))
+        self.assertTrue(context_named_in_text("MBAG Migration",
+                                              "the mbag-migration slipped again"))
+
+    def test_every_token_of_a_multi_word_project_must_appear(self):
+        self.assertFalse(context_named_in_text("DB AI Adoption",
+                                               "we discussed the AI rollout for db"))
+
+    def test_blank_inputs_are_false_not_an_error(self):
+        for name, body in ((None, self.BODY), ("", self.BODY),
+                           ("PPC", ""), ("PPC", None), (None, None),
+                           ("PPC", "   ")):
+            self.assertFalse(context_named_in_text(name, body),
+                             msg=f"({name!r}, {body!r}) must be False, not a raise")
 
 if __name__ == "__main__":
     unittest.main()

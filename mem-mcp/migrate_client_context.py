@@ -29,6 +29,7 @@ from matching_utils import (
     SCOPE_EVIDENCE_EXACT,
     client_header_value,
     client_tags_in_text,
+    context_named_in_text,
     resolve_people_candidates,
     resolve_scope_name,
     text_windows,
@@ -385,22 +386,16 @@ _SCOPE_SYSTEM = (
     "return nulls when the item is generic/shared knowledge or matches no client. "
     "IMPORTANT: if the item content contains an explicit '**Client:**' or 'Client:' header, "
     "that declaration is authoritative — use it and do not override it with content keywords. "
-    "IMPORTANT: decide the client from what the work is FOR, never from who attended. "
-    "A participant's employer is not the client. Consultancies, vendors and "
-    "service providers routinely attend or present at meetings about a different "
-    "organisation's systems, and the known-client list often contains the "
-    "attendees' own employer precisely because their people are recorded as Facts. "
-    "If the people on the item are from one organisation and the subject matter, "
-    "system, product or engagement is plainly about another, choose the "
-    "organisation the work is for. The beneficiary, not the presenter. "
+    "IMPORTANT: decide the client from what the work is FOR. When an item is "
+    "someone's own organisation's work -- their colleagues, their systems, their "
+    "engagement -- then their organisation IS the client, even though they are "
+    "also the people named on the item. Being named on an item is not evidence "
+    "against being its client. "
     "IMPORTANT: the MENTIONS and RELATED sections describe the PEOPLE and FACTS "
-    "the item refers to; a client tag on one of them tells you who that "
-    "person or that fact is scoped to, NOT who the item is about. An "
-    "[own client: X] tag is a named person's own employer and is the weakest "
-    "evidence in the prompt: a consultancy's own staff attend or run meetings "
-    "about a different organisation's systems every week, so their employer is "
-    "almost never the client for the work. It is a tie-breaker for a genuinely "
-    "ambiguous item, never the strongest signal. "
+    "the item refers to. A tag on one of them is WHO THAT PERSON IS, which is "
+    "real evidence: if an item is about an organisation's own people and their "
+    "work, their employer is the client, and a tag naming that employer agrees "
+    "with the item rather than competing with it. "
     "IMPORTANT: a null value is a real, correct, expected answer — not a failure "
     "and not something to avoid. Most items name no client and most name no "
     "project, so nulls are the common case; return one whenever the evidence "
@@ -705,6 +700,19 @@ async def _classify_scope(item_text: str, clients: list) -> tuple:
                     resolved_context, _ = resolve_scope_name(
                         context_name, [x["name"] for x in client.get("contexts", [])]
                     )
+                    if resolved_context and not context_named_in_text(
+                        resolved_context, item_text
+                    ):
+                        # The item never names this project, so the classifier
+                        # picked it off the client's list rather than out of the
+                        # text. Six prompt variants, including an explicit
+                        # "(undefined)" option, all produced this; see
+                        # context_named_in_text for the measurement.
+                        logger.info(
+                            f"[scope_backfill] {resolved_context!r} is never named in "
+                            f"the {matched_client!r} item — dropped as inferred"
+                        )
+                        resolved_context = None
                     if not resolved_context:
                         # A context that is not on the chosen client's own list
                         # belongs to a different client. The client/context pair
