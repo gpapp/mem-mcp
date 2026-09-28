@@ -114,7 +114,28 @@ The full reclassify (`POST /api/maintenance/reclassify`) and the single-item pat
 - **Single-item reclassify touches one point.** `_backfill_qdrant(only_ids={item_id})` restricts both the Cypher and the Qdrant read to that item. The unbounded pass is O(vault) — it scrolls every point in both collections — which made a one-row UI action cost a full-vault scan.
 - **Existing auto-MENTIONS links are preserved.** `_existing_auto_people()` seeds the candidate set before `resolve_people_candidates`, because the stricter `people_match_allowed` gate can otherwise fail to re-find a link that was correct.
 
-Do not reintroduce byte-exact name matching, per-item synchronous clears, or a stamp written on LLM failure.
+- **The classifier reads the whole item, and the read is recorded.** This is the
+  one that is a *correctness* bug rather than a precision loss, which is why it
+  deserves its own rule. `_classify_scope` used to receive
+  `item_text if len(item_text) <= 1500 else item_text[:1500] + "…"`, and the
+  module's own `_extract_people_names` sent `content[:2000]` — the same defect
+  the diary save path had already been fixed for. A long transcription is not
+  a long document for the *classifier*; it is a 40k-char document whose client
+  is named on page three. Because the reclassify verdict is stamped
+  (`scopeCheckedSig`), a fragment-fed verdict is not merely wrong for one run —
+  it is *permanent*, and no later run re-reads the text. `text_windows()` in
+  `matching_utils.py` is the single pure implementation both LLM passes here
+  use, and `classify_scope_full()` runs it: a client named by **any** window
+  counts, disagreement is settled by most-frequent and then by the earliest
+  window, and `ok=False` is returned only when no window found anything *and* at
+  least one window failed — so a sibling timeout cannot discard a verdict that
+  already has evidence behind it.
+- **Do not cap the window count.** `SCOPE_TEXT_WARN_WINDOWS` is a warning about
+  cost, deliberately not a limit; a cap would reintroduce exactly the silent
+  tail-drop this replaces, just at a larger offset. The cost is one LLM call per
+  window and it is only paid on items long enough to need it.
+
+Do not reintroduce byte-exact name matching, per-item synchronous clears, a stamp written on LLM failure, or a prefix slice of the item text anywhere in the reclassify path. `test_matching_regressions.py::ScopeClassificationInputTests` walks the AST for a prefix slice applied to a text carrier — see the "gotcha" below for why it is an AST walk and not a substring search.
 
 ## Backup & Restore
 
@@ -182,6 +203,7 @@ Tests for all of the above live in `mem-mcp/test_embedding_reliability.py`. `com
 - Qdrant not accessible from host—interact via app only
 - Long timeouts (600s) for LLM operations—don't timeout-hunt
 - Collection named `ea_memories` (hardcoded in memory.py)
+- **A substring guard on source is not a guard, and it will pass on the bug.** `ScopeClassificationInputTests` forbids a text prefix slice like `item_text[:1500]`. Written as `assertNotIn("item_text[:", source)` it matched the *docstring I had just written*, which quotes the very slice it forbids — so the guard reported green on the file that contains the bug. It also failed to bite when the bug was genuinely re-injected, because I had checked `slice.lower` when `text[:N]` slices the **upper** bound. A blanket "no numeric prefix slice" rule then failed on the legitimate `kws[:10]`, a deliberate cap on a keyword list. What actually works is an `ast` walk for a `Slice` with `lower is None` and a numeric `upper`, applied only to names in a declared set of text carriers — docstrings are `ast.Constant` and cannot trip it. Related: `assertNotIn` over a whole 2500-line file makes unittest echo the entire file into the failure output; use `assertFalse(needle in src, msg)`.
 - **Validate `templates/dashboard.html` JS with `node --check` after any template edit.** `py_compile` and the Python suites structurally cannot see a JS syntax error, and one stray `await` in a non-async function took down the entire panel — `<body onload="init()">` reported `init is not defined` only as a downstream symptom of the script block failing to parse.
 - **Cypher cannot be parsed locally** — there is no Neo4j and no driver in this environment, so a syntax error ships to production and surfaces as `neo4j.exceptions.CypherSyntaxError` on first execution. `test_cypher_safety.py` exists because of this: it extracts every Cypher string constant and f-string fragment and lints `FOREACH (v IN <list> | ...)` for a variable referenced inside its own list. A `FOREACH (x IN ... ELSE [x] END | DELETE x)` is a parse error, not a runtime one, and it was the reason every full reclassify aborted on its first call. The suite also pins the scope-clear query's shape. Add to it when you add a query.
   - **Every desktop scroll pane here is a flex item with a zero flex basis**, and the mobile block has to release *all* of them, not the one you happen to be looking at. `flex: 1` (and `flex: 1 1 0` with an explicit `min-height: 0` on `#diary-dates-list`) is basis 0. Stacked, the parent column is `height: auto`, a scroll container is sized from that basis, the parent resolves against zero, and the content renders into a box with no height — no error, nothing to scroll, the tab just looks empty. The fix needs **both** halves, `flex: 0 0 auto` *and* `overflow-y: visible`; either alone reproduces it. This bit twice, one level apart: the memories pane was released and `.diary-main` was not, then `.diary-main` was released and `#diary-dates-list` — the date/search-results list, not a detail pane — was not, so searching returned nothing visible while the entries pane looked fine. The sidebars then become the bounded scroll region (`max-height` + `overflow-y: auto`), giving one scroll area per sidebar rather than a nested one. `test_mobile_layout.py::StackedPaneVisibilityTests` derives the whole class from the stylesheet — any full-width selector that declares vertical scrolling *and* a zero flex basis — so a new tab cannot silently repeat this. The same test class is the worked example of **assert presence before asserting a negative**: an earlier version only checked that `overflow-y: auto` was *absent*, and `_decls` returns `""` for a missing selector, so deleting the rule outright made it pass.

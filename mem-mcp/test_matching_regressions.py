@@ -18,6 +18,7 @@ from matching_utils import (
     format_people_merge_text,
     identity_confidence,
     looks_like_person_name,
+    text_windows,
     people_match_allowed,
     resolve_people_candidates,
     scopes_compatible,
@@ -452,6 +453,127 @@ class ClientHeaderTests(unittest.TestCase):
         self.assertEqual(client_header_value("Client:   \nDone."), "")
         self.assertEqual(client_header_value(""), "")
         self.assertEqual(client_header_value(None), "")
+
+class TextWindowTests(unittest.TestCase):
+    """text_windows is how a long document reaches an LLM pass whole.
+
+    The bug it replaces was not a precision loss. A classifier handed
+    ``text[:1500]`` reaches a verdict on a fragment and then *records* that
+    verdict, so the unread text could never influence the answer -- not on that
+    run and not on any later one. The window count is therefore the thing worth
+    asserting: one extra window is one extra place the client can be found.
+    """
+
+    def test_blank_input_yields_no_windows(self):
+        for value in (None, "", "   \n\t "):
+            self.assertEqual(text_windows(value), [], value)
+
+    def test_a_document_that_fits_is_a_single_window(self):
+        self.assertEqual(text_windows("short body", window=100, overlap=10), ["short body"])
+
+    def test_a_long_document_is_split(self):
+        windows = text_windows("x" * 250, window=100, overlap=10)
+        self.assertGreater(len(windows), 1)
+        for window in windows:
+            self.assertLessEqual(len(window), 100)
+
+    def test_every_character_is_covered(self):
+        # Non-repetitive on purpose: a repetitive body matches at every offset,
+        # which is how a coverage test passes while the middle is skipped.
+        body = "".join(f"{i:06d}" for i in range(6000))
+        windows = text_windows(body, window=1000, overlap=100)
+        self.assertTrue(
+            all(marker in "".join(windows) for marker in ("000000", "003000", "005999")),
+            windows,
+        )
+
+    def test_evidence_after_the_old_1500_char_cut_is_still_reachable(self):
+        """The regression itself: a mention past the old slice must be read."""
+        body = "meeting notes. " * 130 + "The account is with Deutsche Bank."
+        self.assertGreater(len(body), 1500)
+        windows = text_windows(body, window=600, overlap=100)
+        self.assertTrue(any("Deutsche Bank" in w for w in windows))
+
+    def test_overlap_repeats_the_boundary_region(self):
+        windows = text_windows("abcdefghij" * 30, window=100, overlap=50)
+        self.assertGreaterEqual(len(windows), 2)
+        self.assertTrue(windows[0][-50:] in "".join(windows[1:]))
+
+    def test_a_degenerate_overlap_still_terminates(self):
+        windows = text_windows("y" * 500, window=100, overlap=100)
+        self.assertTrue(windows)
+        self.assertTrue(all(0 < len(w) <= 100 for w in windows))
+
+    def test_crlf_is_normalised_so_boundaries_are_clean(self):
+        windows = text_windows("line\r\n" * 200, window=100, overlap=10)
+        self.assertNotIn("\r", "".join(windows))
+
+    def test_defaults_are_used_when_no_window_is_given(self):
+        self.assertEqual(text_windows("tiny"), ["tiny"])
+
+
+class ScopeClassificationInputTests(unittest.TestCase):
+    """The scope classifier must not be handed a prefix of the item.
+
+    These assert on the *source* of the reclassify module. They cannot call it:
+    migrate_client_context imports the DB drivers, which are not installed here.
+    What they can do is fail if the truncation comes back, and that is the whole
+    point -- the truncation was load-bearing enough that a diary entry was filed
+    under "generic" and stamped, permanently, from its opening 1500 characters.
+
+    The slice test walks the AST rather than grepping the text. A substring
+    search here matched my own docstring, which quotes the very slice it is
+    meant to forbid -- the guard failed on the explanation of the bug.
+    """
+
+    TEXT_CARRIERS = frozenset((
+        "item_text", "content", "text", "body", "snippet", "snippet_text",
+    ))
+
+    @classmethod
+    def setUpClass(cls):
+        import ast
+        import os
+        path = os.path.join(os.path.dirname(__file__), "migrate_client_context.py")
+        with open(path, "r", encoding="utf-8", newline="") as handle:
+            cls.source = handle.read()
+        cls.tree = ast.parse(cls.source)
+        # Prefix slices -- text[:N] -- applied to the *text* carriers only.
+        # A numeric prefix slice on a list is a different thing and often
+        # deliberate: keywords[:10] caps the keyword list, it does not truncate
+        # prose. Flagging every numeric slice would have failed on that.
+        cls.text_slices = []
+        for node in ast.walk(cls.tree):
+            if not (isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice)):
+                continue
+            # A prefix slice is text[:N] -- no lower bound, numeric upper bound.
+            if node.slice.lower is not None or node.slice.upper is None:
+                continue
+            if not (isinstance(node.slice.upper, ast.Constant)
+                    and isinstance(node.slice.upper.value, int)):
+                continue
+            name = node.value.id if isinstance(node.value, ast.Name) else None
+            if name in cls.TEXT_CARRIERS:
+                cls.text_slices.append((node.lineno, name, node.slice.upper.value))
+
+    def test_no_text_is_sliced_to_a_prefix_anywhere(self):
+        # 1500 is the cut that shipped for the item, 2000 for the people text.
+        # Either coming back is a long entry being judged on its opening.
+        self.assertEqual(
+            self.text_slices, [],
+            f"a text prefix slice reappeared: {self.text_slices}",
+        )
+
+    def test_both_callers_use_the_whole_text_classifier(self):
+        self.assertFalse(
+            "await _classify_scope(body, clients)" in self.source,
+            "a caller still routes through the single-window classifier",
+        )
+        self.assertEqual(self.source.count("await classify_scope_full(body, clients)"), 2)
+
+    def test_the_windowing_helper_is_actually_used(self):
+        self.assertFalse("from matching_utils import" not in self.source, "import block missing")
+        self.assertEqual(self.source.count("text_windows("), 2)
 
 
 if __name__ == "__main__":

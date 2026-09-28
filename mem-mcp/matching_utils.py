@@ -247,6 +247,32 @@ def resolve_scope_name(raw: object, names: object,
     return (best_name, best_evidence)
 
 
+def text_windows(content, window=0, overlap=0):
+    """Split text into overlapping windows so an LLM pass can see all of it.
+
+    A classifier handed ``text[:1500]`` does not merely lose precision -- it
+    reaches a verdict on a fragment and then *records* that verdict, so whatever
+    it never read can never influence the answer. This is the shared,
+    dependency-light form used by both the scope classifier and the diary
+    people extractor.
+
+    The overlap is not cosmetic: a phrase straddling a boundary is cut in half
+    and both halves read as noise. A document that already fits the window is
+    returned as a single element, so short records cost exactly one call.
+
+    Returns ``[]`` for blank input. ``step`` is clamped below the window size so
+    a degenerate overlap cannot produce a zero or negative step and spin.
+    """
+    size = window or 6000
+    step = size - min(overlap or 600, size - 1)
+    body = (content or "").replace("\r\n", "\n").replace("\r", "\n")
+    if not body.strip():
+        return []
+    if len(body) <= size:
+        return [body]
+    return [body[i:i + size] for i in range(0, len(body), step)]
+
+
 def looks_like_person_name(query: str) -> bool:
     """True when a query is shaped like a personal name rather than a keyword."""
     tokens = _name_tokens(normalize_identity(query))

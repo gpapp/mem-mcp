@@ -6,6 +6,7 @@ Project-category facts → Context nodes. Idempotent (MERGE throughout).
 import asyncio
 import hashlib
 import json
+import os
 import re
 from datetime import datetime, timezone
 
@@ -29,6 +30,7 @@ from matching_utils import (
     client_header_value,
     resolve_people_candidates,
     resolve_scope_name,
+    text_windows,
 )
 from chunking import parent_of
 
@@ -504,8 +506,10 @@ async def _classify_scope(item_text: str, clients: list) -> tuple:
         scope_lines.append(f"- {c['name']} [contexts: {ctxs}]")
     scope_block = "\n".join(scope_lines)
 
-    text = item_text if len(item_text) <= 1500 else item_text[:1500] + "…"
-    prompt = f"KNOWN CLIENTS:\n{scope_block}\n\nITEM:\n{text}"
+    # No truncation here. The caller has already split the item into windows,
+    # so this prompt is bounded by the window size rather than by a slice that
+    # could cut the only mention of the client in half.
+    prompt = f"KNOWN CLIENTS:\n{scope_block}\n\nITEM:\n{item_text}"
 
     try:
         raw = await get_llm_response(prompt, system=_SCOPE_SYSTEM, model=SCOPE_MODEL, num_predict=80)
@@ -549,6 +553,75 @@ async def _classify_scope(item_text: str, clients: list) -> tuple:
     except Exception as exc:
         logger.warning(f"[scope_backfill] classification failed: {type(exc).__name__}: {exc}")
         return None, None, False
+
+
+SCOPE_TEXT_WINDOW = max(1000, int(os.getenv("MEM_SCOPE_TEXT_WINDOW", "6000")))
+SCOPE_TEXT_OVERLAP = max(0, min(1000, int(os.getenv("MEM_SCOPE_TEXT_OVERLAP", "600"))))
+# This warns, it does not truncate. Capping would drop the tail, which is the
+# exact defect the windowing replaces.
+SCOPE_TEXT_WARN_WINDOWS = 6
+
+
+async def classify_scope_full(item_text: str, clients: list) -> tuple:
+    """Classify an item's scope from its whole text, not its first 1500 chars.
+
+    ``_classify_scope`` used to receive ``item_text[:1500]``. That was not a
+    precision problem, it was a correctness one: a long diary entry whose client
+    is named in the last paragraph was classified from the opening fragment
+    alone, and the verdict was then *stamped* -- so the unread text could never
+    influence the answer, not on this run and not on any later one.
+
+    Each window is classified independently and the answers are combined:
+
+    * A client named by **any** window counts. Scope evidence accumulates down a
+      document, so a union is the honest reading -- the same rule the people
+      extractor uses.
+    * When windows disagree, the most frequent client wins and a tie goes to the
+      **earliest** window, because the head of a document establishes its
+      subject and a late mention is usually incidental.
+    * ``ok=False`` is returned only when no window produced a client **and** at
+      least one window failed. A verdict backed by real evidence is stamped
+      even if a sibling window timed out; an unevidenced one is not stamped, so
+      the item is retried rather than being permanently filed as generic.
+    """
+    windows = text_windows(item_text, SCOPE_TEXT_WINDOW, SCOPE_TEXT_OVERLAP)
+    if not windows:
+        return None, None, False
+    if len(windows) > SCOPE_TEXT_WARN_WINDOWS:
+        logger.warning(
+            f"[scope_backfill] item is {len(item_text)} chars, so it is classified "
+            f"{len(windows)} times -- raise MEM_SCOPE_TEXT_WINDOW to trade recall for cost"
+        )
+
+    votes = {}
+    any_failed = False
+    for index, window in enumerate(windows):
+        client, context, ok = await _classify_scope(window, clients)
+        if not ok:
+            any_failed = True
+            continue
+        if not client:
+            continue
+        entry = votes.get(client)
+        if entry is None:
+            # Keep the first window that named this client: its context answer
+            # goes with the verdict, so no second pass over the windows.
+            votes[client] = {"count": 1, "first": index, "context": context}
+        else:
+            entry["count"] += 1
+            if not entry["context"] and context:
+                entry["context"] = context
+
+    if not votes:
+        return None, None, not any_failed
+
+    winner = min(votes, key=lambda name: (-votes[name]["count"], votes[name]["first"]))
+    chosen = votes[winner]
+    logger.info(
+        f"[scope_backfill] {winner} chosen from {len(windows)} window(s) "
+        f"({chosen['count']} vote(s), context={chosen['context']})"
+    )
+    return winner, chosen["context"], True
 
 
 # ---------------------------------------------------------------------------
@@ -708,7 +781,7 @@ async def _classify_and_link_fact(item: dict, clients: list, user_id: str, sem: 
     """Classify one fact and create FOR_CLIENT / IN_CONTEXT links. Returns True if linked."""
     async with sem:
         body = _enriched_fact_text(item, neo4j_driver, user_id, scope_snapshot)
-        client_name, context_name, ok = await _classify_scope(body, clients)
+        client_name, context_name, ok = await classify_scope_full(body, clients)
     if not client_name:
         # Only a *successful* "this item is generic" verdict may be stamped. A
         # failed call leaves the item unstamped so the next boot retries it.
@@ -742,30 +815,49 @@ _PEOPLE_SYSTEM = (
 
 
 async def _extract_people_names(content: str) -> list[str]:
-    """Return a list of person name strings mentioned in diary content.
+    """Return every person name mentioned anywhere in the diary content.
 
-    Uses the scope LLM with a tight token budget. Returns [] on any failure.
+    Windows the content rather than sending ``content[:2000]``. That prefix form
+    was still here after the twin in diary_manager was fixed, so reclassification
+    linked a different set of people than the save path: on a long entry everyone
+    named after character 2000 was dropped from the MENTIONS edges, silently.
+
+    One LLM call per window, each wrapped in its own try/except so a single bad
+    response cannot discard the names the other windows found, then the union is
+    deduped -- a name inside an overlap region is seen twice.
     """
-    snippet = content[:2000] if len(content) > 2000 else content
-    logger.debug(f"[people_extract] started (content_len={len(content)}, model={SCOPE_MODEL})")
-    try:
-        raw = await get_llm_response(snippet, system=_PEOPLE_SYSTEM,
-                                     model=SCOPE_MODEL, num_predict=200)
-        raw = re.sub(r"```[a-z]*\n?", "", raw).strip()
-        m = re.search(r"\[.*\]", raw, re.DOTALL)
-        if not m:
-            logger.debug("[people_extract] model response contained no JSON array")
-            return []
-        names = json.loads(m.group())
-        if isinstance(names, list):
-            extracted = clean_extracted_people_names(names)
-            logger.debug(f"[people_extract] completed (count={len(extracted)})")
-            return extracted
-        logger.debug("[people_extract] model response JSON was not a list")
+    windows = text_windows(content, SCOPE_TEXT_WINDOW, SCOPE_TEXT_OVERLAP)
+    if not windows:
         return []
-    except Exception as exc:
-        logger.debug(f"[people_extract] failed: {exc}")
-        return []
+    logger.debug(
+        f"[people_extract] started (content_len={len(content)}, windows={len(windows)}, "
+        f"model={SCOPE_MODEL})"
+    )
+    if len(windows) > SCOPE_TEXT_WARN_WINDOWS:
+        logger.warning(
+            f"[people_extract] entry is {len(content)} chars, so names are extracted "
+            f"{len(windows)} times -- raise MEM_SCOPE_TEXT_WINDOW to trade recall for cost"
+        )
+    found = []
+    for window in windows:
+        try:
+            raw = await get_llm_response(window, system=_PEOPLE_SYSTEM,
+                                         model=SCOPE_MODEL, num_predict=200)
+            raw = re.sub(r"```[a-z]*\n?", "", raw).strip()
+            m = re.search(r"\[.*\]", raw, re.DOTALL)
+            if not m:
+                logger.debug("[people_extract] model response contained no JSON array")
+                continue
+            names = json.loads(m.group())
+            if isinstance(names, list):
+                found.extend(clean_extracted_people_names(names))
+            else:
+                logger.debug("[people_extract] model response JSON was not a list")
+        except Exception as exc:
+            logger.debug(f"[people_extract] window failed: {exc}")
+    names = clean_extracted_people_names(found)
+    logger.debug(f"[people_extract] completed (count={len(names)})")
+    return names
 
 
 def _existing_auto_people(diary_id: str, user_id: str, neo4j_driver) -> list:
@@ -875,7 +967,7 @@ async def _classify_and_link_diary(item: dict, clients: list, user_id: str, sem:
     if not client_name:
         async with sem:
             body = _enriched_diary_text(item, neo4j_driver, user_id, scope_snapshot)
-            client_name, context_name, ok = await _classify_scope(body, clients)
+            client_name, context_name, ok = await classify_scope_full(body, clients)
     else:
         ok = True
     if not client_name:
