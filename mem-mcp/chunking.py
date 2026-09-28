@@ -72,6 +72,16 @@ FULL_TEXT_KEYS = ("text", "content")
 # this factor before collapsing a family down to its best-scoring chunk.
 CHUNK_FETCH_MULTIPLIER = max(1, int(os.getenv("MEM_CHUNK_FETCH_MULTIPLIER", "3")))
 
+# Startup re-chunking. New and edited records are chunked on write, so this only
+# ever applies to records that were already stored as a single point when
+# chunking was switched on. It is a background task, not a blocking lifespan step,
+# because a long vault costs one embedding call per chunk and nothing should wait
+# on that. RECHUNK_LIMIT bounds the work per boot: the remainder is picked up by
+# the next restart rather than by one boot that never finishes.
+RECHUNK_ENABLED = os.getenv("MEM_RECHUNK_ENABLED", "1") == "1"
+RECHUNK_LIMIT = max(0, int(os.getenv("MEM_RECHUNK_LIMIT", "200")))
+RECHUNK_CONCURRENCY = max(1, int(os.getenv("MEM_RECHUNK_CONCURRENCY", "2")))
+
 # Blank lines, then any newline, then sentence ends — tried in that order because
 # a paragraph boundary is the cheapest good split, a line boundary is acceptable
 # and a sentence boundary is the fallback for text with no line structure at all.
@@ -121,7 +131,39 @@ def is_chunk_of(point_id, payload: dict) -> bool:
     """True when this point is a *non-primary* chunk (id is not the record id)."""
     if not payload:
         return False
-    return bool(payload.get("parentId")) and str(point_id) != str(payload["parentId"])
+    return bool(payload.get("parentId")) and str(point_id) != str(payload.get("parentId"))
+
+
+def rechunk_candidates(records: list, chunked_ids: set) -> list:
+    """The records worth re-chunking, biggest benefit first.
+
+    Two filters, and both matter:
+
+    * **Large** — a record that would not be split into more than one chunk is
+      already stored correctly. Re-writing it would cost an embedding call to
+      produce the identical single point.
+    * **Not already chunked** — re-chunking a chunked record is pure waste: the
+      work is already done, and it costs an embedding call per chunk to
+      rediscover the same vectors.
+
+    Sorted longest-first so a boot that hits its limit does the records with the
+    worst recall problem rather than the first ones it happened to find.
+    """
+    wanted = []
+    for record in records:
+        text = record.get("text") or ""
+        if not needs_chunking(text):
+            continue
+        record_id = record.get("id")
+        if record_id is None:
+            continue
+        if parent_of(record_id) in chunked_ids:
+            continue
+        wanted.append(record)
+    wanted.sort(key=lambda r: len(r.get("text") or ""), reverse=True)
+    return wanted
+
+
 
 
 def needs_chunking(text: str) -> bool:

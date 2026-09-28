@@ -36,9 +36,14 @@ from matching_utils import (
 )
 from chunking import (
     CHUNK_FETCH_MULTIPLIER,
+    RECHUNK_CONCURRENCY,
+    RECHUNK_ENABLED,
+    RECHUNK_LIMIT,
     build_chunk_payloads,
     chunk_text_of,
     parent_of,
+    plan_chunks,
+    rechunk_candidates,
     strip_chunk_meta,
 )
 
@@ -2515,3 +2520,148 @@ async def sync_orphans():
         )
     else:
         logger.info("sync_orphans: nothing to fix")
+
+
+# ---------------------------------------------------------------------------
+# Startup re-chunking
+# ---------------------------------------------------------------------------
+# New and edited long records are chunked on write. This exists only for records
+# that predate chunking and are still stored as a single point: they are
+# searchable, but their vector averages the whole document, so a query about a
+# detail in the middle scores poorly against everything else.
+async def _chunked_record_ids(qdrant, collection: str) -> set:
+    """Every record id in a collection that already has more than one point.
+
+    One scroll for the whole collection rather than a lookup per candidate: the
+    lookup is cheap but the count is not, and on a large vault this is the
+    difference between one pass and hundreds of round trips.
+    """
+    chunked = set()
+    try:
+        offset = None
+        while True:
+            result = await qdrant.scroll(
+                collection_name=collection,
+                limit=1000,
+                offset=offset,
+                with_payload=["parentId"],
+                with_vectors=False,
+            )
+            points, next_offset = result
+            for p in points:
+                if p.payload and p.payload.get("parentId"):
+                    chunked.add(str(p.payload["parentId"]))
+            if next_offset is None:
+                break
+            offset = next_offset
+    except Exception as e:
+        # Returning empty here would make every large record look un-chunked and
+        # the run would rewrite all of them, so this is not a soft failure.
+        logger.error(f"rechunk: could not read chunk state from {collection}: {e}")
+        return None
+    return chunked
+
+
+async def _rechunk_collection(qdrant, neo4j_driver, collection: str, label: str,
+                              text_prop: str, upsert, limit: int, sem) -> dict:
+    chunked_ids = await _chunked_record_ids(qdrant, collection)
+    if chunked_ids is None:
+        return {"chunked": 0, "failed": 0, "remaining": 0}
+
+    with neo4j_driver.session() as s:
+        res = s.run(
+            f"""
+            MATCH (n:{label})
+            WHERE n.{text_prop} IS NOT NULL AND n.{text_prop} <> ''
+            RETURN n.id AS id, n.{text_prop} AS text, n.name AS name
+            """,
+        )
+        records = [dict(r) for r in res]
+
+    wanted = rechunk_candidates(records, chunked_ids)[:limit]
+    if not wanted:
+        return {"chunked": 0, "failed": 0, "remaining": 0}
+
+    totals = {"chunked": 0, "failed": 0, "remaining": 0}
+
+    async def one(record):
+        # replace=True: the single point being replaced is deleted as part of
+        # the write, and it happens after every chunk is embedded, so a failed
+        # embed leaves the old vector searchable rather than the record gone.
+        async with sem:
+            await upsert(
+                qdrant, record["id"], record["text"], {},
+                prefix=record.get("name"), replace=True,
+            )
+
+    # A bad record must not abort the run: it is counted and the rest continue.
+    results = await asyncio.gather(
+        *(one(r) for r in wanted), return_exceptions=True
+    )
+    for record, res in zip(wanted, results):
+        if isinstance(res, Exception):
+            totals["failed"] += 1
+            logger.warning(
+                f"rechunk: failed to chunk {label} {(record.get('name') or record['id'])[:60]!r} "
+                f"— {type(res).__name__}: {res}"
+            )
+        else:
+            totals["chunked"] += 1
+            logger.info(
+                f"rechunk: {label} {(record.get('name') or record['id'])[:60]!r} split into "
+                f"{len(plan_chunks(record['text'])['chunks'])} chunks"
+            )
+
+    # Anything past the limit is left for the next boot rather than started and
+    # abandoned, which would leave records half-written.
+    eligible = rechunk_candidates(records, chunked_ids)
+    totals["remaining"] = max(0, len(eligible) - len(wanted))
+    return totals
+
+
+async def rechunk_unindexed_records() -> dict:
+    """Chunk the long records that are still stored as a single point.
+
+    Runs as a background task at startup, not as a blocking lifespan step: it
+    costs one embedding call per chunk and the app should not wait on that. The
+    work is idempotent and bounded, so a restart finishes what is left.
+    """
+    if not RECHUNK_ENABLED or RECHUNK_LIMIT <= 0:
+        logger.info("rechunk: disabled (MEM_RECHUNK_ENABLED=0)")
+        return {}
+
+    from diary_manager import _upsert_diary_points  # local: avoids an import cycle
+
+    qdrant = await get_qdrant()
+    neo4j_driver = get_neo4j()
+    if not qdrant or not neo4j_driver:
+        logger.warning("rechunk: skipped — Qdrant or Neo4j unavailable")
+        return {}
+
+    sem = asyncio.Semaphore(RECHUNK_CONCURRENCY)
+    totals = {"chunked": 0, "failed": 0, "remaining": 0}
+    for collection, label, prop, upsert in (
+        (COLLECTION_NAME, "Fact", "text", _upsert_fact_points),
+        (DIARY_COLLECTION, "DiaryEntry", "content", _upsert_diary_points),
+    ):
+        try:
+            part = await _rechunk_collection(
+                qdrant, neo4j_driver, collection, label, prop, upsert,
+                RECHUNK_LIMIT, sem,
+            )
+        except Exception as e:
+            logger.exception(f"rechunk: {label} pass failed: {e}")
+            continue
+        for key in totals:
+            totals[key] += part.get(key, 0)
+
+    if totals["chunked"] or totals["failed"]:
+        logger.warning(
+            f"rechunk: split {totals['chunked']} long record(s) into multiple vectors, "
+            f"{totals['failed']} failed"
+            + (f", {totals['remaining']} still pending for the next restart"
+               if totals["remaining"] else "")
+        )
+    else:
+        logger.info("rechunk: no long records waiting to be chunked")
+    return totals

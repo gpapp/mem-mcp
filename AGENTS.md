@@ -67,7 +67,7 @@ Run `git -c core.whitespace=cr-at-eol diff --check` after documentation or code 
 - Merge LLM: `MEM_MERGE_MODEL` defaults to `gemma4:e2b` and is used only for dashboard merge-draft generation; override it if the host GPU cannot run that model
 - Scope backfill LLM: `MEM_SCOPE_MODEL` (defaults to the query LLM) classifies unlinked facts/diary entries against existing clients on startup; `MEM_SCOPE_BACKFILL=0` disables it, `MEM_SCOPE_CONCURRENCY` (default 3) caps parallel classifications
 - Backups: `MEM_BACKUP_ENABLED` (default 1), `MEM_BACKUP_HOUR` / `MEM_BACKUP_MINUTES` (local server time, default 03:00), `MEM_BACKUP_KEEP` (default 14), `MEM_BACKUP_DIR` (default `<dirname LOG_DIR>/backup`)
-- Chunking: `MEM_CHUNK_CHARS` (3000), `MEM_CHUNK_MAX` (16), `MEM_CHUNK_OVERLAP` (200), `MEM_CHUNK_FETCH_MULTIPLIER` (3) — see "Long Records & Chunking"
+- Chunking: `MEM_CHUNK_CHARS` (3000), `MEM_CHUNK_MAX` (16), `MEM_CHUNK_OVERLAP` (200), `MEM_CHUNK_FETCH_MULTIPLIER` (3), and startup re-chunking `MEM_RECHUNK_ENABLED` / `MEM_RECHUNK_LIMIT` (200) / `MEM_RECHUNK_CONCURRENCY` (2) — see "Long Records & Chunking"
 - Embedding retries: `MEM_EMBED_RETRIES` (default 2) and `MEM_EMBED_RETRY_BACKOFF` (default 1.5, in seconds), `MEM_EMBED_MAX_CHARS` (default 12000) — see "Embedding Reliability"
 - User vault resolved from `Authorization: Basic` header or session cookie
 - `BASE_URL` must include `/mcp` prefix when behind nginx
@@ -139,6 +139,8 @@ One embedding vector over a long fact or diary entry is a lossy average of the w
 - `MEM_CHUNK_CHARS` (3000), `MEM_CHUNK_MAX` (16), `MEM_CHUNK_OVERLAP` (200) and `MEM_CHUNK_FETCH_MULTIPLIER` (3) tune it. `CHUNK_MAX` is a *call budget*, not a coverage limit: when honouring it would drop the tail, `chunk_limit()` raises it to whatever keeps every part inside the embed ceiling. Silently abandoning the end of a document is the failure mode chunking exists to prevent.
 
 Existing long records are converted with `python mem-mcp/reindex_chunks.py --dry-run` first, then without. It is idempotent and skips anything already chunked.
+
+**Startup re-chunking does the same work automatically.** `rechunk_unindexed_records()` in `fact_manager.py` runs as a background task in the lifespan, *after* `sync_orphans()` so the two stores are already consistent. Two filters keep it cheap, and both matter: a record is only a candidate if it is **large enough to split** and **not already chunked**. Re-chunking an already-chunked record costs one embedding call per chunk to rebuild identical vectors, so `_chunked_record_ids()` reads the whole collection's chunk state in a single scroll rather than one lookup per candidate, and it returns `None` on failure — an empty set there would make every large record look un-chunked and rewrite all of them on every boot. Candidates are sorted longest-first so a boot that hits `RECHUNK_LIMIT` spends it where recall is worst, and the remainder is left for the next restart rather than started and abandoned. A failed record is counted and the run continues. Tunables: `MEM_RECHUNK_ENABLED`, `MEM_RECHUNK_LIMIT` (200), `MEM_RECHUNK_CONCURRENCY` (2).
 
 ## Embedding Reliability
 

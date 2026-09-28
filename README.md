@@ -218,6 +218,11 @@ python mem-mcp/reindex_chunks.py             # rewrite the long ones
 The script is idempotent — it skips anything already chunked — and each record
 costs one embedding call per chunk, so start with the dry run.
 
+You do not actually need to run it: the server converts these records itself on
+the next start, in the background, so a restart is usually enough. `MEM_RECHUNK_ENABLED=0`
+turns that off, and `MEM_RECHUNK_LIMIT` caps how many records a single restart
+converts — the rest carry over to the following one.
+
 ## Claude Desktop Setup
 
 Run this command to add the vault to your Claude configuration:

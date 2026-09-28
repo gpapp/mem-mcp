@@ -78,13 +78,20 @@ async def lifespan(app):
         backup_task = None
         if BACKUP_ENABLED:
             backup_task = asyncio.create_task(scheduled_backup_loop())
+        # Same reasoning: re-chunking the long records that predate chunking
+        # costs one embedding call per chunk. Run after sync_orphans so the two
+        # stores are already consistent, and off the lifespan so a large vault
+        # does not delay serving. It is idempotent and bounded per boot, so a
+        # restart picks up whatever is left.
+        rechunk_task = asyncio.create_task(mem.rechunk_unindexed_records())
         try:
             yield
         finally:
-            if backup_task:
-                backup_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await backup_task
+            for task in (backup_task, rechunk_task):
+                if task:
+                    task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await task
 
 web_app.router.lifespan_context = lifespan
 

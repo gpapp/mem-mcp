@@ -28,6 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from common import get_qdrant, get_neo4j, get_embedding, COLLECTION_NAME, DIARY_COLLECTION
 from matching_utils import identity_confidence, looks_like_person_name
+from chunking import parent_of
 from qdrant_client.models import Filter, FieldCondition, MatchValue
 import difflib
 
@@ -492,7 +493,10 @@ async def inspect_collections():
 
         try:
             info = await qdrant.get_collection(coll_name)
-            print(f"  Points count: {info.points_count}")
+            # A long record is one fact in Neo4j but several points here, so
+            # points_count legitimately exceeds the graph count below. Comparing
+            # them without knowing that produces a false "missing vectors" report.
+            print(f"  Points count: {info.points_count}  (points, not records — a long record is several)")
             print(f"  Vectors size: {info.config.params.vectors.size}")
             print(f"  Status: {info.status}")
         except Exception as e:
@@ -503,29 +507,49 @@ async def inspect_collections():
             print(f"  ** COLLECTION IS EMPTY **")
             continue
 
-        # Sample points to find user IDs
-        print(f"\n  Sampling points to find user IDs...")
+        # Sample *records*, not points. A long record is stored as several
+        # points, so a raw 20-point scroll is likely to be a handful of records
+        # repeated — which would make the user-ID sample unrepresentative and
+        # look like most records are missing their text.
+        print(f"\n  Sampling records to find user IDs...")
         try:
-            samples = await qdrant.scroll(
-                collection_name=coll_name,
-                limit=20,
-                with_payload=True,
-            )
-            user_ids = set()
-            for point in samples[0]:
-                uid = point.payload.get("userId", "MISSING")
-                user_ids.add(uid)
+            seen_records = set()
+            sample_points = []
+            chunked_records = 0
+            offset = None
+            while len(sample_points) < 20:
+                points, offset = await qdrant.scroll(
+                    collection_name=coll_name,
+                    limit=100,
+                    offset=offset,
+                    with_payload=True,
+                )
+                for point in points:
+                    record_id = parent_of(point.id, point.payload)
+                    if record_id in seen_records:
+                        chunked_records += 1
+                        continue
+                    seen_records.add(record_id)
+                    sample_points.append(point)
+                if offset is None or not points:
+                    break
+
+            user_ids = {p.payload.get("userId", "MISSING") for p in sample_points}
 
             print(f"  Unique userIds found in sample: {user_ids}")
+            if chunked_records:
+                print(f"  ({chunked_records} extra points skipped — chunks of an already-sampled record)")
 
             # Show sample payloads
             print(f"\n  Sample payloads:")
-            for i, point in enumerate(samples[0][:5]):
-                name = point.payload.get("name", "?")
-                cat = point.payload.get("category", "?")
-                date = point.payload.get("date", "?")
-                uid = point.payload.get("userId", "?")
-                text = (point.payload.get("text") or "")[:80]
+            for i, point in enumerate(sample_points[:5]):
+                payload = point.payload
+                name = payload.get("name", "?")
+                cat = payload.get("category", "?")
+                date = payload.get("date", "?")
+                uid = payload.get("userId", "?")
+                text = (payload.get("text") or "")[:80]
+                chunk_count = payload.get("chunkCount")
                 print(f"    [{i}] id={point.id}")
                 print(f"        userId={uid}")
                 print(f"        name={name}")
@@ -533,6 +557,14 @@ async def inspect_collections():
                     print(f"        date={date}")
                 else:
                     print(f"        category={cat}")
+                if chunk_count and chunk_count > 1:
+                    # Only chunk 0 carries the full text, by design. Printing
+                    # "text=?" here used to read as missing data.
+                    index = payload.get("chunkIndex", 0)
+                    print(f"        chunk={index + 1}/{chunk_count} of a long record")
+                    snippet = (payload.get("chunkText") or text)[:80]
+                    print(f"        chunkText={snippet}...")
+                else:
                     print(f"        text={text}...")
         except Exception as e:
             print(f"  ERROR scrolling collection: {e}")

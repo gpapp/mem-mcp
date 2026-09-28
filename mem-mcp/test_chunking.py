@@ -20,6 +20,7 @@ from chunking import (
     CHUNK_MAX,
     CHUNK_OVERLAP,
     CHUNK_TARGET_CHARS,
+    CHUNK_TARGET_CHARS,
     build_chunk_payloads,
     chunk_point_id,
     chunk_text_of,
@@ -28,6 +29,7 @@ from chunking import (
     merge_by_parent,
     needs_chunking,
     parent_of,
+    rechunk_candidates,
     split_chunks,
     strip_chunk_meta,
 )
@@ -427,6 +429,65 @@ class CallSiteGuardTests(unittest.TestCase):
             src = self._source(name)
             self.assertTrue("replace=True" in src,
                             f"{name}: update path must replace the family")
+
+
+class RechunkCandidateTests(unittest.TestCase):
+    """Startup re-chunking must touch only large, not-yet-chunked records.
+
+    Both filters exist to avoid spending an embedding call per chunk on work
+    that is already done. Re-chunking an already-chunked record is the expensive
+    mistake: it costs one embedding call per chunk to rebuild identical vectors.
+    """
+
+    LONG_A = "para. " * 2000    # ~12k chars, chunkable
+    LONG_C = "word " * 4000     # ~20k chars, chunkable
+
+    def setUp(self):
+        self.records = [
+            {"id": "a", "text": self.LONG_A, "name": "A"},
+            {"id": "b", "text": "just a short fact", "name": "B"},
+            {"id": "c", "text": self.LONG_C, "name": "C"},
+            {"id": None, "text": self.LONG_A, "name": "no id"},
+            {"id": "d", "text": "", "name": "empty"},
+        ]
+
+    def test_picks_only_large_unchunked_records(self):
+        picked = [r["id"] for r in rechunk_candidates(self.records, set())]
+        self.assertEqual(sorted(picked), ["a", "c"])
+
+    def test_already_chunked_records_are_skipped(self):
+        picked = [r["id"] for r in rechunk_candidates(self.records, {"c"})]
+        self.assertEqual(picked, ["a"])
+
+    def test_nothing_left_is_an_empty_list_not_none(self):
+        # The caller does `if not wanted: return`, and a None here would sail
+        # through that check and then fail on iteration.
+        self.assertEqual(rechunk_candidates(self.records, {"a", "c"}), [])
+
+    def test_longest_first(self):
+        # A boot that hits its limit must spend it where recall is worst.
+        picked = rechunk_candidates(self.records, set())
+        self.assertEqual([r["id"] for r in picked], ["c", "a"])
+        self.assertGreater(len(picked[0]["text"]), len(picked[1]["text"]))
+
+    def test_ids_are_compared_as_strings(self):
+        # Qdrant hands ids back as whatever type it likes, so the comparison goes
+        # through parent_of (which stringifies) rather than a raw `in`. _chunked_
+        # record_ids already emits str, and a numeric node id must still match.
+        record = {"id": 42, "text": self.LONG_A, "name": "numeric id"}
+        self.assertEqual(rechunk_candidates([record], {"42"}), [])
+        self.assertEqual(len(rechunk_candidates([record], set())), 1)
+
+    def test_record_that_would_not_split_is_not_a_candidate(self):
+        # needs_chunking is about the target size; a record that still yields
+        # one chunk is already stored correctly, and rewriting it is a wasted
+        # embedding call that produces the identical single point.
+        just_under = "x " * (CHUNK_TARGET_CHARS // 2)
+        self.assertFalse(needs_chunking(just_under))
+        self.assertEqual(rechunk_candidates([{"id": "z", "text": just_under}], set()), [])
+
+    def test_empty_input(self):
+        self.assertEqual(rechunk_candidates([], set()), [])
 
 
 if __name__ == "__main__":
