@@ -28,6 +28,7 @@ from client_manager import (
 from matching_utils import (
     SCOPE_EVIDENCE_EXACT,
     client_header_value,
+    client_tags_in_text,
     resolve_people_candidates,
     resolve_scope_name,
     text_windows,
@@ -377,21 +378,38 @@ _SCOPE_SYSTEM = (
     "(each with its contexts), decide which single client the item belongs to, "
     "and optionally which context within that client. "
     "Return ONLY a JSON object: {\"client\": \"<exact client name or null>\", "
-    "\"context\": \"<exact context name or null>\"}. "
+    "\"context\": \"<exact context name or null>\", "
+    "\"related\": [\"<other client name the item is also genuinely about>\"]}. "
     "Rules: use exact names from the list, never invent names; "
     "context must belong to the chosen client; "
     "return nulls when the item is generic/shared knowledge or matches no client. "
-    "IMPORTANT: if the MENTIONS section lists facts that are already scoped to a specific client, "
-    "strongly prefer that client — it is the strongest signal available. "
-    "IMPORTANT: if the RELATED section lists facts or people already scoped to a specific client "
-    "(shown as [client: X] tags), strongly prefer that client — it is a strong signal. "
     "IMPORTANT: if the item content contains an explicit '**Client:**' or 'Client:' header, "
     "that declaration is authoritative — use it and do not override it with content keywords. "
+    "IMPORTANT: decide the client from what the work is FOR, never from who attended. "
+    "A participant's employer is not the client. Consultancies, vendors and "
+    "service providers routinely attend or present at meetings about a different "
+    "organisation's systems, and the known-client list often contains the "
+    "attendees' own employer precisely because their people are recorded as Facts. "
+    "If the people on the item are from one organisation and the subject matter, "
+    "system, product or engagement is plainly about another, choose the "
+    "organisation the work is for. The beneficiary, not the presenter. "
+    "IMPORTANT: the MENTIONS and RELATED sections describe the PEOPLE and FACTS "
+    "the item refers to; a [client: X] tag on one of them tells you who that "
+    "person or that fact is scoped to, NOT who the item is about. It is a "
+    "tie-breaker for a genuinely ambiguous item, never the strongest signal — "
+    "otherwise every meeting staffed by a contractor's employees inherits that "
+    "contractor as its client. "
     "IMPORTANT: context (project) selection must be conservative — only assign a context when "
     "the item content explicitly and directly relates to that specific project. "
     "Do NOT assign a context simply because it is the only one available for the chosen client; "
     "if the item is about the client in general or could belong to any of their projects, "
-    "return null for context."
+    "return null for context. The order contexts are listed in is not a ranking — "
+    "never pick one because it comes first. "
+    "Put a client in \"related\" when the item is genuinely about that client too "
+    "(it is a second subject, or a system that client owns and this item discusses). "
+    "Do not put the chosen client in \"related\", and do not put a client there "
+    "merely because one of its employees attended — that is the same error as "
+    "picking them as the client. Return [] when there are none."
 )
 
 
@@ -402,24 +420,98 @@ _SCOPE_SYSTEM = (
 # Tolerates list bullets, blockquote/heading markers and bold markers before the
 # label, and stops the captured value at a trailing separator so a line such as
 # "- **Client:** Acme - Q3 review" yields "Acme" rather than the whole sentence.
-def _link_diary_relevant_to(diary_id: str, client_ids: list, user_id: str, neo4j_driver) -> None:
-    """Create RELEVANT_TO edges from a DiaryEntry to each Client in client_ids.
+def _link_diary_relevant_to(diary_id: str, client_ids: list, user_id: str, neo4j_driver,
+                            label: str = "DiaryEntry") -> None:
+    """Create RELEVANT_TO edges from an item to each Client in client_ids.
 
-    These are secondary associations: the diary entry is not *scoped to* these
-    clients (no FOR_CLIENT link) but mentions their facts/people prominently.
+    These are secondary associations: the item is not *scoped to* these clients
+    (no FOR_CLIENT link) but is genuinely about them too -- a second subject, or
+    an organisation whose people or systems the item discusses.
+
+    ``label`` is a parameter because facts need this too. A handover meeting
+    about another organisation's SAP estate, run by a consultancy's own
+    architects, is filed under the beneficiary and is still legitimately *about*
+    the consultancy; before this was generalised, only diary entries could
+    record that and every fact silently lost it.
     """
     if not client_ids or neo4j_driver is None:
         return
+    if label not in ("Fact", "DiaryEntry"):
+        raise ValueError(f"unexpected node label {label!r}")
     with neo4j_driver.session() as s:
         for cid in client_ids:
             s.run(
-                """
-                MATCH (d:DiaryEntry {id: $did, userId: $userId})
-                MATCH (c:Client {id: $clientId, userId: $userId})
-                MERGE (d)-[:RELEVANT_TO]->(c)
+                f"""
+                MATCH (n:{label} {{id: $nid, userId: $userId}})
+                MATCH (c:Client {{id: $clientId, userId: $userId}})
+                MERGE (n)-[:RELEVANT_TO]->(c)
                 """,
-                did=diary_id, userId=user_id, clientId=cid
+                nid=diary_id, userId=user_id, clientId=cid
             )
+
+
+def _related_clients_for(item_text: str, model_related: list, clients: list,
+                         primary: str | None) -> list:
+    """Client names to write as RELEVANT_TO, resolved to stored spellings.
+
+    Two sources, unioned:
+
+    * ``model_related`` -- what the classifier itself named in its ``related``
+      field, which is a real second opinion from the text.
+    * ``client_tags_in_text`` -- every ``[client: X]`` tag on the item's
+      neighbours.
+
+    The second source is the one that makes a wrong primary guess survivable.
+    A tag is evidence about a *person*, so it is wrong as a reason to file the
+    item under that person's employer -- which is how a meeting about one
+    bank's SAP estate ended up stamped with a consultancy. It is exactly right
+    as a reason to also link the item to that employer, because the item does
+    discuss them even when it is not about them. So the tag stops being an
+    override and becomes a cross-reference.
+
+    Names are resolved through ``resolve_scope_name``, so an abbreviation or a
+    dropped "(DB)" still binds, and a name matching nothing is dropped rather
+    than written. The primary client is excluded: an item linked to its own
+    client through both edges appears twice in a filtered list.
+    """
+    known = [c["name"] for c in clients]
+    ordered = []
+    for name in list(model_related) + client_tags_in_text(item_text):
+        if not name or name == primary or name in ordered:
+            continue
+        matched, _ = resolve_scope_name(name, known)
+        if matched and matched != primary and matched not in ordered:
+            ordered.append(matched)
+    return ordered
+
+
+def _write_related_links(node_id: str, label: str, names: list, user_id: str,
+                         neo4j_driver) -> None:
+    """Resolve ``names`` to Client ids and write the RELEVANT_TO edges.
+
+    Failures are logged and swallowed: a secondary association is a nice-to-have
+    on top of a classification that already succeeded, and losing it must not
+    turn a correct primary scope into a failed reclassification. MERGE makes the
+    write idempotent, so a re-run repairs a partial failure.
+    """
+    if not names or neo4j_driver is None:
+        return
+    try:
+        client_ids = []
+        for name in names:
+            record = db_resolve_client(name, user_id)
+            if record and record["id"] and record["id"] not in client_ids:
+                client_ids.append(record["id"])
+        if client_ids:
+            _link_diary_relevant_to(node_id, client_ids, user_id, neo4j_driver, label=label)
+            logger.info(
+                f"[scope_backfill] {label} {node_id}: RELEVANT_TO -> "
+                f"{', '.join(names)} ({len(client_ids)} link(s))"
+            )
+    except Exception as exc:
+        logger.warning(
+            f"[scope_backfill] {label} {node_id}: RELEVANT_TO write failed: {exc}"
+        )
 
 
 def _fast_diary_scope(item: dict, clients: list, neo4j_driver, user_id: str) -> tuple:
@@ -489,12 +581,18 @@ def _fast_diary_scope(item: dict, clients: list, neo4j_driver, user_id: str) -> 
 async def _classify_scope(item_text: str, clients: list) -> tuple:
     """Ask Ollama which existing client/context an item belongs to.
 
-    Returns ``(client_name|None, context_name|None, ok)``. ``ok`` is False only
-    when the LLM call or the JSON parse failed, which is deliberately distinct
-    from a successful "this item is generic" answer. Callers use that to decide
-    whether the item may be stamped as checked: a transient Ollama timeout must
-    not permanently mark an item as unclassifiable, because the stamp is what
-    makes the boot-time backfill skip it forever.
+    Returns ``(client_name|None, context_name|None, related_names, ok)``. ``ok``
+    is False only when the LLM call or the JSON parse failed, which is
+    deliberately distinct from a successful "this item is generic" answer.
+    Callers use that to decide whether the item may be stamped as checked: a
+    transient Ollama timeout must not permanently mark an item as unclassifiable,
+    because the stamp is what makes the boot-time backfill skip it forever.
+
+    ``related_names`` is the model's second answer, taken from the same call
+    rather than a second one: a host slow enough to need a 300s budget cannot
+    afford two passes per window, and a wrong guess about the primary client
+    costs much less once the item is also linked to the other clients it
+    genuinely concerns.
 
     Names are resolved through ``resolve_scope_name`` against the known list, so
     an answer that differs from the stored spelling only by abbreviation or a
@@ -513,17 +611,28 @@ async def _classify_scope(item_text: str, clients: list) -> tuple:
 
     try:
         raw = await get_llm_response(prompt, system=_SCOPE_SYSTEM, model=SCOPE_MODEL, num_predict=80)
-        raw = re.sub(r"```[a-z]*\n?", "", raw).strip()
-        m = re.search(r"\{[^{}]*\}", raw, re.DOTALL)
+        raw = re.sub(r"```[a-z]*[^\n]*\n?", "", raw).strip()
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
         if not m:
             logger.warning("[scope_backfill] classifier returned no JSON object")
-            return None, None, False
+            return None, None, [], False
         data = json.loads(m.group())
         client_name = (data.get("client") or "").strip() or None
         context_name = (data.get("context") or "").strip() or None
+        raw_related = data.get("related")
+        related = []
+        if isinstance(raw_related, list):
+            related = [str(x).strip() for x in raw_related if str(x).strip()]
+        elif isinstance(raw_related, str) and raw_related.strip():
+            # A model that returns the field as one string is still answering;
+            # discarding the whole item's second opinion over the container type
+            # would be a worse outcome than splitting it.
+            related = [part.strip() for part in raw_related.split(",") if part.strip()]
 
         if not client_name:
-            return None, None, True
+            # No primary client, but the item may still be about a client that
+            # is not the one it is filed under. Keep the second opinion.
+            return None, None, related, True
 
         # Resolve against known names; reject inventions.
         matched_client, client_evidence = resolve_scope_name(
@@ -534,7 +643,7 @@ async def _classify_scope(item_text: str, clients: list) -> tuple:
                 f"[scope_backfill] classifier answered {client_name!r}, which matches no known "
                 f"client — treating the item as generic"
             )
-            return None, None, True
+            return None, None, related, True
         if client_evidence != SCOPE_EVIDENCE_EXACT:
             logger.info(
                 f"[scope_backfill] resolved {client_name!r} to {matched_client!r} via {client_evidence}"
@@ -549,10 +658,10 @@ async def _classify_scope(item_text: str, clients: list) -> tuple:
                 resolved_context, _ = resolve_scope_name(
                     context_name, [x["name"] for x in client.get("contexts", [])]
                 )
-        return matched_client, resolved_context, True
+        return matched_client, resolved_context, related, True
     except Exception as exc:
         logger.warning(f"[scope_backfill] classification failed: {type(exc).__name__}: {exc}")
-        return None, None, False
+        return None, None, [], False
 
 
 SCOPE_TEXT_WINDOW = max(1000, int(os.getenv("MEM_SCOPE_TEXT_WINDOW", "6000")))
@@ -579,6 +688,8 @@ async def classify_scope_full(item_text: str, clients: list) -> tuple:
     * When windows disagree, the most frequent client wins and a tie goes to the
       **earliest** window, because the head of a document establishes its
       subject and a late mention is usually incidental.
+    * ``related`` is a plain union across windows, for the same reason: a second
+      subject mentioned in the last paragraph is still a second subject.
     * ``ok=False`` is returned only when no window produced a client **and** at
       least one window failed. A verdict backed by real evidence is stamped
       even if a sibling window timed out; an unevidenced one is not stamped, so
@@ -586,7 +697,7 @@ async def classify_scope_full(item_text: str, clients: list) -> tuple:
     """
     windows = text_windows(item_text, SCOPE_TEXT_WINDOW, SCOPE_TEXT_OVERLAP)
     if not windows:
-        return None, None, False
+        return None, None, [], False
     if len(windows) > SCOPE_TEXT_WARN_WINDOWS:
         logger.warning(
             f"[scope_backfill] item is {len(item_text)} chars, so it is classified "
@@ -594,12 +705,16 @@ async def classify_scope_full(item_text: str, clients: list) -> tuple:
         )
 
     votes = {}
+    related_names = []
     any_failed = False
     for index, window in enumerate(windows):
-        client, context, ok = await _classify_scope(window, clients)
+        client, context, related, ok = await _classify_scope(window, clients)
         if not ok:
             any_failed = True
             continue
+        for name in related:
+            if name not in related_names:
+                related_names.append(name)
         if not client:
             continue
         entry = votes.get(client)
@@ -613,15 +728,18 @@ async def classify_scope_full(item_text: str, clients: list) -> tuple:
                 entry["context"] = context
 
     if not votes:
-        return None, None, not any_failed
+        return None, None, related_names, not any_failed
 
     winner = min(votes, key=lambda name: (-votes[name]["count"], votes[name]["first"]))
     chosen = votes[winner]
     logger.info(
         f"[scope_backfill] {winner} chosen from {len(windows)} window(s) "
-        f"({chosen['count']} vote(s), context={chosen['context']})"
+        f"({chosen['count']} vote(s), context={chosen['context']}, "
+        f"related={related_names})"
     )
-    return winner, chosen["context"], True
+    # The winner is the file-under, never also a related-to: an item linked to
+    # its own client through both edges shows up twice in a filtered list.
+    return winner, chosen["context"], [n for n in related_names if n != winner], True
 
 
 # ---------------------------------------------------------------------------
@@ -781,12 +899,21 @@ async def _classify_and_link_fact(item: dict, clients: list, user_id: str, sem: 
     """Classify one fact and create FOR_CLIENT / IN_CONTEXT links. Returns True if linked."""
     async with sem:
         body = _enriched_fact_text(item, neo4j_driver, user_id, scope_snapshot)
-        client_name, context_name, ok = await classify_scope_full(body, clients)
+        client_name, context_name, related, ok = await classify_scope_full(body, clients)
     if not client_name:
         # Only a *successful* "this item is generic" verdict may be stamped. A
         # failed call leaves the item unstamped so the next boot retries it.
         if ok:
             _stamp_scope_checked(item["id"], "Fact", user_id, neo4j_driver, scope_sig)
+        # A null primary is not the same as "about nothing": the item can still
+        # be about a client it is not filed under, and RELEVANT_TO is the only
+        # edge that can say so. The tag evidence does not need the classifier
+        # to have agreed on a primary, so this is written on both paths.
+        _write_related_links(
+            item["id"], "Fact",
+            _related_clients_for(body, related, clients, None),
+            user_id, neo4j_driver,
+        )
         return False
     c = db_resolve_client(client_name, user_id)
     if not c:
@@ -796,6 +923,12 @@ async def _classify_and_link_fact(item: dict, clients: list, user_id: str, sem: 
         cx = db_resolve_context(context_name, c["id"], user_id)
         if cx:
             await link_fact_to_context(item["id"], cx["id"], user_id)
+    # A fact is often about more than one client even when it is filed under one.
+    _write_related_links(
+        item["id"], "Fact",
+        _related_clients_for(body, related, clients, client_name),
+        user_id, neo4j_driver,
+    )
     return True
 
 
@@ -964,16 +1097,27 @@ async def _classify_and_link_diary(item: dict, clients: list, user_id: str, sem:
 
     # Fast path: unanimous MENTIONS client or explicit **Client:** header — no LLM needed.
     client_name, context_name = _fast_diary_scope(item, clients, neo4j_driver, user_id)
+    related = []
+    body = ""
     if not client_name:
         async with sem:
             body = _enriched_diary_text(item, neo4j_driver, user_id, scope_snapshot)
-            client_name, context_name, ok = await classify_scope_full(body, clients)
+            client_name, context_name, related, ok = await classify_scope_full(body, clients)
     else:
         ok = True
+        body = _enriched_diary_text(item, neo4j_driver, user_id, scope_snapshot)
     if not client_name:
         # See _classify_and_link_fact: never stamp a transient failure.
         if ok:
             _stamp_scope_checked(item["id"], "DiaryEntry", user_id, neo4j_driver, scope_sig)
+        # Even with no primary client the entry can be about several, which is
+        # exactly what RELEVANT_TO is for -- and the tag evidence does not need
+        # a successful classifier call to be read.
+        _write_related_links(
+            item["id"], "DiaryEntry",
+            _related_clients_for(body, related, clients, None),
+            user_id, neo4j_driver,
+        )
         return False
     c = db_resolve_client(client_name, user_id)
     if not c:
@@ -983,6 +1127,11 @@ async def _classify_and_link_diary(item: dict, clients: list, user_id: str, sem:
         cx = db_resolve_context(context_name, c["id"], user_id)
         if cx:
             await link_diary_to_context(item["id"], cx["id"], user_id)
+    _write_related_links(
+        item["id"], "DiaryEntry",
+        _related_clients_for(body, related, clients, client_name),
+        user_id, neo4j_driver,
+    )
     return True
 
 

@@ -274,6 +274,43 @@ def text_windows(content, window=0, overlap=0):
     return [body[i:i + size] for i in range(0, len(body), step)]
 
 
+# The enriched text handed to the scope classifier marks every neighbour fact
+# with the client it is currently scoped to, e.g. "- Gergely Papp: ..." ending
+# "[client: EPAM]". That tag describes the *person or fact*, never the item
+# being classified.
+_CLIENT_TAG_RES = re.compile(r"\[client:\s*([^\]\r\n]+?)\s*\]")
+
+
+def client_tags_in_text(text) -> list:
+    """Every ``[client: X]`` tag in the enriched text, in first-seen order.
+
+    Read this as "which clients appear in this item's neighbourhood", *not* as
+    "who is this item for". The two were conflated until a handover meeting
+    about another organisation's SAP estate was permanently stamped with the
+    consultancy whose two Enterprise Architects happened to run it: the
+    classifier was told a neighbour's scope tag was "the strongest signal
+    available", and the tag belonged to a person.
+
+    It is the right signal for a *secondary* link. A name surfaced this way
+    becomes a RELEVANT_TO edge, so the item is still findable under the
+    attendees' employer even when that is not where it is scoped -- which is
+    exactly what should happen when a guess about the primary client is wrong.
+
+    Order is first-seen rather than sorted so the log line is stable across
+    runs. Duplicates collapse; tags are not resolved against the client list
+    here, because the caller owns the ambiguity-margin rules in
+    ``resolve_scope_name``.
+    """
+    out = []
+    seen = set()
+    for match in _CLIENT_TAG_RES.finditer(text or ""):
+        name = match.group(1).strip()
+        if name and name not in seen:
+            seen.add(name)
+            out.append(name)
+    return out
+
+
 def looks_like_person_name(query: str) -> bool:
     """True when a query is shaped like a personal name rather than a keyword."""
     tokens = _name_tokens(normalize_identity(query))

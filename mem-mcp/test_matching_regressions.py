@@ -38,6 +38,7 @@ from matching_utils import (
     SCOPE_EVIDENCE_NONE,
     SCOPE_EVIDENCE_TOKENS,
     client_header_value,
+    client_tags_in_text,
     resolve_scope_name,
 )
 
@@ -795,6 +796,261 @@ class ResolverInputTests(unittest.TestCase):
             f"matching_utils gained a dependency: {sorted(imported)}",
         )
 
+
+class ClientTagTests(unittest.TestCase):
+    """`client_tags_in_text` reads the neighbourhood evidence, not the answer.
+
+    A `[client: X]` tag on a neighbouring fact describes that *person or fact*.
+    Treating it as a reason to file the item under X is what stamped a handover
+    meeting about another organisation's SAP estate with the consultancy whose
+    two Enterprise Architects happened to run it.
+    """
+
+    def test_a_tag_is_read(self):
+        self.assertEqual(
+            client_tags_in_text("## Participants\n- Gergely Papp: ... [client: EPAM]"),
+            ["EPAM"],
+        )
+
+    def test_tags_are_first_seen_order_and_deduplicated(self):
+        body = "a [client: EPAM] b [client: SAP SE] c [client: EPAM]"
+        self.assertEqual(client_tags_in_text(body), ["EPAM", "SAP SE"])
+
+    def test_a_parenthesised_stored_spelling_survives(self):
+        """Client names carry qualifiers; the whole one is the lookup key."""
+        self.assertEqual(
+            client_tags_in_text("x [client: Deutsche Bank (DB)] y"),
+            ["Deutsche Bank (DB)"],
+        )
+
+    def test_extra_whitespace_is_trimmed(self):
+        self.assertEqual(client_tags_in_text("[client:   EPAM  ]"), ["EPAM"])
+
+    def test_a_tag_does_not_span_lines(self):
+        """A runaway match would swallow the rest of the enriched text."""
+        self.assertEqual(client_tags_in_text("[client: EPAM\nmore text here]"), [])
+
+    def test_blank_and_none_are_empty(self):
+        self.assertEqual(client_tags_in_text(""), [])
+        self.assertEqual(client_tags_in_text(None), [])
+
+    def test_text_without_tags_is_empty(self):
+        self.assertEqual(client_tags_in_text("SAP GRC handover notes"), [])
+
+
+class RelatedClientSelectionTests(unittest.TestCase):
+    """`_related_clients_for` decides what gets a RELEVANT_TO edge.
+
+    Pure logic lifted out of the module, so it is *called* here rather than
+    read. A source assertion could confirm the function is mentioned on each
+    call site without ever showing what it returns, and the whole point of this
+    change is which names come out.
+    """
+
+    CLIENTS = ["Deutsche Bank (DB)", "EPAM", "LC Security", "SAP SE", "White Cube"]
+
+    @classmethod
+    def setUpClass(cls):
+        import ast
+        path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "migrate_client_context.py"
+        )
+        with open(path, "r", encoding="utf-8") as handle:
+            source = handle.read()
+        tree = ast.parse(source)
+        segment = None
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and node.name == "_related_clients_for":
+                segment = ast.get_source_segment(source, node)
+        assert segment, "_related_clients_for is missing from migrate_client_context.py"
+        namespace = {
+            "resolve_scope_name": resolve_scope_name,
+            "client_tags_in_text": client_tags_in_text,
+        }
+        exec(segment, namespace)
+        cls.fn = staticmethod(namespace["_related_clients_for"])
+
+    def _run(self, text, related, primary):
+        return self.fn(text, related, [{"name": n} for n in self.CLIENTS], primary)
+
+    def test_a_tag_becomes_a_secondary_link(self):
+        body = "- Gergely Papp [client: EPAM]\n- Oleg Tolstashov [client: EPAM]"
+        self.assertEqual(self._run(body, [], "Deutsche Bank (DB)"), ["EPAM"])
+
+    def test_the_primary_is_never_also_related(self):
+        """An item linked to its own client twice appears twice in a filtered list."""
+        body = "- Gergely Papp [client: EPAM]"
+        self.assertEqual(self._run(body, [], "EPAM"), [])
+
+    def test_the_model_list_and_the_tags_are_unioned(self):
+        body = "- Gergely Papp [client: EPAM]"
+        self.assertEqual(
+            sorted(self._run(body, ["SAP SE"], "Deutsche Bank (DB)")),
+            ["EPAM", "SAP SE"],
+        )
+
+    def test_an_unresolvable_name_is_dropped_not_written(self):
+        """Writing it would either invent a client or silently no-op."""
+        self.assertEqual(self._run("", ["Nonexistent Ltd"], "EPAM"), [])
+
+    def test_a_tag_using_an_abbreviation_still_binds(self):
+        body = "- Gergely Papp [client: Deutsche Bank]"
+        self.assertEqual(self._run(body, [], "SAP SE"), ["Deutsche Bank (DB)"])
+
+    def test_no_tags_and_no_model_list_is_empty(self):
+        self.assertEqual(self._run("plain text", [], "EPAM"), [])
+
+    def test_a_null_primary_does_not_filter_everything_out(self):
+        """A generic item can still be about several clients."""
+        body = "- Gergely Papp [client: EPAM]"
+        self.assertEqual(self._run(body, [], None), ["EPAM"])
+
+
+class ScopePromptTests(unittest.TestCase):
+    """The prompt is where the cross-company mistake was actually made.
+
+    The classifier was told a neighbour's `[client: X]` tag was "the strongest
+    signal available". That is a sentence, not code, and nothing else in the
+    suite would have noticed it changing.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import ast
+        path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "migrate_client_context.py"
+        )
+        with open(path, "r", encoding="utf-8") as handle:
+            cls.source = handle.read()
+        tree = ast.parse(cls.source)
+        for node in tree.body:
+            targets = getattr(node, "targets", [])
+            if any(
+                isinstance(t, ast.Name) and t.id == "_SCOPE_SYSTEM" for t in targets
+            ):
+                cls.system = ast.get_source_segment(cls.source, node)
+                return
+        raise AssertionError("_SCOPE_SYSTEM is missing from migrate_client_context.py")
+
+    def test_it_still_instructs_the_model_to_prefer_a_scope_tag(self):
+        """The regression this whole change exists to prevent."""
+        self.assertFalse(
+            "strongly prefer that client" in self.system,
+            msg="the prompt still says a neighbour's scope tag overrides the text",
+        )
+
+    def test_a_participants_employer_is_not_the_client(self):
+        self.assertIn("employer is not the client", self.system)
+
+    def test_it_says_to_judge_by_the_beneficiary_not_the_presenter(self):
+        self.assertIn("what the work is FOR", self.system)
+        self.assertIn("presenter", self.system)
+
+    def test_a_tag_is_described_as_evidence_about_the_person(self):
+        self.assertIn("NOT who the item is about", self.system)
+
+    def test_the_related_field_is_part_of_the_contract(self):
+        self.assertIn('\\"related\\"', self.system)
+        self.assertIn("second subject", self.system)
+
+    def test_the_context_list_order_is_not_a_ranking(self):
+        """It answered EPAM/PPC, and PPC is simply first in EPAM's list."""
+        self.assertIn("not a ranking", self.system)
+
+    def test_an_explicit_client_header_is_still_authoritative(self):
+        self.assertIn("authoritative", self.system)
+
+
+class RelatedLinkWiringTests(unittest.TestCase):
+    """RELEVANT_TO has to be written on both paths, or facts silently lose it.
+
+    `_fast_diary_scope` already wrote these edges for a multi-client diary
+    entry, which meant the feature existed and worked for exactly one of the
+    two node types -- the kind of partial support that reads as "it works".
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import ast
+        path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "migrate_client_context.py"
+        )
+        with open(path, "r", encoding="utf-8") as handle:
+            cls.source = handle.read()
+        tree = ast.parse(cls.source)
+        cls.fns = {
+            node.name: ast.get_source_segment(cls.source, node)
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+
+    def test_the_fact_path_writes_related_links(self):
+        body = self.fns.get("_classify_and_link_fact", "")
+        self.assertIn("_write_related_links(", body, msg=(
+            "facts are filed under a client but never cross-referenced, so a fact "
+            "about two clients is unreachable under the second one"
+        ))
+        self.assertIn('"Fact"', body)
+
+    def test_the_diary_path_writes_related_links(self):
+        body = self.fns.get("_classify_and_link_diary", "")
+        self.assertIn("_write_related_links(", body)
+        self.assertIn('"DiaryEntry"', body)
+
+    def test_the_fact_path_always_writes_even_when_nothing_resolved(self):
+        """A null primary is precisely when RELEVANT_TO is the only signal left.
+
+        Asserted as *presence before position*: the earlier version only
+        asserted that the call was not after the `return False`, which passes
+        vacuously when the call is deleted outright.
+        """
+        body = self.fns.get("_classify_and_link_fact", "")
+        self.assertTrue(
+            "_write_related_links(" in body,
+            msg="the fact path writes RELEVANT_TO only on the success branch",
+        )
+        self.assertLess(
+            body.index("_write_related_links("),
+            body.index("return False"),
+            msg="a fact with no resolved client is returned before its related "
+                "links are written, so it can never be cross-referenced",
+        )
+
+    def test_the_diary_path_also_writes_before_returning(self):
+        body = self.fns.get("_classify_and_link_diary", "")
+        self.assertLess(
+            body.index("_write_related_links("),
+            body.index("return False"),
+        )
+
+    def test_the_link_helper_matches_on_the_label_not_a_fixed_node_type(self):
+        """Positive check, not `assertNotIn("(d:DiaryEntry"...)`.
+
+        The negative form missed a real re-injection: the test looked for
+        `(d:DiaryEntry {id: $did` while the query interpolates the *parameter*
+        name, so swapping `n:{label}` for `d:DiaryEntry` left the guard green.
+        Asserting the shape we require survives any rewording of the failure.
+        """
+        body = self.fns.get("_link_diary_relevant_to", "")
+        self.assertTrue(
+            "MATCH (n:{label}" in body,
+            msg="the node match must interpolate the label, or facts never link",
+        )
+        self.assertTrue(
+            "MATCH (n:" in body,
+            msg=f"RELEVANT_TO no longer targets a parameterised node: {body[-400:]}",
+        )
+
+    def test_an_unexpected_label_is_rejected(self):
+        """The label is interpolated into Cypher, so it must not be free text."""
+        body = self.fns.get("_link_diary_relevant_to", "")
+        self.assertIn("raise ValueError", body)
+
+    def test_the_write_is_swallowed_on_failure(self):
+        """A secondary link must not fail a classification that already worked."""
+        body = self.fns.get("_write_related_links", "")
+        self.assertIn("except Exception", body)
+        self.assertIn("logger.warning", body)
 
 if __name__ == "__main__":
     unittest.main()
