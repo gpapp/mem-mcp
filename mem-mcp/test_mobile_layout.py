@@ -89,25 +89,34 @@ def _assert_declares(case, block_map, selector, declaration, why):
 class StackedPaneVisibilityTests(unittest.TestCase):
     """A stacked pane that stays a scroll container collapses to nothing.
 
-    Both detail panes are `flex: 1` -- a zero flex-basis -- and both live
-    inside a layout that becomes a column of `height: auto` below the
+    Every desktop scroll pane is a flex item with a ZERO flex basis --
+    `flex: 1`, or `flex: 1 1 0` with an explicit `min-height: 0` -- and each
+    lives inside a layout that becomes a column of `height: auto` below the
     breakpoint. A pane that is still `overflow-y: auto` is sized from that
     zero basis, so the auto-height parent resolves against zero and the
     content renders into a box with no height. There is no error and no
-    overflow to see: the diary simply looks empty on a phone.
+    overflow to see: the tab simply looks empty on a phone.
 
-    This is not hypothetical. The memories pane was released and the diary
-    pane was not, so fixing one said nothing about the other -- and the diary
-    pane is the one that shipped broken.
+    This is not hypothetical, and it has now bitten twice, one level apart.
+    The memories pane was released and the diary pane was not. Then the
+    diary pane was released and `#diary-dates-list` -- the date and
+    search-results list, carrying `flex: 1 1 0` and `min-height: 0` -- was
+    not, so searching returned nothing visible while the entries pane
+    looked fine. Fixing the one pane you happened to be looking at is not
+    evidence the others are fine, so the derived test below walks the whole
+    class rather than a list of instances.
     """
 
     _PANES = (".memories-main", ".diary-main")
+    # Not detail panes, but the same trap: these are the scrollable lists
+    # inside the two sidebars.
+    _LISTS = (".memories-list-scroll", "#diary-dates-list")
 
     def setUp(self):
         self.tablet = _declarations(_media_block(900))
 
-    def test_no_detail_pane_stays_a_scroll_container(self):
-        for selector in self._PANES:
+    def test_every_stacked_pane_is_released(self):
+        for selector in self._PANES + self._LISTS:
             with self.subTest(selector=selector):
                 merged = _decls(self.tablet, selector)
                 # Assert presence first. _decls returns "" for an absent
@@ -117,7 +126,7 @@ class StackedPaneVisibilityTests(unittest.TestCase):
                 self.assertTrue(
                     merged.strip(),
                     f"{selector} is not restated below the breakpoint at all, "
-                    f"so it keeps its full-width scroll container",
+                    f"so it keeps its full-width zero-basis scroll container",
                 )
                 self.assertNotIn(
                     "overflow-y: auto", merged,
@@ -125,10 +134,10 @@ class StackedPaneVisibilityTests(unittest.TestCase):
                     f"a zero flex-basis in a height:auto column collapses it; got: {merged.strip()!r}",
                 )
 
-    def test_no_detail_pane_keeps_a_zero_flex_basis(self):
+    def test_no_stacked_pane_keeps_a_zero_flex_basis(self):
         # flex: 1 and flex: 1 1 0% both mean basis 0. flex: 0 0 auto is the
         # only form that lets the pane contribute its content height.
-        for selector in self._PANES:
+        for selector in self._PANES + self._LISTS:
             with self.subTest(selector=selector):
                 merged = _decls(self.tablet, selector)
                 self.assertTrue(merged.strip(), f"{selector} is not restated")
@@ -139,32 +148,71 @@ class StackedPaneVisibilityTests(unittest.TestCase):
                         f"breakpoint; got: {merged.strip()!r}",
                     )
 
-    def test_every_base_pane_that_is_flex_one_is_released(self):
+    def test_the_sidebars_are_the_only_bounded_scroll_region(self):
+        """The inner lists are released, so the sidebar must scroll.
+
+        With `.memories-list-scroll` and `#diary-dates-list` content-sized,
+        a `max-height` on the sidebar does nothing on its own -- the content
+        would spill out of an un-scrolling box. Each sidebar is the bounded
+        scroll region instead, which is also why there is only one scroll
+        area per sidebar rather than a nested one.
+        """
+        for selector in (".memories-list-col", ".diary-sidebar"):
+            with self.subTest(selector=selector):
+                merged = _decls(self.tablet, selector)
+                self.assertTrue(merged.strip(), f"{selector} is not restated")
+                self.assertIn(
+                    "max-height", merged,
+                    f"{selector} is bounded, which only helps if it scrolls",
+                )
+                self.assertIn(
+                    "overflow-y: auto", merged,
+                    f"{selector} is bounded but cannot scroll, so the list "
+                    f"inside it is clipped instead of reachable",
+                )
+
+    def test_every_zero_basis_scroll_container_is_released(self):
         """Belt and braces: derive the panes from the stylesheet, not a list.
 
         A hardcoded list of panes is a list that goes stale the moment a tab
-        is added. This reads which panes are `flex: 1` at full width and
-        requires each one to be released in the mobile block.
+        is added -- and it already was stale once. The first version of this
+        derived only `*-main` selectors, so it passed while the diary's date
+        and search-results list was still collapsing. That list is not a
+        detail pane; it is the list the user searches, and it carries the
+        same `flex: 1 1 0` plus an explicit `min-height: 0`.
+
+        The real class is therefore "a scroll container with a zero flex
+        basis", and that is what this derives: any full-width selector that
+        declares vertical scrolling *and* `flex: 1` / `flex: 1 1 0`. Each
+        one must be restated below the breakpoint, or it collapses to zero
+        height inside the auto-height column and silently renders nothing.
         """
         css = _strip_comments(CSS)
         base = _declarations(css)
         # _declarations maps a selector to a LIST of declaration blocks, so
         # test membership with the joining helper rather than `in`, which
         # would be an exact-element list test and silently never match.
-        flexed = {
-            selector for selector in base
-            if "flex: 1;" in _decls(base, selector) and selector.endswith("-main")
-        }
+        zero_basis = ("flex: 1;", "flex: 1 1 0;", "flex: 1 1 0%")
+        trapped = set()
+        for selector in base:
+            decls = _decls(base, selector)
+            if "overflow-y: auto" not in decls:
+                continue
+            if any(basis in decls for basis in zero_basis):
+                trapped.add(selector)
         self.assertTrue(
-            flexed, "no *-main pane is flex: 1 any more -- update this test"
+            trapped,
+            "no zero-basis scroll container is left -- this test is "
+            "stale, or the panes were all restated at full width",
         )
-        for selector in sorted(flexed):
+        for selector in sorted(trapped):
             with self.subTest(selector=selector):
                 merged = _decls(self.tablet, selector)
                 self.assertTrue(
                     merged.strip(),
-                    f"{selector} is a full-width flex: 1 pane but the mobile "
-                    f"block never mentions it",
+                    f"{selector} is a full-width zero-basis scroll container "
+                    f"but the mobile block never mentions it, so it renders "
+                    f"into a box with no height",
                 )
 
 

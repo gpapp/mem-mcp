@@ -468,22 +468,35 @@
          tall enough to scroll the whole page would bury the detail pane
          you opened it from. */
       .memories-sidebar, .memories-main { overflow-y: visible; }
-      .memories-list-col { max-height: 45vh; }
+      .memories-list-col { max-height: 45vh; overflow-y: auto; }
       .diary-sidebar { max-height: 40vh; overflow-y: auto; }
       .memories-main { padding: .85rem; }
 
-      /* .diary-main needs BOTH halves of this, and the second one is the
-         one that bites. Stacked, it is a flex item in a column whose height
-         is auto, and it carries `flex: 1` -- a zero flex-basis. A pane that
-         is still a scroll container is sized from its flex basis, so the
-         auto-height parent resolves against zero and the entries render
-         into a box with no height: the diary simply looks empty. Setting
-         overflow-y: visible lets the content back into the intrinsic size,
-         and flex: 0 0 auto stops the zero basis from being re-applied.
+      /* Every desktop scroll pane here is a flex item with a ZERO flex
+         basis -- `flex: 1`, or `flex: 1 1 0` with an explicit `min-height: 0`
+         on #diary-dates-list. Stacked, the parent column is `height: auto`,
+         and a scroll container is sized from its flex basis, so the
+         auto-height parent resolves against zero and the content renders
+         into a box with no height. The tab simply looks empty: no error,
+         nothing to scroll.
 
-         .memories-main has the same `flex: 1` and only needed the overflow
-         line above; fixing one pane is not evidence the other is fine. */
-      .diary-main { flex: 0 0 auto; overflow-y: visible; }
+         Both halves are needed. `overflow-y: visible` lets the content back
+         into its intrinsic size, and `flex: 0 0 auto` stops the zero basis
+         from being re-applied. Leaving either one off reproduces the bug.
+
+         The two sidebars keep a max-height and their own overflow, so they
+         become the bounded scroll container instead -- one scroll region per
+         sidebar rather than a nested one.
+
+         This is a class, not an instance: .diary-main, .memories-main,
+         .memories-list-scroll and #diary-dates-list all carry the same
+         declaration, and the diary one is the date/search-results list, so
+         failing to release it makes search results invisible while the
+         entries pane looks fine. */
+      .diary-main, .memories-main,
+      .memories-list-scroll, #diary-dates-list {
+        flex: 0 0 auto; overflow-y: visible; min-height: auto;
+      }
 
       /* Chip rows run sideways rather than stacking into a tall rail. */
       .chips-container { flex-direction: row !important; flex-wrap: nowrap; overflow-x: auto; }
