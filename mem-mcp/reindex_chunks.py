@@ -103,7 +103,10 @@ def _classify(record: dict) -> str:
     text = record.get("text") or ""
     if not needs_chunking(text):
         return "skip-short"
-    if plan_chunks(text)["chunks"] <= 1:
+    # plan["chunks"] is the list of chunk strings, not a count. Comparing it
+    # directly raised TypeError on every long record, so the reindex silently
+    # converted nothing and reported each one as an error.
+    if len(plan_chunks(text)["chunks"]) <= 1:
         return "skip-short"
     return "chunk"
 

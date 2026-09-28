@@ -16,10 +16,10 @@ import uuid
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import chunking
+from reindex_chunks import _classify
 from chunking import (
     CHUNK_MAX,
     CHUNK_OVERLAP,
-    CHUNK_TARGET_CHARS,
     CHUNK_TARGET_CHARS,
     build_chunk_payloads,
     chunk_point_id,
@@ -533,6 +533,41 @@ class RechunkCandidateTests(unittest.TestCase):
 
     def test_empty_input(self):
         self.assertEqual(rechunk_candidates([], set()), [])
+
+
+class ReindexClassifyTests(unittest.TestCase):
+    """reindex_chunks._classify decides whether a record is worth rewriting.
+
+    This is the first thing _process_fact and _process_diary call, so an error
+    here makes the whole script convert nothing while still exiting clean — it
+    used to report every long record as an ERROR and quietly rewrite none of
+    them. plan_chunks()["chunks"] is a list of strings, not a count, and
+    comparing it to 1 raised TypeError on exactly the records that needed
+    chunking; short records short-circuited before reaching it, so the bug was
+    invisible until a real vault was run through the script.
+    """
+
+    def test_long_record_is_selected_for_chunking(self):
+        self.assertEqual(_classify({"text": "Meeting notes. " * 400}), "chunk")
+
+    def test_short_record_is_skipped(self):
+        self.assertEqual(_classify({"text": "A short fact."}), "skip-short")
+
+    def test_blank_and_missing_text_is_skipped(self):
+        for record in ({"text": ""}, {"text": "   \n\t "}, {}):
+            self.assertEqual(_classify(record), "skip-short", record)
+
+    def test_the_split_threshold_is_the_target(self):
+        # The boundary is what actually decides the branch, so pin it. The
+        # `len(chunks) <= 1` guard inside _classify is defensive: text large
+        # enough to need chunking always yields at least two parts, so it is not
+        # reachable from here and a test asserting it would be testing a fiction.
+        at_target = "x" * CHUNK_TARGET_CHARS
+        over_target = "x" * (CHUNK_TARGET_CHARS + 1)
+        self.assertFalse(needs_chunking(at_target))
+        self.assertTrue(needs_chunking(over_target))
+        self.assertEqual(_classify({"text": at_target}), "skip-short")
+        self.assertEqual(_classify({"text": over_target}), "chunk")
 
 
 if __name__ == "__main__":
