@@ -58,6 +58,10 @@ def _format_fact_md(fact: dict) -> str:
         meta_parts.append(f"📂 **{category}**")
     if score is not None:
         meta_parts.append(f"🎯 score: `{score:.3f}`")
+    confidence = fact.get("confidence")
+    if confidence is not None:
+        evidence = fact.get("evidence") or "-"
+        meta_parts.append(f"✅ confidence: `{float(confidence):.2f}` ({evidence})")
     if fact_id:
         meta_parts.append(f"🔑 `{fact_id}`")
     if meta_parts:
@@ -76,11 +80,25 @@ def _format_fact_md(fact: dict) -> str:
 
 
 def _format_facts_md(facts: list) -> str:
-    """Render a list of fact dicts as a combined Markdown document."""
+    """Render fact dicts as a combined Markdown document, separating weak matches."""
     if not facts:
         return "_No facts found._"
-    blocks = [_format_fact_md(f) for f in facts]
-    return "\n\n---\n\n".join(blocks)
+    confident = [f for f in facts if not f.get("weak")]
+    weak = [f for f in facts if f.get("weak")]
+    blocks = [_format_fact_md(f) for f in confident]
+    body = "\n\n---\n\n".join(blocks)
+    if not weak:
+        return body
+    warning = (
+        "_Unconfirmed matches below the confidence threshold. They are close but "
+        "NOT the same record — do not link, merge, or update them. If you need one "
+        "of these, confirm the exact name first; otherwise treat the person/thing as "
+        "not yet recorded and add a new fact._"
+    )
+    weak_body = "\n\n---\n\n".join(_format_fact_md(f) for f in weak)
+    if body:
+        return f"{body}\n\n---\n\n### Unconfirmed matches\n\n{warning}\n\n{weak_body}"
+    return f"### Unconfirmed matches\n\n{warning}\n\n{weak_body}"
 
 @mcp.tool()
 @monitor_mcp_tool("add_fact", context_provider=_current_user)
@@ -137,24 +155,32 @@ async def search_facts(query: str, category: Optional[str] = None, limit: int = 
             "what am I passionate about" (no matching facts)
 
     The search combines Neo4j substring matching (fast, exact) with Qdrant
-    vector similarity (semantic). Vector scores peak at ~0.67 for nomic-embed-text,
-    so verbose/abstract queries often return low-confidence results.
+    vector similarity (semantic), then re-scores every hit as a normalized
+    confidence in 0-1. Each result shows `confidence` and `evidence`:
+      evidence=exact / alias / first+last / first_name — same record
+      evidence=partial_token / fuzzy_name / surname_strong / name_conflict — near miss
+    Results are split into confirmed matches and an "Unconfirmed matches"
+    section. Unconfirmed results are NOT the same record; never link, merge, or
+    update them, and do not report them as found.
 
     Parameters:
       query: keyword or short phrase matching fact names/content
       category: optional filter ('People', 'Technology', 'Client', 'Project', 'Tool')
-      limit: max results (default 5)
-      top_p: similarity threshold (default 0.5; raise to 0.7 for strict, lower to 0.4 for broad)
+      limit: max confirmed results (default 5)
+      top_p: minimum confidence (0-1, default 0.5). Raise to 0.75 to require an
+        exact name/alias/first+last, lower to 0.35 to include fuzzy name hits
       names_only: if True, returns only fact names as newline-separated list
       client: optional client name to scope results (e.g. "Deutsche Bank")
       context: optional context name within the client (e.g. "SAP Implementation")
 
     Strategy: If the first search returns weak results, try shorter/simpler queries.
     For people, use first name only. For projects, use the project name directly.
+    If a name search returns nothing confirmed, the person is not recorded yet —
+    add the fact rather than editing an unconfirmed match.
     """
     facts = await mem.db_search_memories(query, _current_user(), limit, category, top_p, client, context)
     if names_only:
-        return "\n".join(f.get("name", "") or f.get("text", "")[:50] for f in facts if f.get("name"))
+        return "\n".join(f.get("name", "") or f.get("text", "")[:50] for f in facts if f.get("name") and not f.get("weak"))
     return _format_facts_md(facts)
 
 @mcp.tool()

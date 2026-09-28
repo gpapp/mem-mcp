@@ -27,6 +27,7 @@ from typing import Optional
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from common import get_qdrant, get_neo4j, get_embedding, COLLECTION_NAME, DIARY_COLLECTION
+from matching_utils import identity_confidence, looks_like_person_name
 from qdrant_client.models import Filter, FieldCondition, MatchValue
 import difflib
 
@@ -262,13 +263,28 @@ async def diagnose_search_facts(query: str, user_id: str, top_p: float = 0.7, li
                 if matched_query_words:
                     score += 0.1 * best_ratio
 
+        # Threshold on the same normalized confidence the server uses, so this
+        # harness cannot drift into reporting a different verdict than production.
+        name_like = (category or "").strip().lower() == "people" and looks_like_person_name(query)
+        confidence, evidence = identity_confidence(
+            query,
+            name=name,
+            first_name=metadata.get("first_name"),
+            last_name=metadata.get("last_name"),
+            aliases=aliases,
+            raw_vector=r.score,
+            name_like=name_like,
+        )
+
         boosted_results.append({
             "id": r.id,
-            "name": r.payload.get("name"),
+            "name": name,
             "category": r.payload.get("category"),
             "raw_score": r.score,
             "boosted_score": score,
-            "above_threshold": score >= top_p,
+            "confidence": round(confidence, 3),
+            "evidence": evidence,
+            "above_threshold": confidence >= top_p,
         })
 
     # Sort by boosted score
@@ -280,12 +296,12 @@ async def diagnose_search_facts(query: str, user_id: str, top_p: float = 0.7, li
     print(f"\n  Boosted results ABOVE threshold ({top_p}): {len(above)}")
     for r in above[:10]:
         delta = r["boosted_score"] - r["raw_score"]
-        print(f"    [{r['boosted_score']:.4f}] (raw={r['raw_score']:.4f}, boost=+{delta:.4f}) {r['name']}")
+        print(f"    [{r['boosted_score']:.4f}] (raw={r['raw_score']:.4f}, boost=+{delta:.4f}, conf={r['confidence']:.3f} {r['evidence']}) {r['name']}")
 
     print(f"\n  Boosted results BELOW threshold ({top_p}): {len(below)}")
     for r in below[:10]:
         delta = r["boosted_score"] - r["raw_score"]
-        print(f"    [{r['boosted_score']:.4f}] (raw={r['raw_score']:.4f}, boost=+{delta:.4f}) {r['name']}")
+        print(f"    [{r['boosted_score']:.4f}] (raw={r['raw_score']:.4f}, boost=+{delta:.4f}, conf={r['confidence']:.3f} {r['evidence']}) {r['name']}")
 
     # --- Merge ---
     merged = {}

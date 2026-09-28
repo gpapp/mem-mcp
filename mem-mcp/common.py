@@ -50,6 +50,40 @@ LOG_LEVEL = getattr(logging, LOG_LEVEL_NAME.upper(), logging.INFO)
 LOG_DIR = os.getenv("LOG_DIR") or str(Path(__file__).resolve().parent.parent / "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 
+# Savepoints live beside the logs so a single volume mount covers both. In the
+# container LOG_DIR is /app/logs, which puts backups at /app/backup; locally it
+# lands next to the repo's logs/ directory.
+BACKUP_DIR = os.getenv("MEM_BACKUP_DIR") or os.path.join(os.path.dirname(LOG_DIR), "backup")
+os.makedirs(BACKUP_DIR, exist_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Maintenance lock
+#
+# Reclassification and backup/restore both rewrite large parts of the graph. Run
+# them concurrently and the two jobs interleave their writes, so a restore can
+# resurrect links a reclassify just deleted (or the reverse). One owner per user
+# at a time; the holder releases in a finally block.
+# ---------------------------------------------------------------------------
+_MAINTENANCE_OWNERS: dict = {}
+
+
+def claim_maintenance(user_id: str, operation: str) -> bool:
+    """Take the maintenance lock for a user. False if another job holds it."""
+    if _MAINTENANCE_OWNERS.get(user_id):
+        return False
+    _MAINTENANCE_OWNERS[user_id] = operation
+    return True
+
+
+def release_maintenance(user_id: str) -> None:
+    _MAINTENANCE_OWNERS.pop(user_id, None)
+
+
+def current_maintenance(user_id: str) -> Optional[str]:
+    return _MAINTENANCE_OWNERS.get(user_id)
+
+
 
 class _StripAnsiFilter(logging.Filter):
     _ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
@@ -103,6 +137,30 @@ if not any(isinstance(handler, RotatingFileHandler) and handler.name == "memory-
 logger = logging.getLogger("memory-vault")
 logger.setLevel(LOG_LEVEL)
 logging.getLogger("mcp").setLevel(LOG_LEVEL)
+
+# Per-query search ranking audit log. Deliberately independent of LOG_LEVEL:
+# production runs at WARNING, which would otherwise silence the only data that
+# shows how search actually ranked a query after a deploy.
+search_logger = logging.getLogger("mem.search")
+search_logger.setLevel(logging.INFO)
+search_logger.propagate = False
+if not any(getattr(h, "name", None) == "search-stats-file" for h in search_logger.handlers):
+    _search_handler = RotatingFileHandler(
+        os.path.join(LOG_DIR, "search_stats.log"),
+        maxBytes=10 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    _search_handler.name = "search-stats-file"
+    _search_handler.setLevel(logging.INFO)
+    _search_handler.addFilter(_StripAnsiFilter())
+    _search_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    search_logger.addHandler(_search_handler)
+
+
+def log_search_stats(**fields) -> None:
+    """Record one line of per-query search ranking data to search_stats.log."""
+    search_logger.info("search_stats %s", json.dumps(fields, default=str))
 
 
 class _BenignScopeNotificationFilter(logging.Filter):
@@ -315,21 +373,35 @@ def clean_extracted_people_names(names: list) -> list[str]:
 # ---------------------------------------------------------------------------
 # Embedding
 # ---------------------------------------------------------------------------
+_EMBEDDING_CACHE: dict = {}
+EMBED_CACHE_MAX = 2048
+
 async def get_embedding(text: str) -> List[float]:
+    """Embed text via Ollama, memoizing results for the process lifetime.
+
+    Embeddings are deterministic per (model, text), and a single search fans out
+    to one Ollama round trip per query variant. The cache collapses repeats across
+    variants, repeats within a request, and repeat searches by the agent.
+    """
+    key = (EMBED_MODEL, text)
+    cached = _EMBEDDING_CACHE.get(key)
+    if cached is not None:
+        return cached
+
     request_body = {"model": EMBED_MODEL, "prompt": text}
-    logger.warning(f"Ollama request: POST {OLLAMA_URL}/api/embeddings body={request_body}")
+    logger.debug(f"Ollama request: POST {OLLAMA_URL}/api/embeddings model={EMBED_MODEL} chars={len(text)}")
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         resp = await client.post(
             f"{OLLAMA_URL}/api/embeddings",
             json=request_body,
         )
-        logger.warning(
-            f"Ollama response: POST /api/embeddings status={resp.status_code} body={resp.text}"
-        )
         resp.raise_for_status()
         embedding = resp.json()["embedding"]
-        logger.warning(f"Ollama result: embedding model={EMBED_MODEL} dimensions={len(embedding)}")
-        return embedding
+    logger.debug(f"Ollama result: embedding model={EMBED_MODEL} dimensions={len(embedding)}")
+    if len(_EMBEDDING_CACHE) >= EMBED_CACHE_MAX:
+        _EMBEDDING_CACHE.pop(next(iter(_EMBEDDING_CACHE)))
+    _EMBEDDING_CACHE[key] = embedding
+    return embedding
 
 
 async def get_llm_response(prompt: str, system: str = "", model: str = "", num_predict: int = 0) -> str:

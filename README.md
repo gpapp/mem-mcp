@@ -44,6 +44,7 @@ mem-mcp/
 - **Scope Inference** — When no explicit client is passed, search infers the client from the query text (boost-only, never filters).
 - **Inactive Client Handling** — Clients untouched for 90 days are auto-deprioritized (−0.15 score, never hidden). Status can be manually pinned via `set_client_status`, `PUT /api/clients/{id}`, or the Setup-tab toggle; pinned clients are never auto-changed.
 - **Setup Tab** — Client list with active/inactive toggles, plus MCP connection details.
+- **Daily Backups & Restore** — An in-process scheduler writes a vault-wide savepoint (graph + both vector collections) each night, keeps the last `MEM_BACKUP_KEEP`, and Setup → Maintenance → Backup & Restore can take one immediately or restore any of them.
 - **Lazy-Loaded Lists** — Memories and diary sidebar render in batches of 50 with infinite scroll; calendar has a 📅 jump-to-today button.
 
 ## Ports & Access
@@ -110,7 +111,33 @@ C:/tools/miniconda3/python.exe -m unittest -v test_matching_regressions.py
 Pop-Location
 ```
 
-The suite covers scope-aware duplicate matching, weighted scoring, bridge-cluster rejection, merge target ownership, merge mutation ordering, People candidate resolution, and LLM prompt contracts. It does not require the Docker services.
+The suite covers scope-aware duplicate matching, weighted scoring, bridge-cluster rejection, merge target ownership, merge mutation ordering, People candidate resolution, scope-name and `Client:`-header resolution, and LLM prompt contracts. It does not require the Docker services.
+
+## Backups
+
+The vault writes a **savepoint** every day and keeps the most recent
+`MEM_BACKUP_KEEP` of them. Manage them from **Setup → Maintenance → Backup & Restore**.
+
+- A savepoint holds the whole vault: the graph plus both vector collections. It
+  lives in `mem-mcp-data/backup/` on the host (bind-mounted to `/app/backup`).
+- **Back up now** takes an immediate one instead of waiting for the nightly slot.
+- **Restore** replaces all current data with the selected savepoint. Take a fresh
+  savepoint first if you have recent work you want to keep.
+- Restoring a savepoint that did not finish is not possible — incomplete
+  savepoints are listed as *Unusable*.
+
+Schedule and retention are controlled in `.env`:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MEM_BACKUP_ENABLED` | `1` | `0` disables the nightly run; manual backups still work |
+| `MEM_BACKUP_HOUR` / `MEM_BACKUP_MINUTES` | `3` / `0` | Local server time of the nightly run |
+| `MEM_BACKUP_KEEP` | `14` | How many completed savepoints to keep |
+| `MEM_BACKUP_DIR` | `<dirname LOG_DIR>/backup` | Where savepoints are written |
+
+Savepoints are copies, not a live mirror — if the host disk is lost, they are
+lost with it. Copy `mem-mcp-data/backup/` off the machine if you need a
+disaster-recovery copy.
 
 ## Claude Desktop Setup
 

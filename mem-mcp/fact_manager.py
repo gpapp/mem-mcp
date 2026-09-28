@@ -4,6 +4,7 @@ fact_manager.py – Fact management, search, deduplication, and graph operations
 
 from typing import List, Optional
 import re
+import time
 import uuid
 import numpy as np
 import difflib
@@ -11,7 +12,7 @@ from qdrant_client.models import PointStruct, Filter, FieldCondition, MatchValue
 
 from common import (
     get_qdrant, get_neo4j, logger, get_embedding, get_llm_response, publish_db_event,
-    COLLECTION_NAME, DIARY_COLLECTION
+    log_search_stats, COLLECTION_NAME, DIARY_COLLECTION
 )
 from client_manager import (
     db_create_client, db_create_context, db_list_clients,
@@ -22,12 +23,20 @@ from client_manager import (
     INFERRED_SCOPE_BOOST, INACTIVE_PENALTY
 )
 from matching_utils import (
+    MIN_MATCH_CONFIDENCE,
+    VECTOR_CEIL,
+    VECTOR_FLOOR,
     cluster_has_core,
     combine_duplicate_signals,
+    identity_confidence,
+    looks_like_person_name,
     people_match_allowed,
     scopes_compatible,
     validate_merge_ids,
 )
+
+# Max unconfirmed (below top_p) results appended after the confident set.
+WEAK_RESULT_LIMIT = 2
 
 # ---------------------------------------------------------------------------
 # People metadata extraction
@@ -578,15 +587,19 @@ def db_get_connections_by_type(fact_id: str, user_id: str) -> dict:
 
 async def rewrite_search_query(query: str, category: Optional[str] = None,
                                client: Optional[str] = None,
-                               context: Optional[str] = None) -> list:
+                               context: Optional[str] = None,
+                               expand: bool = False) -> list:
     """Use a tiny LLM to rewrite natural language into keyword search phrases.
 
     Returns a list of (keyword_string, weight) tuples.
-    Short queries (<=2 words) are returned as-is.
-    Falls back to _expand_query() heuristic on any LLM error.
+
+    Short queries (<=2 words) are returned as-is unless ``expand`` is set. Callers
+    pass ``expand`` when the exact-name lookup already came back empty, so a
+    one-word miss ("Radoslav") can still be broadened while a one-word hit
+    ("correction") stays a single cheap embedding.
     """
     q = query.strip()
-    if len(q.split()) <= 2:
+    if len(q.split()) <= 2 and not expand:
         return [(q, 1.0)]
 
     filters = ", ".join(
@@ -686,7 +699,13 @@ def _expand_query(query: str) -> list:
 
 
 async def _single_vector_search(qdrant, query: str, user_id: str, category: Optional[str], fetch_limit: int, top_p: float, client: Optional[str] = None, context: Optional[str] = None) -> list:
-    """Run a single vector search against Qdrant. Returns raw results before boosting."""
+    """Run a single vector search against Qdrant. Returns raw results before boosting.
+
+    ``top_p`` is a normalized confidence floor, not a raw cosine threshold: the
+    embedder's useful band starts well above 0, so filtering here only discards
+    results that could not pass the confidence gate after boosting. Passing 0.0
+    disables the pre-filter and lets the caller decide.
+    """
     vec = await get_embedding(query)
     conditions = [FieldCondition(key="userId", match=MatchValue(value=user_id))]
     if category:
@@ -697,12 +716,16 @@ async def _single_vector_search(qdrant, query: str, user_id: str, category: Opti
         conditions.append(FieldCondition(key="contextName", match=MatchValue(value=context.strip())))
 
     filt = Filter(must=conditions)
+    # Translate the confidence floor into the narrowest equivalent raw threshold.
+    score_threshold = 0.0
+    if top_p > 0:
+        score_threshold = max(0.0, VECTOR_FLOOR + top_p * (VECTOR_CEIL - VECTOR_FLOOR))
     result = await qdrant.query_points(
         collection_name=COLLECTION_NAME,
         query=vec,
         query_filter=filt,
         limit=fetch_limit,
-        score_threshold=0.0,  # We apply threshold after boosting
+        score_threshold=score_threshold,
     )
     return result.points
 
@@ -790,17 +813,25 @@ def _boost_result_score(point, query_lower: str) -> float:
 
 
 async def db_search_memories(query: str, user_id: str, limit: int = 5, category: Optional[str] = None, top_p: float = 0.4, client: Optional[str] = None, context: Optional[str] = None) -> list:
-    """Vector-similarity search with multi-query expansion and optional category filter.
+    """Search facts, ranking by score and filtering by normalized confidence.
 
-    For queries with 3+ words, generates multiple query variants and merges
-    results to improve semantic coverage.
+    Two independent rankings are combined. ``score`` is the legacy blended value
+    (vector similarity plus additive name heuristics) and is kept unchanged for
+    ranking and back-compat. ``confidence`` is a normalized 0-1 value derived by
+    ``identity_confidence`` and is what ``top_p`` filters on, because the blended
+    score is not a similarity and cannot be thresholded meaningfully.
 
-    Optional client/context parameters filter results to specific client or context scope.
+    Results at or above ``top_p`` come first. Results below it are returned after
+    the confident set, flagged ``weak: True`` and capped, so recall is preserved
+    without letting an unconfirmed match look like a match.
     """
+    started = time.perf_counter()
     qdrant = await get_qdrant()
     neo4j_driver = get_neo4j()
     if not qdrant or not neo4j_driver:
         raise RuntimeError("Databases not connected.")
+
+    name_like = (category or "").strip().lower() == "people" and looks_like_person_name(query)
 
     # 1. Neo4j exact/substring match on name or aliases
     # We do a quick lookup for nodes containing the query
@@ -809,7 +840,7 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
 
     with neo4j_driver.session() as s:
         # Only do broad CONTAINS match on text if the query is reasonably long to avoid massive irrelevant noise
-        if len(query) > 3:
+        if len(query) > 3 and not name_like:
             cypher = """
             MATCH (f:Fact {userId: $userId})
             WHERE toLower(f.name) CONTAINS toLower($query_str)
@@ -829,7 +860,7 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
             cypher += " AND EXISTS((f)-[:IN_CONTEXT]->(:Context {name: $contextName, userId: $userId}))"
         cypher += " OPTIONAL MATCH (f)-[:FOR_CLIENT]->(fc:Client)"
         cypher += " OPTIONAL MATCH (f)-[:IN_CONTEXT]->(fx:Context)"
-        cypher += " RETURN f, fc.name AS clientName, fx.name AS contextName LIMIT 100"
+        cypher += " RETURN f, fc.name AS clientName, fx.name AS contextName ORDER BY f.name LIMIT 25"
 
         params = {"userId": user_id, "query_str": query}
         if category:
@@ -889,14 +920,25 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
                 "name": f.get("name"),
                 "category": f.get("category"),
                 "score": score,
+                # A literal Neo4j substring hit is stronger evidence than any
+                # embedding, so feed it in as a saturated vector component.
+                "raw_score": 1.0,
                 "clientName": r["clientName"],
                 "contextName": r["contextName"],
                 "metadata": meta
             })
 
     # 2. Multi-query vector search
-    # Use LLM rewrite for better semantic coverage on long queries
-    query_variants = await rewrite_search_query(query, category=category, client=client, context=context)
+    # Long queries go through the LLM rewriter. Short queries only get expanded
+    # when the exact-name lookup found nothing, so a name-shaped miss is retried
+    # while an ordinary hit stays a single embedding.
+    query_variants = await rewrite_search_query(
+        query,
+        category=category,
+        client=client,
+        context=context,
+        expand=not exact_matches,
+    )
     fetch_limit = max(limit * 5, 50)
 
     # Collect all results from all query variants
@@ -954,7 +996,11 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
     else:
         # Fetch status map first so inactive clients skip the inferred boost too.
         status_map = db_get_client_status_map(user_id)
-        inferred_client, _ = infer_scope_from_text(query, user_id)
+        # A name-shaped query cannot name a client, so skip the inference round
+        # trip entirely on the highest-volume search shape.
+        inferred_client = None
+        if not name_like:
+            inferred_client, _ = infer_scope_from_text(query, user_id)
         if inferred_client:
             for r in final_list:
                 cname = r.get("clientName") or r.get("metadata", {}).get("clientName", "")
@@ -973,15 +1019,61 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
             if (xname or "").lower() == context.lower():
                 r["score"] += 0.3
 
-    final_list.sort(key=lambda x: x["score"], reverse=True)
-    return final_list[:limit]
+    # Normalized identity confidence drives thresholding; score drives ranking.
+    for r in final_list:
+        meta = r.get("metadata") or {}
+        confidence, evidence = identity_confidence(
+            query,
+            name=r.get("name"),
+            first_name=meta.get("first_name"),
+            last_name=meta.get("last_name"),
+            aliases=meta.get("aliases"),
+            raw_vector=r.get("raw_score"),
+            name_like=name_like,
+        )
+        r["confidence"] = round(confidence, 3)
+        r["evidence"] = evidence
+
+    final_list.sort(key=lambda x: (x["score"], x["confidence"]), reverse=True)
+    confident = [r for r in final_list if r["confidence"] >= top_p]
+    weak = [r for r in final_list if r["confidence"] < top_p]
+
+    results = confident[:limit]
+    for r in weak[:WEAK_RESULT_LIMIT]:
+        r["weak"] = True
+        results.append(r)
+
+    log_search_stats(
+        query=query,
+        category=category,
+        top_p=top_p,
+        name_like=name_like,
+        exact_hits=len(exact_matches),
+        candidates=len(final_list),
+        confident=len(confident),
+        weak=len(weak),
+        returned=len(results),
+        elapsed_ms=int((time.perf_counter() - started) * 1000),
+        top=[
+            {
+                "name": r.get("name"),
+                "score": r["score"],
+                "confidence": r["confidence"],
+                "evidence": r["evidence"],
+                "weak": bool(r.get("weak")),
+            }
+            for r in results[:5]
+        ],
+    )
+    return results
 
 
-async def db_find_people_matches(names: list[str], user_id: str, min_score: float = 1.2) -> list:
+async def db_find_people_matches(names: list[str], user_id: str, min_score: float = MIN_MATCH_CONFIDENCE) -> list:
     """Find high-confidence existing People facts for extracted names.
 
-    Uses the same scoring as search_facts, including semantic and fuzzy name
-    matching, but rejects weak results before they can create MENTIONS links.
+    Uses the same scoring as search_facts, but rejects weak and conflicting
+    results before they can create MENTIONS links. ``min_score`` is a normalized
+    confidence, so it is matched to the confidence floor passed to the search.
     """
     matches = []
     seen_ids = set()
@@ -991,7 +1083,7 @@ async def db_find_people_matches(names: list[str], user_id: str, min_score: floa
             user_id,
             limit=3,
             category="People",
-            top_p=0.75,
+            top_p=MIN_MATCH_CONFIDENCE,
         )
         for result in results:
             if result.get("id") in seen_ids or not people_match_allowed(name, result, min_score):

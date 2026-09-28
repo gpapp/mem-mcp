@@ -704,6 +704,25 @@ npm install @modelcontextprotocol/sdk</code></pre>
         <div id="reclassify-bar" style="height:100%; width:0%; background:var(--primary); transition:width .3s;"></div>
       </div>
     </div>
+
+    <div style="margin-top: 2rem; padding-top: 1.5rem; border-top: 1px solid var(--border);">
+      <h3 style="margin-top:0;">💾 Backup &amp; Restore</h3>
+      <p style="font-size: 0.9rem; color: var(--muted); margin-bottom: 1rem;">
+        A savepoint is a copy of the <strong>whole vault</strong> — the graph plus both vector
+        collections. One is written automatically every day and the last
+        <span id="backup-keep" class="mono">14</span> are kept. Restoring <strong>replaces all current data</strong>,
+        so take a savepoint first if you have recent work you still need.
+      </p>
+      <div id="backup-schedule" style="font-size:.85rem; color:var(--muted); margin-bottom:.75rem;"></div>
+      <div style="display:flex; gap:.5rem; flex-wrap:wrap; align-items:center;">
+        <button id="backup-now-btn" class="btn btn-primary btn-sm" onclick="runBackupNow()">💾 Back up now</button>
+        <button id="backup-refresh-btn" class="btn btn-sm" onclick="loadSavepoints()">↻ Refresh</button>
+        <span id="backup-status" style="font-size:.9rem; color:var(--muted);"></span>
+      </div>
+      <div id="savepoint-list" style="margin-top:1rem; max-height:280px; overflow-y:auto;">
+        <div style="font-size:.9rem; color:var(--muted);">Loading savepoints…</div>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -990,7 +1009,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     if (tab === 'graph' && !graphLoaded) loadGraph();
     if (tab === 'clients') loadClients();
     if (tab === 'projects') { loadClients(); loadProjects(); }
-    if (tab === 'setup') loadReclassifyStatus();
+    if (tab === 'setup') { loadReclassifyStatus(); loadSavepoints(); }
     saveSessionState();
   }
 
@@ -1415,6 +1434,135 @@ npm install @modelcontextprotocol/sdk</code></pre>
     };
     await tick();
     if (running && !reclassifyTimer) reclassifyTimer = setInterval(tick, 2000);
+  }
+
+  // ---- Backup & restore ---------------------------------------------------
+  let backupTimer = null;
+
+  function humanBytes(n) {
+    n = Number(n) || 0;
+    if (n < 1024) return n + ' B';
+    const units = ['KB', 'MB', 'GB', 'TB'];
+    let i = -1, v = n;
+    do { v = v / 1024; i++; } while (v >= 1024 && i < units.length - 1);
+    return v.toFixed(v >= 10 ? 0 : 1) + ' ' + units[i];
+  }
+
+  function humanStamp(iso) {
+    if (!iso) return 'unknown time';
+    const d = new Date(iso);
+    if (isNaN(d)) return iso;
+    return d.toLocaleString();
+  }
+
+  async function loadSavepoints() {
+    const list = document.getElementById('savepoint-list');
+    const sched = document.getElementById('backup-schedule');
+    const keep = document.getElementById('backup-keep');
+    try {
+      const data = await api.get('backup/savepoints');
+      const cfg = data.config || {};
+      if (keep) keep.textContent = cfg.keep != null ? cfg.keep : '14';
+      if (sched) {
+        sched.textContent = cfg.enabled
+          ? `🗓️ Daily at ${String(cfg.hour).padStart(2,'0')}:${String(cfg.minute).padStart(2,'0')} server time · keeping ${cfg.keep} · ${cfg.directory}`
+          : `⏸️ Automatic backups are disabled (MEM_BACKUP_ENABLED=0) · ${cfg.directory}`;
+      }
+      renderBackupStatus(data.status);
+      renderSavepoints(data.savepoints || []);
+    } catch(e) {
+      if (list) list.innerHTML = `<div style="font-size:.9rem; color:var(--danger);">⚠️ Could not load savepoints${e && e.status ? ' (' + e.status + ')' : ''}</div>`;
+    }
+  }
+
+  function renderSavepoints(savepoints) {
+    const list = document.getElementById('savepoint-list');
+    if (!list) return;
+    if (!savepoints.length) {
+      list.innerHTML = `<div style="font-size:.9rem; color:var(--muted);">No savepoints yet. Use <strong>Back up now</strong>, or wait for tonight's scheduled run.</div>`;
+      return;
+    }
+    list.innerHTML = savepoints.map(s => {
+      const c = s.counts || {};
+      const failed = s.status !== 'complete';
+      const meta = failed
+        ? `<span style="color:var(--danger);">incomplete</span>`
+        : `${c.nodes != null ? c.nodes + ' nodes' : ''}${c.relationships != null ? ', ' + c.relationships + ' links' : ''} · ${humanBytes(s.bytes)}`;
+      const reason = s.reason === 'scheduled' ? 'automatic' : (s.reason || 'manual');
+      return `<div style="display:flex; gap:.75rem; align-items:center; justify-content:space-between; padding:.6rem .7rem; margin-bottom:.4rem; border:1px solid var(--border); border-radius:8px;">
+        <div style="min-width:0;">
+          <div style="font-size:.9rem;">${escHtml(humanStamp(s.created_at))} <span style="color:var(--muted);">· ${escHtml(reason)}</span></div>
+          <div style="font-size:.8rem; color:var(--muted);">${meta}</div>
+        </div>
+        <button class="btn btn-sm" style="white-space:nowrap;" ${failed ? 'disabled' : ''}
+                onclick="runRestore('${escHtml(s.id)}')">${failed ? 'Unusable' : '♻️ Restore'}</button>
+      </div>`;
+    }).join('');
+  }
+
+  function renderBackupStatus(job) {
+    const el = document.getElementById('backup-status');
+    const btn = document.getElementById('backup-now-btn');
+    if (!el) return;
+    if (btn) btn.disabled = !!(job && job.state === 'running');
+    if (!job || job.state === 'idle') { el.textContent = ''; return; }
+    if (job.state === 'running') {
+      el.textContent = `🔄 ${job.operation === 'restore' ? 'Restoring' : 'Backing up'}… ${job.message || ''}`;
+    } else if (job.state === 'done') {
+      el.textContent = `✅ ${job.operation === 'restore' ? 'Restore' : 'Backup'} complete.`;
+      if (job.operation === 'restore') {
+        // The whole vault just changed underneath us — drop every cached list.
+        memories = []; diaryEntries = []; clientListCache = []; clientActiveMap = {}; graphLoaded = false;
+        await Promise.allSettled([loadMemories(), loadClients(), loadDiary()]);
+      }
+      loadSavepoints();
+    } else if (job.state === 'error') {
+      el.textContent = `⚠️ ${job.operation === 'restore' ? 'Restore' : 'Backup'} failed: ${job.error || 'unknown error'}`;
+    }
+  }
+
+  async function runBackupNow() {
+    try {
+      const job = await api.post('backup/run', {});
+      renderBackupStatus(job);
+      pollBackup();
+    } catch(e) {
+      if (e && e.status === 409) { toast('A maintenance job is already running'); renderBackupStatus(await api.get('backup/status')); pollBackup(); }
+      else toast('⚠️ Could not start backup');
+    }
+  }
+
+  async function runRestore(id) {
+    const ok = confirm(
+      `Restore savepoint ${id}?\n\n` +
+      'This REPLACES every memory, diary entry and client with the contents of that savepoint.\n' +
+      'Anything saved since then is lost.\n\n' +
+      'Recommended: click "Back up now" first to keep the current state.'
+    );
+    if (!ok) return;
+    try {
+      const job = await api.post(`backup/restore/${encodeURIComponent(id)}`, {});
+      renderBackupStatus(job);
+      pollBackup();
+    } catch(e) {
+      if (e && e.status === 409) { toast('A maintenance job is already running'); renderBackupStatus(await api.get('backup/status')); pollBackup(); }
+      else toast('⚠️ Could not start restore');
+    }
+  }
+
+  async function pollBackup() {
+    if (backupTimer) { clearInterval(backupTimer); backupTimer = null; }
+    let running = true;
+    const tick = async () => {
+      try {
+        const job = await api.get('backup/status');
+        renderBackupStatus(job);
+        running = !!job && job.state === 'running';
+      } catch(_) { running = false; }
+      if (!running && backupTimer) { clearInterval(backupTimer); backupTimer = null; }
+    };
+    await tick();
+    if (running && !backupTimer) backupTimer = setInterval(tick, 2500);
   }
 
   async function loadMemories() {

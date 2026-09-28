@@ -1,9 +1,351 @@
 import re
 import json
+import difflib
+
+# ---------------------------------------------------------------------------
+# Identity confidence
+#
+# Search scoring combines a narrow vector band with additive name heuristics,
+# so the blended ``score`` is not a similarity and cannot be thresholded. These
+# constants describe a separate, normalized confidence built from two signals:
+# how well the candidate's identity matches the query, and where the raw vector
+# score lands inside the observed embedder band.
+# ---------------------------------------------------------------------------
+VECTOR_FLOOR = 0.35
+VECTOR_CEIL = 0.80
+VECTOR_DAMP_MISS = 0.50
+VECTOR_DAMP_CONFLICT = 0.35
+
+NAME_CONFLICT_FLOOR = 0.50
+NAME_FIRST_STRONG = 0.75
+NAME_SURNAME_STRONG = 0.90
+NAME_SURNAME_FUZZY = 0.75
+
+EVIDENCE_NONE = "none"
+EVIDENCE_CONFLICT = "name_conflict"
+EVIDENCE_PARTIAL = "partial_token"
+EVIDENCE_FUZZY = "fuzzy_name"
+EVIDENCE_SURNAME_STRONG = "surname_strong"
+EVIDENCE_FIRST_NAME = "first_name"
+EVIDENCE_FIRST_LAST = "first+last"
+EVIDENCE_ALIAS = "alias"
+EVIDENCE_EXACT = "exact"
+
+IDENTITY_STRENGTH = {
+    EVIDENCE_NONE: 0.0,
+    EVIDENCE_CONFLICT: 0.20,
+    EVIDENCE_PARTIAL: 0.40,
+    EVIDENCE_FUZZY: 0.45,
+    EVIDENCE_SURNAME_STRONG: 0.65,
+    EVIDENCE_FIRST_NAME: 0.80,
+    EVIDENCE_FIRST_LAST: 0.85,
+    EVIDENCE_ALIAS: 0.95,
+    EVIDENCE_EXACT: 1.00,
+}
+
+# Evidence strong enough that a pure vector score must not be discounted. A
+# shared surname with only a marginal first name stays below this bar, so a
+# strong embedding cannot promote "Jan Smith" over "John Smith" on its own.
+IDENTITY_UNDAMPED = IDENTITY_STRENGTH[EVIDENCE_FIRST_NAME]
+
+# Evidence that asserts the candidate *is* the thing the user asked for.
+IDENTITY_EVIDENCE = frozenset({
+    EVIDENCE_EXACT,
+    EVIDENCE_ALIAS,
+    EVIDENCE_FIRST_LAST,
+    EVIDENCE_FIRST_NAME,
+})
+
+MIN_MATCH_CONFIDENCE = 0.75
+
+_NON_NAME_TOKENS = frozenset({
+    "about", "action", "address", "agenda", "analytics", "api", "app", "backend",
+    "budget", "candidate", "city", "client", "clients", "company", "compliance",
+    "config", "contact", "contract", "correction", "corrections", "cost", "data",
+    "deadline", "decision", "design", "details", "diagram", "domain", "email",
+    "engineer", "engineers", "escalation", "event", "experience", "feedback",
+    "followup", "framework", "goal", "goals", "incident", "infra", "invoice",
+    "issue", "issues", "items", "job", "kubernetes", "launch", "lead", "learning",
+    "machine", "manager", "meeting", "meetings", "mentor", "milestone", "model",
+    "models", "name", "names", "network", "notes", "onboarding", "owner", "patent",
+    "payment", "phase", "phone", "pipeline", "plan", "platform", "position",
+    "priority", "project", "projects", "proposal", "python", "quarter", "release",
+    "report", "reports", "request", "review", "risk", "roadmap", "role", "rollout",
+    "salary", "security", "sprint", "stack", "status", "summary", "task", "tasks",
+    "team", "teams", "tech", "technology", "ticket", "title", "todo", "tool",
+    "tools", "training", "update", "updates", "work", "workflow",
+})
 
 
 def normalize_identity(value: object) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+
+
+def _name_tokens(value: str) -> list:
+    return re.findall(r"[^\W\d_]+", value or "", flags=re.UNICODE)
+
+
+def _name_ratio(left: str, right: str) -> float:
+    if not left or not right:
+        return 0.0
+    return difflib.SequenceMatcher(None, left, right).ratio()
+
+
+def _alias_names(aliases: object) -> list:
+    if isinstance(aliases, dict):
+        return [normalize_identity(a) for a in aliases.keys() if normalize_identity(a)]
+    return [normalize_identity(a) for a in (aliases or []) if normalize_identity(a)]
+
+
+# ---------------------------------------------------------------------------
+# Scope name resolution
+#
+# The scope classifier is a small LLM that is instructed to answer with a name
+# copied verbatim from a supplied list. It does not always comply: it abbreviates
+# ("Deutsche Bank" for "Deutsche Bank (DB)"), drops the parenthesised qualifier,
+# or invents a plausible variant. Accepting only a byte-exact answer threw every
+# such response away, and the item silently stayed unscoped — which surfaces in
+# the UI as "reclassification does not match".
+# ---------------------------------------------------------------------------
+SCOPE_NAME_FUZZY_FLOOR = 0.82
+SCOPE_NAME_AMBIGUITY_MARGIN = 0.04
+SCOPE_NAME_MIN_CHARS = 4
+SCOPE_NAME_TOKEN_COVERAGE = 0.6
+
+SCOPE_EVIDENCE_EXACT = "exact"
+SCOPE_EVIDENCE_TOKENS = "tokens"
+SCOPE_EVIDENCE_CONTAINS = "contains"
+SCOPE_EVIDENCE_FUZZY = "fuzzy"
+SCOPE_EVIDENCE_NONE = "none"
+
+
+# ---------------------------------------------------------------------------
+# Client header extraction
+#
+# Diary and fact text sometimes carries an explicit ownership header written by
+# a human or a transcription prompt ("**Client:** Acme Corp"). That is the
+# strongest scope signal available, so it is read directly instead of asking the
+# LLM. The regex tolerates bullet/heading markers and bold, because the header
+# arrives in whatever shape the author typed it.
+# ---------------------------------------------------------------------------
+_CLIENT_HEADER_RE = re.compile(
+    r"^[ \t]*(?:[-*•>#]+[ \t]*)*\**\s*client\s*\**\s*[:\-–—][ \t]*(.+)",
+    re.MULTILINE | re.IGNORECASE,
+)
+_CLIENT_TRAILING_SEP_RE = re.compile(r"\s+[—–|]\s+|\s+[-–—]\s+")
+
+
+def client_header_value(content: str) -> str:
+    """Extract the client name from an explicit '**Client:** <name>' header line.
+
+    Returns "" when there is no header or nothing usable follows the colon.
+    """
+    match = _CLIENT_HEADER_RE.search(content or "")
+    if not match:
+        return ""
+    raw = match.group(1).strip().rstrip("*").strip()
+    if raw:
+        raw = _CLIENT_TRAILING_SEP_RE.split(raw)[0].strip()
+    return raw.strip("*").strip().rstrip(".,;").strip()
+
+
+def _scope_tokens(value: str) -> frozenset:
+    return frozenset(_name_tokens(normalize_identity(value)))
+
+
+def _scope_score_one(raw: str, raw_tokens: frozenset, name: str, threshold: float) -> tuple:
+    """Score a single candidate against the raw answer. Returns (score, evidence)."""
+    normalized_name = normalize_identity(name)
+    if raw == normalized_name:
+        return (1.00, SCOPE_EVIDENCE_EXACT)
+
+    candidate_tokens = _scope_tokens(normalized_name)
+    # Token containment needs at least two tokens on each side. Without that
+    # guard a single generic word ("bank") would claim any client whose name
+    # happens to contain it.
+    if len(raw_tokens) >= 2 and len(candidate_tokens) >= 2:
+        if raw_tokens <= candidate_tokens:
+            return (0.95, SCOPE_EVIDENCE_TOKENS)
+        if candidate_tokens <= raw_tokens:
+            return (0.90, SCOPE_EVIDENCE_TOKENS)
+        # Qualifier noise: the LLM adds a suffix the stored name does not have
+        # ("Deutsche Bank Group (2026)" vs "Deutsche Bank (DB)"). Neither token
+        # set is a subset, but the candidate is still clearly meant. Requires two
+        # shared tokens so "Atlas Migration" and "Atlas Reporting" stay apart,
+        # and most of the candidate's own tokens so a bare first-name hit does
+        # not qualify.
+        shared = raw_tokens & candidate_tokens
+        if len(shared) >= 2 and len(shared) / len(candidate_tokens) >= SCOPE_NAME_TOKEN_COVERAGE:
+            return (0.86, SCOPE_EVIDENCE_TOKENS)
+    if (len(raw_tokens) >= 2 and len(candidate_tokens) >= 2
+            and len(raw) >= SCOPE_NAME_MIN_CHARS and len(normalized_name) >= SCOPE_NAME_MIN_CHARS
+            and (normalized_name in raw or raw in normalized_name)):
+        return (0.88, SCOPE_EVIDENCE_CONTAINS)
+
+    ratio = _name_ratio(raw, normalized_name)
+    if ratio >= threshold:
+        return (ratio, SCOPE_EVIDENCE_FUZZY)
+    return (0.0, SCOPE_EVIDENCE_NONE)
+
+
+def _scope_first_token_match(raw: str, raw_tokens: frozenset, candidates: list) -> str:
+    """Resolve a bare distinctive first word ("Nordwind") to its client ("Nordwind Energie").
+
+    Only fires when exactly one candidate starts with that token, so the result is
+    unambiguous by construction and never trips the ambiguity margin. Short generic
+    tokens are excluded so "bank" cannot claim "Deutsche Bank (DB)".
+    """
+    if len(raw_tokens) != 1:
+        return ""
+    token = next(iter(raw_tokens))
+    if len(token) < 5 or not raw:
+        return ""
+    starts = [name for name, _ in candidates if normalize_identity(name).split()[:1] == [token]]
+    if len(starts) != 1:
+        return ""
+    if _name_ratio(raw, normalize_identity(starts[0])) >= SCOPE_NAME_FUZZY_FLOOR:
+        return ""  # the fuzzy ladder already resolves this one
+    return starts[0]
+
+
+def resolve_scope_name(raw: object, names: object,
+                       threshold: float = SCOPE_NAME_FUZZY_FLOOR) -> tuple:
+    """Resolve a model- or header-produced scope name to a canonical stored name.
+
+    Returns ``(canonical_name, evidence)`` where ``canonical_name`` is always the
+    *stored* spelling rather than the raw input, so downstream links use the
+    exact node name. Returns ``(None, SCOPE_EVIDENCE_NONE)`` when nothing clears
+    the bar — and also when the two best candidates are within
+    ``SCOPE_NAME_AMBIGUITY_MARGIN`` of each other. An ambiguous winner is worse
+    than no answer, because it writes a confidently wrong ``FOR_CLIENT`` link
+    that has to be cleaned up by the next reclassification.
+    """
+    normalized = normalize_identity(raw)
+    if not normalized or not names:
+        return (None, SCOPE_EVIDENCE_NONE)
+
+    candidates = [(name, normalize_identity(name)) for name in names if normalize_identity(name)]
+    if not candidates:
+        return (None, SCOPE_EVIDENCE_NONE)
+
+    raw_tokens = _scope_tokens(normalized)
+    scored = []
+    for name, normalized_name in candidates:
+        score, evidence = _scope_score_one(normalized, raw_tokens, name, threshold)
+        if score > 0.0:
+            scored.append((score, evidence, name))
+    if not scored:
+        first_token = _scope_first_token_match(normalized, raw_tokens, candidates)
+        if first_token:
+            return (first_token, SCOPE_EVIDENCE_FUZZY)
+        return (None, SCOPE_EVIDENCE_NONE)
+
+    scored.sort(key=lambda item: (-item[0], item[2]))
+    best_score, best_evidence, best_name = scored[0]
+    if len(scored) > 1 and (best_score - scored[1][0]) < SCOPE_NAME_AMBIGUITY_MARGIN:
+        return (None, SCOPE_EVIDENCE_NONE)
+    return (best_name, best_evidence)
+
+
+def looks_like_person_name(query: str) -> bool:
+    """True when a query is shaped like a personal name rather than a keyword."""
+    tokens = _name_tokens(normalize_identity(query))
+    if not tokens or len(tokens) > 3:
+        return False
+    if any(token in _NON_NAME_TOKENS for token in tokens):
+        return False
+    return all(len(token) >= 3 for token in tokens)
+
+
+def vector_confidence(raw_vector: object) -> float:
+    """Normalize a raw vector score into 0-1 across the embedder's useful band."""
+    if raw_vector is None:
+        return 0.0
+    try:
+        value = float(raw_vector)
+    except (TypeError, ValueError):
+        return 0.0
+    span = VECTOR_CEIL - VECTOR_FLOOR
+    return max(0.0, min(1.0, (value - VECTOR_FLOOR) / span))
+
+
+def _full_name_evidence(query_tokens: list, candidate_tokens: list,
+                        candidate_first: str, candidate_last: str) -> str:
+    if not candidate_last:
+        whole = _name_ratio(" ".join(query_tokens), " ".join(candidate_tokens))
+        return EVIDENCE_FUZZY if whole >= NAME_SURNAME_STRONG else EVIDENCE_PARTIAL
+    first_ratio = _name_ratio(query_tokens[0], candidate_first)
+    last_ratio = _name_ratio(query_tokens[-1], candidate_last)
+    surname_strong = last_ratio >= NAME_SURNAME_STRONG
+    surname_fuzzy = last_ratio >= NAME_SURNAME_FUZZY
+    first_strong = first_ratio >= NAME_FIRST_STRONG
+    if first_ratio < NAME_CONFLICT_FLOOR:
+        # The query names a different person; a shared surname cannot rescue it.
+        return EVIDENCE_CONFLICT
+    if surname_strong and first_strong:
+        return EVIDENCE_FIRST_LAST
+    if surname_strong:
+        return EVIDENCE_SURNAME_STRONG
+    if surname_fuzzy and first_strong:
+        return EVIDENCE_PARTIAL
+    return EVIDENCE_PARTIAL
+
+
+def _single_token_evidence(token: str, candidate_tokens: list, candidate_first: str) -> str:
+    if candidate_first and token == candidate_first:
+        return EVIDENCE_FIRST_NAME
+    if token in candidate_tokens:
+        return EVIDENCE_FIRST_NAME
+    for candidate_token in candidate_tokens:
+        if _name_ratio(token, candidate_token) >= NAME_SURNAME_STRONG:
+            return EVIDENCE_FUZZY
+    return EVIDENCE_NONE
+
+
+def identity_confidence(query: str, name: object = None, first_name: object = None,
+                        last_name: object = None, aliases: object = None,
+                        raw_vector: object = None, name_like: bool = False) -> tuple:
+    """Score how confidently a candidate record is the thing the query asked for.
+
+    Returns ``(confidence, evidence)`` where confidence is 0-1 and evidence is one
+    of the ``EVIDENCE_*`` labels. Identity strength is compared against a
+    normalized vector score, so an exact name always outranks a merely similar
+    embedding and a weak vector hit cannot masquerade as an identity match.
+
+    When ``name_like`` is set and identity evidence is weak, the vector component
+    is discounted: a name-shaped query with no name match is far more likely to be
+    a misspelling of someone absent than a genuine semantic match.
+    """
+    normalized_query = normalize_identity(query)
+    if not normalized_query:
+        return (0.0, EVIDENCE_NONE)
+
+    normalized_name = normalize_identity(name)
+    alias_names = _alias_names(aliases)
+
+    if not normalized_name:
+        evidence = EVIDENCE_NONE
+    elif normalized_query == normalized_name:
+        evidence = EVIDENCE_EXACT
+    elif normalized_query in alias_names:
+        evidence = EVIDENCE_ALIAS
+    else:
+        candidate_tokens = _name_tokens(normalized_name)
+        candidate_first = normalize_identity(first_name) or (candidate_tokens[0] if candidate_tokens else "")
+        candidate_last = normalize_identity(last_name) or (candidate_tokens[-1] if candidate_tokens else "")
+        query_tokens = _name_tokens(normalized_query)
+        if len(query_tokens) >= 2:
+            evidence = _full_name_evidence(query_tokens, candidate_tokens, candidate_first, candidate_last)
+        elif query_tokens:
+            evidence = _single_token_evidence(query_tokens[0], candidate_tokens, candidate_first)
+        else:
+            evidence = EVIDENCE_NONE
+
+    strength = IDENTITY_STRENGTH[evidence]
+    confidence = vector_confidence(raw_vector)
+    if name_like and strength < IDENTITY_UNDAMPED:
+        confidence *= VECTOR_DAMP_CONFLICT if evidence == EVIDENCE_CONFLICT else VECTOR_DAMP_MISS
+    return (max(strength, confidence), evidence)
 
 
 def validate_merge_ids(master_id: str, duplicate_ids: list[str]) -> list[str]:
@@ -112,20 +454,34 @@ def scopes_compatible(left: dict, right: dict) -> bool:
     return True
 
 
-def people_match_allowed(query: str, result: dict, min_score: float = 1.2) -> bool:
-    if result.get("score", 0) < min_score:
+def people_match_allowed(query: str, result: dict, min_score: float = MIN_MATCH_CONFIDENCE) -> bool:
+    """Decide whether a search hit is safe to auto-link as the queried person.
+
+    ``min_score`` is a normalized confidence, not the blended search score. The
+    gate is deliberately strict: a weak/unconfirmed hit, a query that names a
+    different first name, or a single-token query that is not an exact identity
+    all return False so callers never create MENTIONS links for the wrong person.
+    """
+    if result.get("weak"):
         return False
 
-    normalized_query = normalize_identity(query)
-    candidate_name = normalize_identity(result.get("name"))
     metadata = result.get("metadata") or {}
-    aliases = metadata.get("aliases") or []
-    if isinstance(aliases, dict):
-        aliases = aliases.keys()
-    normalized_aliases = {normalize_identity(alias) for alias in aliases}
-    exact_identity = normalized_query == candidate_name or normalized_query in normalized_aliases
-    query_has_full_name = len(normalized_query.split()) >= 2
-    return exact_identity or (query_has_full_name and result.get("score", 0) >= 1.6)
+    confidence, evidence = identity_confidence(
+        query,
+        name=result.get("name"),
+        first_name=metadata.get("first_name"),
+        last_name=metadata.get("last_name"),
+        aliases=metadata.get("aliases"),
+        raw_vector=result.get("raw_score"),
+        name_like=True,
+    )
+    if confidence < min_score:
+        return False
+    if evidence in (EVIDENCE_EXACT, EVIDENCE_ALIAS):
+        return True
+    if len(normalize_identity(query).split()) < 2:
+        return False
+    return evidence in IDENTITY_EVIDENCE
 
 
 async def resolve_people_candidates(names: list[str], content: str,

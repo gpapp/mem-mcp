@@ -101,9 +101,16 @@ services:
       - BASE_URL=${BASE_URL}
       - HTPASSWD_PATH=/app/htpasswd
 
+        # Daily savepoints (Setup → Maintenance → Backup & Restore)
+      - MEM_BACKUP_ENABLED=${MEM_BACKUP_ENABLED:-1}
+      - MEM_BACKUP_HOUR=${MEM_BACKUP_HOUR:-3}
+      - MEM_BACKUP_MINUTES=${MEM_BACKUP_MINUTES:-0}
+      - MEM_BACKUP_KEEP=${MEM_BACKUP_KEEP:-14}
+
     volumes:
       - MEM_model_cache:/root/.cache/fastembed
       - ./mem-mcp-data/logs:/app/logs
+      - ./mem-mcp-data/backup:/app/backup
       - ./mem-mcp-data/htpasswd:/app/htpasswd:ro
 
 volumes:

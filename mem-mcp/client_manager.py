@@ -4,6 +4,7 @@ client_manager.py – Client and Context management for multi-client memory sepa
 
 import uuid
 import hashlib
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -15,6 +16,8 @@ from common import get_neo4j, get_qdrant, logger, COLLECTION_NAME, DIARY_COLLECT
 STALE_DAYS = 90            # no mention within this window → client counts as inactive
 INACTIVE_PENALTY = 0.15    # score demotion for inactive-scope results in global search
 INFERRED_SCOPE_BOOST = 0.2  # boost for query-inferred scope (below explicit +0.3)
+SCOPE_LIST_TTL_SECONDS = 60
+_SCOPE_LIST_CACHE: dict = {}
 
 
 def _resolve_client_by_id(client_id: str, user_id: str) -> Optional[dict]:
@@ -561,15 +564,25 @@ def infer_scope_from_text(text: str, user_id: str) -> tuple:
     Pure name matching, no LLM: exact full-name substring wins, otherwise the
     client with the best word-overlap score (minimum one shared word of len > 2).
     Context is only returned when it belongs to the matched client.
+
+    The client list is cached briefly because this runs inside unscoped search,
+    where it would otherwise add a Neo4j round trip to every query.
     """
     neo4j_driver = get_neo4j()
     if not neo4j_driver or not text:
         return (None, None)
-    try:
-        clients = db_list_clients(user_id)
-    except Exception as e:
-        logger.warning(f"[infer_scope] list_clients failed: {e}")
-        return (None, None)
+
+    now = time.time()
+    cached = _SCOPE_LIST_CACHE.get(user_id)
+    if cached and now - cached[0] < SCOPE_LIST_TTL_SECONDS:
+        clients = cached[1]
+    else:
+        try:
+            clients = db_list_clients(user_id)
+        except Exception as e:
+            logger.warning(f"[infer_scope] list_clients failed: {e}")
+            return (None, None)
+        _SCOPE_LIST_CACHE[user_id] = (now, clients)
 
     t = text.lower()
     t_words = {w for w in t.split() if len(w) > 2}

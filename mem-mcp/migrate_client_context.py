@@ -14,6 +14,7 @@ from common import (
     COLLECTION_NAME, DIARY_COLLECTION,
     SCOPE_MODEL, SCOPE_BACKFILL_ENABLED, SCOPE_BACKFILL_CONCURRENCY,
     clean_extracted_people_names,
+    claim_maintenance, release_maintenance,
 )
 from qdrant_client.models import PointStruct, Filter, FieldCondition, MatchValue
 from client_manager import (
@@ -23,7 +24,12 @@ from client_manager import (
     link_fact_to_client, link_fact_to_context,
     link_diary_to_client, link_diary_to_context,
 )
-from matching_utils import resolve_people_candidates
+from matching_utils import (
+    SCOPE_EVIDENCE_EXACT,
+    client_header_value,
+    resolve_people_candidates,
+    resolve_scope_name,
+)
 
 
 async def migrate_client_context():
@@ -308,12 +314,9 @@ _SCOPE_SYSTEM = (
 # Fast (no-LLM) scope resolution for diary entries.
 # Returns (client_name, context_name) or (None, None) if no hard signal found.
 # ---------------------------------------------------------------------------
-_CLIENT_HEADER_RE = re.compile(
-    r"(?:^\*{0,2}Client\*{0,2}|^Client)\s*[:\-]\s*(.+)",
-    re.MULTILINE | re.IGNORECASE,
-)
-
-
+# Tolerates list bullets, blockquote/heading markers and bold markers before the
+# label, and stops the captured value at a trailing separator so a line such as
+# "- **Client:** Acme - Q3 review" yields "Acme" rather than the whole sentence.
 def _link_diary_relevant_to(diary_id: str, client_ids: list, user_id: str, neo4j_driver) -> None:
     """Create RELEVANT_TO edges from a DiaryEntry to each Client in client_ids.
 
@@ -343,11 +346,12 @@ def _fast_diary_scope(item: dict, clients: list, neo4j_driver, user_id: str) -> 
        edges are written for each mentioned client so diary filtering can still surface it.
     2. The diary content contains an explicit '**Client:** <name>' header line.
 
+    Both signals resolve through ``resolve_scope_name`` rather than an exact
+    string compare, so a header written as "Client: Deutsche Bank" still binds to
+    the stored "Deutsche Bank (DB)".
+
     Returns (None, None) when no hard signal is present — caller falls back to LLM.
     """
-    # Build a set of crossClient client IDs so we can exclude them from voting
-    cross_client_ids = {c["id"] for c in clients if c.get("crossClient")}
-
     # Signal 1: unanimous MENTIONS client (excluding crossClient facts)
     if neo4j_driver is not None:
         try:
@@ -365,17 +369,15 @@ def _fast_diary_scope(item: dict, clients: list, neo4j_driver, user_id: str) -> 
             unique_ids = {cid for cid, _ in scoped}
             if len(unique_ids) == 1:
                 cid, cname = scoped[0]
-                matched = next((c["name"] for c in clients if c["name"].lower() == cname.lower()), None)
+                matched, _ = resolve_scope_name(cname, [c["name"] for c in clients])
                 if matched:
                     logger.debug(f"[scope_fast] diary {item.get('id')}: unanimous MENTIONS → {matched}")
                     return matched, None
             elif len(unique_ids) > 1:
-                # Multi-client: leave unscoped but write RELEVANT_TO for each client
-                matched_ids = [
-                    c["id"] for cid, cname in scoped
-                    for c in clients if c["name"].lower() == cname.lower()
-                ]
-                matched_ids = list(dict.fromkeys(matched_ids))  # deduplicate, preserve order
+                # Multi-client: leave unscoped but write RELEVANT_TO for each client.
+                # The query already returned the ids, so match on those rather than
+                # re-deriving them from the name.
+                matched_ids = list(dict.fromkeys(cid for cid, _ in scoped))
                 _link_diary_relevant_to(item["id"], matched_ids, user_id, neo4j_driver)
                 logger.debug(
                     f"[scope_fast] diary {item.get('id')}: multi-client MENTIONS "
@@ -386,14 +388,15 @@ def _fast_diary_scope(item: dict, clients: list, neo4j_driver, user_id: str) -> 
             logger.debug(f"[scope_fast] MENTIONS lookup failed for {item.get('id')}: {exc}")
 
     # Signal 2: explicit **Client:** header in content
-    content = item.get("content", "") or ""
-    m = _CLIENT_HEADER_RE.search(content)
-    if m:
-        raw = m.group(1).strip().rstrip("*").strip()
-        matched = next((c["name"] for c in clients if c["name"].lower() == raw.lower()), None)
+    raw_header = client_header_value(item.get("content", "") or "")
+    if raw_header:
+        matched, _ = resolve_scope_name(raw_header, [c["name"] for c in clients])
         if matched:
-            logger.debug(f"[scope_fast] diary {item.get('id')}: content header → {matched}")
+            logger.debug(f"[scope_fast] diary {item.get('id')}: content header {raw_header!r} → {matched}")
             return matched, None
+        logger.debug(
+            f"[scope_fast] diary {item.get('id')}: header {raw_header!r} matched no known client"
+        )
 
     return None, None
 
@@ -401,8 +404,16 @@ def _fast_diary_scope(item: dict, clients: list, neo4j_driver, user_id: str) -> 
 async def _classify_scope(item_text: str, clients: list) -> tuple:
     """Ask Ollama which existing client/context an item belongs to.
 
-    Returns (client_name|None, context_name|None), validated against `clients`.
-    Empty tuple parts on any error — classification must never block migration.
+    Returns ``(client_name|None, context_name|None, ok)``. ``ok`` is False only
+    when the LLM call or the JSON parse failed, which is deliberately distinct
+    from a successful "this item is generic" answer. Callers use that to decide
+    whether the item may be stamped as checked: a transient Ollama timeout must
+    not permanently mark an item as unclassifiable, because the stamp is what
+    makes the boot-time backfill skip it forever.
+
+    Names are resolved through ``resolve_scope_name`` against the known list, so
+    an answer that differs from the stored spelling only by abbreviation or a
+    dropped "(DB)" qualifier still binds.
     """
     scope_lines = []
     for c in clients:
@@ -418,35 +429,43 @@ async def _classify_scope(item_text: str, clients: list) -> tuple:
         raw = re.sub(r"```[a-z]*\n?", "", raw).strip()
         m = re.search(r"\{[^{}]*\}", raw, re.DOTALL)
         if not m:
-            return None, None
+            logger.warning("[scope_backfill] classifier returned no JSON object")
+            return None, None, False
         data = json.loads(m.group())
         client_name = (data.get("client") or "").strip() or None
         context_name = (data.get("context") or "").strip() or None
 
-        # Validate against known names (case-insensitive); reject inventions.
-        matched_client = None
-        if client_name:
-            for c in clients:
-                if c["name"].lower() == client_name.lower():
-                    matched_client = c
-                    break
+        if not client_name:
+            return None, None, True
+
+        # Resolve against known names; reject inventions.
+        matched_client, client_evidence = resolve_scope_name(
+            client_name, [c["name"] for c in clients]
+        )
         if not matched_client:
-            return None, None
+            logger.warning(
+                f"[scope_backfill] classifier answered {client_name!r}, which matches no known "
+                f"client — treating the item as generic"
+            )
+            return None, None, True
+        if client_evidence != SCOPE_EVIDENCE_EXACT:
+            logger.info(
+                f"[scope_backfill] resolved {client_name!r} to {matched_client!r} via {client_evidence}"
+            )
+
+        resolved_context = None
         if context_name:
-            ok = any(x["name"].lower() == context_name.lower()
-                     for x in matched_client.get("contexts", []))
-            if not ok:
-                context_name = None
-            else:
-                # Normalize to the canonical stored spelling.
-                for x in matched_client.get("contexts", []):
-                    if x["name"].lower() == context_name.lower():
-                        context_name = x["name"]
-                        break
-        return matched_client["name"], context_name
+            # Look the resolved name back up on the client record: the resolver
+            # returns a name, not the node, and the context list hangs off it.
+            client = next((c for c in clients if c["name"] == matched_client), None)
+            if client:
+                resolved_context, _ = resolve_scope_name(
+                    context_name, [x["name"] for x in client.get("contexts", [])]
+                )
+        return matched_client, resolved_context, True
     except Exception as exc:
         logger.warning(f"[scope_backfill] classification failed: {type(exc).__name__}: {exc}")
-        return None, None
+        return None, None, False
 
 
 # ---------------------------------------------------------------------------
@@ -464,7 +483,39 @@ def _snippet(text: str, limit: int = _SNIPPET_CHARS) -> str:
     return text if len(text) <= limit else text[:limit] + "…"
 
 
-def _enriched_fact_text(item: dict, neo4j_driver, user_id: str) -> str:
+def _capture_scope_snapshot(user_id: str, neo4j_driver) -> dict:
+    """Read every current FOR_CLIENT assignment for a user into memory.
+
+    Full reclassification clears all scope links before classifying. Without a
+    snapshot the classifier's RELATED / MENTIONS sections progressively lose
+    their ``[client: X]`` tags as the job works through the list, so items
+    classified late in the run are materially worse than items classified first
+    — the symptom that reads as "reclassification does not match". Capturing the
+    tags up front and feeding them to the enrichers keeps the evidence constant
+    for the whole run.
+    """
+    snapshot = {}
+    if neo4j_driver is None:
+        return snapshot
+    try:
+        with neo4j_driver.session() as s:
+            for row in s.run(
+                """
+                MATCH (n) WHERE n.userId = $userId AND (n:Fact OR n:DiaryEntry)
+                MATCH (n)-[:FOR_CLIENT]->(cl:Client)
+                WHERE NOT coalesce(cl.crossClient, false) = true
+                RETURN n.id AS id, cl.name AS clientName
+                """,
+                userId=user_id,
+            ):
+                if row["id"] and row["clientName"]:
+                    snapshot[row["id"]] = row["clientName"]
+    except Exception as exc:
+        logger.debug(f"[scope_backfill] scope snapshot failed for {user_id}: {exc}")
+    return snapshot
+
+
+def _enriched_fact_text(item: dict, neo4j_driver, user_id: str, scope_snapshot=None) -> str:
     parts = []
     if item.get("name"):
         parts.append(item["name"])
@@ -479,7 +530,7 @@ def _enriched_fact_text(item: dict, neo4j_driver, user_id: str) -> str:
                     MATCH (f:Fact {userId: $userId, id: $fid})-[r]-(n)
                     WHERE (n:Fact OR n:People) AND n.userId = $userId
                     OPTIONAL MATCH (n)-[:FOR_CLIENT]->(cl:Client {userId: $userId})
-                    RETURN DISTINCT type(r) AS rel, n.name AS name,
+                    RETURN DISTINCT type(r) AS rel, n.id AS nid, n.name AS name,
                            coalesce(n.text, n.content, '') AS body,
                            cl.name AS clientName, coalesce(cl.crossClient, false) AS crossClient
                     LIMIT 6
@@ -490,8 +541,11 @@ def _enriched_fact_text(item: dict, neo4j_driver, user_id: str) -> str:
                 rel_lines = []
                 for r in rows:
                     line = f"- [{r['rel']}] {r['name'] or 'Unnamed'}: {_snippet(r['body'])}"
-                    if r["clientName"] and not r["crossClient"]:
-                        line += f" [client: {r['clientName']}]"
+                    # Prefer the pre-cleared snapshot so reclassification always
+                    # sees the scope the graph had before this run started.
+                    client_name = (scope_snapshot or {}).get(r["nid"]) or r["clientName"]
+                    if client_name and not r["crossClient"]:
+                        line += f" [client: {client_name}]"
                     rel_lines.append(line)
                 parts.append("RELATED:\n" + "\n".join(rel_lines))
         except Exception as exc:
@@ -499,7 +553,7 @@ def _enriched_fact_text(item: dict, neo4j_driver, user_id: str) -> str:
     return "\n".join(p for p in parts if p)
 
 
-def _enriched_diary_text(item: dict, neo4j_driver, user_id: str) -> str:
+def _enriched_diary_text(item: dict, neo4j_driver, user_id: str, scope_snapshot=None) -> str:
     parts = []
     if item.get("name"):
         parts.append(item["name"])
@@ -517,7 +571,7 @@ def _enriched_diary_text(item: dict, neo4j_driver, user_id: str) -> str:
                     MATCH (d:DiaryEntry {userId: $userId, id: $did})-[:MENTIONS]->(f:Fact)
                     WHERE f.userId = $userId
                     OPTIONAL MATCH (f)-[:FOR_CLIENT]->(cl:Client {userId: $userId})
-                    RETURN DISTINCT f.name AS name, f.text AS body,
+                    RETURN DISTINCT f.id AS fid, f.name AS name, f.text AS body,
                            cl.name AS clientName, coalesce(cl.crossClient, false) AS crossClient
                     LIMIT 6
                     """,
@@ -527,8 +581,10 @@ def _enriched_diary_text(item: dict, neo4j_driver, user_id: str) -> str:
                 m_lines = []
                 for r in rows:
                     line = f"- {r['name'] or 'Unnamed'}: {_snippet(r['body'])}"
-                    if r["clientName"] and not r["crossClient"]:
-                        line += f" [client: {r['clientName']}]"
+                    # Prefer the pre-cleared snapshot — see _capture_scope_snapshot.
+                    client_name = (scope_snapshot or {}).get(r["fid"]) or r["clientName"]
+                    if client_name and not r["crossClient"]:
+                        line += f" [client: {client_name}]"
                     m_lines.append(line)
                 parts.append("MENTIONS:\n" + "\n".join(m_lines))
         except Exception as exc:
@@ -565,13 +621,16 @@ def _stamp_scope_checked(node_id: str, label: str, user_id: str, neo4j_driver, s
 
 
 async def _classify_and_link_fact(item: dict, clients: list, user_id: str, sem: asyncio.Semaphore,
-                                  neo4j_driver=None, scope_sig=None) -> bool:
+                                  neo4j_driver=None, scope_sig=None, scope_snapshot=None) -> bool:
     """Classify one fact and create FOR_CLIENT / IN_CONTEXT links. Returns True if linked."""
     async with sem:
-        body = _enriched_fact_text(item, neo4j_driver, user_id)
-        client_name, context_name = await _classify_scope(body, clients)
+        body = _enriched_fact_text(item, neo4j_driver, user_id, scope_snapshot)
+        client_name, context_name, ok = await _classify_scope(body, clients)
     if not client_name:
-        _stamp_scope_checked(item["id"], "Fact", user_id, neo4j_driver, scope_sig)
+        # Only a *successful* "this item is generic" verdict may be stamped. A
+        # failed call leaves the item unstamped so the next boot retries it.
+        if ok:
+            _stamp_scope_checked(item["id"], "Fact", user_id, neo4j_driver, scope_sig)
         return False
     c = db_resolve_client(client_name, user_id)
     if not c:
@@ -626,6 +685,33 @@ async def _extract_people_names(content: str) -> list[str]:
         return []
 
 
+def _existing_auto_people(diary_id: str, user_id: str, neo4j_driver) -> list:
+    """People facts already auto-linked to this entry, as minimal candidate dicts.
+
+    Seeding the candidate set with these keeps reclassification non-destructive.
+    ``db_find_people_matches`` is deliberately strict, so a re-run can fail to
+    re-find a link that is in fact correct. The resolver then sees the full
+    picture and may keep or drop each one, instead of the entry silently losing
+    every auto link it had.
+    """
+    if neo4j_driver is None:
+        return []
+    try:
+        with neo4j_driver.session() as s:
+            rows = list(s.run(
+                """
+                MATCH (d:DiaryEntry {id: $did, userId: $userId})-[r:MENTIONS]->(f:Fact)
+                WHERE coalesce(r.source, 'manual') = 'auto'
+                RETURN f.id AS id, f.name AS name, f.text AS text
+                """,
+                did=diary_id, userId=user_id,
+            ))
+        return [dict(r) for r in rows]
+    except Exception as exc:
+        logger.debug(f"[people_extract] existing-link read failed for {diary_id}: {exc}")
+        return []
+
+
 async def _link_missing_people(diary_id: str, names: list[str], user_id: str,
                                neo4j_driver, content: str = "") -> int:
     """Reconcile automatically detected People links for a diary entry."""
@@ -634,6 +720,12 @@ async def _link_missing_people(diary_id: str, names: list[str], user_id: str,
     from fact_manager import db_find_people_matches
 
     people_matches = await db_find_people_matches(names, user_id)
+    # Fold in links that already exist so they are adjudicated, not dropped.
+    found_ids = {p.get("id") for p in people_matches}
+    for existing in _existing_auto_people(diary_id, user_id, neo4j_driver):
+        if existing.get("id") and existing["id"] not in found_ids:
+            people_matches.append(existing)
+            found_ids.add(existing["id"])
     people_matches = await resolve_people_candidates(
         names, content, people_matches, get_llm_response
     )
@@ -685,7 +777,7 @@ def _diary_has_mentions(diary_id: str, user_id: str, neo4j_driver) -> bool:
 
 
 async def _classify_and_link_diary(item: dict, clients: list, user_id: str, sem: asyncio.Semaphore,
-                                   neo4j_driver=None, scope_sig=None) -> bool:
+                                   neo4j_driver=None, scope_sig=None, scope_snapshot=None) -> bool:
     """Classify one diary entry and create FOR_CLIENT / IN_CONTEXT links. Returns True if linked."""
     # Reconcile People links even when the entry already has mentions; edits can
     # remove names or replace one person with another.
@@ -699,10 +791,14 @@ async def _classify_and_link_diary(item: dict, clients: list, user_id: str, sem:
     client_name, context_name = _fast_diary_scope(item, clients, neo4j_driver, user_id)
     if not client_name:
         async with sem:
-            body = _enriched_diary_text(item, neo4j_driver, user_id)
-            client_name, context_name = await _classify_scope(body, clients)
+            body = _enriched_diary_text(item, neo4j_driver, user_id, scope_snapshot)
+            client_name, context_name, ok = await _classify_scope(body, clients)
+    else:
+        ok = True
     if not client_name:
-        _stamp_scope_checked(item["id"], "DiaryEntry", user_id, neo4j_driver, scope_sig)
+        # See _classify_and_link_fact: never stamp a transient failure.
+        if ok:
+            _stamp_scope_checked(item["id"], "DiaryEntry", user_id, neo4j_driver, scope_sig)
         return False
     c = db_resolve_client(client_name, user_id)
     if not c:
@@ -783,6 +879,11 @@ async def llm_backfill_scope():
         total = len(facts) + len(diaries)
         done = 0
 
+        # Backfill only touches already-unlinked items, so the snapshot is mostly
+        # redundant here — but it keeps the neighbour evidence identical whether
+        # the pass runs at boot or from the UI, and it costs one query.
+        scope_snapshot = await asyncio.to_thread(_capture_scope_snapshot, user_id, neo4j_driver)
+
         async def _track(coro):
             nonlocal linked, done
             ok = await coro
@@ -794,11 +895,11 @@ async def llm_backfill_scope():
             return ok
 
         await asyncio.gather(*[
-            _track(_classify_and_link_fact(dict(r), clients, user_id, sem, neo4j_driver, sig))
+            _track(_classify_and_link_fact(dict(r), clients, user_id, sem, neo4j_driver, sig, scope_snapshot))
             for r in facts
         ])
         await asyncio.gather(*[
-            _track(_classify_and_link_diary(dict(r), clients, user_id, sem, neo4j_driver, sig))
+            _track(_classify_and_link_diary(dict(r), clients, user_id, sem, neo4j_driver, sig, scope_snapshot))
             for r in diaries
         ])
 
@@ -933,22 +1034,62 @@ def _utcnow() -> str:
 
 def clear_scope_links(node_id: str, user_id: str, neo4j_driver) -> None:
     """Reset scope state of one fact or diary node: links + checked signature."""
+    clear_scope_links_batch([node_id], user_id, neo4j_driver)
+
+
+def clear_scope_links_batch(node_ids: list, user_id: str, neo4j_driver) -> int:
+    """Reset scope state for many nodes in one round trip.
+
+    Reclassification used to issue one blocking query per item from the event
+    loop, which stalled the whole server for the length of the run. Batching
+    keeps the round trips proportional to the vault size rather than to the item
+    count times a per-item constant.
+    """
+    ids = [nid for nid in dict.fromkeys(node_ids) if nid]
+    if not ids or neo4j_driver is None:
+        return 0
     with neo4j_driver.session() as s:
-        s.run(
+        result = s.run(
             """
-            MATCH (n {id: $id, userId: $userId})
+            MATCH (n {id: $ids, userId: $userId})
             OPTIONAL MATCH (n)-[r:FOR_CLIENT|IN_CONTEXT]->()
-            FOREACH (x IN CASE WHEN r IS NULL THEN [] ELSE [r] END | DELETE x)
+            FOREACH (x IN CASE WHEN r IS NULL THEN [] ELSE [x] END | DELETE x)
             REMOVE n.scopeCheckedSig
+            RETURN count(n) AS cleared
             """,
-            id=node_id, userId=user_id,
+            ids=ids, userId=user_id,
         )
+        row = result.single()
+    return int(row["cleared"]) if row and row["cleared"] else 0
+
+
+async def clear_scope_links_async(node_ids: list, user_id: str, neo4j_driver) -> int:
+    """Batched clear off the event loop so the UI/MCP stay responsive during a run."""
+    return await asyncio.to_thread(clear_scope_links_batch, node_ids, user_id, neo4j_driver)
+
+
+_RECLASSIFY_JOB_HISTORY = 8
+_CLEAR_BATCH = 250
+
+
+def _prune_reclassify_jobs(keep: int = _RECLASSIFY_JOB_HISTORY) -> None:
+    """Keep the registry bounded — it is keyed by user and never expires on its own."""
+    if len(_RECLASSIFY_JOBS) <= keep:
+        return
+    finished = [
+        (job.get("finished_at") or job.get("started_at") or "", user_id)
+        for user_id, job in _RECLASSIFY_JOBS.items()
+        if job.get("state") != "running"
+    ]
+    finished.sort()
+    for _, user_id in finished[:len(_RECLASSIFY_JOBS) - keep]:
+        _RECLASSIFY_JOBS.pop(user_id, None)
 
 
 def _public_reclassify_job(job) -> dict:
     if not job:
         return {"state": "idle", "total": 0, "done": 0, "linked": 0, "unlinked": 0,
-                "started_at": None, "finished_at": None, "error": None}
+                "errors": 0, "started_at": None, "finished_at": None, "error": None}
     return {k: v for k, v in job.items() if k != "task"}
 
 
@@ -957,9 +1098,15 @@ def start_reclassify_scope(user_id: str) -> dict:
     job = _RECLASSIFY_JOBS.get(user_id)
     if job and job.get("state") == "running":
         return {"started": False, "job": _public_reclassify_job(job)}
+    if not claim_maintenance(user_id, "reclassify"):
+        logger.warning(f"reclassify [{user_id}]: refused, another maintenance job holds the lock")
+        return {"started": False, "job": _public_reclassify_job(job), "conflict": "maintenance"}
     job = {"state": "running", "total": 0, "done": 0, "linked": 0, "unlinked": 0,
-           "started_at": _utcnow(), "finished_at": None, "error": None}
+           "errors": 0, "started_at": _utcnow(), "finished_at": None, "error": None}
+    # Prune after inserting: pruning first would evict one entry only to add a
+    # new one, leaving the registry permanently one over the limit.
     _RECLASSIFY_JOBS[user_id] = job
+    _prune_reclassify_jobs(keep=_RECLASSIFY_JOB_HISTORY - 1)
     job["task"] = asyncio.create_task(_reclassify_all_scope(user_id, job))
     logger.info(f"reclassify [{user_id}]: full reclassification started in background")
     return {"started": True, "job": _public_reclassify_job(job)}
@@ -1007,16 +1154,41 @@ async def _reclassify_all_scope(user_id: str, job: dict) -> None:
             f"reclassify [{user_id}]: classifying {len(facts)} facts + "
             f"{len(diaries)} diary entries with {SCOPE_MODEL}"
         )
+
+        # Capture the current scope BEFORE clearing. The classifier's strongest
+        # signal is the [client: X] tag on neighbouring facts, and those tags
+        # come from FOR_CLIENT links this run is about to remove. Clearing
+        # up front and feeding the snapshot keeps that evidence constant for
+        # every item instead of decaying as the run progresses.
+        scope_snapshot = await asyncio.to_thread(_capture_scope_snapshot, user_id, neo4j_driver)
+        if scope_snapshot:
+            logger.info(f"reclassify [{user_id}]: captured scope for {len(scope_snapshot)} items")
+
+        all_ids = [r["id"] for r in list(facts) + list(diaries) if r.get("id")]
+        cleared = 0
+        for start in range(0, len(all_ids), _CLEAR_BATCH):
+            cleared += await clear_scope_links_async(
+                all_ids[start:start + _CLEAR_BATCH], user_id, neo4j_driver
+            )
+        logger.info(f"reclassify [{user_id}]: cleared scope links on {cleared} items")
+
         sem = asyncio.Semaphore(max(1, SCOPE_BACKFILL_CONCURRENCY))
 
         async def _process(kind: str, item: dict) -> None:
-            # Clear-then-classify per item: interrupt-safe, and a null verdict
-            # correctly leaves the item generic (unlinked).
-            clear_scope_links(item["id"], user_id, neo4j_driver)
-            if kind == "fact":
-                ok = await _classify_and_link_fact(item, clients, user_id, sem, neo4j_driver, sig)
-            else:
-                ok = await _classify_and_link_diary(item, clients, user_id, sem, neo4j_driver, sig)
+            try:
+                if kind == "fact":
+                    ok = await _classify_and_link_fact(
+                        item, clients, user_id, sem, neo4j_driver, sig, scope_snapshot)
+                else:
+                    ok = await _classify_and_link_diary(
+                        item, clients, user_id, sem, neo4j_driver, sig, scope_snapshot)
+            except Exception as exc:
+                # One bad item must not abort the run, and must not be stamped:
+                # leaving it unstamped means the next boot retries it.
+                logger.warning(f"reclassify [{user_id}] {kind} {item.get('id')}: {exc}")
+                job["errors"] += 1
+                job["done"] += 1
+                return
             job["done"] += 1
             if ok:
                 job["linked"] += 1
@@ -1024,7 +1196,7 @@ async def _reclassify_all_scope(user_id: str, job: dict) -> None:
                 job["unlinked"] += 1
             if job["done"] % 25 == 0 or job["done"] == job["total"]:
                 logger.info(f"reclassify [{user_id}]: {job['done']}/{job['total']} classified, "
-                            f"{job['linked']} linked")
+                            f"{job['linked']} linked, {job['errors']} errored")
 
         await asyncio.gather(*[_process("fact", dict(r)) for r in facts])
         await asyncio.gather(*[_process("diary", dict(r)) for r in diaries])
@@ -1034,13 +1206,20 @@ async def _reclassify_all_scope(user_id: str, job: dict) -> None:
         await _backfill_qdrant(user_id, neo4j_driver, qdrant)
 
         job.update(state="done", finished_at=_utcnow())
-        logger.info(f"reclassify [{user_id}]: done, {job['linked']}/{job['total']} linked to clients")
+        logger.info(
+            f"reclassify [{user_id}]: done, {job['linked']}/{job['total']} linked to clients, "
+            f"{job['errors']} errored (left for retry)"
+        )
         await publish_db_event(user_id, "reclassify_done", {
-            "total": job["total"], "linked": job["linked"], "unlinked": job["unlinked"]
+            "total": job["total"], "linked": job["linked"], "unlinked": job["unlinked"],
+            "errors": job["errors"],
         })
     except Exception as exc:
         logger.exception(f"reclassify [{user_id}]: failed: {exc}")
         job.update(state="error", finished_at=_utcnow(), error=str(exc))
+    finally:
+        # The lock is what stops a restore from interleaving with this run.
+        release_maintenance(user_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1051,6 +1230,15 @@ async def _reclassify_all_scope(user_id: str, job: dict) -> None:
 
 async def reclassify_single_fact(item_id: str, user_id: str) -> bool:
     """Clear and re-classify scope for a single fact. Returns True if linked."""
+    if not claim_maintenance(user_id, "reclassify_single"):
+        raise RuntimeError("Another maintenance operation (backup/restore/reclassify) is running")
+    try:
+        return await _reclassify_single_fact(item_id, user_id)
+    finally:
+        release_maintenance(user_id)
+
+
+async def _reclassify_single_fact(item_id: str, user_id: str) -> bool:
     neo4j_driver = get_neo4j()
     qdrant = await get_qdrant()
     if not neo4j_driver or not qdrant:
@@ -1071,9 +1259,13 @@ async def reclassify_single_fact(item_id: str, user_id: str) -> bool:
         return False
 
     sig = _scope_signature(clients)
-    clear_scope_links(item_id, user_id, neo4j_driver)
+    # Snapshot before clearing so the neighbour evidence is the same as it is
+    # during a full run rather than a post-clear graph.
+    scope_snapshot = await asyncio.to_thread(_capture_scope_snapshot, user_id, neo4j_driver)
+    await clear_scope_links_async([item_id], user_id, neo4j_driver)
     sem = asyncio.Semaphore(1)
-    linked = await _classify_and_link_fact(item, clients, user_id, sem, neo4j_driver, sig)
+    linked = await _classify_and_link_fact(
+        item, clients, user_id, sem, neo4j_driver, sig, scope_snapshot)
     await _backfill_qdrant(user_id, neo4j_driver, qdrant)
     logger.info(f"reclassify_single_fact [{user_id}] {item_id}: linked={linked}")
     return linked
@@ -1081,6 +1273,15 @@ async def reclassify_single_fact(item_id: str, user_id: str) -> bool:
 
 async def reclassify_single_diary(item_id: str, user_id: str) -> bool:
     """Clear and re-classify scope for a single diary entry. Returns True if linked."""
+    if not claim_maintenance(user_id, "reclassify_single"):
+        raise RuntimeError("Another maintenance operation (backup/restore/reclassify) is running")
+    try:
+        return await _reclassify_single_diary(item_id, user_id)
+    finally:
+        release_maintenance(user_id)
+
+
+async def _reclassify_single_diary(item_id: str, user_id: str) -> bool:
     neo4j_driver = get_neo4j()
     qdrant = await get_qdrant()
     if not neo4j_driver or not qdrant:
@@ -1101,9 +1302,11 @@ async def reclassify_single_diary(item_id: str, user_id: str) -> bool:
         return False
 
     sig = _scope_signature(clients)
-    clear_scope_links(item_id, user_id, neo4j_driver)
+    scope_snapshot = await asyncio.to_thread(_capture_scope_snapshot, user_id, neo4j_driver)
+    await clear_scope_links_async([item_id], user_id, neo4j_driver)
     sem = asyncio.Semaphore(1)
-    linked = await _classify_and_link_diary(item, clients, user_id, sem, neo4j_driver, sig)
+    linked = await _classify_and_link_diary(
+        item, clients, user_id, sem, neo4j_driver, sig, scope_snapshot)
     await _backfill_qdrant(user_id, neo4j_driver, qdrant)
     logger.info(f"reclassify_single_diary [{user_id}] {item_id}: linked={linked}")
     return linked

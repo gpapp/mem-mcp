@@ -10,6 +10,8 @@ All services run on port 8080 by default.
 """
 
 import os
+import asyncio
+from contextlib import suppress
 import uvicorn
 import memory as mem
 
@@ -60,6 +62,7 @@ from contextlib import asynccontextmanager
 async def lifespan(app):
     async with mcp_app.lifespan(mcp_app):
         from migrate_client_context import migrate_client_context, strip_scope_properties, restore_scope_links, llm_backfill_scope, sync_qdrant_scope
+        from backup import BACKUP_ENABLED, scheduled_backup_loop
         await mem.ensure_ollama_models()
         await migrate_client_context()
         await sync_qdrant_scope()
@@ -70,7 +73,18 @@ async def lifespan(app):
         await mem.run_diary_consistency_checks()
         await mem.fix_diary_entries()
         await mem.sync_orphans()
-        yield
+        # Daily savepoints run as their own task so a long export never blocks
+        # the app from serving requests; the loop sleeps until the next slot.
+        backup_task = None
+        if BACKUP_ENABLED:
+            backup_task = asyncio.create_task(scheduled_backup_loop())
+        try:
+            yield
+        finally:
+            if backup_task:
+                backup_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await backup_task
 
 web_app.router.lifespan_context = lifespan
 

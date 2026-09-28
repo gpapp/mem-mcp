@@ -30,6 +30,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 import memory as mem
+from backup import list_savepoints, start_backup, start_restore, get_backup_status
 from migrate_client_context import (
     start_reclassify_scope, get_reclassify_status,
     reclassify_single_fact, reclassify_single_diary,
@@ -838,7 +839,10 @@ async def api_start_reclassify(request: Request):
     try:
         result = start_reclassify_scope(_require_user(request))
         if not result["started"]:
-            raise HTTPException(status_code=409, detail="Reclassification already running.")
+            detail = ("A backup or restore is running — wait for it to finish."
+                      if result.get("conflict") == "maintenance"
+                      else "Reclassification already running.")
+            raise HTTPException(status_code=409, detail=detail)
         return result["job"]
     except HTTPException:
         raise
@@ -851,6 +855,70 @@ async def api_reclassify_status(request: Request):
     """Return the current (or last) reclassification job status."""
     try:
         return get_reclassify_status(_require_user(request))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Backup & restore
+#
+# Savepoints hold the whole vault, not one user: the Qdrant snapshot API only
+# works per collection and the graph export is a full-store dump. The GUI
+# session still gates who may trigger them, but a restore is vault-wide.
+# ---------------------------------------------------------------------------
+@web_app.get("/api/backup/savepoints", response_class=JSONResponse)
+async def api_list_savepoints(request: Request):
+    """List available savepoints, newest first, plus the schedule in effect."""
+    _require_user(request)
+    from backup import backup_config, get_backup_status
+    return {
+        "savepoints": list_savepoints(),
+        "config": backup_config(),
+        "status": get_backup_status(_require_user(request)),
+    }
+
+
+@web_app.post("/api/backup/run", response_class=JSONResponse)
+async def api_run_backup(request: Request):
+    """Create a savepoint now (409 if a maintenance job is already running)."""
+    try:
+        result = start_backup(_require_user(request))
+        if not result["started"]:
+            detail = ("A reclassification, backup or restore is already running."
+                      if result.get("conflict") == "maintenance"
+                      else "A backup is already running.")
+            raise HTTPException(status_code=409, detail=detail)
+        return result["job"]
+    except HTTPException:
+        raise
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@web_app.post("/api/backup/restore/{savepoint_id}", response_class=JSONResponse)
+async def api_run_restore(savepoint_id: str, request: Request):
+    """Overwrite the vault with a savepoint. Destructive — confirm in the UI."""
+    try:
+        result = start_restore(_require_user(request), savepoint_id)
+        if not result["started"]:
+            detail = ("A reclassification or backup is running — wait for it to finish."
+                      if result.get("conflict") == "maintenance"
+                      else "A restore is already running.")
+            raise HTTPException(status_code=409, detail=detail)
+        return result["job"]
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@web_app.get("/api/backup/status", response_class=JSONResponse)
+async def api_backup_status(request: Request):
+    """Current (or last) backup/restore job status."""
+    try:
+        return get_backup_status(_require_user(request))
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
