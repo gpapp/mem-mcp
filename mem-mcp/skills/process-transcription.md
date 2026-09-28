@@ -68,17 +68,27 @@ Other metadata:
 
 Recognize the input format; do not assume a single layout.
 
-**asr-mcp client export** (most common):
+**asr-mcp client export — current** (most common):
 ```
 Audio: <filename>
 Date: <transcription run time — NOT the meeting time>
 Speakers: N
 Duration: NNN.Ns
 
-[Speaker 1] 12.3s - 45.6s: text continues
-    on indented continuation lines
+============================================================
+SPEAKER VOICE PROFILES
+============================================================
+  Gergely Papp: pitch=123Hz (±82Hz)  energy=0.0089  speech=313s
+  Speaker 3: pitch=98Hz (±45Hz)  energy=0.0042  speech=45s
+============================================================
+
+[00:00:12] Gergely Papp (77%): paragraph text
+[00:04:05] Speaker 3: paragraph without confidence suffix
 ```
-Speakers may be known names (matched to voiceprints) or `Speaker N` (1-indexed diarization labels).
+- The **profiles banner is optional** (absent when the export predates it or profiles are unavailable) — the header lines above are always present.
+- Body paragraphs are `[HH:MM:SS] <speaker> (<NN>%): <text>` — timestamp is the paragraph's **absolute** start; the `(NN%)` confidence suffix appears only when the ASR backend reports it (absence is normal, not a parse error).
+- Legacy client exports use `[Speaker 1] 12.3s - 45.6s: text` with 4-space continuation lines — still valid; parse both.
+- Speakers may be known names (matched to voiceprints) or `Speaker N` (1-indexed diarization labels).
 
 **asr-mcp GUI export:**
 ```
@@ -89,7 +99,7 @@ text on the next line, blank line after
 
 **Other / unknown layouts:** parse whatever speaker + timestamp convention is present; if none exists, extract without speaker attribution and note it in the digest.
 
-Voice profiles are **guidance only** — verify speaker identity from content:
+Voice profiles (`SPEAKER VOICE PROFILES` banner, when present) are **guidance only** — verify speaker identity from content:
 - Topic expertise: who would naturally discuss this subject
 - Questions asked vs. answers given
 - Demonstrated knowledge, perspective, or role
