@@ -185,8 +185,14 @@ async def _backfill_qdrant(user_id: str, neo4j_driver, qdrant, only_ids=None):
     is a property of the record, so it is written to every point of the family
     and the diff is computed per record rather than per point.
     """
-    id_filter = "AND f.id IN $onlyIds" if only_ids else ""
-    diary_id_filter = "AND d.id IN $onlyIds" if only_ids else ""
+    # These must be complete WHERE clauses, not a bare "AND f.id IN ...". The
+    # template has MATCH with no WHERE of its own, so a leading AND is a parse
+    # error ("Invalid input 'AND': expected a graph pattern") and the
+    # single-item reclassify — the only caller that passes only_ids — died on
+    # every invocation. The full pass passes only_ids=None, the fragment is
+    # empty, and the query is valid, which is why this only surfaced there.
+    id_filter = "WHERE f.id IN $onlyIds" if only_ids else ""
+    diary_id_filter = "WHERE d.id IN $onlyIds" if only_ids else ""
     with neo4j_driver.session() as s:
         fact_rows = list(s.run(
             f"""

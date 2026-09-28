@@ -69,6 +69,66 @@ class ForeachScopeTests(unittest.TestCase):
         self.assertGreater(checked, 0, "the lint found no FOREACH at all; it is not running")
 
 
+class DanglingConjunctionTests(unittest.TestCase):
+    """A bare AND needs a WHERE to attach to.
+
+    Queries that build an optional filter interpolate a fragment which used to
+    be "AND f.id IN $onlyIds" into a template whose only preceding clause was
+    MATCH. Cypher rejects that at parse time ("Invalid input 'AND': expected a
+    graph pattern"), and the failure only ever happened on the single-item
+    reclassify, because the full pass leaves the fragment empty. The identical
+    trap to the FOREACH one: a construct that one caller happens to exercise.
+    """
+
+    def test_no_query_starts_a_line_with_and_without_a_where(self):
+        offenders = []
+        for path in _python_sources():
+            for lineno, query in _cypher_strings(path):
+                seen_where = False
+                for line in query.splitlines():
+                    text = line.strip()
+                    if not text:
+                        continue
+                    if re.match(r"AND\b", text, re.I):
+                        if not seen_where:
+                            offenders.append(
+                                f"{os.path.basename(path)}:{lineno}: {text}"
+                            )
+                        continue
+                    # Any clause keyword resets the search: an AND after one of
+                    # these has nothing to attach to.
+                    if re.match(r"(MATCH|OPTIONAL|WITH|UNWIND|MERGE|CREATE|RETURN|SET|DELETE|DETACH|REMOVE|CALL)\b",
+                                text, re.I):
+                        seen_where = False
+                    elif re.search(r"\bWHERE\b", text, re.I):
+                        seen_where = True
+        self.assertEqual(
+            offenders, [],
+            "a line-leading AND with no WHERE since the last clause needs fixing: "
+            + "; ".join(offenders),
+        )
+
+    def test_conditional_fragments_render_a_complete_clause(self):
+        """Pin the two _backfill_qdrant filters to a full WHERE, not a bare AND."""
+        path = os.path.join(HERE, "migrate_client_context.py")
+        with open(path, "r", encoding="utf-8") as handle:
+            source = handle.read()
+        found = 0
+        for line in source.splitlines():
+            if not re.match(r"\s*(?:diary_)?id_filter\s*=", line):
+                continue
+            found += 1
+            self.assertIn(
+                '"WHERE ', line,
+                f"filter must render a complete WHERE clause: {line.strip()}",
+            )
+            self.assertNotIn(
+                '"AND ', line,
+                f"a bare AND is a parse error when injected: {line.strip()}",
+            )
+        self.assertEqual(found, 2, "expected the fact and diary only_ids filters")
+
+
 class ClearScopeQueryTests(unittest.TestCase):
     """The query that broke reclassification, pinned so it cannot drift back."""
 
