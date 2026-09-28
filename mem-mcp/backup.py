@@ -4,14 +4,18 @@ backup.py — Savepoints for the memory vault.
 A savepoint is a self-contained directory under ``BACKUP_DIR``:
 
     <BACKUP_DIR>/<id>/
-        manifest.json          human-readable inventory + counters
-        neo4j.jsonl            one JSON object per line: nodes then relationships
-        qdrant-<name>.snapshot  one binary Qdrant collection snapshot per collection
+        manifest.json                human-readable inventory + counters
+        neo4j.jsonl.gz               one JSON object per line: nodes then rels
+        qdrant-<name>.snapshot.gz    one gzip-compressed Qdrant snapshot
 
 Why the two stores are dumped differently
 -----------------------------------------
 Qdrant gets its own binary snapshot API, so vectors and payloads round-trip
-byte-exactly with no serialization step to get wrong. Neo4j Community has no
+byte-exactly with no serialization step to get wrong. Those snapshots are then
+gzipped on the way to disk, and decompressed on the way back — a chunked long
+record repeats its entire payload across every chunk, so the raw snapshot is
+mostly near-duplicate JSON. Restore decides by filename suffix rather than by
+manifest version, so savepoints taken before compression still restore. Neo4j Community has no
 equivalent: ``neo4j-admin database backup`` is Enterprise-only and
 ``dump``/``load`` require stopping the database, so it is unusable as a daily
 job from inside the app container. The graph is therefore exported over Bolt and
@@ -61,7 +65,7 @@ BACKUP_MINUTES = min(59, max(0, int(os.getenv("MEM_BACKUP_MINUTES", "0"))))
 MANIFEST_NAME = "manifest.json"
 GRAPH_NAME = "neo4j.jsonl"
 GRAPH_NAME_GZ = "neo4j.jsonl.gz"
-MANIFEST_VERSION = 2
+MANIFEST_VERSION = 3
 
 # Rows per Bolt page. The neo4j container caps the heap at 1g, so pages stay
 # small enough that a busy vault cannot push the export out of memory.
@@ -243,8 +247,13 @@ async def _qdrant_snapshot(collection: str, dest_dir: str) -> dict:
         snapshot = max(fresh, key=lambda s: s.get("creation_time") or 0)
         name = snapshot.get("name")
 
-        target = os.path.join(dest_dir, f"qdrant-{collection}.snapshot")
-        size = 0
+        # Compressed on the way in. A chunked long record repeats its whole
+        # payload across every chunk, so the uncompressed snapshot is mostly
+        # near-duplicate JSON — exactly the shape gzip collapses well. mtime=0
+        # keeps two snapshots of identical data byte-identical, so a diff is
+        # meaningful.
+        target = os.path.join(dest_dir, f"qdrant-{collection}.snapshot.gz")
+        raw = 0
         async with client.stream(
             "GET", f"{QDRANT_URL}/collections/{collection}/snapshots/{name}"
         ) as stream:
@@ -253,16 +262,51 @@ async def _qdrant_snapshot(collection: str, dest_dir: str) -> dict:
                     f"Qdrant snapshot download for {collection} failed: HTTP {stream.status_code}"
                 )
             with open(target, "wb") as handle:
-                async for chunk in stream.aiter_bytes():
-                    handle.write(chunk)
-                    size += len(chunk)
+                gz = gzip.GzipFile(fileobj=handle, mode="wb", mtime=0)
+                try:
+                    async for chunk in stream.aiter_bytes():
+                        gz.write(chunk)
+                        raw += len(chunk)
+                finally:
+                    gz.close()
         # The snapshot now lives in our savepoint; drop the copy on the server
         # so repeated runs cannot fill the qdrant volume.
         try:
             await client.delete(f"{QDRANT_URL}/collections/{collection}/snapshots/{name}")
         except Exception as exc:
             logger.debug(f"backup: server snapshot cleanup for {collection} failed: {exc}")
-    return {"collection": collection, "file": os.path.basename(target), "bytes": size}
+    stored = os.path.getsize(target)
+    ratio = f"{100 * stored // raw}%" if raw else "?"
+    logger.info(f"backup: {collection} snapshot {raw} -> {stored} bytes ({ratio})")
+    return {
+        "collection": collection,
+        "file": os.path.basename(target),
+        "bytes": stored,
+        "raw_bytes": raw,
+        "compression": "gzip",
+    }
+
+
+def _open_snapshot(path: str):
+    """Open a savepoint snapshot for reading, gunzipping it when compressed.
+
+    The decision is by filename suffix rather than by manifest version so that
+    savepoints written before compression existed still restore. A manifest bump
+    would make the old ones look invalid and lose data that is sitting on disk.
+    """
+    if path.endswith(".gz"):
+        return gzip.open(path, "rb")
+    return open(path, "rb")
+
+
+def _upload_name(path: str, collection: str) -> str:
+    """The filename to send to Qdrant, which rejects anything but *.snapshot.
+
+    Our copy is gzipped on disk, but Qdrant validates the multipart filename's
+    extension and would reject ``foo.snapshot.gz`` outright. The name is
+    therefore reconstructed rather than derived from the path.
+    """
+    return f"{collection}.snapshot"
 
 
 async def _qdrant_restore(collection: str, source: str) -> None:
@@ -271,11 +315,19 @@ async def _qdrant_restore(collection: str, source: str) -> None:
         dropped = await client.delete(f"{QDRANT_URL}/collections/{collection}")
         if dropped.status_code not in (200, 204, 404):
             raise RuntimeError(f"Qdrant drop of {collection} failed: HTTP {dropped.status_code}")
-        with open(source, "rb") as handle:
+        # Opened through _open_snapshot, so a compressed savepoint is streamed
+        # back to Qdrant byte-identically instead of being uploaded as gzip.
+        with _open_snapshot(source) as handle:
             uploaded = await client.put(
                 f"{QDRANT_URL}/collections/{collection}/snapshots/upload",
                 params={"priority": "snapshot"},
-                files={"file": (os.path.basename(source), handle, "application/octet-stream")},
+                files={
+                    "file": (
+                        _upload_name(source, collection),
+                        handle,
+                        "application/octet-stream",
+                    )
+                },
             )
         if uploaded.status_code not in (200, 201):
             raise RuntimeError(f"Qdrant snapshot upload for {collection} failed: HTTP {uploaded.status_code}")

@@ -28,11 +28,11 @@ After completing any code changes:
 
 ### Focused Tests
 
-The dependency-light regression suite covers matching, scope compatibility, scope-name and `Client:`-header resolution, duplicate scoring and clustering, merge validation, merge callback ordering, People candidate resolution, LLM prompt contracts, and the chunking split. Two more suites need no database either: `test_embedding_reliability.py` lifts the real functions out of `common.py` with `ast.get_source_segment`, and `test_cypher_safety.py` lints the Cypher in every module (see Gotchas for why).
+The dependency-light regression suite covers matching, scope compatibility, scope-name and `Client:`-header resolution, duplicate scoring and clustering, merge validation, merge callback ordering, People candidate resolution, LLM prompt contracts, and the chunking split. Two more suites need no database either: `test_embedding_reliability.py` lifts the real functions out of `common.py` with `ast.get_source_segment`, and `test_cypher_safety.py` lints the Cypher in every module (see Gotchas for why). `test_backup_compression.py` uses the same `ast` lift for the snapshot compression helpers, since `backup.py` also cannot be imported without `httpx`.
 
 ```powershell
 Push-Location mem-mcp
-C:/tools/miniconda3/python.exe -m unittest -v test_matching_regressions.py test_embedding_reliability.py test_chunking.py test_cypher_safety.py
+C:/tools/miniconda3/python.exe -m unittest -v test_matching_regressions.py test_embedding_reliability.py test_chunking.py test_cypher_safety.py test_backup_compression.py
 Pop-Location
 ```
 
@@ -107,9 +107,10 @@ Do not reintroduce byte-exact name matching, per-item synchronous clears, or a s
 
 `mem-mcp/backup.py` maintains **savepoints** under `BACKUP_DIR` (default `<dirname LOG_DIR>/backup`, i.e. `/app/backup` in Docker with `./mem-mcp-data/backup` bind-mounted there).
 
-- A savepoint is a directory: `manifest.json`, `neo4j.jsonl.gz`, and one `qdrant-<collection>.snapshot` per collection.
+- A savepoint is a directory: `manifest.json`, `neo4j.jsonl.gz`, and one `qdrant-<collection>.snapshot.gz` per collection.
 - **Ordering is load-bearing.** Qdrant is snapshotted *first*, then Neo4j is exported. A fact written in between then exists in Neo4j but not in the vector snapshot, and `sync_orphans()` re-embeds it. The reverse order strands a fact with no vector and nothing to rebuild it from.
 - **Qdrant uses its own snapshot API**; the server-side copy is deleted after download so repeated runs cannot fill the volume. Restore is `DELETE` the collection then `PUT .../snapshots/upload`.
+- **Qdrant snapshots are gzipped, and the restore path has two traps.** A chunked long record repeats its whole payload across every chunk, so the raw snapshot is mostly near-duplicate JSON — measured 3% of original on a repeating chunk family. Download streams through `gzip.GzipFile(fileobj=..., mtime=0)` (handed a file object, not a path, so the target's basename is not recorded in the header, and `mtime=0` so two exports of identical data are byte-identical and a diff is meaningful). On restore, `_open_snapshot()` decides by **filename suffix, not manifest version** — a version check would strand every savepoint taken before compression, and the suffix is the only thing on disk that cannot lie. `_upload_name()` **rebuilds** the multipart filename as `<collection>.snapshot` because Qdrant validates the extension and rejects `*.snapshot.gz` outright, after the collection has already been dropped.
 - **Neo4j Community has no online backup** (`neo4j-admin database backup` is Enterprise; `dump`/`load` need the DB stopped), so the graph is exported over Bolt and replayed. Relationships resolve endpoints by **business key, never `elementId`** — elementIds are reassigned by any dump/load, so keying on them produces edges that point at nothing after a restore.
 - **Temporal properties are type-tagged.** `_encode_value()` writes `{"__t": "datetime", "v": "<iso>"}`; the replay re-applies them with the matching Cypher constructor. Without this, a `ZonedDateTime` returns as a plain string and the corruption does not surface until something queries a date.
 - Dynamic relationship types are rebuilt with `apoc.create.relationship()` (APOC is already required by compose).

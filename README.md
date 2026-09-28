@@ -127,6 +127,11 @@ The vault writes a **savepoint** every day and keeps the most recent
   savepoint first if you have recent work you want to keep.
 - Restoring a savepoint that did not finish is not possible — incomplete
   savepoints are listed as *Unusable*.
+- Everything in a savepoint is gzipped — both the graph export and the two
+  vector-collection snapshots. The vector snapshots compress well because a long
+  record is stored as several vectors that share the same payload, so the raw
+  file is mostly repetition. Savepoints taken before compression were added
+  still restore normally.
 
 Schedule and retention are controlled in `.env`:
 
