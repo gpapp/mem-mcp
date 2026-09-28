@@ -1512,8 +1512,10 @@ npm install @modelcontextprotocol/sdk</code></pre>
       el.textContent = `✅ ${job.operation === 'restore' ? 'Restore' : 'Backup'} complete.`;
       if (job.operation === 'restore') {
         // The whole vault just changed underneath us — drop every cached list.
+        // Not awaited: allSettled keeps one failing loader from skipping the
+        // others, and the poll loop must stay responsive.
         memories = []; diaryEntries = []; clientListCache = []; clientActiveMap = {}; graphLoaded = false;
-        await Promise.allSettled([loadMemories(), loadClients(), loadDiary()]);
+        Promise.allSettled([loadMemories(), loadClients(), loadDiary()]);
       }
       loadSavepoints();
     } else if (job.state === 'error') {
