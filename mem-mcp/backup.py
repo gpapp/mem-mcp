@@ -43,6 +43,7 @@ from common import (
     DIARY_COLLECTION,
     HTTP_TIMEOUT,
     QDRANT_URL,
+    active_maintenance,
     claim_maintenance,
     logger,
     publish_db_event,
@@ -83,6 +84,10 @@ _VALUE_ENCODERS = {
 
 _BACKUP_JOBS: dict = {}
 _JOB_HISTORY = 8
+# How long the scheduler waits before re-checking after deferring to a
+# maintenance job. A full reclassify can run for a long time; the loop keeps
+# re-checking rather than backing up the moment the slot passes.
+_RETRY_SECONDS = 300
 
 
 def _utcnow() -> str:
@@ -724,6 +729,17 @@ async def scheduled_backup_loop() -> None:
             await asyncio.sleep(seconds_until_next_run())
             if not BACKUP_ENABLED:
                 logger.info("backup: skipped — MEM_BACKUP_ENABLED=0")
+                continue
+            # The lock is per-user and this job is vault-wide, so it cannot take
+            # one. It has to yield instead: snapshotting mid-reclassify would
+            # interleave the two jobs' graph writes.
+            busy = active_maintenance()
+            if busy:
+                logger.warning(
+                    f"backup: deferred — maintenance in progress for {len(busy)} user(s): "
+                    f"{sorted(busy.values())}"
+                )
+                await asyncio.sleep(_RETRY_SECONDS)
                 continue
             result = await run_backup("scheduled")
             logger.warning(f"backup: scheduled savepoint {result['id']} written")

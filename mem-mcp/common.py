@@ -84,6 +84,15 @@ def current_maintenance(user_id: str) -> Optional[str]:
     return _MAINTENANCE_OWNERS.get(user_id)
 
 
+def active_maintenance() -> dict:
+    """Every user currently running a maintenance job, mapped to the operation.
+
+    A scheduled backup is vault-wide but the lock is per-user, so it cannot
+    simply take the lock: it has to check that no user is mid-reclassify.
+    """
+    return dict(_MAINTENANCE_OWNERS)
+
+
 
 class _StripAnsiFilter(logging.Filter):
     _ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")

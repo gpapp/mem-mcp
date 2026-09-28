@@ -166,7 +166,7 @@ async def _migrate_user(user_id: str, neo4j_driver, qdrant):
     logger.info(f"migrate_client_context [{user_id}]: done ({len(client_map)} clients)")
 
 
-async def _backfill_qdrant(user_id: str, neo4j_driver, qdrant):
+async def _backfill_qdrant(user_id: str, neo4j_driver, qdrant, only_ids=None):
     """Sync FOR_CLIENT / IN_CONTEXT links into Qdrant payloads for fast filtering.
 
     Diff-based: scrolls current payloads (no vectors) and upserts only points
@@ -174,28 +174,36 @@ async def _backfill_qdrant(user_id: str, neo4j_driver, qdrant):
     unlinked items. Steady-state boots therefore issue zero write requests,
     while any drift source (UI reassignment, re-saves, restores) self-heals.
     Vectors are preserved (no re-embed): retrieved only for changed points.
+
+    ``only_ids`` restricts the pass to specific points. Without it this is
+    O(vault): a single-item reclassify would otherwise scroll every point in
+    both collections just to change one row.
     """
+    id_filter = "AND f.id IN $onlyIds" if only_ids else ""
+    diary_id_filter = "AND d.id IN $onlyIds" if only_ids else ""
     with neo4j_driver.session() as s:
         fact_rows = list(s.run(
-            """
-            MATCH (f:Fact {userId: $userId})
+            f"""
+            MATCH (f:Fact {{userId: $userId}})
+            {id_filter}
             OPTIONAL MATCH (f)-[:FOR_CLIENT]->(c:Client)
             OPTIONAL MATCH (f)-[:IN_CONTEXT]->(ctx:Context)
             RETURN f.id AS id, c.id AS clientId, c.name AS clientName,
                    ctx.id AS contextId, ctx.name AS contextName
             """,
-            userId=user_id
+            userId=user_id, onlyIds=list(only_ids) if only_ids else None
         ))
     with neo4j_driver.session() as s:
         diary_rows = list(s.run(
-            """
-            MATCH (d:DiaryEntry {userId: $userId})
+            f"""
+            MATCH (d:DiaryEntry {{userId: $userId}})
+            {diary_id_filter}
             OPTIONAL MATCH (d)-[:FOR_CLIENT]->(c:Client)
             OPTIONAL MATCH (d)-[:IN_CONTEXT]->(ctx:Context)
             RETURN d.id AS id, c.id AS clientId, c.name AS clientName,
                    ctx.id AS contextId, ctx.name AS contextName
             """,
-            userId=user_id
+            userId=user_id, onlyIds=list(only_ids) if only_ids else None
         ))
 
     def _desired(rows) -> dict:
@@ -215,21 +223,37 @@ async def _backfill_qdrant(user_id: str, neo4j_driver, qdrant):
     for collection, desired in ((COLLECTION_NAME, _desired(fact_rows)),
                                 (DIARY_COLLECTION, _desired(diary_rows))):
         current: dict = {}
-        offset = None
-        while True:
-            points, next_offset = await qdrant.scroll(
-                collection_name=collection,
-                limit=1000,
-                offset=offset,
-                with_payload=True,
-                with_vectors=False,
-                scroll_filter=Filter(must=[FieldCondition(key="userId", match=MatchValue(value=user_id))]),
-            )
+        if only_ids:
+            # Targeted pass: fetch exactly the points in question instead of
+            # scrolling the collection. A vector-less retrieve is one request.
+            try:
+                points = await qdrant.retrieve(
+                    collection_name=collection,
+                    ids=list(only_ids),
+                    with_payload=True,
+                    with_vectors=False,
+                )
+            except Exception as e:
+                logger.warning(f"scope_qdrant_sync [{user_id}]: retrieve failed for {collection}: {e}")
+                continue
             for p in points:
                 current[str(p.id)] = dict(p.payload or {})
-            if next_offset is None:
-                break
-            offset = next_offset
+        else:
+            offset = None
+            while True:
+                points, next_offset = await qdrant.scroll(
+                    collection_name=collection,
+                    limit=1000,
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False,
+                    scroll_filter=Filter(must=[FieldCondition(key="userId", match=MatchValue(value=user_id))]),
+                )
+                for p in points:
+                    current[str(p.id)] = dict(p.payload or {})
+                if next_offset is None:
+                    break
+                offset = next_offset
         changed = [
             pid for pid, payload in current.items()
             if {k: payload.get(k) for k in _SCOPE_PAYLOAD_KEYS if payload.get(k) is not None}
@@ -1198,8 +1222,30 @@ async def _reclassify_all_scope(user_id: str, job: dict) -> None:
                 logger.info(f"reclassify [{user_id}]: {job['done']}/{job['total']} classified, "
                             f"{job['linked']} linked, {job['errors']} errored")
 
-        await asyncio.gather(*[_process("fact", dict(r)) for r in facts])
-        await asyncio.gather(*[_process("diary", dict(r)) for r in diaries])
+        # A fixed pool of workers rather than one task per item. gather over
+        # every row would materialise a coroutine for each fact in the vault;
+        # the worker queue bounds live tasks to SCOPE_BACKFILL_CONCURRENCY,
+        # which is the number that actually matters because it bounds the
+        # in-flight Ollama calls.
+        queue: asyncio.Queue = asyncio.Queue()
+        for row in facts:
+            queue.put_nowait(("fact", dict(row)))
+        for row in diaries:
+            queue.put_nowait(("diary", dict(row)))
+        worker_count = max(1, min(job["total"], max(1, SCOPE_BACKFILL_CONCURRENCY) * 2))
+
+        async def _worker():
+            while True:
+                try:
+                    kind, item = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                try:
+                    await _process(kind, item)
+                finally:
+                    queue.task_done()
+
+        await asyncio.gather(*[_worker() for _ in range(worker_count)])
 
         # Push the new links into Qdrant payloads; the diff-based backfill also
         # strips stale scope keys off items that are now generic.
@@ -1266,7 +1312,8 @@ async def _reclassify_single_fact(item_id: str, user_id: str) -> bool:
     sem = asyncio.Semaphore(1)
     linked = await _classify_and_link_fact(
         item, clients, user_id, sem, neo4j_driver, sig, scope_snapshot)
-    await _backfill_qdrant(user_id, neo4j_driver, qdrant)
+    # Only this item's payload changed, so sync just it rather than the vault.
+    await _backfill_qdrant(user_id, neo4j_driver, qdrant, only_ids={item_id})
     logger.info(f"reclassify_single_fact [{user_id}] {item_id}: linked={linked}")
     return linked
 
@@ -1307,6 +1354,7 @@ async def _reclassify_single_diary(item_id: str, user_id: str) -> bool:
     sem = asyncio.Semaphore(1)
     linked = await _classify_and_link_diary(
         item, clients, user_id, sem, neo4j_driver, sig, scope_snapshot)
-    await _backfill_qdrant(user_id, neo4j_driver, qdrant)
+    # Only this entry's payload changed, so sync just it rather than the vault.
+    await _backfill_qdrant(user_id, neo4j_driver, qdrant, only_ids={item_id})
     logger.info(f"reclassify_single_diary [{user_id}] {item_id}: linked={linked}")
     return linked
