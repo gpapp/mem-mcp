@@ -1077,9 +1077,9 @@ def clear_scope_links_batch(node_ids: list, user_id: str, neo4j_driver) -> int:
             """
             MATCH (n {id: $ids, userId: $userId})
             OPTIONAL MATCH (n)-[r:FOR_CLIENT|IN_CONTEXT]->()
-            FOREACH (x IN CASE WHEN r IS NULL THEN [] ELSE [x] END | DELETE x)
+            FOREACH (ignored IN CASE WHEN r IS NULL THEN [] ELSE [r] END | DELETE ignored)
             REMOVE n.scopeCheckedSig
-            RETURN count(n) AS cleared
+            RETURN count(DISTINCT n) AS cleared
             """,
             ids=ids, userId=user_id,
         )
