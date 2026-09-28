@@ -109,11 +109,11 @@ Run the focused dependency-light regression suite from the repository root:
 
 ```powershell
 Push-Location mem-mcp
-C:/tools/miniconda3/python.exe -m unittest -v test_matching_regressions.py test_embedding_reliability.py
+C:/tools/miniconda3/python.exe -m unittest -v test_matching_regressions.py test_embedding_reliability.py test_chunking.py test_cypher_safety.py test_backup_compression.py test_people_extraction.py
 Pop-Location
 ```
 
-The suites cover scope-aware duplicate matching, weighted scoring, bridge-cluster rejection, merge target ownership, merge mutation ordering, People candidate resolution, scope-name and `Client:`-header resolution, LLM prompt contracts, and the embedding retry/fallback behaviour. They do not require the Docker services.
+The suites cover scope-aware duplicate matching, weighted scoring, bridge-cluster rejection, merge target ownership, merge mutation ordering, People candidate resolution, scope-name and `Client:`-header resolution, LLM prompt contracts, the chunking split, embedding retry/fallback behaviour, the Cypher written in each module, snapshot compression, and diary people-extraction windowing. They do not require the Docker services.
 
 ## Backups
 

@@ -28,11 +28,11 @@ After completing any code changes:
 
 ### Focused Tests
 
-The dependency-light regression suite covers matching, scope compatibility, scope-name and `Client:`-header resolution, duplicate scoring and clustering, merge validation, merge callback ordering, People candidate resolution, LLM prompt contracts, and the chunking split. Two more suites need no database either: `test_embedding_reliability.py` lifts the real functions out of `common.py` with `ast.get_source_segment`, and `test_cypher_safety.py` lints the Cypher in every module (see Gotchas for why). `test_backup_compression.py` uses the same `ast` lift for the snapshot compression helpers, since `backup.py` also cannot be imported without `httpx`.
+The dependency-light regression suite covers matching, scope compatibility, scope-name and `Client:`-header resolution, duplicate scoring and clustering, merge validation, merge callback ordering, People candidate resolution, LLM prompt contracts, and the chunking split. Two more suites need no database either: `test_embedding_reliability.py` lifts the real functions out of `common.py` with `ast.get_source_segment`, and `test_cypher_safety.py` lints the Cypher in every module (see Gotchas for why). `test_backup_compression.py` uses the same `ast` lift for the snapshot compression helpers, since `backup.py` also cannot be imported without `httpx`. `test_people_extraction.py` lifts `people_extract_windows` out of `diary_manager.py` for the same reason.
 
 ```powershell
 Push-Location mem-mcp
-C:/tools/miniconda3/python.exe -m unittest -v test_matching_regressions.py test_embedding_reliability.py test_chunking.py test_cypher_safety.py test_backup_compression.py
+C:/tools/miniconda3/python.exe -m unittest -v test_matching_regressions.py test_embedding_reliability.py test_chunking.py test_cypher_safety.py test_backup_compression.py test_people_extraction.py
 Pop-Location
 ```
 
@@ -261,3 +261,15 @@ Every diary save/update triggers automatic keyword extraction via the query LLM 
 - Keywords boost vector search relevance in `diary_search_entries`
 - Backfill existing entries: `python mem-mcp/reindex_diary_keywords.py -u <user_id>`
 - CLI options: `-f/--force` (re-extract even if keywords exist), `-d/--dry-run`, `-c/--concurrency` (default 3)
+
+### Diary People Extraction
+
+Diary people extraction runs the **whole entry**, in overlapping windows, not a prefix. `_extract_people_names()` in `diary_manager.py` iterates `people_extract_windows(content)` and unions the results.
+
+The prefix form is the one to avoid. It sent `content[:2000]`, so on a 40k-char transcription every person named after character 2000 was silently missed — no error, just a missing `MENTIONS` edge nobody was looking for. Keyword extraction (above) already ran on the full content, so the two paths disagreed on what "the entry" means.
+
+- `people_extract_windows(content, window=0, overlap=0)` is pure and unit-tested (`test_people_extraction.py`): blank → `[]`, a doc that fits the window → one element (short entries cost what they always did), otherwise `body[i:i+size] for i in range(0, len(body), size - overlap)`.
+- The overlap exists because a name straddling a boundary is cut in half, and both halves then look like garbage to the extractor. `step` is clamped to `size - 1` so a degenerate overlap cannot make the loop non-terminating.
+- `MEM_PEOPLE_WINDOW` (6000) and `MEM_PEOPLE_OVERLAP` (600) tune it.
+- **Do not cap the window count.** Capping would reintroduce exactly the silent tail-drop the windowing fixed. Above `PEOPLE_EXTRACT_WARN_WINDOWS` (6) the entry is expensive (one LLM call per window) and logs a WARNING naming the knob instead. This is chat traffic, so WARNING is the right level per the logging policy in "Embedding Reliability".
+- Each window is wrapped in its own `try/except` inside the loop, so one bad window cannot discard the names the other windows found. `clean_extracted_people_names(found)` dedupes the union, since a name spanning the overlap is found twice.

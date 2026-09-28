@@ -159,6 +159,9 @@ _PEOPLE_EXTRACT_SYSTEM = (
 # boundary, which both halves would otherwise drop.
 PEOPLE_EXTRACT_WINDOW = max(1000, int(os.getenv("MEM_PEOPLE_WINDOW", "6000")))
 PEOPLE_EXTRACT_OVERLAP = max(0, min(1000, int(os.getenv("MEM_PEOPLE_OVERLAP", "600"))))
+# Above this many windows an entry is worth telling the operator about: each
+# window is its own LLM call. This warns, it does not truncate.
+PEOPLE_EXTRACT_WARN_WINDOWS = 6
 
 
 def people_extract_windows(content: str, window: int = 0, overlap: int = 0) -> list:
@@ -194,6 +197,14 @@ async def _extract_people_names(content: str) -> list:
     logger.debug(
         f"[extract_people_names] started (content_len={len(content)}, windows={len(windows)})"
     )
+    if len(windows) > PEOPLE_EXTRACT_WARN_WINDOWS:
+        # Every window is a separate LLM round trip, so a very long entry is
+        # genuinely expensive. Warn rather than cap: capping would silently drop
+        # the tail, which is the exact defect the windowing replaced.
+        logger.warning(
+            f"[extract_people_names] entry is {len(content)} chars, so name extraction "
+            f"runs {len(windows)} times — raise MEM_PEOPLE_WINDOW to trade recall for cost"
+        )
     found = []
     for index, window in enumerate(windows):
         try:
