@@ -28,11 +28,11 @@ After completing any code changes:
 
 ### Focused Tests
 
-The dependency-light regression suite covers matching, scope compatibility, scope-name and `Client:`-header resolution, duplicate scoring and clustering, merge validation, merge callback ordering, People candidate resolution, LLM prompt contracts, and the chunking split. Two more suites need no database either: `test_embedding_reliability.py` lifts the real functions out of `common.py` with `ast.get_source_segment`, and `test_cypher_safety.py` lints the Cypher in every module (see Gotchas for why). `test_backup_compression.py` uses the same `ast` lift for the snapshot compression helpers, since `backup.py` also cannot be imported without `httpx`. `test_people_extraction.py` lifts `people_extract_windows` out of `diary_manager.py` for the same reason.
+The dependency-light regression suite covers matching, scope compatibility, scope-name and `Client:`-header resolution, duplicate scoring and clustering, merge validation, merge callback ordering, People candidate resolution, LLM prompt contracts, and the chunking split. Two more suites need no database either: `test_embedding_reliability.py` lifts the real functions out of `common.py` with `ast.get_source_segment`, and `test_cypher_safety.py` lints the Cypher in every module (see Gotchas for why). `test_backup_compression.py` uses the same `ast` lift for the snapshot compression helpers, since `backup.py` also cannot be imported without `httpx`. `test_people_extraction.py` lifts `people_extract_windows` out of `diary_manager.py` for the same reason. `test_graph_scope.py` lifts the graph scoping and cap policy out of `fact_manager.py` the same way.
 
 ```powershell
 Push-Location mem-mcp
-C:/tools/miniconda3/python.exe -m unittest -v test_matching_regressions.py test_embedding_reliability.py test_chunking.py test_cypher_safety.py test_backup_compression.py test_people_extraction.py
+C:/tools/miniconda3/python.exe -m unittest -v test_matching_regressions.py test_embedding_reliability.py test_chunking.py test_cypher_safety.py test_backup_compression.py test_people_extraction.py test_graph_scope.py
 Pop-Location
 ```
 
@@ -69,6 +69,7 @@ All three backing services are pinned to an exact tag — `qdrant/qdrant:v1.19.1
 - Merge LLM: `MEM_MERGE_MODEL` defaults to `gemma4:e2b` and is used only for dashboard merge-draft generation; override it if the host GPU cannot run that model
 - Scope backfill LLM: `MEM_SCOPE_MODEL` (defaults to the query LLM) classifies unlinked facts/diary entries against existing clients on startup; `MEM_SCOPE_BACKFILL=0` disables it, `MEM_SCOPE_CONCURRENCY` (default 3) caps parallel classifications
 - Backups: `MEM_BACKUP_ENABLED` (default 1), `MEM_BACKUP_HOUR` / `MEM_BACKUP_MINUTES` (local server time, default 03:00), `MEM_BACKUP_KEEP` (default 14), `MEM_BACKUP_DIR` (default `<dirname LOG_DIR>/backup`)
+- Graph: `MEM_GRAPH_MAX_NODES` (600) caps the records in one graph response, keeping the most connected — see "Build Graph Mode"
 - Chunking: `MEM_CHUNK_CHARS` (3000), `MEM_CHUNK_MAX` (16), `MEM_CHUNK_OVERLAP` (200), `MEM_CHUNK_FETCH_MULTIPLIER` (3), and startup re-chunking `MEM_RECHUNK_ENABLED` / `MEM_RECHUNK_LIMIT` (200) / `MEM_RECHUNK_CONCURRENCY` (2) — see "Long Records & Chunking"
 - Embedding retries: `MEM_EMBED_RETRIES` (default 2) and `MEM_EMBED_RETRY_BACKOFF` (default 1.5, in seconds), `MEM_EMBED_MAX_CHARS` (default 12000) — see "Embedding Reliability"
 - User vault resolved from `Authorization: Basic` header or session cookie
@@ -202,13 +203,86 @@ Rules that matter when changing this code:
 Build your own focused subgraph starting from any memory.
 
 1. Go to **Graph** tab → click **Build Graph** mode toggle
-2. In **Memories** tab, click **📍 Show on map** on any memory
+2. In **Memories** or **Diary** tab, open a record's menu and choose **🕸️ Show in Graph**
+   (the `📍 Show on map` button on a memory card does the same thing)
 3. Node appears centered with its connections
 4. **Right-click** any node for context menu:
    - **Go to fact** → navigate to memory details
    - **Show all connected** → add all direct neighbors
    - **Show connection → [verb]** → add nodes by specific relationship type
 5. Click **🗑️ Clear** to reset the build graph
+
+The graph obeys the **same client / project selection as the memory list**. Two
+filters exist and they are independent:
+
+- **Scope** — the client (and optionally the project) picker. Handed to the API
+  as `clientId` / `contextId` and resolved in `db_get_graph`, so the server does
+  the filtering rather than the browser.
+- **Categories** — the chips in the graph sidebar. Client-side, applied to every
+  path that adds a node, including "Show all connected".
+
+#### Scope is resolved server-side, from the edges
+
+`db_get_graph(user_id, client_id, context_id, limit)` filters through
+`_scope_and_cap_graph`, which decides membership from the `FOR_CLIENT` /
+`IN_CONTEXT` **relationships**, not the denormalised `clientId` property. The
+property is written by the scope classifier and can lag the edge it mirrors, and
+a fact whose link was just deleted has to leave the filtered view immediately
+rather than on the next reclassify. `gui.py` forwards `clientId` / `contextId`
+on `/api/graph`, `/api/graph/neighbors/{id}` and `/api/graph/focus/{id}`.
+
+Client, Context and Category nodes are **always** kept under a scope filter. A
+graph that has been filtered to one client and then omits that client's node
+reads as "this client has no facts", which is worse than a slightly noisy graph.
+
+`clientFilter` is `'all' | 'active' | <clientId>`. Only the third is a node id;
+`graphScopeParams()` deliberately drops the first two rather than sending a
+literal `'all'` as an id that matches nothing. `'active'` is expanded client-side
+to the active ids in `clientListCache` when filtering node lists.
+
+#### The cap
+
+`MEM_GRAPH_MAX_NODES` (default 600) caps the records in one response. Over the
+cap the **most connected** records are kept — a graph of leaves explains nothing,
+and that is the case that makes "full graph" feel useless. The response carries
+`truncated` and `total`; the UI shows a banner rather than silently rendering a
+partial graph. Edges touching a dropped record are dropped with it.
+
+#### Neighbours are not just facts
+
+`db_get_neighborhood` used to end its Cypher in `(neighbor:Fact)`, so "Show all
+connected" could only ever add other facts. It now returns Fact, DiaryEntry,
+Client and Context nodes — the connections a person actually recognises. Category
+is still excluded: it is shared across the whole vault and only adds clutter.
+`_filter_neighborhood_scope` keeps a Client/Context node that **is** the active
+scope, for the reason given above.
+
+**Every node-adding path filters through `nodeInCategory()`**, and reports what
+it skipped in the toast. A path that ignores the category chips puts nodes on the
+map that the sidebar says are hidden, which is indistinguishable from the filter
+being broken.
+
+#### "Show in Graph" has to say when it cannot help
+
+`openInGraph(id)` checks the id is in the current DataSet before focusing it.
+`network.focus()` on an absent id is a silent no-op: the tab switches, the canvas
+looks identical, and the user concludes the button is broken. It now toasts
+"not in the current graph — outside the selected client / project / categories".
+
+Diary entries have a **Show in Graph** menu item (`_diaryMenuGraph`). They did
+not, which meant a diary entry could not reach the graph by any route at all.
+
+#### Related entries
+
+`RELEVANT_TO` targets a Client **or** a Context — the relationship type is the
+same for both, and the target was only pinned to `:Client` by the Cypher label,
+so widening it needs no migration and no backfill. The read side emits
+`kind: 'client' | 'context'`, which the chips use for their `📁` prefix and the
+"add" picker, which enumerates `client.contexts` alongside the clients.
+
+Do not reintroduce a `:Client`-only match here. A project stored as relevant
+would be unreachable, and the existing `:Client` links are indistinguishable
+from the new ones except by label.
 
 ### Link Management
 Modify or delete links between memories directly from the UI.

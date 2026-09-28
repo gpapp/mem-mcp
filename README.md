@@ -109,7 +109,7 @@ Run the focused dependency-light regression suite from the repository root:
 
 ```powershell
 Push-Location mem-mcp
-C:/tools/miniconda3/python.exe -m unittest -v test_matching_regressions.py test_embedding_reliability.py test_chunking.py test_cypher_safety.py test_backup_compression.py test_people_extraction.py
+C:/tools/miniconda3/python.exe -m unittest -v test_matching_regressions.py test_embedding_reliability.py test_chunking.py test_cypher_safety.py test_backup_compression.py test_people_extraction.py test_graph_scope.py
 Pop-Location
 ```
 

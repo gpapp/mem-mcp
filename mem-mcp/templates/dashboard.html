@@ -617,7 +617,10 @@
         <div style="font-size:.7rem; font-weight:700; text-transform:uppercase; letter-spacing:.5px; color:var(--muted); padding-bottom:.6rem;">Categories</div>
         <div id="graph-categories-sidebar" class="chips-container" style="flex-direction: column;"></div>
       </div>
-      <div id="graph-container" style="flex: 1; height: 70vh; min-height: 500px; border: 1px solid var(--border); border-radius: 8px; background: #fff;"></div>
+      <div style="flex: 1; display: flex; flex-direction: column; gap: .5rem; min-width: 0;">
+        <div id="graph-truncation-note" style="display: none; font-size: .78rem; color: var(--muted); background: var(--bg-subtle, #f8fafc); border: 1px solid var(--border); border-radius: 6px; padding: .5rem .7rem;"></div>
+        <div id="graph-container" style="flex: 1; height: 70vh; min-height: 500px; border: 1px solid var(--border); border-radius: 8px; background: #fff;"></div>
+      </div>
     </div>
   </div>
 </div><!-- /page-graph -->
@@ -770,8 +773,13 @@ npm install @modelcontextprotocol/sdk</code></pre>
     const relevantMatch = !contextFilter &&
       Array.isArray(m.relevantClients) && m.relevantClients.some(rc => rc.id === clientFilter);
     if (!clientMatch && !relevantMatch) return false;
-    // If a specific project (context) is selected, further filter by contextId.
-    if (contextFilter && m.contextId !== contextFilter) return false;
+    // If a specific project (context) is selected, the fact matches on its own
+    // context or on a project it is merely RELEVANT_TO, since a related
+    // project is now possible and would otherwise be invisible under its filter.
+    if (contextFilter) {
+      if (m.contextId === contextFilter) return true;
+      return Array.isArray(m.relevantClients) && m.relevantClients.some(rc => rc.id === contextFilter);
+    }
     return true;
   }
   let lastSortOrder = 'alphabetical';
@@ -1691,11 +1699,24 @@ npm install @modelcontextprotocol/sdk</code></pre>
         categories.push('Diary');
         counts['Diary'] = diaryEntries.length;
     }
+    // The graph also carries Client and Context nodes, grouped under those
+    // names. They were never added to the list, so the default init below
+    // selected 'Client' -- a value no chip ever had, and never displayed.
+    // A chip you cannot see is a filter that silently hides its nodes.
+    for (const extra of ['Client', 'Context']) {
+      if (!categories.includes(extra)) {
+        categories.push(extra);
+        counts[extra] = (clientListCache || []).filter(c => extra === 'Context' ? c.isContext : !c.isContext).length;
+      }
+    }
+    categories.sort();
 
-    if (activeGraphCategories.size === 0 && !activeGraphCategories.hasInit) {
-        if (categories.includes('People')) activeGraphCategories.add('People');
-        if (categories.includes('Client')) activeGraphCategories.add('Client');
-        activeGraphCategories.hasInit = true;
+    if (!activeGraphCategories.hasInit) {
+      // Everything on, not a hardcoded pair. Pre-selecting People + Client was
+      // written before the graph was scoped, and left a first-time visitor
+      // looking at an almost empty canvas with no indication why.
+      categories.forEach(c => activeGraphCategories.add(c));
+      activeGraphCategories.hasInit = true;
     }
 
     const chipsHtml = categories.map(cat => {
@@ -1945,14 +1966,14 @@ npm install @modelcontextprotocol/sdk</code></pre>
               </div>
             </div>
             <div class="fact-edit-field">
-              <label>Related clients</label>
+              <label>Related clients &amp; projects</label>
               <div style="display:flex; flex-wrap:wrap; gap:.35rem; align-items:center; margin-top:.35rem; min-height:2rem;">
-                ${(m.relevantClients || []).filter(rc => rc.id !== m.clientId).map(rc => `
-                  <span class="scope-chip scope-chip--relevant">${escHtml(rc.name)}
+                ${(m.relevantClients || []).filter(rc => rc.id !== m.clientId && rc.id !== m.contextId).map(rc => `
+                  <span class="scope-chip scope-chip--relevant">${rc.kind === 'context' ? '📁 ' : ''}${escHtml(rc.name)}
                     <button class="scope-chip-remove" type="button" onclick="_factRemoveRelevant('${m.id}','${rc.id}')" title="Remove">×</button>
                   </span>
-                `).join('') || '<span style="font-size:.8rem; color:var(--muted);">No related clients.</span>'}
-                <button class="scope-chip scope-chip--add" type="button" onclick="_factAddRelevant(this,'${m.id}')" title="Add related client">＋</button>
+                `).join('') || '<span style="font-size:.8rem; color:var(--muted);">No related clients or projects.</span>'}
+                <button class="scope-chip scope-chip--add" type="button" onclick="_factAddRelevant(this,'${m.id}')" title="Add related client or project">＋</button>
               </div>
             </div>
             <div id="ep-meta-section" style="margin:.5rem 0;"></div>
@@ -1976,8 +1997,8 @@ npm install @modelcontextprotocol/sdk</code></pre>
               <div class="fact-detail-scope diary-scope-row" style="display:flex; flex-wrap:wrap; gap:.4rem; margin-top:.35rem; align-items:center;">
                 <button class="scope-chip scope-chip--client" onclick="_factPickClient(this,'${m.id}')" title="Click to change client">🏢 ${m.clientName ? escHtml(m.clientName) + ((clientListCache.find(c=>c.id===m.clientId)||{}).crossClient ? ' [cross]' : '') : '—'}</button>
                 <button class="scope-chip scope-chip--project" onclick="_factPickProject(this,'${m.id}')" title="Click to change project">📁 ${m.contextName ? escHtml(m.contextName) : '—'}</button>
-                ${(m.relevantClients || []).filter(rc => rc.id !== m.clientId).map(rc => `<span class="scope-chip scope-chip--relevant">${escHtml(rc.name)}<button class="scope-chip-remove" onclick="_factRemoveRelevant('${m.id}','${rc.id}')" title="Remove">×</button></span>`).join('')}
-                <button class="scope-chip scope-chip--add" onclick="_factAddRelevant(this,'${m.id}')" title="Add related client">＋</button>
+                ${(m.relevantClients || []).filter(rc => rc.id !== m.clientId && rc.id !== m.contextId).map(rc => `<span class="scope-chip scope-chip--relevant">${rc.kind === 'context' ? '📁 ' : ''}${escHtml(rc.name)}<button class="scope-chip-remove" onclick="_factRemoveRelevant('${m.id}','${rc.id}')" title="Remove">×</button></span>`).join('')}
+                <button class="scope-chip scope-chip--add" onclick="_factAddRelevant(this,'${m.id}')" title="Add related client or project">＋</button>
               </div>
             </div>
             <div style="display:flex; gap:.25rem; align-items:center; flex-shrink:0;">
@@ -2222,6 +2243,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
       { icon: '✏️', label: 'Edit',                  action: '_diaryMenuEdit' },
       { icon: '📋', label: 'Copy MD',               action: '_diaryMenuCopyMd' },
       { separator: true },
+      { icon: '🕸️', label: 'Show in Graph',          action: '_diaryMenuGraph' },
       { icon: '👥', label: 'Extract participants',  action: '_diaryMenuExtractPeople' },
       { icon: '🔄', label: 'Reload',                action: '_diaryMenuReload' },
       { icon: '🔀', label: 'Reclassify scope',      action: '_diaryMenuReclassify' },
@@ -2231,6 +2253,9 @@ npm install @modelcontextprotocol/sdk</code></pre>
   }
   function _diaryMenuEdit()   { if (_diaryMenuId) renderDiaryEditMode(_diaryMenuId); }
   function _diaryMenuCopyMd() { if (_diaryMenuId) { const e = diaryEntries.find(x=>x.id===_diaryMenuId); if (e) copyDiaryMd(e); } }
+  // A diary entry had no route into the graph at all, so "show on graph" did
+  // nothing for one of the two things it can be done from.
+  function _diaryMenuGraph()  { if (_diaryMenuId) addToBuildGraph(_diaryMenuId); }
   function _diaryMenuDelete() { if (_diaryMenuId) deleteDiaryEntry(_diaryMenuId); }
   async function _diaryMenuReload() {
     if (!_diaryMenuId) return;
@@ -2554,10 +2579,19 @@ npm install @modelcontextprotocol/sdk</code></pre>
     };
 
     await waitForNetwork();
-    if (network) {
-      network.focus(id, { scale: 1.5, animation: { duration: 1000, easingFunction: 'easeInOutQuad' } });
-      network.selectNodes([id]);
+    if (!network) {
+      toast('⚠️ Graph did not load');
+      return;
     }
+    // Focusing an id that is not in the DataSet silently does nothing, so the
+    // tab changed and the canvas looked identical -- which reads as "the button
+    // did not work". Say which filter is responsible instead.
+    if (!graphData.nodes.get(id)) {
+      toast('⚠️ Not in the current graph — it is outside the selected client / project / categories');
+      return;
+    }
+    network.focus(id, { scale: 1.5, animation: { duration: 1000, easingFunction: 'easeInOutQuad' } });
+    network.selectNodes([id]);
   }
 
   async function saveEdit(id) {
@@ -3059,7 +3093,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
         <button class="scope-chip scope-chip--client" onclick="_diaryPickClient(this,'${entry.id}')" title="Click to change client">🏢 ${entry.clientName ? escHtml(entry.clientName) + ((clientListCache.find(c=>c.id===entry.clientId)||{}).crossClient ? ' [cross]' : '') : '—'}</button>
         <button class="scope-chip scope-chip--project" onclick="_diaryPickProject(this,'${entry.id}')" title="Click to change project">📁 ${entry.contextName ? escHtml(entry.contextName) : '—'}</button>
         <span style="font-size:.75rem;color:var(--muted);margin-left:.25rem;">🔗</span>
-        ${(entry.relevantClients||[]).filter(rc=>rc.id!==entry.clientId).map(rc=>`<span class="scope-chip scope-chip--relevant">${escHtml(rc.name)}<button class="scope-chip-remove" onclick="_diaryRemoveRelevant('${entry.id}','${rc.id}')" title="Remove">×</button></span>`).join('')}
+        ${(entry.relevantClients||[]).filter(rc=>rc.id!==entry.clientId && rc.id!==entry.contextId).map(rc=>`<span class="scope-chip scope-chip--relevant">${rc.kind === 'context' ? '📁 ' : ''}${escHtml(rc.name)}<button class="scope-chip-remove" onclick="_diaryRemoveRelevant('${entry.id}','${rc.id}')" title="Remove">×</button></span>`).join('')}
         <button class="scope-chip scope-chip--add" onclick="_diaryAddRelevant(this,'${entry.id}')" title="Add relevant client">＋</button>
       </div>
       <div class="markdown-body">${marked.parse(entry.content || '')}</div>
@@ -3189,28 +3223,44 @@ npm install @modelcontextprotocol/sdk</code></pre>
     });
   }
 
+  // Related entries can be a client or a project. Both are RELEVANT_TO targets,
+  // so the picker used to show only clients because that was all it enumerated
+  // -- a fact could never be marked related to a project.
+  function _relatedCandidates(record) {
+    const existing = new Set((record.relevantClients || []).map(rc => rc.id));
+    const taken = new Set([record.clientId, record.contextId].filter(Boolean));
+    const items = [];
+    for (const c of clientListCache) {
+      if (taken.has(c.id) || existing.has(c.id)) continue;
+      items.push({
+        label: (c.effectiveActive !== false ? '🟢 ' : '⚪ ') + c.name + (c.crossClient ? ' [cross]' : ''),
+        value: c.id, kind: 'client'
+      });
+      for (const ctx of (c.contexts || [])) {
+        if (!ctx.id || taken.has(ctx.id) || existing.has(ctx.id)) continue;
+        items.push({ label: '   📁 ' + ctx.name, value: ctx.id, kind: 'context' });
+      }
+    }
+    return items;
+  }
+
   async function _factAddRelevant(anchorEl, factId) {
     await ensureClients();
     const fact = memories.find(m => m.id === factId);
     if (!fact) return;
-    const existing = new Set((fact.relevantClients || []).map(rc => rc.id));
-    const candidates = clientListCache.filter(c => c.id !== fact.clientId && !existing.has(c.id));
-    if (!candidates.length) { toast('No other clients to add'); return; }
-    const items = candidates.map(c => ({
-      label: (c.effectiveActive !== false ? '🟢 ' : '⚪ ') + c.name + (c.crossClient ? ' [cross]' : ''),
-      value: c.id
-    }));
+    const items = _relatedCandidates(fact);
+    if (!items.length) { toast('No other clients or projects to add'); return; }
     _showScopePopup(anchorEl, items, async val => {
       try {
         await api.post('memories/' + factId + '/relevant', { clientId: val });
-        const c = clientListCache.find(x => x.id === val);
-        if (c) {
+        const picked = items.find(i => i.value === val);
+        if (picked) {
           if (!fact.relevantClients) fact.relevantClients = [];
-          fact.relevantClients.push({ id: c.id, name: c.name });
+          fact.relevantClients.push({ id: picked.value, name: picked.label.replace(/^\s*(🟢|⚪)\s*/, '').replace(/^📁\s*/, ''), kind: picked.kind });
         }
         renderMemories();
         renderFactPane(fact);
-      } catch(e) { toast('❌ Could not add related client'); }
+      } catch(e) { toast('❌ Could not add related entry'); }
     });
   }
 
@@ -3222,7 +3272,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
       if (fact.relevantClients) fact.relevantClients = fact.relevantClients.filter(rc => rc.id !== clientId);
       renderMemories();
       renderFactPane(fact);
-    } catch(e) { toast('❌ Could not remove related client'); }
+    } catch(e) { toast('❌ Could not remove related entry'); }
   }
 
   async function _diaryPickProject(anchorEl, entryId) {
@@ -3251,24 +3301,18 @@ npm install @modelcontextprotocol/sdk</code></pre>
     await ensureClients();
     const entry = diaryEntries.find(e => e.id === entryId);
     if (!entry) return;
-    const existing = new Set((entry.relevantClients || []).map(rc => rc.id));
-    // Exclude: primary client AND already-added relevant clients
-    const candidates = clientListCache.filter(c => c.id !== entry.clientId && !existing.has(c.id));
-    if (!candidates.length) { toast('No other clients to add'); return; }
-    const items = candidates.map(c => ({
-      label: (c.effectiveActive !== false ? '🟢 ' : '⚪ ') + c.name + (c.crossClient ? ' [cross]' : ''),
-      value: c.id
-    }));
+    const items = _relatedCandidates(entry);
+    if (!items.length) { toast('No other clients or projects to add'); return; }
     _showScopePopup(anchorEl, items, async val => {
       try {
         await api.post('diary/' + entryId + '/relevant', { clientId: val });
-        const c = clientListCache.find(x => x.id === val);
-        if (c) {
+        const picked = items.find(i => i.value === val);
+        if (picked) {
           if (!entry.relevantClients) entry.relevantClients = [];
-          entry.relevantClients.push({ id: c.id, name: c.name });
+          entry.relevantClients.push({ id: picked.value, name: picked.label.replace(/^\s*(🟢|⚪)\s*/, '').replace(/^📁\s*/, ''), kind: picked.kind });
         }
         renderDiaryEntryView(entry);
-      } catch(e) { toast('❌ Could not add relevant client'); }
+      } catch(e) { toast('❌ Could not add relevant entry'); }
     });
   }
 
@@ -3698,34 +3742,87 @@ npm install @modelcontextprotocol/sdk</code></pre>
 
   // Declared at top of script to allow loadSessionState initialization
 
-  async function loadGraph() {
-    const container = document.getElementById('graph-container');
-    container.innerHTML = '<p class="empty">Loading graph...</p>';
-    try {
-      const data = await api.get('graph');
-      graphLoaded = true;
+// The graph used to ignore the client/project selection entirely, so a scoped
+// session still drew the whole vault. 'all' and 'active' are list-level
+// shorthands, not node ids, so they must not be sent as one.
+function graphScopeParams() {
+  const params = {};
+  if (clientFilter && clientFilter !== 'all' && clientFilter !== 'active') params.clientId = clientFilter;
+  if (contextFilter) params.contextId = contextFilter;
+  return params;
+}
+
+// 'active' means "every client that is not archived", which is a node set the
+// server cannot derive from a single id. Resolve it to real ids.
+function graphScopeClientIds() {
+  if (clientFilter === 'active') {
+    return clientListCache.filter(c => c.active !== false && c.active !== 0).map(c => c.id);
+  }
+  if (clientFilter && clientFilter !== 'all') return [clientFilter];
+  return [];
+}
+
+function nodeInCategory(n) {
+  if (!activeGraphCategories || activeGraphCategories.size === 0) return true;
+  if (n.label === 'Category') return activeGraphCategories.has(n.name);
+  return activeGraphCategories.has(n.group);
+}
+
+async function loadGraph() {
+  const container = document.getElementById('graph-container');
+  container.innerHTML = '<p class="empty">Loading graph...</p>';
+  try {
+    const data = await api.get('graph', graphScopeParams());
+    graphLoaded = true;
       container.innerHTML = '';
 
       let nodesToKeep = new Set();
-      const allActive = activeGraphCategories.size === 0;
+
+      // 'active' spans several clients, which is not a single node id, so the
+      // server cannot filter it. The scope edges are in the response, so resolve
+      // it here: a record is in scope when it is joined to one of the wanted
+      // client or context nodes. Direction-agnostic, because an edge is drawn
+      // from either end depending on its arrow setting.
+      const wantedClients = new Set(graphScopeClientIds());
+      const wantedContexts = new Set(contextFilter ? [contextFilter] : []);
+      const labelById = {};
+      for (const n of data.nodes) labelById[n.id] = n.label;
+      const scopeMembers = new Map();   // scope node id -> Set of record ids
+      if (wantedClients.size || wantedContexts.size) {
+        for (const e of data.edges) {
+          for (const [a, b] of [[e.from, e.to], [e.to, e.from]]) {
+            const la = labelById[a], lb = labelById[b];
+            const wanted = (la === 'Client' && wantedClients.has(a))
+                        || (la === 'Context' && wantedContexts.has(a));
+            if (wanted && lb === 'Fact') {
+              if (!scopeMembers.has(a)) scopeMembers.set(a, new Set());
+              scopeMembers.get(a).add(b);
+            }
+          }
+        }
+      }
+      const inSelectedScope = (n) => {
+        if (n.label !== 'Fact') return true;
+        if (!scopeMembers.size) return true;
+        for (const ids of scopeMembers.values()) if (ids.has(n.id)) return true;
+        return false;
+      };
 
       const filteredDataNodes = data.nodes.filter(n => {
-        if (allActive) {
-            nodesToKeep.add(n.id);
-            return true;
+        if (n.label === 'Client') {
+          if (wantedClients.size && !wantedClients.has(n.id)) return false;
+          nodesToKeep.add(n.id);
+          return true;
         }
-        if (n.label === 'Category') {
-            if (activeGraphCategories.has(n.name)) {
-                nodesToKeep.add(n.id);
-                return true;
-            }
-            return false;
+        if (n.label === 'Context') {
+          if (wantedContexts.size && !wantedContexts.has(n.id)) return false;
+          nodesToKeep.add(n.id);
+          return true;
         }
-        if (activeGraphCategories.has(n.group)) {
-            nodesToKeep.add(n.id);
-            return true;
-        }
-        return false;
+        if (!inSelectedScope(n)) return false;
+        if (!nodeInCategory(n)) return false;
+        nodesToKeep.add(n.id);
+        return true;
       });
 
       graphData.nodes = new vis.DataSet(filteredDataNodes.map(n => ({
@@ -3751,15 +3848,18 @@ npm install @modelcontextprotocol/sdk</code></pre>
 
 
       if (isBuildMode && buildGraphNodes.size > 0) {
+        // Built from the scoped + category-filtered set, not data.nodes raw, or
+        // build mode would re-introduce every node the filters just removed.
         const filteredNodes = new vis.DataSet(
-          data.nodes.filter(n => buildGraphNodes.has(n.id)).map(n => ({
+          filteredDataNodes.filter(n => buildGraphNodes.has(n.id)).map(n => ({
             id: n.id,
             label: n.label === 'Category' ? n.name : (n.label === 'DiaryEntry' ? n.name : truncateText(n.name, 20)),
             name: n.name,
             group: n.group,
-            shape: n.label === 'Category' ? 'box' : 'dot',
-            size: n.label === 'Category' ? 20 : 10,
-            font: { size: 12, face: 'Inter' }
+            shape: n.label === 'Category' ? 'box' : (n.label === 'DiaryEntry' ? 'diamond' : 'dot'),
+            size: n.label === 'Category' ? 20 : (n.label === 'DiaryEntry' ? 15 : 10),
+            font: { size: 12, face: 'Inter' },
+            color: n.label === 'DiaryEntry' ? { background: '#fbbf24', border: '#b45309' } : undefined
           }))
         );
         const filteredEdges = new vis.DataSet(
@@ -3780,6 +3880,23 @@ npm install @modelcontextprotocol/sdk</code></pre>
         container.innerHTML = '<p class="empty" style="padding-top: 3rem;">Select a memory and click "📍 Show on map" to start building your graph.</p>';
       } else {
         initNetwork(graphData);
+      }
+
+      // The server caps the graph so vis.js is not handed thousands of nodes.
+      // Saying so is the difference between "this is the graph" and "you are
+      // looking at a fragment of it and did not know".
+      const banner = document.getElementById('graph-truncation-note');
+      if (banner) {
+        if (data.truncated) {
+          const shown = filteredDataNodes.length;
+          banner.style.display = '';
+          banner.innerHTML = 'Showing the <strong>' + shown + ' most connected</strong> of ' +
+            (data.total || 0) + ' records in scope. Raise <code>MEM_GRAPH_MAX_NODES</code> ' +
+            'or narrow the client / project / category filter to see more.';
+        } else {
+          banner.style.display = 'none';
+          banner.innerHTML = '';
+        }
       }
     } catch(e) {
       const container = document.getElementById('graph-container');
@@ -4083,42 +4200,47 @@ let contextMenu = null;
     }
 
     try {
-      const focusData = await api.get('graph/focus/' + id);
+      const scope = graphScopeParams();
+      const focusData = await api.get('graph/focus/' + id, scope);
 
       buildGraphNodes.add(focusData.center.id);
 
+      // "Show all connected" must add only what the current filters admit,
+      // otherwise picking a client and then expanding a node quietly brings
+      // back everything that filter was hiding.
+      const hiddenByCategory = [];
       const newNodes = [];
       for (const node of focusData.nodes) {
-        if (!buildGraphNodes.has(node.id)) {
-          buildGraphNodes.add(node.id);
-          newNodes.push({
-            id: node.id,
-            label: truncateText(node.name, 20),
-            name: node.name,
-            group: node.category,
-            shape: 'dot',
-            size: 10,
-            font: { size: 12, face: 'Inter' }
-          });
-        }
+        if (buildGraphNodes.has(node.id)) continue;
+        if (!nodeInCategory(node)) { hiddenByCategory.push(node.name || node.id); continue; }
+        buildGraphNodes.add(node.id);
+        newNodes.push({
+          id: node.id,
+          label: truncateText(node.name, 20),
+          name: node.name,
+          group: node.category,
+          shape: 'dot',
+          size: 10,
+          font: { size: 12, face: 'Inter' }
+        });
       }
 
       const connData = await api.get('graph/connections/' + id);
 
       for (const [relType, connections] of Object.entries(connData)) {
         for (const conn of connections) {
-          if (!buildGraphNodes.has(conn.id)) {
-            buildGraphNodes.add(conn.id);
-            newNodes.push({
-              id: conn.id,
-              label: truncateText(conn.name, 20),
-              name: conn.name,
-              group: conn.category,
-              shape: 'dot',
-              size: 10,
-              font: { size: 12, face: 'Inter' }
-            });
-          }
+          if (buildGraphNodes.has(conn.id)) continue;
+          if (!nodeInCategory(conn)) { hiddenByCategory.push(conn.name || conn.id); continue; }
+          buildGraphNodes.add(conn.id);
+          newNodes.push({
+            id: conn.id,
+            label: truncateText(conn.name, 20),
+            name: conn.name,
+            group: conn.category,
+            shape: 'dot',
+            size: 10,
+            font: { size: 12, face: 'Inter' }
+          });
         }
       }
 
@@ -4134,7 +4256,8 @@ let contextMenu = null;
         }
       }, 300);
 
-      toast('📍 Added to map');
+      toast('📍 Added to map'
+        + (hiddenByCategory.length ? ' (' + hiddenByCategory.length + ' hidden by the category filter)' : ''));
     } catch(e) {
       toast('⚠️ Error loading node: ' + e.message);
     }
@@ -4156,14 +4279,17 @@ let contextMenu = null;
     }
 
     try {
-      const neighbors = await api.get('graph/neighbors/' + nodeId);
+      const neighbors = await api.get('graph/neighbors/' + nodeId, graphScopeParams());
 
+      // The category filter applies here too. It never did, which is why
+      // "show all connected" pulled in nodes the user had just filtered out.
       let addedCount = 0;
+      let skipped = 0;
       for (const neighbor of neighbors) {
-        if (!buildGraphNodes.has(neighbor.id)) {
-          buildGraphNodes.add(neighbor.id);
-          addedCount++;
-        }
+        if (buildGraphNodes.has(neighbor.id)) continue;
+        if (!nodeInCategory(neighbor)) { skipped++; continue; }
+        buildGraphNodes.add(neighbor.id);
+        addedCount++;
       }
 
       updateBuildStatus();
@@ -4176,7 +4302,12 @@ let contextMenu = null;
         }
       }, 500);
 
-      toast('🔗 Added ' + addedCount + ' connected node' + (addedCount !== 1 ? 's' : ''));
+      if (addedCount === 0 && skipped > 0) {
+        toast('🔗 Nothing added — all ' + skipped + ' connected node' + (skipped !== 1 ? 's are' : ' is') + ' outside the selected categories');
+      } else {
+        toast('🔗 Added ' + addedCount + ' connected node' + (addedCount !== 1 ? 's' : '')
+          + (skipped ? ' (' + skipped + ' outside the selected categories)' : ''));
+      }
     } catch(e) {
       toast('⚠️ Error: ' + e.message);
     }
@@ -4186,15 +4317,16 @@ let contextMenu = null;
     hideContextMenu();
 
     try {
-      const connections = await api.get('graph/connections/' + nodeId);
+      const connections = await api.get('graph/connections/' + nodeId, graphScopeParams());
       const connList = connections[relType] || [];
 
       let addedCount = 0;
+      let skipped = 0;
       for (const conn of connList) {
-        if (!buildGraphNodes.has(conn.id)) {
-          buildGraphNodes.add(conn.id);
-          addedCount++;
-        }
+        if (buildGraphNodes.has(conn.id)) continue;
+        if (!nodeInCategory(conn)) { skipped++; continue; }
+        buildGraphNodes.add(conn.id);
+        addedCount++;
       }
 
       updateBuildStatus();
@@ -4207,7 +4339,8 @@ let contextMenu = null;
         }
       }, 300);
 
-      toast(`🔗 Added ${addedCount} node${addedCount !== 1 ? 's' : ''} via ${relType}`);
+      toast(`🔗 Added ${addedCount} node${addedCount !== 1 ? 's' : ''} via ${relType}`
+        + (skipped ? ` (${skipped} outside the selected categories)` : ''));
     } catch(e) {
       toast('⚠️ Error: ' + e.message);
     }
