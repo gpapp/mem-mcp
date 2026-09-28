@@ -413,9 +413,16 @@ _SCOPE_SYSTEM = (
     "return null for context. The order contexts are listed in is not a ranking — "
     "never pick one because it comes first. If the item names no project at all, "
     "null is the only correct answer. "
-    "IMPORTANT: a client listed as '(no contexts)' is a normal, valid choice, not "
-    "a dead end. Do not prefer a client merely because it can supply a context "
-    "name that the other option cannot. "
+    "IMPORTANT: pick the client first, then read its context from that same "
+    "line. The context must be one of the projects listed after the client you "
+    "chose, or null. Never take a project from another client's line — the two "
+    "lines are unrelated lists. A client whose line ends in '(none)' has no "
+    "project at all, so choosing it forces context to be null. "
+    "IMPORTANT: a client whose line ends in '(none)' is a normal, valid choice, "
+    "not a dead end. If you choose such a client, the context MUST be null; it "
+    "has no project to name and there is nothing to copy from its line. Do not "
+    "prefer a client merely because it can supply a context name that the other "
+    "option cannot. "
     "Put a client in \"related\" when the item is genuinely about that client too "
     "(it is a second subject, or a system that client owns and this item discusses). "
     "Do not put the chosen client in \"related\", and do not put a client there "
@@ -611,8 +618,23 @@ async def _classify_scope(item_text: str, clients: list) -> tuple:
     """
     scope_lines = []
     for c in clients:
-        ctxs = ", ".join(x["name"] for x in c.get("contexts", [])) or "(no contexts)"
-        scope_lines.append(f"- {c['name']} [contexts: {ctxs}]")
+        ctxs = [x["name"] for x in c.get("contexts", []) if x.get("name")]
+        # Contexts sit on the client's OWN line, and a client with no projects
+        # says so in its own words.
+        #
+        # Two earlier forms both produced a context belonging to a DIFFERENT
+        # client. `[contexts: a, b]` on a separate bracket, and the even older
+        # `(no contexts)` placeholder, both let the model lift any project line
+        # out of the list and attach it to whichever client it picked — the
+        # evidence for that pairing was never on one line, so nothing told it
+        # otherwise. Measured on the SAP RAM/GRC entry: SAP SE is the right
+        # client and has no projects, and the bracket form answered
+        # {"client": "SAP SE", "context": "DB AI Adoption"} — a Deutsche Bank
+        # project. Prose rules did not fix it in four separate variants. The
+        # model copies evidence, and the pairing has to be visible in it.
+        line = f"- {c['name']}"
+        line += f": {', '.join(ctxs)}" if ctxs else ": (none)"
+        scope_lines.append(line)
     scope_block = "\n".join(scope_lines)
 
     # No truncation here. The caller has already split the item into windows,
@@ -666,9 +688,32 @@ async def _classify_scope(item_text: str, clients: list) -> tuple:
             # returns a name, not the node, and the context list hangs off it.
             client = next((c for c in clients if c["name"] == matched_client), None)
             if client:
-                resolved_context, _ = resolve_scope_name(
-                    context_name, [x["name"] for x in client.get("contexts", [])]
-                )
+                if not client.get("contexts"):
+                    # The client has no projects at all, so there is nothing the
+                    # context could name. This is enforced here rather than left
+                    # to the prompt because the model has now lifted three
+                    # different strings out of the client list and returned each
+                    # one as the context: "(no contexts)", "DB AI Adoption" (a
+                    # different client's project) and "(none)". Prose rules and
+                    # reworded evidence all failed; the client is right and only
+                    # the context needs discarding, so discard it.
+                    logger.info(
+                        f"[scope_backfill] {matched_client!r} has no projects, so the "
+                        f"answered context {context_name!r} is dropped"
+                    )
+                else:
+                    resolved_context, _ = resolve_scope_name(
+                        context_name, [x["name"] for x in client.get("contexts", [])]
+                    )
+                    if not resolved_context:
+                        # A context that is not on the chosen client's own list
+                        # belongs to a different client. The client/context pair
+                        # is the only thing the answer is trusted for, and a
+                        # cross-client pair is not one of them.
+                        logger.info(
+                            f"[scope_backfill] {context_name!r} is not a project of "
+                            f"{matched_client!r} — dropped as a cross-client match"
+                        )
         return matched_client, resolved_context, related, True
     except Exception as exc:
         logger.warning(f"[scope_backfill] classification failed: {type(exc).__name__}: {exc}")

@@ -1,3 +1,4 @@
+import ast
 import asyncio
 import json
 import os
@@ -1144,8 +1145,20 @@ class NullableScopePromptTests(unittest.TestCase):
             names = [t.id for t in targets if isinstance(t, ast.Name)]
             if "_SCOPE_SYSTEM" in names:
                 cls.prompt = ast.literal_eval(node.value)
-                return
-        raise AssertionError("migrate_client_context no longer defines _SCOPE_SYSTEM")
+                break
+        else:
+            raise AssertionError("migrate_client_context no longer defines _SCOPE_SYSTEM")
+
+        cls.source = source
+        cls.tree = tree
+
+    @classmethod
+    def _fn(cls, name):
+        """Source of one top-level function, for the code-level guards."""
+        for node in cls.tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+                return ast.get_source_segment(cls.source, node)
+        raise AssertionError(f"migrate_client_context no longer defines {name}()")
 
     def test_a_null_answer_is_described_as_correct_and_expected(self):
         self.assertTrue(
@@ -1162,9 +1175,58 @@ class NullableScopePromptTests(unittest.TestCase):
 
     def test_a_client_with_no_contexts_is_not_a_dead_end(self):
         self.assertTrue(
-            "(no contexts)' is a normal, valid choice" in self.prompt,
+            "'(none)' is a normal, valid choice" in self.prompt,
             msg="SAP SE has no contexts and EPAM has three; without this the "
                 "model picks whichever client can supply a context name",
+        )
+
+    def test_choosing_a_contextless_client_forces_a_null_context(self):
+        self.assertTrue(
+            "the context MUST be null" in self.prompt,
+            msg="a client with no projects has no context to name; without this "
+                "the model copies whatever its line contains",
+        )
+
+    def test_the_code_drops_a_context_for_a_client_with_no_projects(self):
+        """The prompt is not the guarantee; this is.
+
+        The model has lifted three different strings out of the client list and
+        returned each as the context value, so reworded evidence is not a fix.
+        The stored pair is decided here instead: a client with no projects cannot
+        have a context, whatever the model said.
+        """
+        seg = self._fn("_classify_scope")
+        self.assertTrue(
+            "if not client.get(\"contexts\")" in seg
+            and "resolved_context, _ = resolve_scope_name(" in seg,
+            msg="_classify_scope must consult the chosen client's own project "
+                "list before keeping a context",
+        )
+        # The keep must be inside the else, i.e. gated on the client having one.
+        self.assertTrue(
+            "else:" in seg,
+            msg="without an else the resolve call is reached regardless",
+        )
+
+    def test_the_context_must_come_from_the_chosen_clients_own_line(self):
+        self.assertTrue(
+            "Never take a project from another client's line" in self.prompt,
+            msg="the observed failure was SAP SE answered with DB AI Adoption, "
+                "which is Deutsche Bank's project and was never on SAP SE's line",
+        )
+
+    def test_the_old_placeholder_is_gone_from_the_prompt(self):
+        """The placeholder was the bug: the model copied it into the answer.
+
+        The client line now reads "- SAP SE: (none)". Every earlier form let the
+        model attach a project belonging to a DIFFERENT client, because the
+        pairing was never visible on one line.
+        """
+        self.assertFalse(
+            "(no contexts)" in self.prompt
+            or "[contexts:" in self.prompt,
+            msg="this exact string was returned as the context value in "
+                "production; the client list must render absence by omission",
         )
 
     def test_the_own_client_tag_is_described_as_the_weakest_evidence(self):
