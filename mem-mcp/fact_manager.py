@@ -2059,11 +2059,13 @@ def db_get_graph(user_id: str, client_id: str = "", context_id: str = "", limit:
                     "name": d_node.get("title") or d_node.get("content", ""),
                     "group": "Diary"
                 }
-            # Seeded from the properties and overwritten by the FOR_CLIENT /
-            # IN_CONTEXT passes below, which run later. The property is the
-            # classifier's denormalised copy of an edge it may not have
-            # written yet, so it is a fallback rather than the authority.
-            diary_scope[d_id] = [d_node.get("clientId") or "", d_node.get("contextId") or ""]
+            # Seeded empty and filled by the FOR_CLIENT / IN_CONTEXT passes
+            # below. There is deliberately no read of a clientId property here:
+            # a Fact or DiaryEntry never has one in Neo4j. clientId is a Qdrant
+            # payload key, and the only thing that writes scope in the graph is
+            # the edge. Reading the property returned None for every entry, so
+            # every diary entry was unscoped and a client filter dropped the lot.
+            diary_scope.setdefault(d_id, ["", ""])
             f_node = dr["f"]
             rel = dr["rel_type"]
             if f_node and rel:
@@ -2190,11 +2192,12 @@ def _scope_and_cap_graph(node_map, edges, fact_clients, fact_contexts, diary_sco
                          client_id, context_id, limit):
     """Drop out-of-scope records, cap the size, and drop the edges left dangling.
 
-    Split out of ``db_get_graph`` so the policy is readable on its own. Filtering
-    on relationship membership rather than the ``clientId`` property matters:
-    the property is written by the scope classifier and can lag the edge it
-    mirrors, and a fact that lost its link must disappear from the filtered view
-    immediately rather than on the next reclassify.
+    Split out of ``db_get_graph`` so the policy is readable on its own. Every
+    record scopes through its ``FOR_CLIENT`` / ``IN_CONTEXT`` edge and nothing
+    else: a Fact or DiaryEntry carries no ``clientId`` property in Neo4j, so
+    reading one yields None for every record. Membership by edge is also what
+    makes a just-unlinked fact leave the view immediately rather than on the
+    next reclassify.
     """
     def in_scope(node):
         label = node.get("label")

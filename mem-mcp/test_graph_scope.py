@@ -239,14 +239,14 @@ class NeighborhoodScopeTests(unittest.TestCase):
 class DiaryScopeSourceTests(unittest.TestCase):
     """Diary scope must come from the edges, like every other record.
 
-    ``db_get_graph`` reads a fact's client from its ``FOR_CLIENT`` edge but used
-    to read a diary entry's from the denormalised ``clientId`` property. Those
-    are not the same thing: the property is the classifier's cached copy of an
-    edge it has not necessarily written yet, so a reclassified diary entry sat
-    in the previous client's graph until the next boot reconciled it. Worse,
-    the ``FOR_CLIENT``/``IN_CONTEXT`` passes matched ``:Fact`` only, so a diary
-    entry's scope edge produced no graph edge at all and the property was the
-    only scope it could ever have.
+    ``db_get_graph`` reads a fact's client from its ``FOR_CLIENT`` edge but read
+    a diary entry's from a ``clientId`` property. No Fact or DiaryEntry node has
+    that property in Neo4j -- scope lives on the ``FOR_CLIENT``/``IN_CONTEXT``
+    edges, and ``clientId`` is only ever a Qdrant payload key. So the read
+    returned None for every entry, every diary entry came out unscoped, and a
+    client or project filter dropped all of them. Separately, the two scope
+    passes matched ``:Fact`` only, so a diary entry's scope edge produced no
+    graph edge at all.
     """
 
     @classmethod
@@ -276,16 +276,27 @@ class DiaryScopeSourceTests(unittest.TestCase):
                 f"read from the stale property",
             )
 
-    def test_diary_scope_is_seeded_from_the_property_and_overwritten_by_the_edges(self):
-        """The property seeds the dict; the edge passes must be able to replace it."""
-        self.assertTrue(
-            'diary_scope[d_id] = [d_node.get("clientId") or "", d_node.get("contextId") or ""]'
-            in self.body,
-            "diary_scope is no longer seeded from the DiaryEntry properties",
+    def test_diary_scope_comes_only_from_the_edges(self):
+        """No property read, and the edge passes must write into it.
+
+        The original read ``d_node.get("clientId")``. A Fact or DiaryEntry never
+        has a clientId property in Neo4j -- it is a Qdrant payload key -- so that
+        read returned None for every entry, every diary entry came out unscoped,
+        and a client filter dropped all of them. Pinning the absence of the read
+        is the point: a "harmless fallback" that can never hold anything is not a
+        fallback, it is a silent unscoped verdict.
+        """
+        self.assertFalse(
+            'd_node.get("clientId")' in self.body,
+            "db_get_graph reads a clientId property that no Fact or DiaryEntry "
+            "node has; that read is always None and unscopes the entry",
         )
-        # A list, not a tuple: the edge passes assign into it by index, and a
-        # tuple would raise TypeError the first time an edge disagrees with the
-        # property -- which is precisely the case the fix exists for.
+        self.assertFalse(
+            'd_node.get("contextId")' in self.body,
+            "db_get_graph reads a contextId property that no DiaryEntry node has",
+        )
+        # A list, not a tuple: the passes assign into it by index, and a tuple
+        # would raise TypeError the moment the first edge lands.
         self.assertTrue(
             'diary_scope.setdefault(f_node["id"], ["", ""])[0] = c_id' in self.body,
             "the FOR_CLIENT pass no longer writes diary scope",

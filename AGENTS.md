@@ -231,21 +231,21 @@ a fact whose link was just deleted has to leave the filtered view immediately
 rather than on the next reclassify. `gui.py` forwards `clientId` / `contextId`
 on `/api/graph`, `/api/graph/neighbors/{id}` and `/api/graph/focus/{id}`.
 
-**Diary entries are scoped from their edges too.** `db_get_graph` reads a
-diary entry's client from the `clientId` property, but the `FOR_CLIENT` and
-`IN_CONTEXT` passes write it back over the top from the edge. The property is
-seeded first as a fallback, and the property and the edge are the same subject:
-`link_diary_to_client` in `client_manager.py` writes the edge, and
-`db_set_diary_scope` writes both. Scoping diary entries from the property alone
-put a reclassified entry in its previous client's graph until the next boot
-reconciled it, and because the passes matched `:Fact` only, a diary entry's
-scope edge produced no graph edge at all. The label test is
-`node_map[id]["label"] == "Fact"` rather than a label in Cypher, because both
-passes run after every node is in `node_map`. `diary_scope` holds a **list**,
-not a tuple — the edge passes assign into it by index, and a tuple raises
-`TypeError` on the first edge that disagrees with the property, which is exactly
-the case the fallback exists to handle. Guarded by `DiaryScopeSourceTests` and
-`DiaryScopeTests` in `test_graph_scope.py`.
+**Diary entries are scoped from their edges too, and only from their edges.**
+`db_get_graph` used to read a diary entry's client from a `clientId` property.
+**No Fact or DiaryEntry node has that property in Neo4j** — scope lives on the
+`FOR_CLIENT` / `IN_CONTEXT` edges, and `clientId` is only ever a *Qdrant payload*
+key. So that read returned `None` for every entry, every diary entry came out
+unscoped, and a client or project filter dropped all of them. The two scope
+passes also matched `:Fact` only, so a diary entry's scope edge produced no
+graph edge at all. Both now match `Fact` or `DiaryEntry` and the property read
+is gone. The Fact/DiaryEntry test is `node_map[id]["label"] == "Fact"` rather
+than a label in Cypher, because both passes run after every node is in
+`node_map`. `diary_scope` holds a **list**, not a tuple, because the passes
+assign into it by index and a tuple raises `TypeError` on the first edge. The
+`r["clientId"]` reads in `fact_manager` / `diary_manager` are fine — those are
+Cypher `AS clientId` aliases off the edges, not properties. Guarded by
+`DiaryScopeSourceTests` and `DiaryScopeTests` in `test_graph_scope.py`.
 
 Client, Context and Category nodes are **always** kept under a scope filter. A
 graph that has been filtered to one client and then omits that client's node
