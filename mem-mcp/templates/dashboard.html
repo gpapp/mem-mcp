@@ -421,6 +421,81 @@
     .cf-ctx:hover { background: var(--primary-light); color: var(--primary); }
     .cf-ctx.active { background: var(--primary-light); color: var(--primary); font-weight: 600; }
     .cf-ctx.active::before { content: '✓'; font-size: .7rem; margin-right: 4px; }
+
+    /* Was an inline style on the markup, which put it beyond the reach of
+       any media query. Declared here so the mobile block can collapse it. */
+    .graph-layout { display: flex; gap: 1rem; }
+
+    /* ── Mobile ──────────────────────────────────────────────────────────
+       Three page layouts are built as fixed-width columns: memories is
+       180px + 280px + flex, diary 220px + flex, graph 200px + flex. None
+       of that fits a phone -- the widest column plus padding is already
+       over a small screen before the content column gets a pixel.
+
+       Each pane also sits inside `height: calc(100vh - Npx)` with its own
+       `overflow-y: auto`, so on touch the page itself cannot scroll: you
+       drag inside a pane that may be one line tall. Below 900px the
+       columns stack and the page becomes a single document again. */
+    @media (max-width: 900px) {
+      /* iOS zooms the viewport on focus for any control under 16px, and
+         the zoom cannot be undone without a reload, so the form never
+         recovers its layout. 16px is the threshold, not a preference. */
+      input, textarea, select { font-size: 16px; }
+      html { -webkit-text-size-adjust: 100%; }
+      /* `clip` rather than `hidden`: hidden makes body a scroll container,
+         which unsticks the nav. clip does not. */
+      body { overflow-x: clip; }
+
+      nav { padding: .6rem .75rem; }
+      nav h1 { font-size: 1rem; }
+
+      /* Tabs scroll sideways instead of wrapping into a wall of buttons. */
+      .tabs { padding: .6rem .5rem .2rem; overflow-x: auto; scrollbar-width: none; }
+      .tabs::-webkit-scrollbar { display: none; }
+      .tab-btn { flex: 0 0 auto; white-space: nowrap; min-height: 40px; }
+
+      .page { padding: .75rem; }
+      #page-memories { padding: .5rem; }
+
+      .memories-layout, .diary-layout, .graph-layout {
+        flex-direction: column; height: auto; min-height: 0; gap: .5rem;
+      }
+      .memories-sidebar, .memories-list-col, .diary-sidebar, .graph-sidebar {
+        width: auto; flex-shrink: 1; border-right: none; padding-right: 0;
+      }
+      /* Undo the per-pane scroll trap. The two that stay scrollable are
+         bounded on purpose -- they are lists, like a dropdown, and a list
+         tall enough to scroll the whole page would bury the detail pane
+         you opened it from. */
+      .memories-sidebar, .memories-main { overflow-y: visible; }
+      .memories-list-col { max-height: 45vh; }
+      .diary-sidebar { max-height: 40vh; overflow-y: auto; }
+      .memories-main { padding: .85rem; }
+
+      /* Chip rows run sideways rather than stacking into a tall rail. */
+      .chips-container { flex-direction: row !important; flex-wrap: nowrap; overflow-x: auto; }
+
+      #graph-container { height: 55vh; min-height: 320px; }
+
+      /* A submenu anchored at left:100% lands off the right edge of a
+         phone with no way to scroll to it. Static stacks it inline. */
+      .submenu-items { position: static; min-width: 0; box-shadow: none; }
+      .context-menu { max-width: calc(100vw - 16px); }
+    }
+
+    @media (max-width: 640px) {
+      .page { padding: .5rem; }
+      /* 28px targets are below the reliable thumb size. */
+      .alpha-btn { width: 36px; height: 36px; }
+      .item-menu-btn { padding: .45rem .6rem; min-height: 36px; }
+      .dedup-cluster-header { flex-direction: column; gap: .3rem; }
+      .link-edit-form input { width: 100%; }
+      .form-row > * { flex: 1 1 100%; }
+      /* The metadata editors are grids of inputs. Squeezing the table to
+         the viewport gives each input about 40px, so the table itself
+         becomes the scroll container and the inputs keep their width. */
+      #meta-editor-table, #de-meta-editor-table { display: block; overflow-x: auto; }
+    }
   </style>
 </head>
 <body onload="init()">
@@ -612,7 +687,7 @@
         🗑️ Clear
       </button>
     </div>
-    <div class="graph-layout" style="display: flex; gap: 1rem;">
+    <div class="graph-layout">
       <div class="graph-sidebar" style="width: 200px; flex-shrink: 0; border-right: 1px solid var(--border); padding-right: 1rem;">
         <div style="font-size:.7rem; font-weight:700; text-transform:uppercase; letter-spacing:.5px; color:var(--muted); padding-bottom:.6rem;">Categories</div>
         <div id="graph-categories-sidebar" class="chips-container" style="flex-direction: column;"></div>
@@ -787,6 +862,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
   let activeTab = 'memories';
   let selectedFactId = null;
   let network = null;
+  let graphResizeObserver = null;
   /* ── Lazy loading (infinite scroll): render in batches, append on scroll ── */
   const LAZY_BATCH = 50;
   let memVisible = [], memRendered = 0, memObserver = null;
@@ -3958,6 +4034,37 @@ async function loadGraph() {
       const nativeEvent = params.event.originalEvent || params.event;
       showContextMenu(nativeEvent, nodeId);
     });
+
+    // `oncontext` is a right-click, which a phone has no way to produce.
+    // vis fires `hold` on long-press for touch, so the build-graph menu is
+    // otherwise unreachable without a mouse. Guarded on the pointer type so
+    // a desktop long-press does not open it as well.
+    network.on("hold", function (params) {
+      const src = params.event && (params.event.originalEvent || params.event);
+      const type = src && (src.pointerType || src.type || "");
+      if (type !== "touch" && src && src.pointerType !== undefined) return;
+      if (params.nodes.length === 0) return;
+      const nativeEvent = src || { clientX: 0, clientY: 0 };
+      showContextMenu(nativeEvent, params.nodes[0]);
+    });
+
+    // vis.js sizes its canvas once, at construction. Below 900px the layout
+    // stacks, so the canvas keeps the width it was built at and gets clipped
+    // instead of reflowing -- the graph is present but half off-screen.
+    if (typeof ResizeObserver !== 'undefined') {
+      graphResizeObserver = new ResizeObserver(function () {
+        if (!network) return;
+        network.redraw();
+        network.fit({ animation: false });
+      });
+      graphResizeObserver.observe(container);
+    } else {
+      window.addEventListener('resize', function () {
+        if (!network || !container.offsetParent) return;
+        network.redraw();
+        network.fit({ animation: false });
+      });
+    }
   }
 
   function setGraphMode(mode) {
@@ -3978,6 +4085,9 @@ async function loadGraph() {
 
   function rebuildNetwork() {
     if (network) {
+      // The observer captures `network` by closure through the shared global,
+      // but it must be detached or a destroyed canvas keeps being refit.
+      if (graphResizeObserver) { graphResizeObserver.disconnect(); graphResizeObserver = null; }
       network.destroy();
       network = null;
     }
@@ -4062,9 +4172,10 @@ let contextMenu = null;
 
     contextMenu = document.createElement('div');
     contextMenu.className = 'context-menu';
-    contextMenu.style.left = Math.min(x, window.innerWidth - 200) + 'px';
-    contextMenu.style.top = Math.min(y, window.innerHeight - 200) + 'px';
-
+    // Append before measuring, and clamp against the menu's real size. The
+    // old Math.min(x, innerWidth - 200) assumed a >=200px viewport, so on a
+    // phone the right edge ran off the screen and a tap in the left margin
+    // produced a negative left.
     contextMenu.innerHTML = `
       <div class="context-menu-item" onclick="goToFact('${nodeId}')">📖 Go to fact</div>
       <div class="context-menu-separator"></div>
@@ -4075,6 +4186,13 @@ let contextMenu = null;
     `;
 
     document.body.appendChild(contextMenu);
+
+    const menuW = contextMenu.offsetWidth;
+    const menuH = contextMenu.offsetHeight;
+    const margin = 8;
+    contextMenu.style.left = Math.max(margin, Math.min(x, window.innerWidth - menuW - margin)) + 'px';
+    contextMenu.style.top = Math.max(margin, Math.min(y, window.innerHeight - menuH - margin)) + 'px';
+
     currentContextNodeData = nodeData;
 
     // Use capture to catch clicks outside the menu
