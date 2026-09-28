@@ -479,13 +479,26 @@ def db_context_items(context_id: str, user_id: str) -> Optional[dict]:
     return _scope_items(user_id, "", {"label": ":Context", "rel": ":IN_CONTEXT", "scopeId": context_id})
 
 
-async def _drop_scope_payload(collection: str, point_ids: list, keys: list):
-    """Best-effort Qdrant scope-key cleanup (the boot diff-sync self-heals any remainder)."""
-    if not point_ids or not keys:
+async def _drop_scope_payload(collection: str, record_ids: list, keys: list):
+    """Drop scope keys from every Qdrant point belonging to these records.
+
+    The ids arrive from Neo4j, so they are *record* ids. Passing them straight
+    through as point ids would clear chunk 0 only, leaving chunks 1..N-1 holding
+    a clientId/contextId whose node has just been deleted — the record would
+    then keep appearing under a client that no longer exists. The boot
+    diff-sync would eventually repair it, but only after a restart, so the stale
+    filter is live in the meantime. Resolve the family first.
+    """
+    if not record_ids or not keys:
         return
     try:
         qdrant = await get_qdrant()
-        if qdrant:
+        if not qdrant:
+            return
+        point_ids = []
+        for record_id in record_ids:
+            point_ids.extend(await _scope_targets(qdrant, record_id, collection))
+        if point_ids:
             await qdrant.delete_payload(collection_name=collection, keys=keys, points=point_ids)
     except Exception as e:
         logger.warning(f"scope Qdrant cleanup failed ({collection}): {e}")

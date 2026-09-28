@@ -449,6 +449,23 @@ class CallSiteGuardTests(unittest.TestCase):
         self.assertTrue("find_chunk_family" in src,
                         "the family must be resolved via find_chunk_family")
 
+    def test_deleting_a_client_clears_scope_on_every_chunk(self):
+        # db_delete_client / db_delete_context collect *record* ids from Neo4j and
+        # hand them to _drop_scope_payload to clear the Qdrant scope keys. The
+        # client node is DELETEd in the same call, so chunks 1..N-1 left holding
+        # that clientId keep answering a client-filtered search for a client that
+        # no longer exists. The boot diff-sync repairs it, but only on the next
+        # restart, so the stale filter is live until then.
+        src = self._source("client_manager.py")
+        body = src.split("async def _drop_scope_payload", 1)[1].split("\nasync def ", 1)[0]
+        self.assertIn("_scope_targets(", body,
+                      "_drop_scope_payload must expand record ids into chunk families")
+        self.assertIn("point_ids.extend", body,
+                      "the resolved family must be accumulated before delete_payload")
+        # The expansion has to actually reach the call, otherwise it is dead code.
+        self.assertIn("points=point_ids", body,
+                      "delete_payload must be given the expanded point list")
+
     def test_client_manager_does_not_import_fact_manager_at_module_scope(self):
         # fact_manager imports client_manager, so the reverse at module scope
         # would be a cycle. The helper is imported inside the function instead.
