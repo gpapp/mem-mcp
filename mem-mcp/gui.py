@@ -940,30 +940,53 @@ async def api_get_insights(request: Request):
 
 
 @web_app.get("/api/graph", response_class=JSONResponse)
-async def api_get_graph(request: Request):
+async def api_get_graph(request: Request, clientId: str = "", contextId: str = "", limit: int = 0):
+    """The whole knowledge graph, optionally scoped to one client or project.
+
+    The scope travels as a query param because it is part of what the user is
+    looking at, not a property of the response: the panel remembers the selected
+    client and re-requests the same graph when the tab is reopened.
+    """
     try:
-        return mem.db_get_graph(_require_user(request))
+        return mem.db_get_graph(
+            _require_user(request),
+            client_id=clientId,
+            context_id=contextId,
+            limit=limit,
+        )
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
 
 @web_app.get("/api/graph/neighbors/{fact_id}", response_class=JSONResponse)
-async def api_get_neighbors(request: Request, fact_id: str):
+async def api_get_neighbors(request: Request, fact_id: str, clientId: str = "", contextId: str = ""):
+    """Neighbours of a fact, honouring the client's active scope.
+
+    "Show all connected" runs under the same client/project selection as the
+    graph itself; without the params it returned everything the fact touched,
+    which is how unrelated nodes ended up in a scoped view.
+    """
     try:
-        return mem.db_get_neighborhood(fact_id, depth=1, rel_types=None, user_id=_require_user(request))
+        return mem.db_get_neighborhood(
+            fact_id, depth=1, rel_types=None, user_id=_require_user(request),
+            client_id=clientId, context_id=contextId,
+        )
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
 
 @web_app.get("/api/graph/focus/{fact_id}", response_class=JSONResponse)
-async def api_focus_graph(request: Request, fact_id: str):
+async def api_focus_graph(request: Request, fact_id: str, clientId: str = "", contextId: str = ""):
     try:
         user_id = _require_user(request)
         fact = mem.db_get_fact_by_id(fact_id, user_id)
         if not fact:
             raise HTTPException(status_code=404, detail="Fact not found")
 
-        neighbors = mem.db_get_neighborhood(fact_id, depth=1, rel_types=None, user_id=user_id)
+        neighbors = mem.db_get_neighborhood(
+            fact_id, depth=1, rel_types=None, user_id=user_id,
+            client_id=clientId, context_id=contextId,
+        )
 
         # Group connections by relationship type
         connections_by_type = {}

@@ -3,6 +3,7 @@ fact_manager.py – Fact management, search, deduplication, and graph operations
 """
 
 from typing import List, Optional
+import os
 import re
 import time
 import uuid
@@ -49,6 +50,12 @@ from chunking import (
 
 # Max unconfirmed (below top_p) results appended after the confident set.
 WEAK_RESULT_LIMIT = 2
+
+# The graph is drawn by vis.js in the browser, so the practical ceiling is
+# render time rather than memory. A vault of several thousand records produces
+# a hairball that reads as noise and is slow enough to feel broken, which is
+# worse than showing the most connected slice and saying it was capped.
+GRAPH_MAX_NODES = max(50, int(os.getenv("MEM_GRAPH_MAX_NODES", "600")))
 
 
 # ---------------------------------------------------------------------------
@@ -400,7 +407,13 @@ async def db_delete_memory(memory_id: str, user_id: str) -> bool:
 
 
 async def db_add_fact_relevant(fact_id: str, client_id: str, user_id: str):
-    """Create a RELEVANT_TO relationship from a fact to a client."""
+    """Create a RELEVANT_TO relationship from a fact to a client or a project.
+
+    The target is a Client or a Context; both are "related scope" and the UI
+    offers whichever the user picked. The relationship type is RELEVANT_TO for
+    both, so links that already exist against clients keep working untouched and
+    no migration is involved — only the label match in this query changed.
+    """
     neo4j_driver = get_neo4j()
     if not neo4j_driver:
         raise RuntimeError("Neo4j not connected.")
@@ -409,7 +422,8 @@ async def db_add_fact_relevant(fact_id: str, client_id: str, user_id: str):
         s.run(
             """
             MATCH (f:Fact {id: $factId, userId: $userId})
-            MATCH (c:Client {id: $clientId, userId: $userId})
+            MATCH (c {id: $clientId, userId: $userId})
+            WHERE c:Client OR c:Context
             MERGE (f)-[:RELEVANT_TO]->(c)
             """,
             factId=fact_id, clientId=client_id, userId=user_id,
@@ -419,7 +433,7 @@ async def db_add_fact_relevant(fact_id: str, client_id: str, user_id: str):
 
 
 async def db_remove_fact_relevant(fact_id: str, client_id: str, user_id: str):
-    """Remove a RELEVANT_TO relationship from a fact to a client."""
+    """Remove a RELEVANT_TO relationship from a fact to a client or project."""
     neo4j_driver = get_neo4j()
     if not neo4j_driver:
         raise RuntimeError("Neo4j not connected.")
@@ -427,7 +441,8 @@ async def db_remove_fact_relevant(fact_id: str, client_id: str, user_id: str):
     with neo4j_driver.session() as s:
         s.run(
             """
-            MATCH (f:Fact {id: $factId, userId: $userId})-[r:RELEVANT_TO]->(c:Client {id: $clientId, userId: $userId})
+            MATCH (f:Fact {id: $factId, userId: $userId})-[r:RELEVANT_TO]->(c {id: $clientId, userId: $userId})
+            WHERE c:Client OR c:Context
             DELETE r
             """,
             factId=fact_id, clientId=client_id, userId=user_id,
@@ -604,8 +619,19 @@ async def db_unlink_facts(source_id: str, target_id: str, rel_type: str, user_id
             raise RuntimeError(f"Cannot unlink {a_label} to {b_label}: only Fact↔Fact and DiaryEntry↔Fact are supported")
 
 
-def db_get_neighborhood(fact_id: str, depth: int, rel_types: List[str], user_id: str) -> list:
-    """Explore context around a fact in the graph."""
+def db_get_neighborhood(fact_id: str, depth: int, rel_types: List[str], user_id: str,
+                        client_id: str = "", context_id: str = "") -> list:
+    """Everything within ``depth`` hops of a fact, not just other facts.
+
+    The old query ended in ``(neighbor:Fact)``, so "Show all connected" on a
+    node could only ever add other facts. The client, project, category and diary
+    links attached to a fact are the connections a person actually recognises,
+    so the label is not pinned any more.
+
+    Nodes are returned in the same shape as ``db_get_graph`` (``id``, ``label``,
+    ``name``, ``group``) so the panel can add them to the build set without a
+    second lookup, and each carries the relationship that reached it.
+    """
     neo4j_driver = get_neo4j()
     if not neo4j_driver:
         raise RuntimeError("Neo4j not connected.")
@@ -620,21 +646,67 @@ def db_get_neighborhood(fact_id: str, depth: int, rel_types: List[str], user_id:
         result = s.run(
             f"""
             MATCH (f:Fact {{id: $id, userId: $userId}})
-            MATCH path = (f)-[{rel_filter}*1..{depth}]-(neighbor:Fact)
-            WHERE neighbor.userId = $userId
-            RETURN neighbor, labels(neighbor) as labels, relationships(path) as rels
+            MATCH path = (f)-[{rel_filter}*1..{depth}]-(neighbor)
+            WHERE (neighbor:Fact AND neighbor.userId = $userId)
+               OR (neighbor:DiaryEntry AND neighbor.userId = $userId)
+               OR (neighbor:Client AND neighbor.userId = $userId)
+               OR (neighbor:Context AND neighbor.userId = $userId)
+            RETURN neighbor, labels(neighbor) as labels,
+                   [r IN relationships(path) | type(r)] as rels,
+                   length(path) as distance
             """,
             id=fact_id, userId=user_id
         )
         nodes = []
+        seen = set()
         for r in result:
+            node = r["neighbor"]
+            labels = r["labels"] or []
+            if "Fact" in labels:
+                node_id, label, name = node["id"], "Fact", (node.get("name") or node.get("text") or "")
+                group = node.get("category", "General")
+            elif "DiaryEntry" in labels:
+                node_id, label = node["id"], "DiaryEntry"
+                name = node.get("title") or node.get("content", "")
+                group = "Diary"
+            elif "Client" in labels:
+                node_id, label, name, group = node["id"], "Client", node["name"], "Client"
+            elif "Context" in labels:
+                node_id, label, name, group = node["id"], "Context", node["name"], "Context"
+            else:
+                continue
+            if node_id == fact_id or node_id in seen:
+                continue
+            seen.add(node_id)
             nodes.append({
-                "id": r["neighbor"]["id"],
-                "text": r["neighbor"]["text"],
-                "category": r["neighbor"]["category"],
-                "labels": r["labels"]
+                "id": node_id,
+                "label": label,
+                "name": name,
+                "text": node.get("text") or node.get("content") or "",
+                "category": node.get("category", "") or group,
+                "group": group,
+                "labels": labels,
+                "rel": (r["rels"] or [None])[-1],
+                "distance": r["distance"],
             })
+        return _filter_neighborhood_scope(nodes, client_id, context_id)
+
+
+def _filter_neighborhood_scope(nodes, client_id, context_id):
+    """Keep only the Client/Context nodes matching the active scope.
+
+    A Client or Context node *is* the scope, so it survives the filter it is not
+    the subject of: when the graph is scoped to one client, that client's node
+    must still be drawn or the result looks broken.
+    """
+    if not client_id and not context_id:
         return nodes
+    return [
+        n for n in nodes
+        if (client_id and n["id"] == client_id)
+        or (context_id and n["id"] == context_id)
+        or n["label"] not in ("Client", "Context")
+    ]
 
 
 def db_get_fact_by_id(fact_id: str, user_id: str) -> Optional[dict]:
@@ -1270,10 +1342,11 @@ def db_list_memories(user_id: str) -> list:
             MATCH (c:Category)<-[:IN_CATEGORY]-(f:Fact {userId: $userId})
             OPTIONAL MATCH (f)-[:FOR_CLIENT]->(cl:Client)
             OPTIONAL MATCH (f)-[:IN_CONTEXT]->(ctx:Context)
-            OPTIONAL MATCH (f)-[:RELEVANT_TO]->(rc:Client)
+            OPTIONAL MATCH (f)-[:RELEVANT_TO]->(rc)
             RETURN f, c.name as category, cl.name as clientName, cl.id as clientId,
                    ctx.name as contextName, ctx.id as contextId,
-                   collect(DISTINCT {id: rc.id, name: rc.name}) as relevantClients,
+                   collect(DISTINCT {id: rc.id, name: rc.name,
+                                     kind: CASE WHEN rc:Context THEN 'context' ELSE 'client' END}) as relevantClients,
                    [(f)-[r]-(other {userId: $userId})
                     WHERE (other:Fact OR other:DiaryEntry)
                       AND type(r) <> 'IN_CATEGORY' AND type(r) <> 'KNOWS'
@@ -1875,8 +1948,23 @@ async def db_merge_memories(master_id: str, duplicate_ids: List[str], user_id: s
     })
 
 
-def db_get_graph(user_id: str) -> dict:
-    """Return the entire knowledge graph for a user (nodes and edges)."""
+def db_get_graph(user_id: str, client_id: str = "", context_id: str = "", limit: int = 0) -> dict:
+    """Return the knowledge graph for a user (nodes and edges), optionally scoped.
+
+    ``client_id`` / ``context_id`` restrict *records* — Facts and Diary entries —
+    to those linked to that client or project. Scope membership is read from the
+    FOR_CLIENT / IN_CONTEXT edges the passes below already walk, not from the
+    denormalised ``clientId`` property, because that property is written by the
+    classifier and can lag the relationship. Category, Client and Context nodes
+    are always kept so a filtered graph stays connected.
+
+    ``limit`` caps how many records are returned, largest-degree first, so a big
+    vault cannot hand vis.js more than it can draw. The response carries
+    ``truncated`` and ``total`` so the UI can say so rather than silently
+    showing a partial graph.
+    """
+    if limit <= 0:
+        limit = GRAPH_MAX_NODES
     neo4j_driver = get_neo4j()
     if not neo4j_driver:
         raise RuntimeError("Neo4j not connected.")
@@ -1895,6 +1983,11 @@ def db_get_graph(user_id: str) -> dict:
         node_map = {}
         edges = []
         edge_lookup = {}  # sig -> edge_dict for collapsing bidirectional links
+        # record_id -> set(scope node ids), filled by the Client/Context passes
+        # so the filter below never has to trust a denormalised property.
+        fact_clients = {}
+        fact_contexts = {}
+        diary_scope = {}  # diary id -> (client_id, context_id)
 
         for r in result:
             f = r["f"]
@@ -1966,6 +2059,7 @@ def db_get_graph(user_id: str) -> dict:
                     "name": d_node.get("title") or d_node.get("content", ""),
                     "group": "Diary"
                 }
+            diary_scope[d_id] = (d_node.get("clientId") or "", d_node.get("contextId") or "")
             f_node = dr["f"]
             rel = dr["rel_type"]
             if f_node and rel:
@@ -2006,6 +2100,7 @@ def db_get_graph(user_id: str) -> dict:
                 }
             f_node = cr["f"]
             if f_node:
+                fact_clients.setdefault(f_node["id"], set()).add(c_id)
                 edge_sig = (f_node["id"], c_id, "FOR_CLIENT")
                 reverse_sig = (c_id, f_node["id"], "FOR_CLIENT")
                 if reverse_sig not in edge_lookup and edge_sig not in edge_lookup:
@@ -2042,6 +2137,7 @@ def db_get_graph(user_id: str) -> dict:
                 }
             f_node = xrr["f"]
             if f_node:
+                fact_contexts.setdefault(f_node["id"], set()).add(ctx_id)
                 edge_sig = (f_node["id"], ctx_id, "IN_CONTEXT")
                 reverse_sig = (ctx_id, f_node["id"], "IN_CONTEXT")
                 if reverse_sig not in edge_lookup and edge_sig not in edge_lookup:
@@ -2069,10 +2165,65 @@ def db_get_graph(user_id: str) -> dict:
                     edge_lookup[edge_sig] = new_edge
                     edges.append(new_edge)
 
-        return {
-            "nodes": list(node_map.values()),
-            "edges": edges
-        }
+        return _scope_and_cap_graph(
+            node_map, edges, fact_clients, fact_contexts, diary_scope,
+            client_id, context_id, limit,
+        )
+
+
+def _scope_and_cap_graph(node_map, edges, fact_clients, fact_contexts, diary_scope,
+                         client_id, context_id, limit):
+    """Drop out-of-scope records, cap the size, and drop the edges left dangling.
+
+    Split out of ``db_get_graph`` so the policy is readable on its own. Filtering
+    on relationship membership rather than the ``clientId`` property matters:
+    the property is written by the scope classifier and can lag the edge it
+    mirrors, and a fact that lost its link must disappear from the filtered view
+    immediately rather than on the next reclassify.
+    """
+    def in_scope(node):
+        label = node.get("label")
+        if label == "Fact":
+            if client_id and client_id not in fact_clients.get(node["id"], ()):
+                return False
+            if context_id and context_id not in fact_contexts.get(node["id"], ()):
+                return False
+            return True
+        if label == "DiaryEntry":
+            d_client, d_context = diary_scope.get(node["id"], ("", ""))
+            if client_id and client_id != d_client:
+                return False
+            if context_id and context_id != d_context:
+                return False
+            return True
+        # Category / Client / Context nodes: keep them, a filtered graph with no
+        # client node in it reads as "this client has no facts".
+        return True
+
+    scoped = [n for n in node_map.values() if in_scope(n)]
+    total = len(scoped)
+    truncated = False
+
+    records = [n for n in scoped if n.get("label") in ("Fact", "DiaryEntry")]
+    if limit and len(records) > limit:
+        # Keep the most connected records: a graph of leaves explains nothing and
+        # is the case that makes the full graph feel useless.
+        degree = {}
+        for e in edges:
+            degree[e["from"]] = degree.get(e["from"], 0) + 1
+            degree[e["to"]] = degree.get(e["to"], 0) + 1
+        records.sort(key=lambda n: (-degree.get(n["id"], 0), n["id"]))
+        keep = {n["id"] for n in records[:limit]}
+        dropped = {n["id"] for n in records[limit:]}
+        truncated = True
+        keep |= {n["id"] for n in scoped if n.get("label") not in ("Fact", "DiaryEntry")}
+        scoped = [n for n in scoped if n["id"] in keep]
+        edges = [e for e in edges if e["from"] not in dropped and e["to"] not in dropped]
+    else:
+        kept = {n["id"] for n in scoped}
+        edges = [e for e in edges if e["from"] in kept and e["to"] in kept]
+
+    return {"nodes": scoped, "edges": edges, "truncated": truncated, "total": total}
 
 
 # ---------------------------------------------------------------------------

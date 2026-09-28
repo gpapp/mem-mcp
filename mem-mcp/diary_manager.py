@@ -3,6 +3,7 @@ diary_manager.py – Diary entry management, search, and automatic link generati
 """
 
 import json
+import os
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -20,6 +21,7 @@ from chunking import (
     CHUNK_FETCH_MULTIPLIER,
     build_chunk_payloads,
     chunk_text_of,
+    normalize_text,
     parent_of,
     strip_chunk_meta,
 )
@@ -151,28 +153,75 @@ _PEOPLE_EXTRACT_SYSTEM = (
     "For example, 'Alice Smith (host)' → extract only 'Alice Smith'."
 )
 
+# Name extraction runs per window, so these control both the coverage of a long
+# entry and the cost of scanning it. The window must fit the extractor's context
+# or Ollama rejects the length; the overlap catches a name split across a
+# boundary, which both halves would otherwise drop.
+PEOPLE_EXTRACT_WINDOW = max(1000, int(os.getenv("MEM_PEOPLE_WINDOW", "6000")))
+PEOPLE_EXTRACT_OVERLAP = max(0, min(1000, int(os.getenv("MEM_PEOPLE_OVERLAP", "600"))))
+
+
+def people_extract_windows(content: str, window: int = 0, overlap: int = 0) -> list:
+    """Split diary content into overlapping windows for name extraction.
+
+    The old code sent ``content[:2000]`` — one call, and only the opening of the
+    entry. On a 40k-char transcription every person named after character 2000
+    was silently missed, so their MENTIONS edge was never created. Splitting
+    into overlapping windows is the fix; the overlap is what stops a name that
+    straddles a boundary from being cut in half and lost by both halves.
+
+    Windows are returned in order and a doc that fits the window is a single
+    element, so short entries cost exactly what they always did.
+    """
+    size = window or PEOPLE_EXTRACT_WINDOW
+    step = size - min(overlap or PEOPLE_EXTRACT_OVERLAP, size - 1)
+    body = normalize_text(content or "")
+    if not body.strip():
+        return []
+    if len(body) <= size:
+        return [body]
+    return [body[i:i + size] for i in range(0, len(body), step)]
+
 
 async def _extract_people_names(content: str) -> list:
-    """Return a list of person name strings extracted from diary content via LLM."""
-    snippet = content[:2000]
-    logger.debug(f"[extract_people_names] started (content_len={len(content)})")
-    try:
-        raw = await get_llm_response(snippet, system=_PEOPLE_EXTRACT_SYSTEM, num_predict=200)
-        raw = re.sub(r"```[a-z]*\n?", "", raw).strip()
-        m = re.search(r"\[.*\]", raw, re.DOTALL)
-        if not m:
-            logger.debug("[extract_people_names] model response contained no JSON array")
-            return []
-        names = json.loads(m.group())
-        if not isinstance(names, list):
-            logger.debug("[extract_people_names] model response JSON was not a list")
-            return []
-        extracted = clean_extracted_people_names(names)
-        logger.debug(f"[extract_people_names] completed (count={len(extracted)})")
-        return extracted
-    except Exception as exc:
-        logger.debug(f"[extract_people_names] failed: {exc}")
-        return []
+    """Return a list of person name strings extracted from diary content via LLM.
+
+    Runs once per window (see people_extract_windows) and unions the results.
+    Every name in the entry has to be seen by the extractor, not just the ones
+    that happen to fall in the first paragraph.
+    """
+    windows = people_extract_windows(content)
+    logger.debug(
+        f"[extract_people_names] started (content_len={len(content)}, windows={len(windows)})"
+    )
+    found = []
+    for index, window in enumerate(windows):
+        try:
+            raw = await get_llm_response(window, system=_PEOPLE_EXTRACT_SYSTEM, num_predict=200)
+            raw = re.sub(r"```[a-z]*\n?", "", raw).strip()
+            m = re.search(r"\[.*\]", raw, re.DOTALL)
+            if not m:
+                logger.debug(
+                    f"[extract_people_names] window {index + 1}/{len(windows)} had no JSON array"
+                )
+                continue
+            names = json.loads(m.group())
+            if not isinstance(names, list):
+                logger.debug(
+                    f"[extract_people_names] window {index + 1}/{len(windows)} JSON was not a list"
+                )
+                continue
+            found.extend(clean_extracted_people_names(names))
+        except Exception as exc:
+            # One bad window must not discard the names the other windows found.
+            logger.debug(f"[extract_people_names] window {index + 1}/{len(windows)} failed: {exc}")
+
+    # clean_extracted_people_names already dedupes within a call, but each
+    # window is a separate call and a name can span the overlap, so dedupe
+    # across the union too.
+    extracted = clean_extracted_people_names(found)
+    logger.debug(f"[extract_people_names] completed (count={len(extracted)})")
+    return extracted
 
 
 async def find_people_candidates(entry_id: str, content: str, user_id: str) -> list:
@@ -712,7 +761,10 @@ async def db_unlink_diary_mention(entry_id: str, fact_id: str, user_id: str):
 
 
 async def db_add_diary_relevant(entry_id: str, client_id: str, user_id: str):
-    """Create a RELEVANT_TO relationship from a diary entry to a client."""
+    """Create a RELEVANT_TO relationship from a diary entry to a client or project.
+
+    Same RELEVANT_TO type for both target kinds, so existing links keep working.
+    """
     neo4j_driver = get_neo4j()
     if not neo4j_driver:
         raise RuntimeError("Neo4j not connected.")
@@ -720,7 +772,8 @@ async def db_add_diary_relevant(entry_id: str, client_id: str, user_id: str):
         s.run(
             """
             MATCH (d:DiaryEntry {id: $entryId, userId: $userId})
-            MATCH (c:Client {id: $clientId, userId: $userId})
+            MATCH (c {id: $clientId, userId: $userId})
+            WHERE c:Client OR c:Context
             MERGE (d)-[:RELEVANT_TO]->(c)
             """,
             entryId=entry_id, clientId=client_id, userId=user_id
@@ -729,14 +782,15 @@ async def db_add_diary_relevant(entry_id: str, client_id: str, user_id: str):
 
 
 async def db_remove_diary_relevant(entry_id: str, client_id: str, user_id: str):
-    """Remove a RELEVANT_TO relationship from a diary entry to a client."""
+    """Remove a RELEVANT_TO relationship from a diary entry to a client or project."""
     neo4j_driver = get_neo4j()
     if not neo4j_driver:
         raise RuntimeError("Neo4j not connected.")
     with neo4j_driver.session() as s:
         s.run(
             """
-            MATCH (d:DiaryEntry {id: $entryId, userId: $userId})-[r:RELEVANT_TO]->(c:Client {id: $clientId, userId: $userId})
+            MATCH (d:DiaryEntry {id: $entryId, userId: $userId})-[r:RELEVANT_TO]->(c {id: $clientId, userId: $userId})
+            WHERE c:Client OR c:Context
             DELETE r
             """,
             entryId=entry_id, clientId=client_id, userId=user_id
@@ -830,13 +884,14 @@ def db_list_diary(user_id: str) -> list:
             OPTIONAL MATCH (d)-[:IN_CONTEXT]->(ctx:Context)
             WITH d, cl, ctx
             OPTIONAL MATCH (d)-[:MENTIONS]->(f:Fact)
-            OPTIONAL MATCH (d)-[:RELEVANT_TO]->(rc:Client)
+            OPTIONAL MATCH (d)-[:RELEVANT_TO]->(rc)
             RETURN d.id as id, d.date as date, d.content as content, d.timestamp as timestamp, d.name as name,
                    d.metadata as metadata, d.keywords as keywords,
                    cl.name as clientName, cl.id as clientId,
                    ctx.name as contextName, ctx.id as contextId,
                    collect(DISTINCT {id: f.id, text: f.text, name: f.name}) as mentions,
-                   collect(DISTINCT {id: rc.id, name: rc.name}) as relevantClients
+                   collect(DISTINCT {id: rc.id, name: rc.name,
+                                     kind: CASE WHEN rc:Context THEN 'context' ELSE 'client' END}) as relevantClients
             ORDER BY d.date DESC, d.timestamp DESC
             """,
             userId=user_id,
