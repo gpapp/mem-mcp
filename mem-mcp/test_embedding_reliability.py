@@ -20,6 +20,7 @@ serves, so these tests pin three properties:
 import ast
 import asyncio
 import os
+import re
 import unittest
 
 COMMON_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "common.py")
@@ -518,6 +519,82 @@ class OversizedInputTests(unittest.TestCase):
         asyncio.run(ns["get_embedding"](long_text))
         self.assertEqual(len(recorder.posts), 1, "the long text must still be cached")
         self.assertIn(("nomic-embed-text", long_text), ns["_EMBEDDING_CACHE"])
+
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+# Every path that persists a fact or diary entry. Each must embed before it
+# touches Neo4j, so a failed embed leaves the graph and the vector store
+# agreeing on the old text.
+WRITE_PATHS = (
+    ("fact_manager.py", "db_add_memory"),
+    ("fact_manager.py", "db_update_memory"),
+    ("diary_manager.py", "db_save_diary"),
+    ("diary_manager.py", "db_update_diary"),
+)
+
+# Reads, ownership checks and the initial ``MATCH ... RETURN`` are not writes.
+_MUTATES = re.compile(r"\b(MERGE|CREATE|DELETE|DETACH|SET\b|REMOVE)\b")
+
+
+def _function_source(name, body):
+    lines = body.split("\n")
+    start = next(i for i, line in enumerate(lines) if re.match(rf"async def {name}\(", line))
+    try:
+        end = next(i for i in range(start + 1, len(lines)) if re.match(r"async def ", lines[i]))
+    except StopIteration:
+        end = len(lines)
+    return "\n".join(lines[start:end])
+
+
+class WriteOrderingGuardTests(unittest.TestCase):
+    """A failed embed must never leave a half-written record.
+
+    These paths cannot run here — they need Neo4j, Qdrant and Ollama — so the
+    invariant is asserted against the source. ``db_update_diary`` had the two
+    steps the other way round, which left Neo4j holding text the vector store
+    could no longer find; nothing about that failure is loud.
+    """
+
+    def _read(self, module):
+        with open(os.path.join(_HERE, module), "r", encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_embed_precedes_the_neo4j_write(self):
+        for module, func in WRITE_PATHS:
+            with self.subTest(f"{module}::{func}"):
+                body = _function_source(func, self._read(module))
+                hits = [
+                    body.find(needle)
+                    for needle in ("_upsert_fact_points(", "_upsert_diary_points(")
+                    if body.find(needle) != -1
+                ]
+                self.assertTrue(hits, f"{func} never embeds")
+                embed = min(hits)
+                # A read-only session.run (ownership check) is not a write.
+                writes = [
+                    m.start()
+                    for m in re.finditer(r"\.run\(", body)
+                    if _MUTATES.search(body[m.start():body.find(")", m.start()) + 400])
+                ]
+                if not writes:
+                    self.skipTest(f"{func} writes to Neo4j through a helper, not an inline query")
+                self.assertLess(
+                    embed, writes[0],
+                    f"{func} writes to Neo4j before it embeds — a failed embed would "
+                    f"leave the two stores describing different text",
+                )
+
+    def test_no_write_path_embeds_without_an_upsert(self):
+        """A bare get_embedding whose result is then discarded."""
+        for module, func in WRITE_PATHS:
+            with self.subTest(f"{module}::{func}"):
+                body = _function_source(func, self._read(module))
+                self.assertNotIn(
+                    "await get_embedding(", body,
+                    f"{func} embeds directly; route it through the _upsert_* helper so "
+                    f"the chunk family and the delete-then-upsert order stay correct",
+                )
 
 
 if __name__ == "__main__":

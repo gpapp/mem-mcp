@@ -614,6 +614,22 @@ async def db_update_diary(entry_id: str, user_id: str, content: Optional[str] = 
                 new_metadata = {}
             new_metadata["keywords"] = ", ".join(keywords)
 
+        # Embed and write to Qdrant BEFORE the Neo4j SET below, matching
+        # db_save_diary/db_add_memory/db_update_memory. A failed embed then
+        # leaves both stores still describing the old text. The other order
+        # leaves the canonical text in Neo4j ahead of the vector store, and the
+        # entry is only findable by the text it no longer has.
+        payload = {"content": new_content, "name": new_name, "date": entry_date, "timestamp": new_ts, "userId": user_id}
+        if keywords:
+            payload["keywords"] = keywords
+        if new_metadata is not None:
+            payload["metadata"] = new_metadata
+        # replace=True because shortening the text can leave fewer chunks than
+        # before, and the stale high-index points would otherwise keep answering
+        # searches for text that no longer exists.
+        await _upsert_diary_points(qdrant, entry_id, new_content, payload,
+                                   prefix=new_name, replace=True)
+
         neo4j_props = "d.content = $content, d.name = $name, d.timestamp = $ts, d.date = $date"
         params = dict(id=entry_id, userId=user_id, content=new_content, name=new_name, ts=new_ts, date=entry_date)
         if keywords:
@@ -653,17 +669,6 @@ async def db_update_diary(entry_id: str, user_id: str, content: Optional[str] = 
                     """,
                     id=entry_id, userId=user_id, factIds=linked_facts
                 )
-
-    # Re-embed in Qdrant. replace=True because shortening the text can leave
-    # fewer chunks than before, and the stale high-index points would otherwise
-    # keep answering searches for text that no longer exists.
-    payload = {"content": new_content, "name": new_name, "date": entry_date, "timestamp": new_ts, "userId": user_id}
-    if keywords:
-        payload["keywords"] = keywords
-    if new_metadata is not None:
-        payload["metadata"] = new_metadata
-    await _upsert_diary_points(qdrant, entry_id, new_content, payload,
-                               prefix=new_name, replace=True)
 
     await publish_db_event(user_id, "diary_changed", {"action": "update", "id": entry_id, "date": entry_date})
     # Auto-link People facts mentioned by name (add-only, fire-and-forget)
