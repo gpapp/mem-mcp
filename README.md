@@ -21,7 +21,8 @@ mem-mcp/
 ├── test_matching_regressions.py  # Focused regression and fake-boundary tests
 ├── reindex_diary_keywords.py  # CLI tool to backfill keyword extraction for existing diary entries
 ├── requirements.txt
-└── Dockerfile
+├── Dockerfile
+└── .dockerignore
 ```
 
 ## Features
@@ -97,7 +98,7 @@ User identity is resolved automatically from:
 4. **Initialize Embedder**: `docker exec ollama ollama pull nomic-embed-text`
 5. **Initialize Query LLM**: `docker exec ollama ollama pull qwen3.5:0.8b`
 6. **Initialize Merge LLM**: `docker exec ollama ollama pull gemma4:e2b`
-7. **After code changes**: rebuild the image with `docker-compose up -d --build mem-mcp`
+7. **After code changes**: rebuild the image with `docker-compose up -d --build mem-mcp` (dependency downloads are cached by BuildKit, so this is fast after the first build)
 
 Visit **http://localhost:8086/** for the interactive setup guide.
 

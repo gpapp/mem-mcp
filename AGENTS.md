@@ -38,6 +38,10 @@ Pop-Location
 
 Run `git diff --check` after documentation or code edits. The suite uses pure helpers and fake callbacks so it does not require Neo4j, Qdrant, or Ollama.
 
+### Image Build
+
+`mem-mcp/Dockerfile` pins `# syntax=docker/dockerfile:1` and installs Python deps with `RUN --mount=type=cache,target=/root/.cache/pip`. Wheels live in a BuildKit cache that survives rebuilds, so a rebuild after a source-only change no longer re-downloads PyPI. Do not reintroduce `--no-cache-dir` — it disables the mount and is the reason the layer grew on every build. `mem-mcp/.dockerignore` keeps `__pycache__`, `logs/`, and `backup/` out of the build context, since `COPY . .` would otherwise ship them into the image.
+
 ## Architecture
 
 | Component | Port | Notes |
