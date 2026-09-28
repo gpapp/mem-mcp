@@ -69,6 +69,129 @@ class ForeachScopeTests(unittest.TestCase):
         self.assertGreater(checked, 0, "the lint found no FOREACH at all; it is not running")
 
 
+# A property map, i.e. the `{k: v, ...}` of MATCH (n {..}) / MERGE / CREATE.
+_PROP_MAP_RE = re.compile(r"\{([^{}]*)\}")
+
+
+def _is_list_expr(expr):
+    """Does this expression evaluate to a list?"""
+    if isinstance(expr, (ast.List, ast.ListComp, ast.SetComp)):
+        return True
+    if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name):
+        return expr.func.id in ("list", "sorted", "set")
+    return False
+
+
+def _list_arg_names(node):
+    """Names bound to a *list* inside the enclosing function body.
+
+    Deliberately derived from the Python rather than guessed from the parameter
+    name. A plural-looking name is a guess that misses `where_ids` and flags
+    `status`; the AST does not. Covers a list literal, a list comprehension, a
+    call to ``list()``/``sorted()``/``set()``, and a name assigned from any of
+    those at any point in the same function.
+    """
+    lists = set()
+    for child in ast.walk(node):
+        targets = []
+        if isinstance(child, ast.Assign):
+            targets = [t for t in child.targets if isinstance(t, ast.Name)]
+            value = child.value
+        elif isinstance(child, ast.AnnAssign) and isinstance(child.target, ast.Name):
+            targets = [child.target]
+            value = child.value
+        else:
+            continue
+        if value is not None and _is_list_expr(value):
+            lists.update(t.id for t in targets)
+    return lists
+
+
+def _run_calls(source):
+    """(lineno, query_text, list_kwarg_names) for every ``s.run(...)``."""
+    tree = ast.parse(source)
+    # The binding we need is a *sibling* statement in the enclosing function
+    # (``ids = [...]`` above the call), not a descendant of the call, so the
+    # search has to start at the function.
+    enclosing = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for child in ast.walk(node):
+                enclosing[child] = node
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "run"):
+            continue
+        if not node.args or not isinstance(node.args[0], ast.Constant):
+            continue
+        if not isinstance(node.args[0].value, str):
+            continue
+        # A kwarg is a list if its value is one, or a name bound to one.
+        list_names = set()
+        known = _list_arg_names(enclosing.get(node, node))
+        for kw in node.keywords:
+            if kw.arg and (_is_list_expr(kw.value) or
+                           (isinstance(kw.value, ast.Name) and kw.value.id in known)):
+                list_names.add(kw.arg)
+        yield node.lineno, node.args[0].value, list_names
+
+
+class ListParameterInPropertyMapTests(unittest.TestCase):
+    """A list in a MATCH property map matches nothing, and fails silently.
+
+    ``MATCH (n {id: $ids})`` reads like "n whose id is in $ids" and is not: a
+    list on the right of a property test is compared for *equality*, so it
+    matches a node whose ``id`` literally is that list -- no node, ever. The
+    query returns zero rows, which is indistinguishable from "nothing to clear".
+
+    That silence is what made this dangerous. The batch scope clear is how a
+    reclassify overwrites the previous verdict, so with the id test broken every
+    reclassify only ever *added* links: a real entry accumulated two
+    FOR_CLIENT edges and an IN_CONTEXT left over from answers the classifier had
+    stopped giving, ``REMOVE n.scopeCheckedSig`` silently never ran, and
+    re-running the reclassify appeared to change nothing at all.
+    """
+
+    def test_no_list_parameter_is_used_as_a_property_map_value(self):
+        checked = 0
+        offenders = []
+        for path in _python_sources():
+            with open(path, "r", encoding="utf-8") as handle:
+                source = handle.read()
+            for lineno, query, list_names in _run_calls(source):
+                if not list_names:
+                    continue
+                checked += 1
+                for match in _PROP_MAP_RE.finditer(query):
+                    body = match.group(1)
+                    for name in list_names:
+                        if re.search(rf":\s*\${re.escape(name)}\b", body):
+                            offenders.append(
+                                f"{os.path.basename(path)}:{lineno} — ${name} is a list "
+                                f"used in a property map `{match.group(0).strip()}`; "
+                                f"use `WHERE n.<key> IN ${name}` instead")
+        self.assertEqual(offenders, [], "\n".join(offenders))
+        self.assertGreater(checked, 0, "the lint found no parameterised run() at all; "
+                                       "it is not running")
+
+    def test_the_batch_clear_tests_its_ids_with_in(self):
+        """Pin the one query whose whole job is to delete by a list of ids."""
+        for path in _python_sources():
+            with open(path, "r", encoding="utf-8") as handle:
+                source = handle.read()
+            for lineno, query, _list_names in _run_calls(source):
+                if "count(DISTINCT n) AS cleared" not in query:
+                    continue
+                self.assertRegex(
+                    query, r"WHERE\s+n\.id\s+IN\s+\$ids",
+                    f"{os.path.basename(path)}:{lineno} — the scope clear must test "
+                    f"ids with IN; a list in a property map matches nothing")
+                self.assertNotRegex(
+                    query, r"\{\s*id\s*:\s*\$ids",
+                    f"{os.path.basename(path)}:{lineno} — a list in a property map "
+                    f"matches nothing and fails silently")
+
+
 class DanglingConjunctionTests(unittest.TestCase):
     """A bare AND needs a WHERE to attach to.
 

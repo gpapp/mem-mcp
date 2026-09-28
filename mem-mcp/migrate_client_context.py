@@ -1461,6 +1461,19 @@ def clear_scope_links_batch(node_ids: list, user_id: str, neo4j_driver) -> int:
     loop, which stalled the whole server for the length of the run. Batching
     keeps the round trips proportional to the vault size rather than to the item
     count times a per-item constant.
+
+    The id test must be a ``WHERE n.id IN $ids``, never a list in the MATCH
+    property map. ``MATCH (n {id: $ids})`` looks equivalent and is not: a list
+    on the right of a property test is compared for *equality* against the
+    property, so it matches a node whose ``id`` literally is that list -- which
+    is no node at all. It fails silently, returning ``cleared = 0`` while
+    looking like a successful no-op, and because a reclassify's whole point is
+    to overwrite the previous verdict, the effect is that scope links are only
+    ever *added*: every run stacks a new FOR_CLIENT/IN_CONTEXT on top of the
+    old one, and a wrong verdict is never actually removed. Measured on a real
+    entry that had been reclassified repeatedly: two FOR_CLIENT edges (EPAM and
+    SAP SE) and an IN_CONTEXT left over from answers the classifier had stopped
+    giving, and ``REMOVE n.scopeCheckedSig`` silently not running either.
     """
     ids = [nid for nid in dict.fromkeys(node_ids) if nid]
     if not ids or neo4j_driver is None:
@@ -1468,7 +1481,8 @@ def clear_scope_links_batch(node_ids: list, user_id: str, neo4j_driver) -> int:
     with neo4j_driver.session() as s:
         result = s.run(
             """
-            MATCH (n {id: $ids, userId: $userId})
+            MATCH (n {userId: $userId})
+            WHERE n.id IN $ids
             OPTIONAL MATCH (n)-[r:FOR_CLIENT|IN_CONTEXT]->()
             FOREACH (ignored IN CASE WHEN r IS NULL THEN [] ELSE [r] END | DELETE ignored)
             REMOVE n.scopeCheckedSig
