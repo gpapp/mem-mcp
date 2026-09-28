@@ -296,13 +296,15 @@ class DiaryScopeSourceTests(unittest.TestCase):
             "db_get_graph reads a contextId property that no DiaryEntry node has",
         )
         # A list, not a tuple: the passes assign into it by index, and a tuple
-        # would raise TypeError the moment the first edge lands.
+        # would raise TypeError the moment the first edge lands. The node is
+        # called `n_node` because the pass returns a Fact *or* a DiaryEntry
+        # under the Cypher variable `n` -- see ReturnAliasTests.
         self.assertTrue(
-            'diary_scope.setdefault(f_node["id"], ["", ""])[0] = c_id' in self.body,
+            'diary_scope.setdefault(n_node["id"], ["", ""])[0] = c_id' in self.body,
             "the FOR_CLIENT pass no longer writes diary scope",
         )
         self.assertTrue(
-            'diary_scope.setdefault(f_node["id"], ["", ""])[1] = ctx_id' in self.body,
+            'diary_scope.setdefault(n_node["id"], ["", ""])[1] = ctx_id' in self.body,
             "the IN_CONTEXT pass no longer writes diary scope",
         )
 
@@ -336,6 +338,95 @@ class DiaryScopeTests(unittest.TestCase):
         """No entry at all means unlinked, which is not the same as in-scope."""
         result = self.scope([diary("d1")], {}, client_id="c1")
         self.assertNotIn("d1", ids(result))
+
+
+class ReturnAliasTests(unittest.TestCase):
+    """A Cypher ``RETURN`` alias and the key Python reads back are a contract.
+
+    Production shipped a ``KeyError: 'f'`` that killed the entire graph
+    response on every call. The two client/context passes matched
+    ``(n:Fact OR n:DiaryEntry)`` and returned ``c, n``, but the Python still
+    read ``cr["f"]`` -- the variable had been renamed and the read had not.
+    Every request to ``/api/graph`` raised, so the whole tab was dead.
+
+    The existing source guard for this function checked the *query text* (that
+    it mentions ``DiaryEntry``) and passed throughout, because the query was
+    correct. What it never checked is that the consuming code reads the keys the
+    query actually returns. This does.
+    """
+
+    _FACT_MANAGER = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "fact_manager.py")
+
+    def _source(self):
+        with open(self._FACT_MANAGER, "r", encoding="utf-8") as handle:
+            return handle.read()
+
+    def _return_aliases(self, query):
+        """The keys a RETURN hands back: ``type(r) as rel_type`` -> rel_type."""
+        tail = query[query.upper().rfind("RETURN"):]
+        aliases = set()
+        for part in tail[len("RETURN"):].split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if " as " in part.lower():
+                aliases.add(part.lower().split(" as ")[-1].strip())
+            else:
+                aliases.add(part.split()[0].strip() if part.split() else "")
+        return aliases
+
+    def _loops(self):
+        """(loop var, keys read off it, the query just above it)."""
+        source = self._source()
+        tree = ast.parse(source)
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                  and n.name == "db_get_graph")
+
+        queries = []  # (lineno, query text)
+        for node in ast.walk(fn):
+            if (isinstance(node, ast.Constant) and isinstance(node.value, str)
+                    and "RETURN" in node.value.upper()):
+                queries.append((node.lineno, node.value))
+
+        out = []
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.For) or not isinstance(node.target, ast.Name):
+                continue
+            var = node.target.id
+            keys = {
+                s.slice.value for s in ast.walk(node)
+                if isinstance(s, ast.Subscript)
+                and isinstance(s.value, ast.Name) and s.value.id == var
+                and isinstance(s.slice, ast.Constant)
+                and isinstance(s.slice.value, str)
+            }
+            if not keys:
+                continue
+            earlier = [q for ln, q in queries if ln < node.lineno]
+            if not earlier:
+                continue
+            out.append((var, keys, earlier[-1]))
+        return out
+
+    def test_db_get_graph_has_queries_to_check(self):
+        """If this fails the guard is vacuous, so it is checked first."""
+        self.assertGreaterEqual(len(self._loops()), 4)
+
+    def test_every_key_read_off_a_result_is_produced_by_its_own_query(self):
+        for var, keys, query in self._loops():
+            aliases = self._return_aliases(query)
+            missing = keys - aliases
+            self.assertEqual(
+                missing, set(),
+                msg=(
+                    f"the loop over `{var}` reads {sorted(missing)} but its query "
+                    f"only returns {sorted(aliases)} -- a renamed Cypher variable "
+                    f"that the Python never followed. Every call raises KeyError, "
+                    f"which takes down the whole response rather than one edge."
+                ),
+            )
 
 
 if __name__ == "__main__":

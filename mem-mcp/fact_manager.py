@@ -2104,23 +2104,24 @@ def db_get_graph(user_id: str, client_id: str = "", context_id: str = "", limit:
                     "name": c_node["name"],
                     "group": "Client"
                 }
-            f_node = cr["f"]
-            if f_node:
-                # Diary entries carry FOR_CLIENT too -- link_diary_to_client
-                # writes it -- and scoping them from the denormalised property
-                # instead of the edge is what put them in the wrong client.
-                scope_of = fact_clients if f_node.get("id") in node_map and \
-                    node_map[f_node["id"]]["label"] == "Fact" else None
+            n_node = cr["n"]
+            if n_node:
+                # The returned node is a Fact or a DiaryEntry, so `n` is the
+                # honest name. It must not be read as "f": the query aliases it
+                # as `n`, and a mismatch here is a KeyError that kills the
+                # whole graph response rather than degrading one edge.
+                scope_of = fact_clients if n_node.get("id") in node_map and \
+                    node_map[n_node["id"]]["label"] == "Fact" else None
                 if scope_of is not None:
-                    scope_of.setdefault(f_node["id"], set()).add(c_id)
+                    scope_of.setdefault(n_node["id"], set()).add(c_id)
                 else:
-                    diary_scope.setdefault(f_node["id"], ["", ""])[0] = c_id
-                edge_sig = (f_node["id"], c_id, "FOR_CLIENT")
-                reverse_sig = (c_id, f_node["id"], "FOR_CLIENT")
+                    diary_scope.setdefault(n_node["id"], ["", ""])[0] = c_id
+                edge_sig = (n_node["id"], c_id, "FOR_CLIENT")
+                reverse_sig = (c_id, n_node["id"], "FOR_CLIENT")
                 if reverse_sig not in edge_lookup and edge_sig not in edge_lookup:
                     new_edge = {
-                        "id": f"{f_node['id']}_{c_id}_FOR_CLIENT",
-                        "from": f_node["id"],
+                        "id": f"{n_node['id']}_{c_id}_FOR_CLIENT",
+                        "from": n_node["id"],
                         "to": c_id,
                         "label": "FOR_CLIENT",
                         "arrows": "to"
@@ -2149,18 +2150,18 @@ def db_get_graph(user_id: str, client_id: str = "", context_id: str = "", limit:
                     "name": ctx_node["name"],
                     "group": "Context"
                 }
-            f_node = xrr["f"]
-            if f_node:
-                if f_node.get("id") in node_map and node_map[f_node["id"]]["label"] == "Fact":
-                    fact_contexts.setdefault(f_node["id"], set()).add(ctx_id)
+            n_node = xrr["n"]
+            if n_node:
+                if n_node.get("id") in node_map and node_map[n_node["id"]]["label"] == "Fact":
+                    fact_contexts.setdefault(n_node["id"], set()).add(ctx_id)
                 else:
-                    diary_scope.setdefault(f_node["id"], ["", ""])[1] = ctx_id
-                edge_sig = (f_node["id"], ctx_id, "IN_CONTEXT")
-                reverse_sig = (ctx_id, f_node["id"], "IN_CONTEXT")
+                    diary_scope.setdefault(n_node["id"], ["", ""])[1] = ctx_id
+                edge_sig = (n_node["id"], ctx_id, "IN_CONTEXT")
+                reverse_sig = (ctx_id, n_node["id"], "IN_CONTEXT")
                 if reverse_sig not in edge_lookup and edge_sig not in edge_lookup:
                     new_edge = {
-                        "id": f"{f_node['id']}_{ctx_id}_IN_CONTEXT",
-                        "from": f_node["id"],
+                        "id": f"{n_node['id']}_{ctx_id}_IN_CONTEXT",
+                        "from": n_node["id"],
                         "to": ctx_id,
                         "label": "IN_CONTEXT",
                         "arrows": "to"

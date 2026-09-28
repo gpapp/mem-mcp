@@ -341,6 +341,28 @@ is still excluded: it is shared across the whole vault and only adds clutter.
 `_filter_neighborhood_scope` keeps a Client/Context node that **is** the active
 scope, for the reason given above.
 
+#### A Cypher `RETURN` alias and the key Python reads back are a contract
+
+`db_get_graph` raised `KeyError: 'f'` on **every** call in production, so the
+whole graph tab was dead. The two scope passes had been changed to match
+`(n:Fact OR n:DiaryEntry)` and return `c, n` / `ctx, n, c`, but the Python kept
+reading `cr["f"]` and `xrr["f"]`. The variable had been renamed and the read had
+not.
+
+`DiaryScopeSourceTests` passed the whole time, because every fact it asserted
+was individually true on the broken file: the query mentions `DiaryEntry`,
+nothing reads a `clientId` property, and the edge passes do write into
+`diary_scope`. None of that says whether the key the loop reads is a key the
+query returns. A source test can check the query and the writes and still miss
+the seam between them.
+
+`ReturnAliasTests` closes it: it walks the AST, pairs each `for <var> in <res>`
+loop with the `s.run(...)` immediately above it, and asserts that every
+`var["key"]` in the loop body appears in that query's `RETURN` clause
+(`type(r) as rel_type` -> `rel_type`). When you rename a Cypher variable,
+rename the read — and prefer a name that is true of *both* node types: a
+variable that can be a Fact **or** a DiaryEntry should not be called `f`.
+
 **Every node-adding path filters through `nodeInCategory()`**, and reports what
 it skipped in the toast. A path that ignores the category chips puts nodes on the
 map that the sidebar says are hidden, which is indistinguishable from the filter
