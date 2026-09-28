@@ -20,6 +20,24 @@ SCOPE_LIST_TTL_SECONDS = 60
 _SCOPE_LIST_CACHE: dict = {}
 
 
+async def _scope_targets(qdrant, record_id: str, collection: str) -> list:
+    """Every Qdrant point id for a record, so a scope patch reaches all of it.
+
+    A long record is stored as a family of chunk points. Chunk 0 keeps the
+    record id, which is why addressing a single point by ``record_id`` looks
+    correct until a record is long enough to be chunked — then the other chunks
+    keep stale scope keys. The import is function-local because
+    ``fact_manager`` and ``client_manager`` are peers; a module-level import
+    would couple them for the sake of one helper.
+    """
+    from fact_manager import find_chunk_family
+    try:
+        return await find_chunk_family(qdrant, record_id, collection)
+    except Exception as exc:  # noqa: BLE001 - a scope patch must not fail the write
+        logger.warning(f"could not resolve chunk family for {record_id}: {exc}")
+        return [record_id]  # unchunked record: the record id is the point id
+
+
 def _resolve_client_by_id(client_id: str, user_id: str) -> Optional[dict]:
     """Look up a Client by ID. Returns dict with id/name or None."""
     neo4j_driver = get_neo4j()
@@ -371,12 +389,18 @@ async def db_set_fact_scope(fact_id: str, client_id: Optional[str], context_id: 
             if ctx:
                 patch["contextId"] = ctx["id"]
                 patch["contextName"] = ctx["name"]
+            # Scope belongs to the record, not to a point. A long fact is several
+            # points, so patching only the one whose id equals the record id
+            # leaves every other chunk with stale scope keys — a client-filtered
+            # search would then match only the first passage, and unlinking a
+            # client would not remove the record from that client's results.
+            family = await _scope_targets(qdrant, fact_id, COLLECTION_NAME)
             if patch:
-                await qdrant.set_payload(collection_name=COLLECTION_NAME, payload=patch, points=[fact_id])
+                await qdrant.set_payload(collection_name=COLLECTION_NAME, payload=patch, points=family)
             drop = [k for k, present in (("clientId", client), ("clientName", client),
                                          ("contextId", ctx), ("contextName", ctx)) if not present]
             if drop:
-                await qdrant.delete_payload(collection_name=COLLECTION_NAME, keys=drop, points=[fact_id])
+                await qdrant.delete_payload(collection_name=COLLECTION_NAME, keys=drop, points=family)
     except Exception as e:
         logger.warning(f"db_set_fact_scope: Qdrant payload patch failed for {fact_id}: {e}")
     _stamp_manual_scope(fact_id, "Fact", user_id)
@@ -744,12 +768,16 @@ async def db_set_diary_scope(entry_id: str, client_id: Optional[str], context_id
             if ctx:
                 patch["contextId"] = ctx["id"]
                 patch["contextName"] = ctx["name"]
+            # Same reasoning as db_set_fact_scope: a long entry is several points
+            # and they must all carry the same scope, or the link survives on the
+            # chunks that were never patched.
+            family = await _scope_targets(qdrant, entry_id, DIARY_COLLECTION)
             if patch:
-                await qdrant.set_payload(collection_name=DIARY_COLLECTION, payload=patch, points=[entry_id])
+                await qdrant.set_payload(collection_name=DIARY_COLLECTION, payload=patch, points=family)
             drop = [k for k, present in (("clientId", client), ("clientName", client),
                                          ("contextId", ctx), ("contextName", ctx)) if not present]
             if drop:
-                await qdrant.delete_payload(collection_name=DIARY_COLLECTION, keys=drop, points=[entry_id])
+                await qdrant.delete_payload(collection_name=DIARY_COLLECTION, keys=drop, points=family)
     except Exception as e:
         logger.warning(f"db_set_diary_scope: Qdrant payload patch failed for {entry_id}: {e}")
     _stamp_manual_scope(entry_id, "DiaryEntry", user_id)

@@ -430,6 +430,34 @@ class CallSiteGuardTests(unittest.TestCase):
             self.assertTrue("replace=True" in src,
                             f"{name}: update path must replace the family")
 
+    def test_scope_patches_address_the_whole_family(self):
+        # client_manager sets and drops clientId/contextId. Addressed by the bare
+        # record id that is chunk 0 only, so the other chunks keep stale scope
+        # keys: a client-filtered search would then match only the first
+        # passage, and unlinking a client would not remove the record from that
+        # client's results — the exact failure AGENTS.md warns about under
+        # "Scope is a property of the record, not the point".
+        src = self._source("client_manager.py")
+        for needle in ("payload=patch, points=[fact_id]",
+                       "keys=drop, points=[fact_id]",
+                       "payload=patch, points=[entry_id]",
+                       "keys=drop, points=[entry_id]"):
+            self.assertFalse(needle in src,
+                             f"scope patch addresses a single point, found: {needle}")
+        self.assertTrue("points=family" in src,
+                        "scope patches must be applied to the resolved chunk family")
+        self.assertTrue("find_chunk_family" in src,
+                        "the family must be resolved via find_chunk_family")
+
+    def test_client_manager_does_not_import_fact_manager_at_module_scope(self):
+        # fact_manager imports client_manager, so the reverse at module scope
+        # would be a cycle. The helper is imported inside the function instead.
+        src = self._source("client_manager.py")
+        self.assertFalse("\nfrom fact_manager" in src,
+                         "fact_manager must only be imported inside a function (cycle)")
+        self.assertTrue("from fact_manager import find_chunk_family" in src,
+                        "the function-local import of find_chunk_family is required")
+
 
 class RechunkCandidateTests(unittest.TestCase):
     """Startup re-chunking must touch only large, not-yet-chunked records.

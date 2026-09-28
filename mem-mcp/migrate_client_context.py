@@ -244,10 +244,13 @@ async def _backfill_qdrant(user_id: str, neo4j_driver, qdrant, only_ids=None):
             current.setdefault(parent_of(p.id, p.payload), []).append((str(p.id), dict(p.payload or {})))
 
         if only_ids:
-            # Targeted pass: chunk 0 is addressed by the record id itself, and
-            # the remaining chunks by parentId. Both are needed or the family is
-            # only half-updated. Without this the pass is O(vault): a single-item
-            # reclassify would otherwise scroll every point in both collections.
+            # Targeted pass. Two lookups are needed, for opposite reasons: an
+            # unchunked record has no parentId in its payload at all, so only a
+            # direct retrieve finds it, while a chunked record's extra points are
+            # reachable only by a parentId scroll. Either one alone leaves the
+            # family half-updated. Without this the pass is O(vault): a
+            # single-item reclassify would scroll every point in both
+            # collections to change one row.
             try:
                 points = await qdrant.retrieve(
                     collection_name=collection,
