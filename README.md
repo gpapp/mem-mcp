@@ -46,6 +46,7 @@ mem-mcp/
 - **Inactive Client Handling** — Clients untouched for 90 days are auto-deprioritized (−0.15 score, never hidden). Status can be manually pinned via `set_client_status`, `PUT /api/clients/{id}`, or the Setup-tab toggle; pinned clients are never auto-changed.
 - **Setup Tab** — Client list with active/inactive toggles, plus MCP connection details.
 - **Daily Backups & Restore** — An in-process scheduler writes a vault-wide savepoint (graph + both vector collections) each night, keeps the last `MEM_BACKUP_KEEP`, and Setup → Maintenance → Backup & Restore can take one immediately or restore any of them.
+- **Long-Record Chunking** — A fact or diary entry that runs past the embedding budget is indexed as several vectors, so a query about a detail in the middle of a 40k-char transcription can still find the record. Search collapses a chunk family back to one result and returns the full text.
 - **Lazy-Loaded Lists** — Memories and diary sidebar render in batches of 50 with infinite scroll; calendar has a 📅 jump-to-today button.
 
 ## Ports & Access
@@ -182,6 +183,40 @@ At `LOG_LEVEL=WARNING` (the production setting) you get:
 
 `WARNING` otherwise belongs to the chat/LLM traffic, which is what you are
 usually looking for.
+
+## Long Records & Chunking
+
+One vector for a 40k-char transcription is a lossy average of the whole thing: a
+query about a decision in the middle scores poorly against it and against
+everything else. Truncating to fit the embedding window bounds the damage but
+discards the middle entirely. So a record that runs past the budget is indexed
+as **several vectors**, one per chunk.
+
+- A short record is stored exactly as before — one point, and nothing to
+  migrate. Only records that exceed the budget get chunked.
+- A long record becomes N points sharing the record's category, client, context
+  and keywords, so filtering behaves identically whichever chunk matched.
+- Search collapses a family to its best chunk, so a record still appears once,
+  and the full text is returned regardless of which chunk matched.
+- Updating a record replaces the whole family. Shortening the text removes the
+  now-stale trailing chunks.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MEM_CHUNK_CHARS` | `3000` | Target characters per chunk |
+| `MEM_CHUNK_MAX` | `16` | Embedding calls per save (a cost budget, not a coverage cap — the chunk size grows to keep every part covered) |
+| `MEM_CHUNK_OVERLAP` | `200` | Characters repeated between neighbouring chunks so a sentence on a boundary is not lost |
+| `MEM_CHUNK_FETCH_MULTIPLIER` | `3` | Widens the vector result window, since one record can now occupy several slots |
+
+Existing long records are converted with:
+
+```bash
+python mem-mcp/reindex_chunks.py --dry-run   # report only, writes nothing
+python mem-mcp/reindex_chunks.py             # rewrite the long ones
+```
+
+The script is idempotent — it skips anything already chunked — and each record
+costs one embedding call per chunk, so start with the dry run.
 
 ## Claude Desktop Setup
 

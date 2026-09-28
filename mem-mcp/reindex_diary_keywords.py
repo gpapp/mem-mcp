@@ -69,7 +69,6 @@ async def _fetch_entries_neo4j(neo4j_driver, user_id: str) -> list:
 
 async def _fetch_qdrant_payload(qdrant, entry_id: str, collection: str) -> dict:
     """Fetch the current Qdrant payload for a single point."""
-    from qdrant_client.models import PointIdsList
     result = await qdrant.retrieve(
         collection_name=collection,
         ids=[entry_id],
@@ -79,6 +78,38 @@ async def _fetch_qdrant_payload(qdrant, entry_id: str, collection: str) -> dict:
     if result:
         return result[0].payload
     return {}
+
+
+async def _chunk_family(qdrant, entry_id: str, collection: str) -> list:
+    """Every Qdrant point belonging to a diary entry (see ``chunking.py``).
+
+    A long entry is stored as one point per chunk and chunk 0 keeps the entry id.
+    Keywords must reach all of them, because they are read off the payload at
+    query time to boost a vector hit — a chunk missing them is a chunk that
+    cannot be found by its own keywords.
+    """
+    from qdrant_client.models import Filter, FieldCondition, MatchValue
+
+    ids = [str(entry_id)]
+    offset = None
+    while True:
+        points, offset = await qdrant.scroll(
+            collection_name=collection,
+            scroll_filter=Filter(must=[
+                FieldCondition(key="parentId", match=MatchValue(value=str(entry_id)))
+            ]),
+            limit=256,
+            offset=offset,
+            with_payload=False,
+            with_vectors=False,
+        )
+        for point in points:
+            pid = str(point.id)
+            if pid not in ids:
+                ids.append(pid)
+        if offset is None:
+            break
+    return ids
 
 
 async def _patch_entry(qdrant, neo4j_driver, entry: dict, keywords: list, collection: str, dry_run: bool) -> None:
@@ -103,13 +134,15 @@ async def _patch_entry(qdrant, neo4j_driver, entry: dict, keywords: list, collec
         metadata_payload = dict(existing_meta)
         metadata_payload["keywords"] = ", ".join(keywords)
 
+        # Chunk 0 carries the existing metadata; every point of the family needs
+        # the same keywords, so the patch is addressed to the whole family.
         await qdrant.set_payload(
             collection_name=collection,
             payload={
                 "keywords": keywords,
                 "metadata": metadata_payload
             },
-            points=[entry_id],
+            points=await _chunk_family(qdrant, entry_id, collection),
         )
 
     # --- Neo4j: set d.keywords and d.metadata ---

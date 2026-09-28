@@ -16,6 +16,13 @@ from common import (
     DIARY_COLLECTION, QDRANT_URL, clean_extracted_people_names
 )
 from matching_utils import resolve_people_candidates
+from chunking import (
+    CHUNK_FETCH_MULTIPLIER,
+    build_chunk_payloads,
+    chunk_text_of,
+    parent_of,
+    strip_chunk_meta,
+)
 from client_manager import (
     link_diary_to_client, link_diary_to_context,
     _resolve_client_by_id, _resolve_context_by_id,
@@ -29,6 +36,74 @@ from client_manager import (
 
 def _diary_id(user_id: str, timestamp: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"diary_{user_id}_{timestamp}"))
+
+
+# ---------------------------------------------------------------------------
+# Chunked vector writes
+#
+# Same rationale as facts: one vector over a long diary entry is a lossy
+# average, so a long entry gets one point per chunk. Chunk 0 keeps the entry
+# id, so short entries are stored exactly as before.
+# ---------------------------------------------------------------------------
+async def _upsert_diary_points(qdrant, entry_id: str, content: str, base_payload: dict,
+                                prefix: Optional[str] = None, replace: bool = False) -> int:
+    """Write one point, or N when the entry needs chunking. Returns the count."""
+    parts = build_chunk_payloads(entry_id, content, strip_chunk_meta(base_payload))
+    if len(parts) == 1:
+        vector = await get_embedding(f"{prefix}: {content}" if prefix else content)
+        if replace:
+            await _delete_diary_chunks(entry_id)
+        await qdrant.upsert(
+            collection_name=DIARY_COLLECTION,
+            points=[PointStruct(id=entry_id, vector=vector, payload=parts[0]["payload"])],
+        )
+        return 1
+
+    points = []
+    for part in parts:
+        body = chunk_text_of(part["payload"])
+        vector = await get_embedding(f"{prefix}: {body}" if prefix else body)
+        points.append(PointStruct(id=part["id"], vector=vector, payload=part["payload"]))
+
+    if replace:
+        await _delete_diary_chunks(entry_id)
+    await qdrant.upsert(collection_name=DIARY_COLLECTION, points=points)
+    logger.info(f"[chunking] diary {entry_id}: {len(points)} chunk points written")
+    return len(points)
+
+
+async def find_diary_chunk_family(qdrant, entry_id: str) -> list:
+    """Every Qdrant point id for a diary entry, chunked or not."""
+    ids = [str(entry_id)]
+    offset = None
+    while True:
+        points, offset = await qdrant.scroll(
+            collection_name=DIARY_COLLECTION,
+            scroll_filter=Filter(must=[FieldCondition(key="parentId", match=MatchValue(value=str(entry_id)))]),
+            limit=256,
+            offset=offset,
+            with_payload=False,
+            with_vectors=False,
+        )
+        for point in points:
+            pid = str(point.id)
+            if pid not in ids:
+                ids.append(pid)
+        if offset is None:
+            break
+    return ids
+
+
+async def _delete_diary_chunks(entry_id: str) -> None:
+    """Delete every point for a diary entry via raw HTTP (avoids shard_key: null)."""
+    qdrant = await get_qdrant()
+    family = await find_diary_chunk_family(qdrant, entry_id)
+    async with httpx.AsyncClient() as client:
+        await client.post(
+            f"{QDRANT_URL}/collections/{DIARY_COLLECTION}/points/delete",
+            json={"points": family},
+            params={"wait": "true"},
+        )
 
 
 async def extract_diary_keywords(name: str, content: str) -> list:
@@ -227,7 +302,6 @@ async def db_save_diary(content: str, user_id: str, timestamp: str, name: str, m
     doc_id   = _diary_id(user_id, timestamp)
     # Keep a plain date string for display / grouping purposes
     entry_date = timestamp[:10]
-    vector   = await get_embedding(f"{name}: {content}" if name else content)
 
     # Extract keywords asynchronously — non-blocking; empty list on failure
     keywords = await extract_diary_keywords(name or "", content)
@@ -253,15 +327,10 @@ async def db_save_diary(content: str, user_id: str, timestamp: str, name: str, m
             payload["contextId"] = context_id
             payload["contextName"] = ctx_info["name"]
 
-    # Qdrant — upsert by the stable doc_id so re-saving replaces the vector
-    await qdrant.upsert(
-        collection_name=DIARY_COLLECTION,
-        points=[PointStruct(
-            id=doc_id,
-            vector=vector,
-            payload=payload,
-        )],
-    )
+    # Qdrant — upsert by the stable doc_id so re-saving replaces the vector.
+    # Long entries are split into chunk points; embedding happens inside here and
+    # before the Neo4j MERGE below, so a failed embed leaves no entry behind.
+    await _upsert_diary_points(qdrant, doc_id, content, payload, prefix=name)
 
     neo4j_props = "d.date = $date, d.timestamp = $timestamp, d.content = $content, d.name = $name"
     if keywords:
@@ -350,7 +419,10 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
 
     # 1. Rewrite query into keyword variants for better semantic coverage
     query_variants = await rewrite_search_query(query, client=client, context=context)
-    fetch_limit = max(limit * 4, 20)
+    # A chunked entry contributes one point per chunk, so each entry can appear
+    # several times in a single result set. Over-fetch or a long entry crowds
+    # every other entry out of the window before the merge below can collapse it.
+    fetch_limit = max(limit * 4 * CHUNK_FETCH_MULTIPLIER, 20)
     conditions = [FieldCondition(key="userId", match=MatchValue(value=user_id))]
     if client:
         conditions.append(FieldCondition(key="clientName", match=MatchValue(value=client.strip())))
@@ -401,11 +473,43 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
                     score += 0.15
                     break
 
-            if r.id not in all_results or score > all_results[r.id]["score"]:
-                all_results[r.id] = {"point": r, "score": score}
+            # Key by the entry, not the point: a chunked entry owns one point per
+            # chunk and all of them carry the same payload keys, so the filters
+            # above and the boosts here behave identically on every chunk.
+            entry_id = parent_of(r.id, r.payload)
+            if entry_id not in all_results or score > all_results[entry_id]["score"]:
+                all_results[entry_id] = {"point": r, "score": score}
 
     # 3. Apply top_p threshold after merging all variants
     passing = {rid: v for rid, v in all_results.items() if v["score"] >= top_p}
+
+    # The best-scoring chunk of a long entry is usually not chunk 0, and only
+    # chunk 0 carries the full content — the others deliberately store just
+    # their slice. One batched retrieve fills them in, so the caller gets whole
+    # entries rather than whichever fragment happened to match best.
+    missing_content = {
+        rid for rid, v in passing.items()
+        if not (v["point"].payload or {}).get("content")
+    }
+    if missing_content:
+        try:
+            fetched = await qdrant.retrieve(
+                collection_name=DIARY_COLLECTION,
+                ids=list(missing_content),
+                with_payload=True,
+                with_vectors=False,
+            )
+            for point in fetched:
+                item = passing.get(str(point.id))
+                if not item:
+                    continue
+                full = (point.payload or {}).get("content")
+                if full:
+                    item["point"].payload = dict(item["point"].payload or {}, content=full)
+                item["matchedChunk"] = (item["point"].payload or {}).get("chunkText")
+        except Exception as exc:
+            # Degrade to the fragment we already have rather than losing the hit.
+            logger.warning(f"diary search: could not hydrate chunked entries: {exc}")
 
     # 4. Enrich with Neo4j MENTIONS and format output
     entries = []
@@ -421,12 +525,12 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
         with neo4j_driver.session() as s:
             m_res = s.run(
                 "MATCH (d:DiaryEntry {id: $id, userId: $userId})-[:MENTIONS]->(f:Fact) RETURN f.id as id, f.text as text",
-                id=str(r.id), userId=user_id
+                id=str(rid), userId=user_id
             )
             mentions = [{"id": mr["id"], "text": mr["text"]} for mr in m_res]
 
-        entries.append({
-            "id": r.id,
+        entry = {
+            "id": rid,
             "date": date,
             "timestamp": entry_ts,
             "content": content,
@@ -437,7 +541,10 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
             "contextName": r.payload.get("contextName"),
             "metadata": r.payload.get("metadata") or {},
             "mentions": mentions,
-        })
+        }
+        if v.get("matchedChunk"):
+            entry["matchedChunk"] = v["matchedChunk"]
+        entries.append(entry)
 
     # Apply client/context scoring. Explicit scope boosts; inferred scope is a
     # weaker boost-only fallback; inactive clients penalized in global search only.
@@ -547,22 +654,16 @@ async def db_update_diary(entry_id: str, user_id: str, content: Optional[str] = 
                     id=entry_id, userId=user_id, factIds=linked_facts
                 )
 
-    # Re-embed in Qdrant
-    vector = await get_embedding(f"{new_name}: {new_content}" if new_name else new_content)
-
+    # Re-embed in Qdrant. replace=True because shortening the text can leave
+    # fewer chunks than before, and the stale high-index points would otherwise
+    # keep answering searches for text that no longer exists.
     payload = {"content": new_content, "name": new_name, "date": entry_date, "timestamp": new_ts, "userId": user_id}
     if keywords:
         payload["keywords"] = keywords
     if new_metadata is not None:
         payload["metadata"] = new_metadata
-    await qdrant.upsert(
-        collection_name=DIARY_COLLECTION,
-        points=[PointStruct(
-            id=entry_id,
-            vector=vector,
-            payload=payload,
-        )],
-    )
+    await _upsert_diary_points(qdrant, entry_id, new_content, payload,
+                               prefix=new_name, replace=True)
 
     await publish_db_event(user_id, "diary_changed", {"action": "update", "id": entry_id, "date": entry_date})
     # Auto-link People facts mentioned by name (add-only, fire-and-forget)
@@ -660,14 +761,10 @@ async def db_delete_diary(entry_id: str, user_id: str) -> bool:
             id=entry_id, userId=user_id
         )
 
-    # Delete from Qdrant (direct HTTP call to avoid serializing shard_key: null)
-    async with httpx.AsyncClient() as client:
-        r = await client.post(
-            f"{QDRANT_URL}/collections/{DIARY_COLLECTION}/points/delete",
-            json={"points": [entry_id]},
-            params={"wait": "true"},
-        )
-        r.raise_for_status()
+    # Delete from Qdrant (direct HTTP call to avoid serializing shard_key: null).
+    # A long entry owns one point per chunk, so the whole family must go or the
+    # leftover chunks stay searchable for an entry the user just deleted.
+    await _delete_diary_chunks(entry_id)
 
     await publish_db_event(user_id, "diary_changed", {"action": "delete", "id": entry_id})
     return True
@@ -759,7 +856,12 @@ def db_list_diary(user_id: str) -> list:
 
 
 async def _scroll_diary_ids(qdrant, user_id: str) -> set:
-    """Scroll all Qdrant point IDs for a user in the diary collection."""
+    """Scroll the entry IDs a user has in the diary collection.
+
+    Counts records, not points: a chunked entry owns one point per chunk and the
+    extra ids exist in no Neo4j node, so collecting raw point ids here would
+    report every long entry as an orphan and inflate the count.
+    """
     ids = set()
     try:
         offset = None
@@ -768,13 +870,13 @@ async def _scroll_diary_ids(qdrant, user_id: str) -> set:
                 collection_name=DIARY_COLLECTION,
                 limit=1000,
                 offset=offset,
-                with_payload=False,
+                with_payload=["parentId"],
                 with_vectors=False,
                 scroll_filter=Filter(must=[FieldCondition(key="userId", match=MatchValue(value=user_id))]),
             )
             points, next_offset = result
             for p in points:
-                ids.add(str(p.id))
+                ids.add(parent_of(p.id, p.payload))
             if next_offset is None:
                 break
             offset = next_offset

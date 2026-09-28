@@ -67,6 +67,7 @@ Run `git -c core.whitespace=cr-at-eol diff --check` after documentation or code 
 - Merge LLM: `MEM_MERGE_MODEL` defaults to `gemma4:e2b` and is used only for dashboard merge-draft generation; override it if the host GPU cannot run that model
 - Scope backfill LLM: `MEM_SCOPE_MODEL` (defaults to the query LLM) classifies unlinked facts/diary entries against existing clients on startup; `MEM_SCOPE_BACKFILL=0` disables it, `MEM_SCOPE_CONCURRENCY` (default 3) caps parallel classifications
 - Backups: `MEM_BACKUP_ENABLED` (default 1), `MEM_BACKUP_HOUR` / `MEM_BACKUP_MINUTES` (local server time, default 03:00), `MEM_BACKUP_KEEP` (default 14), `MEM_BACKUP_DIR` (default `<dirname LOG_DIR>/backup`)
+- Chunking: `MEM_CHUNK_CHARS` (3000), `MEM_CHUNK_MAX` (16), `MEM_CHUNK_OVERLAP` (200), `MEM_CHUNK_FETCH_MULTIPLIER` (3) — see "Long Records & Chunking"
 - Embedding retries: `MEM_EMBED_RETRIES` (default 2) and `MEM_EMBED_RETRY_BACKOFF` (default 1.5, in seconds), `MEM_EMBED_MAX_CHARS` (default 12000) — see "Embedding Reliability"
 - User vault resolved from `Authorization: Basic` header or session cookie
 - `BASE_URL` must include `/mcp` prefix when behind nginx
@@ -122,6 +123,22 @@ Do not reintroduce byte-exact name matching, per-item synchronous clears, or a s
 `claim_maintenance()` / `release_maintenance()` in `common.py` are a per-user in-process mutex. Reclassification and backup/restore both rewrite large parts of the graph; running them together interleaves the writes. Every maintenance job takes the lock when it starts and releases it in a `finally` block, and the API answers `409` with a human-readable reason when it cannot.
 
 The scheduled backup is the one exception: it is vault-wide, so there is no single user whose lock it could take. `scheduled_backup_loop()` calls `active_maintenance()` first and defers by `_RETRY_SECONDS` if any user holds the lock. Keep it that way — calling `run_backup()` directly from the scheduler would snapshot a graph mid-reclassify.
+
+## Long Records & Chunking
+
+One embedding vector over a long fact or diary entry is a lossy average of the whole document: a query about a detail in the middle scores poorly against everything else. `mem-mcp/chunking.py` splits a long record into several vector points instead. It is dependency-light (no DB drivers) so it is unit-testable on its own, like `matching_utils.py`.
+
+- **Chunk 0 keeps the record id.** Every existing id-based path keeps working for chunk 0, and a record short enough not to chunk is written byte-identically to before, so existing data needs no migration. Chunks 1..N-1 get deterministic ids from `chunk_point_id()` (`uuid5` under a pinned `CHUNK_NS`), which makes a rewrite idempotent instead of accumulating orphan points.
+- **Every chunk carries the full record payload**, plus `parentId`, `chunkIndex`, `chunkCount`. The scope/category/keyword filters are evaluated against the payload at query time, so a chunk with a partial payload would be invisible to those filters.
+- **Only chunk 0 carries `text`/`content`.** Chunks 1..N-1 carry `chunkText` and omit the full text entirely, so a search that forgets to hydrate cannot return a fragment as if it were the whole record. Hydration is a single batched `retrieve` per search.
+- **`parent_of(point_id, payload)` is the only correct way to get a record id from a Qdrant point.** Every reconciliation pass must use it. Raw `str(point.id)` is wrong in both directions: chunk ids would look like orphans, and a delete would leave the rest of the family searchable.
+- **Search collapses a family to its best chunk.** Results are keyed by parent and a record appears once. Because a chunked record contributes N points to every vector query, `fetch_limit` is multiplied by `CHUNK_FETCH_MULTIPLIER` (default 3) — without it a single long entry can occupy the entire top-N window and no other record is ever returned.
+- **An update deletes the old family before upserting.** Shortening a text produces fewer chunks, and the leftover high-index points would keep answering for text that no longer exists. `replace=True` does this, and it happens *after* all chunks are embedded so a rejected embed leaves the previous version searchable.
+- **Scope is a property of the record, not the point.** `_backfill_qdrant` diffs per record and writes to every point of the family; `restore_scope_links` links once per record. Keying either by point id makes every chunk mismatch and silently strips the scope keys, which then surfaces as searches returning facts the user filtered out.
+- **Chunk ids are derived, never stored as an index.** The count of points for a record is discovered by scrolling on `parentId` (`find_chunk_family`). Deriving it from `chunkCount` would need the payload, which is gone by the time a delete runs, and a stale `chunkCount` would orphan points.
+- `MEM_CHUNK_CHARS` (3000), `MEM_CHUNK_MAX` (16), `MEM_CHUNK_OVERLAP` (200) and `MEM_CHUNK_FETCH_MULTIPLIER` (3) tune it. `CHUNK_MAX` is a *call budget*, not a coverage limit: when honouring it would drop the tail, `chunk_limit()` raises it to whatever keeps every part inside the embed ceiling. Silently abandoning the end of a document is the failure mode chunking exists to prevent.
+
+Existing long records are converted with `python mem-mcp/reindex_chunks.py --dry-run` first, then without. It is idempotent and skips anything already chunked.
 
 ## Embedding Reliability
 

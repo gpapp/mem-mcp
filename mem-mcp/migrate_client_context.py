@@ -30,6 +30,7 @@ from matching_utils import (
     resolve_people_candidates,
     resolve_scope_name,
 )
+from chunking import parent_of
 
 
 async def migrate_client_context():
@@ -175,9 +176,14 @@ async def _backfill_qdrant(user_id: str, neo4j_driver, qdrant, only_ids=None):
     while any drift source (UI reassignment, re-saves, restores) self-heals.
     Vectors are preserved (no re-embed): retrieved only for changed points.
 
-    ``only_ids`` restricts the pass to specific points. Without it this is
+    ``only_ids`` restricts the pass to specific records. Without it this is
     O(vault): a single-item reclassify would otherwise scroll every point in
-    both collections just to change one row.
+    both collections just to change one row. A chunked record is still fully
+    covered, because its extra points are found by ``parentId``.
+
+    A record may be stored as several Qdrant points (see ``chunking.py``). Scope
+    is a property of the record, so it is written to every point of the family
+    and the diff is computed per record rather than per point.
     """
     id_filter = "AND f.id IN $onlyIds" if only_ids else ""
     diary_id_filter = "AND d.id IN $onlyIds" if only_ids else ""
@@ -222,10 +228,26 @@ async def _backfill_qdrant(user_id: str, neo4j_driver, qdrant, only_ids=None):
     synced = 0
     for collection, desired in ((COLLECTION_NAME, _desired(fact_rows)),
                                 (DIARY_COLLECTION, _desired(diary_rows))):
+        # Keyed by the *parent* id, because scope lives on the record. A chunked
+        # record owns several points that must all carry the same scope keys or
+        # the query-time filter misses whichever chunk happened to be searched.
+        # Keying this by point id instead would make every chunk mismatch
+        # `desired` and silently strip its scope, and the search would then
+        # return facts the user had filtered out.
         current: dict = {}
+        seen_point_ids: set = set()
+
+        def _record(p):
+            if p.id in seen_point_ids:
+                return
+            seen_point_ids.add(p.id)
+            current.setdefault(parent_of(p.id, p.payload), []).append((str(p.id), dict(p.payload or {})))
+
         if only_ids:
-            # Targeted pass: fetch exactly the points in question instead of
-            # scrolling the collection. A vector-less retrieve is one request.
+            # Targeted pass: chunk 0 is addressed by the record id itself, and
+            # the remaining chunks by parentId. Both are needed or the family is
+            # only half-updated. Without this the pass is O(vault): a single-item
+            # reclassify would otherwise scroll every point in both collections.
             try:
                 points = await qdrant.retrieve(
                     collection_name=collection,
@@ -233,11 +255,28 @@ async def _backfill_qdrant(user_id: str, neo4j_driver, qdrant, only_ids=None):
                     with_payload=True,
                     with_vectors=False,
                 )
+                for p in points:
+                    _record(p)
+                offset = None
+                while True:
+                    points, offset = await qdrant.scroll(
+                        collection_name=collection,
+                        limit=1000,
+                        offset=offset,
+                        with_payload=True,
+                        with_vectors=False,
+                        scroll_filter=Filter(should=[
+                            FieldCondition(key="parentId", match=MatchValue(value=oid))
+                            for oid in only_ids
+                        ]),
+                    )
+                    for p in points:
+                        _record(p)
+                    if offset is None:
+                        break
             except Exception as e:
                 logger.warning(f"scope_qdrant_sync [{user_id}]: retrieve failed for {collection}: {e}")
                 continue
-            for p in points:
-                current[str(p.id)] = dict(p.payload or {})
         else:
             offset = None
             while True:
@@ -250,33 +289,44 @@ async def _backfill_qdrant(user_id: str, neo4j_driver, qdrant, only_ids=None):
                     scroll_filter=Filter(must=[FieldCondition(key="userId", match=MatchValue(value=user_id))]),
                 )
                 for p in points:
-                    current[str(p.id)] = dict(p.payload or {})
+                    _record(p)
                 if next_offset is None:
                     break
                 offset = next_offset
+
         changed = [
-            pid for pid, payload in current.items()
-            if {k: payload.get(k) for k in _SCOPE_PAYLOAD_KEYS if payload.get(k) is not None}
-            != desired.get(pid, {})
+            parent for parent, family in current.items()
+            if {k: family[0][1].get(k) for k in _SCOPE_PAYLOAD_KEYS if family[0][1].get(k) is not None}
+            != desired.get(parent, {})
         ]
-        for pid in changed:
+        for parent in changed:
+            # One retrieve for the whole family: a scoped record is stored as N
+            # points and they must all move together.
+            family = current[parent]
             try:
-                # Preserve existing vector; skip points with none (sync_orphans re-embeds those).
-                with_vec = await qdrant.retrieve(collection_name=collection, ids=[pid], with_vectors=True)
-                vec = with_vec[0].vector if with_vec else None
-                if vec is None:
-                    continue
-                merged = dict(current[pid])
-                for k in _SCOPE_PAYLOAD_KEYS:
-                    merged.pop(k, None)
-                merged.update(desired.get(pid, {}))
-                await qdrant.upsert(
+                # Preserve existing vectors; skip points with none (sync_orphans re-embeds those).
+                with_vec = await qdrant.retrieve(
                     collection_name=collection,
-                    points=[PointStruct(id=pid, vector=vec, payload=merged)],
+                    ids=[pid for pid, _ in family],
+                    with_vectors=True,
                 )
-                synced += 1
+                structs = []
+                vectors = {str(p.id): p.vector for p in with_vec}
+                for pid, payload in family:
+                    vec = vectors.get(pid)
+                    if vec is None:
+                        continue
+                    merged = dict(payload)
+                    for k in _SCOPE_PAYLOAD_KEYS:
+                        merged.pop(k, None)
+                    merged.update(desired.get(parent, {}))
+                    structs.append(PointStruct(id=pid, vector=vec, payload=merged))
+                if not structs:
+                    continue
+                await qdrant.upsert(collection_name=collection, points=structs)
+                synced += len(structs)
             except Exception as e:
-                logger.warning(f"migrate_client_context [{user_id}]: Qdrant scope sync failed for {pid}: {e}")
+                logger.warning(f"migrate_client_context [{user_id}]: Qdrant scope sync failed for {parent}: {e}")
     if synced:
         logger.info(f"scope_qdrant_sync [{user_id}]: updated {synced} payloads")
 
@@ -963,6 +1013,7 @@ async def restore_scope_links():
                     with_vectors=False,
                     scroll_filter=Filter(must=[FieldCondition(key="userId", match=MatchValue(value=user_id))]),
                 )
+                linked_nodes: set = set()
                 for p in points:
                     payload = p.payload or {}
                     client_id = payload.get("clientId")
@@ -970,7 +1021,14 @@ async def restore_scope_links():
                         continue
                     if _resolve_client_by_id(client_id, user_id) is None:
                         continue
-                    node_id = str(p.id)
+                    # The link belongs to the record, not to a chunk. Linking
+                    # per point would either target a node that does not exist
+                    # (a derived chunk id) or repeat the same MERGE once per
+                    # chunk, so a long entry would link N times.
+                    node_id = parent_of(p.id, payload)
+                    if node_id in linked_nodes:
+                        continue
+                    linked_nodes.add(node_id)
                     if is_diary:
                         await link_diary_to_client(node_id, client_id, user_id)
                     else:

@@ -34,9 +34,119 @@ from matching_utils import (
     scopes_compatible,
     validate_merge_ids,
 )
+from chunking import (
+    CHUNK_FETCH_MULTIPLIER,
+    build_chunk_payloads,
+    chunk_text_of,
+    parent_of,
+    strip_chunk_meta,
+)
 
 # Max unconfirmed (below top_p) results appended after the confident set.
 WEAK_RESULT_LIMIT = 2
+
+
+# ---------------------------------------------------------------------------
+# Chunked vector writes
+#
+# A single vector over a 40k-character record is a lossy average — the answer to
+# "which meeting did we decide the renewal term in" may live in paragraph 14 and
+# be invisible in the mean. A long record therefore gets one point per chunk, so
+# a query can match the part that actually contains it.
+#
+# Two invariants make this safe to adopt incrementally:
+#   * chunk 0 keeps ``id == <fact id>``, so every existing id-based path (and
+#     every record short enough not to need chunking) is byte-for-byte unchanged.
+#   * chunk ids are derived with uuid5 from the parent, so re-writing a record
+#     overwrites the same points instead of accumulating orphans.
+# ---------------------------------------------------------------------------
+async def _upsert_fact_points(qdrant, record_id: str, text: str, base_payload: dict,
+                               prefix: Optional[str] = None, replace: bool = False) -> int:
+    """Write one point, or N when the text needs chunking. Returns the count.
+
+    ``prefix`` is prepended to every chunk before embedding (the fact name), so
+    each chunk carries the same context the single-vector path used to encode
+    once.
+
+    ``replace`` drops the record's previous points first. It is required for an
+    update: a shorter text produces fewer chunks, and without this the tail
+    chunks of the old, longer version survive with stale text and are returned
+    by search as though they were current.
+    """
+    # build_chunk_payloads is the single decision point: it returns one untagged
+    # point for a short record and N chunk points for a long one.
+    parts = build_chunk_payloads(record_id, text, strip_chunk_meta(base_payload))
+    if len(parts) == 1:
+        vector = await get_embedding(f"{prefix}: {text}" if prefix else text)
+        if replace:
+            # A long record edited down to a short one stops being chunked; its
+            # old chunks would otherwise outlive the text they describe.
+            await _delete_fact_chunks(qdrant, record_id)
+        await qdrant.upsert(
+            collection_name=COLLECTION_NAME,
+            points=[PointStruct(id=record_id, vector=vector, payload=parts[0]["payload"])],
+        )
+        return 1
+
+    points = []
+    for part in parts:
+        body = chunk_text_of(part["payload"])
+        vector = await get_embedding(f"{prefix}: {body}" if prefix else body)
+        points.append(PointStruct(id=part["id"], vector=vector, payload=part["payload"]))
+
+    if replace:
+        # Every chunk embeds before anything is written, so a rejected embed
+        # still leaves the previous version searchable rather than deleting it
+        # and failing to replace it.
+        await _delete_fact_chunks(qdrant, record_id)
+
+    await qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
+    logger.info(f"[chunking] {record_id}: {len(points)} chunk points written")
+    return len(points)
+
+
+async def find_chunk_family(qdrant, record_id: str, collection: str) -> list:
+    """Every Qdrant point id belonging to a record, chunked or not.
+
+    Chunk ids are derived, not stored on the record, so a caller that only knows
+    ``record_id`` cannot enumerate the family. Rather than guessing a chunk
+    count from the text (which is gone by delete time) this filters on the
+    ``parentId`` that every chunk carries.
+
+    Returns ``[record_id]`` when the record is not chunked, so a single call
+    covers both shapes and the delete path never needs to know which it was.
+    """
+    ids = [str(record_id)]
+    offset = None
+    while True:
+        points, offset = await qdrant.scroll(
+            collection_name=collection,
+            scroll_filter=Filter(must=[FieldCondition(key="parentId", match=MatchValue(value=str(record_id)))]),
+            limit=256,
+            offset=offset,
+            with_payload=False,
+            with_vectors=False,
+        )
+        for point in points:
+            pid = str(point.id)
+            if pid not in ids:
+                ids.append(pid)
+        if offset is None:
+            break
+    return ids
+
+
+async def _delete_fact_chunks(qdrant, record_id: str) -> None:
+    """Delete every point belonging to a fact, chunked or not.
+
+    A plain ``delete(record_id)`` would leave chunks 1..N-1 behind as orphans for
+    ``sync_orphans()`` to find.
+    """
+    ids = await find_chunk_family(qdrant, record_id, COLLECTION_NAME)
+    await qdrant.delete(
+        collection_name=COLLECTION_NAME,
+        points_selector=PointIdsList(points=ids) if len(ids) > 1 else ids,
+    )
 
 # ---------------------------------------------------------------------------
 # People metadata extraction
@@ -87,8 +197,6 @@ async def db_add_memory(text: str, category: str, user_id: str, metadata: Option
     category = category.strip().capitalize()
     people_meta = extract_people_metadata(name) if category.lower() == "people" else {}
     meta = {**people_meta, **(metadata or {})}
-    embed_text = f"{name}: {text}" if name else text
-    vector   = await get_embedding(embed_text)
 
     # Qdrant
     payload = {"text": text, "name": name, "category": category, "userId": user_id, "metadata": meta}
@@ -105,14 +213,10 @@ async def db_add_memory(text: str, category: str, user_id: str, metadata: Option
             payload["contextId"] = context_id
             payload["contextName"] = ctx_info["name"]
 
-    await qdrant.upsert(
-        collection_name=COLLECTION_NAME,
-        points=[PointStruct(
-            id=doc_id,
-            vector=vector,
-            payload=payload,
-        )],
-    )
+    # Embeds last, after the payload is final, so a rejected embed leaves no
+    # half-written record: a long text is split and each chunk is embedded
+    # separately, but the failure still happens before anything is written.
+    await _upsert_fact_points(qdrant, doc_id, text, payload, prefix=name)
 
     # Neo4j
     with neo4j_driver.session() as s:
@@ -180,15 +284,7 @@ async def db_update_memory(memory_id: str, name: Optional[str], text: Optional[s
 
     # Qdrant Update
     # Re-embed if text OR name changes
-    embed_text = f"{new_name}: {new_text}" if new_name else new_text
     needs_embed = text is not None or name is not None
-
-    try:
-        vector = await get_embedding(embed_text) if needs_embed else None
-        logger.info(f"[db_update_memory] Embedding generated, vector_len={len(vector) if vector else 0}")
-    except Exception as e:
-        logger.error(f"[db_update_memory] Embedding failed: {e}")
-        raise RuntimeError(f"Embedding failed: {e}")
 
     # Prepare payload, converting Neo4j types to JSON-serializable ones
     payload = {}
@@ -212,14 +308,22 @@ async def db_update_memory(memory_id: str, name: Optional[str], text: Optional[s
 
     logger.info(f"[db_update_memory] Upserting to Qdrant, payload keys: {list(payload.keys())}")
 
-    await qdrant.upsert(
-        collection_name=COLLECTION_NAME,
-        points=[PointStruct(
-            id=memory_id,
-            vector=vector or await get_embedding(embed_text),
-            payload=payload,
-        )],
-    )
+    if needs_embed:
+        # replace=True: a shortened text produces fewer chunks, and the old
+        # tail would otherwise survive and be returned as current text.
+        await _upsert_fact_points(qdrant, memory_id, new_text or "", payload,
+                                   prefix=new_name, replace=True)
+    else:
+        # Only category/metadata changed, so the vector still describes the
+        # text. It has to reach every chunk: filtering on category is done at
+        # query time against the payload, so a chunk left behind would make the
+        # record unfindable by its own new category.
+        family = await find_chunk_family(qdrant, memory_id, COLLECTION_NAME)
+        await qdrant.set_payload(
+            collection_name=COLLECTION_NAME,
+            payload=strip_chunk_meta(payload),
+            points=PointIdsList(points=family) if len(family) > 1 else family,
+        )
 
     # Neo4j Update
     logger.info(f"[db_update_memory] Updating Neo4j")
@@ -255,10 +359,7 @@ async def db_delete_memory(memory_id: str, user_id: str) -> bool:
     if not qdrant or not neo4j_driver:
         raise RuntimeError("Database connections not established.")
 
-    await qdrant.delete(
-        collection_name=COLLECTION_NAME,
-        points_selector=[memory_id],
-    )
+    await _delete_fact_chunks(qdrant, memory_id)
     with neo4j_driver.session() as s:
         # Find category to check for orphans after deletion
         cat_res = s.run(
@@ -282,10 +383,7 @@ async def db_delete_memory(memory_id: str, user_id: str) -> bool:
 
         if deleted:
             # Delete from Qdrant only if found in Neo4j
-            await qdrant.delete(
-                collection_name=COLLECTION_NAME,
-                points_selector=[memory_id],
-            )
+            await _delete_fact_chunks(qdrant, memory_id)
 
             await publish_db_event(user_id, "memory_changed", {
                 "action": "delete",
@@ -698,6 +796,40 @@ def _expand_query(query: str) -> list:
     return [(k, v) for k, v in seen.items()]
 
 
+async def _hydrate_chunk_texts(qdrant, entries: list) -> None:
+    """Fill in the full text for results that matched on a non-zero chunk.
+
+    Only chunk 0 carries ``text`` — a partial copy on the others would let a
+    search return a fragment as though it were the whole record. So when the
+    winning chunk is chunk 7, the record's real text is fetched here.
+
+    Mutates in place and costs one batched ``retrieve`` per search, and only
+    when a non-zero chunk actually won.
+    """
+    missing = [e for e in entries if e.get("text") is None]
+    if not missing:
+        return
+    try:
+        found = await qdrant.retrieve(
+            collection_name=COLLECTION_NAME,
+            ids=[e["id"] for e in missing],
+            with_payload=True,
+            with_vectors=False,
+        )
+    except Exception as exc:
+        logger.warning(f"chunk hydrate: could not load full text for {len(missing)} result(s): {exc}")
+        return
+    by_id = {str(p.id): p.payload for p in found}
+    for entry in missing:
+        payload = by_id.get(str(entry["id"]))
+        if not payload:
+            continue
+        entry["text"] = payload.get("text")
+        # The winning chunk is still worth reporting: it is the passage that
+        # actually matched, and it is what a user wants to see highlighted.
+        entry["matchedChunk"] = payload.get("chunkText")
+
+
 async def _single_vector_search(qdrant, query: str, user_id: str, category: Optional[str], fetch_limit: int, top_p: float, client: Optional[str] = None, context: Optional[str] = None) -> list:
     """Run a single vector search against Qdrant. Returns raw results before boosting.
 
@@ -939,10 +1071,12 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
         context=context,
         expand=not exact_matches,
     )
-    fetch_limit = max(limit * 5, 50)
+    # A chunked record occupies one fetch slot per chunk, so the raw limit has to
+    # leave room for the family collapsing back down to `limit` records.
+    fetch_limit = max(limit * 5 * CHUNK_FETCH_MULTIPLIER, 50)
 
     # Collect all results from all query variants
-    all_vector_results = {}  # id -> best result across all variants
+    all_vector_results = {}  # record id -> best result across all variants
 
     for variant_query, weight in query_variants:
         raw_points = await _single_vector_search(qdrant, variant_query, user_id, category, fetch_limit, top_p, client, context)
@@ -952,8 +1086,14 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
             # Apply query variant weight
             weighted_score = boosted_score * weight
 
+            # A chunked record contributes one point per chunk, all matching the
+            # same filters. Key on the parent so the record appears once, with
+            # the score of its best-matching chunk — otherwise a long record
+            # fills the result list with N copies of itself.
+            record_id = parent_of(r.id, r.payload)
+
             result_entry = {
-                "id": r.id,
+                "id": record_id,
                 "text": r.payload.get("text"),
                 "name": r.payload.get("name"),
                 "category": r.payload.get("category"),
@@ -965,10 +1105,11 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
             }
 
             # Keep the best version of each result
-            if r.id not in all_vector_results or weighted_score > all_vector_results[r.id]["score"]:
-                all_vector_results[r.id] = result_entry
+            if record_id not in all_vector_results or weighted_score > all_vector_results[record_id]["score"]:
+                all_vector_results[record_id] = result_entry
 
     results = list(all_vector_results.values())
+    await _hydrate_chunk_texts(qdrant, results)
 
     # Merge exact matches and vector results, deduplicating by ID
     merged_results = {}
@@ -1701,10 +1842,11 @@ async def db_merge_memories(master_id: str, duplicate_ids: List[str], user_id: s
 
     # Delete duplicates from Qdrant
     try:
-        await qdrant.delete(
-            collection_name=COLLECTION_NAME,
-            points_selector=PointIdsList(points=duplicate_ids),
-        )
+        # The family, not just the record id: a merged-away chunked fact still
+        # has chunks 1..N-1 in the collection, and `pendingQdrantDeletes` is
+        # replayed by sync_orphans using the same expansion.
+        for dup_id in duplicate_ids:
+            await _delete_fact_chunks(qdrant, dup_id)
     except Exception:
         logger.exception(
             "Merge committed to Neo4j but Qdrant cleanup failed; "
@@ -2058,7 +2200,12 @@ def _normalize_point_id(raw_id: str):
 
 
 async def _scroll_qdrant_ids(qdrant, collection: str, user_id: str) -> set:
-    """Scroll all Qdrant point IDs for a user in a collection."""
+    """Scroll all Qdrant record IDs for a user in a collection.
+
+    Counts records, not points: a chunked record is one Fact/DiaryEntry in
+    Neo4j and N points here, so returning point ids would report every long
+    record as a Qdrant-only orphan and make the count check fire constantly.
+    """
     ids = set()
     try:
         offset = None
@@ -2067,13 +2214,13 @@ async def _scroll_qdrant_ids(qdrant, collection: str, user_id: str) -> set:
                 collection_name=collection,
                 limit=1000,
                 offset=offset,
-                with_payload=False,
+                with_payload=["parentId"],
                 with_vectors=False,
                 scroll_filter=Filter(must=[FieldCondition(key="userId", match=MatchValue(value=user_id))]),
             )
             points, next_offset = result
             for p in points:
-                ids.add(str(p.id))
+                ids.add(parent_of(p.id, p.payload))
             if next_offset is None:
                 break
             offset = next_offset
@@ -2146,10 +2293,11 @@ async def sync_orphans():
             if not pending_ids:
                 continue
             try:
-                await qdrant.delete(
-                    collection_name=COLLECTION_NAME,
-                    points_selector=PointIdsList(points=pending_ids),
-                )
+                # pendingQdrantDeletes holds record ids. Replaying it verbatim
+                # would clear only chunk 0 of a merged-away chunked fact and
+                # leave the rest to be treated as orphans on the next boot.
+                for pending_id in pending_ids:
+                    await _delete_fact_chunks(qdrant, pending_id)
             except Exception:
                 logger.exception(
                     f"sync_orphans [{user_id}]: pending merge cleanup failed "
@@ -2172,25 +2320,29 @@ async def sync_orphans():
                 collection_name=COLLECTION_NAME,
                 limit=1000,
                 offset=offset,
-                with_payload=False,
+                # parentId is needed to collapse a chunk family onto its record.
+                # Without it every chunk 1..N-1 looks like a Qdrant-only point
+                # and sync_orphans deletes the middle of every long record.
+                with_payload=["parentId"],
                 with_vectors=False,
                 scroll_filter=Filter(must=[FieldCondition(key="userId", match=MatchValue(value=user_id))]),
             )
             points, next_offset = result
             for p in points:
-                qdrant_fact_ids.add(str(p.id))
+                qdrant_fact_ids.add(parent_of(p.id, p.payload))
             if next_offset is None:
                 break
             offset = next_offset
 
-        # Qdrant-only fact points → delete
+        # Qdrant-only fact records → delete
         orphan_fact_qdrant = qdrant_fact_ids - neo4j_fact_ids
         if orphan_fact_qdrant:
             logger.info(f"sync_orphans [{user_id}]: deleting {len(orphan_fact_qdrant)} Qdrant-only fact orphans")
-            await qdrant.delete(
-                collection_name=COLLECTION_NAME,
-                points_selector=PointIdsList(points=list(orphan_fact_qdrant)),
-            )
+            # Per record, not per id: the set holds record ids (chunks were
+            # collapsed by parent_of), so a bulk delete by those ids would
+            # remove chunk 0 and strand chunks 1..N-1 forever.
+            for orphan_id in orphan_fact_qdrant:
+                await _delete_fact_chunks(qdrant, orphan_id)
             total_deleted += len(orphan_fact_qdrant)
 
         # Neo4j-only facts → re-embed
@@ -2199,13 +2351,12 @@ async def sync_orphans():
             logger.info(f"sync_orphans [{user_id}]: re-embedding {len(orphan_fact_neo4j)} Neo4j-only facts")
             for oid in orphan_fact_neo4j:
                 info = neo4j_fact_map[oid]
-                vector = await get_embedding(info["text"])
-                await qdrant.upsert(
-                    collection_name=COLLECTION_NAME,
-                    points=[PointStruct(id=oid, vector=vector, payload={
-                        "text": info["text"], "name": info["name"], "userId": user_id
-                    })],
-                )
+                # Through the chunking helper so a re-embedded long record is
+                # restored as the same multi-point family it was written as,
+                # not collapsed back into one lossy vector.
+                await _upsert_fact_points(qdrant, oid, info["text"], {
+                    "text": info["text"], "name": info["name"], "userId": user_id,
+                })
             total_reembedded += len(orphan_fact_neo4j)
 
         # -----------------------------------------------------------------------
@@ -2235,28 +2386,31 @@ async def sync_orphans():
                 collection_name=DIARY_COLLECTION,
                 limit=1000,
                 offset=offset,
-                with_payload=False,
+                # parentId collapses a chunk family onto its entry, as above.
+                with_payload=["parentId"],
                 with_vectors=False,
                 scroll_filter=Filter(must=[FieldCondition(key="userId", match=MatchValue(value=user_id))]),
             )
             points, next_offset = result
             for p in points:
-                qdrant_diary_ids.add(str(p.id))
+                qdrant_diary_ids.add(parent_of(p.id, p.payload))
             if next_offset is None:
                 break
             offset = next_offset
 
-        # Qdrant-only diary points → delete
+        # Qdrant-only diary records → delete
         orphan_diary_qdrant = qdrant_diary_ids - neo4j_diary_ids
         if orphan_diary_qdrant:
             logger.info(
                 f"sync_orphans [{user_id}]: deleting {len(orphan_diary_qdrant)} "
                 f"Qdrant-only diary orphans"
             )
-            await qdrant.delete(
-                collection_name=DIARY_COLLECTION,
-                points_selector=PointIdsList(points=list(orphan_diary_qdrant)),
-            )
+            # Per record, so a chunked orphan loses all of its points.
+            # Local import: diary_manager is a peer module, not a dependency of
+            # this one, and pulling it in at module scope would tie them together.
+            from diary_manager import _delete_diary_chunks
+            for orphan_id in orphan_diary_qdrant:
+                await _delete_diary_chunks(orphan_id)
             total_deleted += len(orphan_diary_qdrant)
 
         # Neo4j-only diary entries → re-embed
@@ -2279,7 +2433,6 @@ async def sync_orphans():
                             oldId=oid, userId=user_id, newId=qdrant_id
                         )
                 embed_text = f"{info['name']}: {info['content']}" if info["name"] else info["content"]
-                vector = await get_embedding(embed_text)
                 payload = {
                     "content": info["content"],
                     "name": info["name"],
@@ -2287,10 +2440,15 @@ async def sync_orphans():
                     "timestamp": info["timestamp"],
                     "userId": user_id,
                 }
-                await qdrant.upsert(
-                    collection_name=DIARY_COLLECTION,
-                    points=[PointStruct(id=qdrant_id, vector=vector, payload=payload)],
-                )
+                # Chunked for the same reason as facts: a long diary entry is
+                # not one searchable vector.
+                points = build_chunk_payloads(qdrant_id, info["content"], payload)
+                structs = []
+                for part in points:
+                    body = chunk_text_of(part["payload"])
+                    vectors = await get_embedding(f"{info['name']}: {body}" if info["name"] else body)
+                    structs.append(PointStruct(id=part["id"], vector=vectors, payload=part["payload"]))
+                await qdrant.upsert(collection_name=DIARY_COLLECTION, points=structs)
             total_reembedded += len(orphan_diary_neo4j)
 
         # -----------------------------------------------------------------------
