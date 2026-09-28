@@ -365,6 +365,48 @@ class ConfigTests(unittest.TestCase):
         self.assertGreaterEqual(widened, chunking.CHUNK_TARGET_CHARS)
 
 
+class EmbedCeilingAgreementTests(unittest.TestCase):
+    """chunking and common read the same env var but cannot import each other.
+
+    chunking.py duplicates ``MEM_EMBED_MAX_CHARS`` because common.py pulls in
+    the DB drivers, and the duplicate exists only to size chunk parts. If the
+    two defaults drift, the larger one wins and every chunk is built to a
+    ceiling the embedder refuses -- so each chunk pays a rejected request
+    before the shrink ladder rescues it. That is the same waste the default was
+    corrected to remove, reintroduced one layer up.
+
+    The production log is what caught it: an 11189-char input was refused while
+    6000 succeeded, so the real window is ~2048 tokens and the budget default
+    was lowered to 8000. Both copies had to move together.
+    """
+
+    _PATTERN = re.compile(
+        r'EMBED_(?:MAX_CHARS|CEILING) = max\(500, int\(os\.getenv\("MEM_EMBED_MAX_CHARS", "(\d+)"\)\)\)'
+    )
+
+    def _default_in(self, filename):
+        path = os.path.join(os.path.dirname(__file__), filename)
+        with open(path, "r", encoding="utf-8") as handle:
+            match = self._PATTERN.search(handle.read())
+        self.assertIsNotNone(match, f"{filename} no longer declares the shared default")
+        return int(match.group(1))
+
+    def test_common_and_chunking_declare_the_same_default(self):
+        self.assertEqual(
+            self._default_in("common.py"),
+            self._default_in("chunking.py"),
+            "the two copies of MEM_EMBED_MAX_CHARS must share a default, or "
+            "chunks get sized for a ceiling the embedder refuses",
+        )
+
+    def test_the_default_fits_the_measured_window(self):
+        # 11189 chars was refused and 6000 accepted, so the real window sits
+        # between them. 8000 is inside that range; a default at or above the
+        # refused size reintroduces a wasted request per long record.
+        for filename in ("common.py", "chunking.py"):
+            self.assertLess(self._default_in(filename), 11189, filename)
+
+
 class CallSiteGuardTests(unittest.TestCase):
     """Pin the invariants that only hold if the call sites were wired correctly.
 

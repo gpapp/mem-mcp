@@ -418,11 +418,15 @@ EMBED_RETRY_BACKOFF = float(os.getenv("MEM_EMBED_RETRY_BACKOFF", "1.5"))
 # Character budget for one embedding. Ollama serves embedding models with a
 # smaller window than the model advertises (num_ctx defaults to 2048-4096
 # regardless of the model's real 8192), so a long fact or diary entry can blow
-# the limit while looking modest on screen. 12000 chars is ~3000 tokens of
-# English and fits the common default window; it is only a first guess, and the
-# shrink ladder below adapts if the real window is smaller. Raise it if your
-# model genuinely has room, lower it if you see 500s in the log.
-EMBED_MAX_CHARS = max(500, int(os.getenv("MEM_EMBED_MAX_CHARS", "12000")))
+# the limit while looking modest on screen. Measured against the production
+# embedder: 11189 chars was refused as too long, 6000 accepted — a window of
+# about 2048 tokens, so ~2000 tokens of English is what actually fits. 8000
+# chars clears it with headroom. The old 12000 default assumed the upper end of
+# that 2048-4096 range and was over budget for this model, which the shrink
+# ladder absorbed, so nothing broke — but every long record paid a rejected
+# request before succeeding. Raise it if your model genuinely has room, lower it
+# if you see 500s in the log.
+EMBED_MAX_CHARS = max(500, int(os.getenv("MEM_EMBED_MAX_CHARS", "8000")))
 # Statuses worth a second attempt. A 5xx from Ollama is usually a cold model
 # load or two requests racing to load the same model, both of which clear.
 # 4xx is not retried: a bad model name or a missing route will not fix itself.

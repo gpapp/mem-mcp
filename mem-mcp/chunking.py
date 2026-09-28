@@ -54,8 +54,11 @@ CHUNK_MAX = max(1, int(os.getenv("MEM_CHUNK_MAX", "16")))
 CHUNK_OVERLAP = max(0, min(500, int(os.getenv("MEM_CHUNK_OVERLAP", "200"))))
 # Mirrors EMBED_MAX_CHARS in common.py. Duplicated rather than imported because
 # common.py pulls in the DB drivers; a chunk larger than this is silently
-# head+tail truncated by the embedder, so callers compare against it.
-EMBED_CEILING = max(500, int(os.getenv("MEM_EMBED_MAX_CHARS", "12000")))
+# head+tail truncated by the embedder, so callers compare against it. The
+# default must stay equal to common.py's or chunk parts get sized for a ceiling
+# the embedder refuses, and every chunk would pay the same rejected request the
+# budget default was corrected to avoid.
+EMBED_CEILING = max(500, int(os.getenv("MEM_EMBED_MAX_CHARS", "8000")))
 
 # Keys that exist only to describe the chunking itself. Stripped from chunk 0's
 # payload so an unchunked record and chunk 0 of a chunked one are byte-identical.

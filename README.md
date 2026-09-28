@@ -161,7 +161,7 @@ model and the reason Ollama gave, instead of a bare `500`.
 |---|---|---|
 | `MEM_EMBED_RETRIES` | `2` | Retries per route for a transient failure |
 | `MEM_EMBED_RETRY_BACKOFF` | `1.5` | Seconds multiplied by the attempt number |
-| `MEM_EMBED_MAX_CHARS` | `12000` | Character budget per embedding |
+| `MEM_EMBED_MAX_CHARS` | `8000` | Character budget per embedding (measured: the embedder refused 11189 chars, accepted 6000) |
 
 A missing model is not retried — the error tells you to run
 `docker exec ollama ollama pull <model>`.
