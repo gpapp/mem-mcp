@@ -317,6 +317,35 @@ def wait_for_service(url: str, label: str, max_retries: int = 5) -> bool:
     return False
 
 
+def _ollama_model_matches(installed, wanted: str) -> bool:
+    """Is ``wanted`` already present in Ollama's reported model names?
+
+    Ollama reports a tagless model as ``name:latest`` and an untagged one as
+    ``name:any``, while the configuration usually just says ``name``. A plain
+    set membership test therefore never matches and the model is re-pulled on
+    every boot -- 23 unnecessary downloads of a 274MB embedder in one week.
+    """
+    wanted = (wanted or "").strip()
+    if not wanted:
+        return False
+    if wanted in installed:
+        return True
+    # A configured name that already carries a tag must match exactly, or via
+    # the implicit :latest. Only a tagless name may also satisfy :any.
+    base, sep, tag = wanted.rpartition(":")
+    if not sep:
+        base, tag = wanted, ""
+    for name in installed:
+        name_base, _, name_tag = name.rpartition(":")
+        if not _:
+            continue
+        if name_base != base:
+            continue
+        if not tag or name_tag in (tag, "latest") or (not tag and name_tag == "any"):
+            return True
+    return False
+
+
 async def ensure_ollama_models() -> None:
     """Ensure every configured Ollama model is available before startup work."""
     models = list(dict.fromkeys((EMBED_MODEL, LLM_QUERY_MODEL, SCOPE_MODEL, MERGE_MODEL)))
@@ -337,7 +366,7 @@ async def ensure_ollama_models() -> None:
         }
 
         for model in models:
-            if model in installed:
+            if _ollama_model_matches(installed, model):
                 logger.warning(f"Ollama result: model ready: {model}")
                 continue
 

@@ -30,6 +30,7 @@ _FUNCTIONS = (
     "_embed_once",
     "_is_input_too_long",
     "_truncate_for_embed",
+    "_ollama_model_matches",
     "get_embedding",
 )
 _ASSIGNMENTS = (
@@ -599,3 +600,76 @@ class WriteOrderingGuardTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class OllamaModelMatchTests(unittest.TestCase):
+    """The boot-time model check must not re-pull what is already installed.
+
+    Ollama reports a tagless model as ``name:latest`` (and an untagged one as
+    ``name:any``) while the configuration says just ``name``. Set membership
+    therefore never matched, and every restart re-downloaded a 274MB embedder --
+    23 times in the week this was found.
+    """
+
+    def setUp(self):
+        self._matches = _load(Recorder(), _ok_for)["_ollama_model_matches"]
+
+    def test_a_tagless_config_name_matches_the_latest_tag(self):
+        # The exact case from the log: nomic-embed-text vs nomic-embed-text:latest
+        self.assertTrue(self._matches({"nomic-embed-text:latest"}, "nomic-embed-text"))
+
+    def test_a_tagless_config_name_matches_the_any_tag(self):
+        self.assertTrue(self._matches({"llama3:any"}, "llama3"))
+
+    def test_an_exact_tagged_name_still_matches(self):
+        self.assertTrue(self._matches({"qwen3.5:2b"}, "qwen3.5:2b"))
+        self.assertTrue(self._matches({"gemma4:e2b"}, "gemma4:e2b"))
+
+    def test_a_different_tag_is_not_the_same_model(self):
+        # 0.8b and 2b are genuinely different models; matching them would leave
+        # the vault embedded with the wrong one.
+        self.assertFalse(self._matches({"qwen3.5:2b"}, "qwen3.5:0.8b"))
+        self.assertFalse(self._matches({"gemma4:e2b"}, "gemma4:4b"))
+
+    def test_a_different_model_is_not_a_match(self):
+        self.assertFalse(self._matches({"nomic-embed-text:latest"}, "qwen3.5:2b"))
+
+    def test_a_missing_model_is_not_a_match(self):
+        self.assertFalse(self._matches(set(), "nomic-embed-text"))
+
+    def test_an_empty_name_never_matches(self):
+        self.assertFalse(self._matches({"nomic-embed-text:latest"}, ""))
+        self.assertFalse(self._matches({"nomic-embed-text:latest"}, "   "))
+        self.assertFalse(self._matches({"nomic-embed-text:latest"}, None))
+
+    def test_a_colonless_installed_name_matches_a_tagless_wanted(self):
+        # Defensive: a proxy in front of Ollama could report a bare name.
+        self.assertTrue(self._matches({"nomic-embed-text"}, "nomic-embed-text"))
+
+    def test_the_real_installed_set_from_the_production_log(self):
+        installed = {
+            "nomic-embed-text:latest", "qwen3.5:2b", "qwen3.5:0.8b",
+            "nomic-ea:latest", "gemma4:e2b",
+        }
+        for wanted in ("nomic-embed-text", "qwen3.5:2b", "qwen3.5:0.8b", "gemma4:e2b"):
+            self.assertTrue(self._matches(installed, wanted), wanted)
+        self.assertFalse(self._matches(installed, "gemma4:e4b"))
+
+    def test_ensure_ollama_models_actually_calls_the_helper(self):
+        """Pin the call site.
+
+        The tests above exercise the helper directly, so re-injecting the old
+        ``if model in installed`` at the call site leaves all nine green --
+        verified by doing exactly that. The download bug lives in the call
+        site, so the call site is what has to be asserted.
+        """
+        with open(COMMON_PY, "r", encoding="utf-8") as handle:
+            source = handle.read()
+        tree = ast.parse(source)
+        segment = next(
+            ast.get_source_segment(source, n)
+            for n in tree.body
+            if isinstance(n, ast.AsyncFunctionDef) and n.name == "ensure_ollama_models"
+        )
+        self.assertIn("_ollama_model_matches(installed, model)", segment)
+        # The old form must not survive anywhere in the function.
+        self.assertNotRegex(segment, r"if\s+model\s+in\s+installed\s*:")
