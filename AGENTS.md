@@ -40,6 +40,8 @@ Run `git -c core.whitespace=cr-at-eol diff --check` after documentation or code 
 
 ### Image Build
 
+All three backing services are pinned to an exact tag — `qdrant/qdrant:v1.19.1`, `neo4j:5.26.0`, `ollama/ollama:0.34.4`. They were all `:latest` at one point, which meant `docker-compose up -d --build` silently upgraded them. Two concrete consequences, not hypothetical ones: Ollama moved its embed route across versions (hence the dual `/api/embeddings` + `/api/embed` client), and `backup.py` depends on Qdrant's snapshot create/download/upload API, so an unpinned major bump there would make a savepoint unrestorable rather than fail visibly. When bumping, change the tag deliberately and expect to re-run the backup round trip.
+
 `mem-mcp/Dockerfile` pins `# syntax=docker/dockerfile:1` and installs Python deps with `RUN --mount=type=cache,target=/root/.cache/pip`. Wheels live in a BuildKit cache that survives rebuilds, so a rebuild after a source-only change no longer re-downloads PyPI. Do not reintroduce `--no-cache-dir` — it disables the mount and is the reason the layer grew on every build. `mem-mcp/.dockerignore` keeps `__pycache__`, `logs/`, and `backup/` out of the build context, since `COPY . .` would otherwise ship them into the image.
 
 ## Architecture

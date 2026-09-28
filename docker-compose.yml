@@ -1,6 +1,10 @@
 services:
   qdrant:
-    image: qdrant/qdrant:latest
+    # Pinned, like neo4j and ollama. backup.py depends directly on the
+    # snapshot create/download/upload API, so a surprise major bump would turn
+    # into an unrestorable vault rather than a visible failure. Same digest as
+    # `latest` when this was pinned.
+    image: qdrant/qdrant:v1.19.1
     container_name: qdrant
     restart: always
     healthcheck:
@@ -42,7 +46,12 @@ services:
       - ./neo4j_logs:/logs
 
   ollama:
-    image: ollama/ollama:latest
+    # Pinned, like neo4j. `latest` moves between deploys and the embed/chat
+    # route surface has shifted across versions — the app now tries both
+    # /api/embeddings and /api/embed, but pinning means an unexpected Ollama
+    # upgrade is a deliberate change here rather than a side effect of
+    # `docker-compose up -d --build`. This tag is what `latest` resolved to.
+    image: ollama/ollama:0.34.4
     container_name: ollama
     restart: always
     healthcheck:
