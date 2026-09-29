@@ -16,7 +16,11 @@ from common import (
     get_qdrant, get_neo4j, logger, get_embedding, get_llm_response, publish_db_event,
     DIARY_COLLECTION, QDRANT_URL, clean_extracted_people_names
 )
-from matching_utils import resolve_people_candidates, text_windows
+from matching_utils import (
+    parse_people_name_array,
+    resolve_people_candidates,
+    text_windows,
+)
 from chunking import (
     CHUNK_FETCH_MULTIPLIER,
     build_chunk_payloads,
@@ -220,6 +224,18 @@ PEOPLE_EXTRACT_OVERLAP = max(0, min(1000, int(os.getenv("MEM_PEOPLE_OVERLAP", "6
 # window is its own LLM call. This warns, it does not truncate.
 PEOPLE_EXTRACT_WARN_WINDOWS = 6
 
+# Output budget for ONE window's JSON array. It is a budget, not a formality:
+# a dense 6000-char window can easily hold thirty-odd names, and at 200 tokens
+# the model hit the cap mid-array on a real 30k-char entry. The parse then
+# found no JSON object, the window was skipped, and the names it had already
+# emitted were lost with no error anywhere -- the silent-recall-loss shape this
+# windowing exists to prevent. Raising it costs generation time only when a
+# window really is that dense; a sparse window stops well short of it.
+# Sizing rule of thumb: a name is ~4 tokens in JSON, so 800 covers ~200 names.
+PEOPLE_EXTRACT_MAX_TOKENS = max(
+    200, int(os.getenv("MEM_PEOPLE_EXTRACT_TOKENS") or 800)
+)
+
 
 def people_extract_windows(content: str, window: int = 0, overlap: int = 0) -> list:
     """Split diary content into overlapping windows for name extraction.
@@ -265,18 +281,12 @@ async def _extract_people_names(content: str) -> list:
     found = []
     for index, window in enumerate(windows):
         try:
-            raw = await get_llm_response(window, system=_PEOPLE_EXTRACT_SYSTEM, num_predict=200)
-            raw = re.sub(r"```[a-z]*\n?", "", raw).strip()
-            m = re.search(r"\[.*\]", raw, re.DOTALL)
-            if not m:
+            raw = await get_llm_response(window, system=_PEOPLE_EXTRACT_SYSTEM,
+                                         num_predict=PEOPLE_EXTRACT_MAX_TOKENS)
+            names = parse_people_name_array(raw)
+            if names is None:
                 logger.debug(
                     f"[extract_people_names] window {index + 1}/{len(windows)} had no JSON array"
-                )
-                continue
-            names = json.loads(m.group())
-            if not isinstance(names, list):
-                logger.debug(
-                    f"[extract_people_names] window {index + 1}/{len(windows)} JSON was not a list"
                 )
                 continue
             found.extend(clean_extracted_people_names(names))

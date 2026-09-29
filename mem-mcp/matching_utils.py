@@ -772,6 +772,54 @@ class TTLCache:
         return time.monotonic() if now is None else now
 
 
+def parse_people_name_array(raw: str):
+    """Parse a JSON array of names, tolerating a model that never closes it.
+
+    Returns the names, or None if nothing usable is present.
+
+    Extraction asks for a JSON array and a model asked for a *list* of every
+    person in a dense passage will sometimes stop emitting structure: measured
+    on a real 30k-char entry, one window enumerated ten correct names and then
+    repeated the same name two hundred times without ever closing the bracket.
+    The caller used to regex for ``\\[.*\\]``, find nothing, and drop the whole
+    window -- so ten good names were lost because the eleventh went wrong, and
+    nothing was logged. A larger num_predict does not help: the repetition is
+    the fault, and it simply runs longer.
+
+    So an unterminated array is closed at the last *complete* quoted element
+    and what came before it is kept. Names before the degenerate tail are as
+    trustworthy as any other extraction; a truncated parse is strictly better
+    than discarding them. Complete, well-formed input is unaffected.
+    """
+    if not raw:
+        return None
+    body = re.sub(r"```[a-z]*\n?", "", raw).strip()
+    # One guard for both paths: the response has to *be* an array, i.e. open
+    # with "[". Without this the happy path's `\[.*\]` happily matches the
+    # array nested inside a JSON object, and salvaging would mine one out of
+    # prose. Neither is a truncated answer, and both would invent names.
+    stripped = body.lstrip()
+    if not stripped.startswith("["):
+        return None
+    try:
+        data = json.loads(stripped)
+        if isinstance(data, list):
+            return data
+    except ValueError:
+        pass
+    # Salvage the complete quoted elements of an unterminated array.
+    salvaged = re.findall(r'"((?:[^"\\]|\\.)*)"', stripped[1:])
+    if not salvaged:
+        return None
+    out = []
+    for item in salvaged:
+        try:
+            out.append(json.loads('"' + item + '"'))
+        except ValueError:
+            out.append(item)
+    return out
+
+
 def cache_key(*parts) -> tuple:
     """A hashable key from parts that may be ``None`` or unhashable.
 

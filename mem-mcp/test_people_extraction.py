@@ -26,7 +26,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from chunking import normalize_text
-from matching_utils import text_windows
+from matching_utils import parse_people_name_array, text_windows
 
 DIARY_MANAGER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "diary_manager.py")
 
@@ -437,6 +437,45 @@ class KeywordSourceTests(unittest.TestCase):
             "text_windows(content, KEYWORD_EXTRACT_WINDOW, KEYWORD_EXTRACT_OVERLAP)" in self.body,
             "extract_diary_keywords no longer windows the content",
         )
+
+
+class DegenerateArrayParseTests(unittest.TestCase):
+    """A model that never closes its array must not cost us the names in it.
+
+    Measured on a real 30k-char diary entry: one 6000-char window enumerated
+    ten correct names and then repeated the same name two hundred times
+    without ever emitting the closing bracket. The old `re.search(r"\\[.*\\]")`
+    found nothing, the window was skipped, and ten good names were lost with
+    no error logged. Raising num_predict does not fix it -- the repetition is
+    the fault, it just runs longer.
+    """
+
+    def test_a_closed_array_is_unchanged(self):
+        self.assertEqual(parse_people_name_array('["Alice Smith", "Bob Jones"]'),
+                         ["Alice Smith", "Bob Jones"])
+
+    def test_fenced_json_is_still_parsed(self):
+        self.assertEqual(parse_people_name_array('```json\n["Alice"]\n```'), ["Alice"])
+
+    def test_a_repeating_unterminated_array_yields_the_good_prefix(self):
+        raw = '["Priyanka", "Siarhei Bahdanau", "Tim Lohmann"' + ', "Siarhei Bahdanau"' * 300
+        names = parse_people_name_array(raw)
+        self.assertIsNotNone(names, msg="an unterminated array must not be discarded")
+        self.assertEqual(names[:3], ["Priyanka", "Siarhei Bahdanau", "Tim Lohmann"],
+                         msg="names emitted before the degenerate tail are as "
+                             "trustworthy as any other extraction")
+
+    def test_prose_with_no_array_is_none(self):
+        for raw in ("I could not find any people.", "", "no bracket here"):
+            self.assertIsNone(parse_people_name_array(raw))
+
+    def test_a_json_object_is_not_mistaken_for_a_name_array(self):
+        self.assertIsNone(parse_people_name_array('{"names": ["Alice"]}'),
+                          msg="an object is not an array of names")
+
+    def test_escaped_quotes_inside_a_name_survive(self):
+        self.assertEqual(parse_people_name_array('["Ann \\"Annie\\" Lee"]'),
+                         ['Ann "Annie" Lee'])
 
 
 if __name__ == "__main__":
