@@ -1,3 +1,9 @@
+from matching_utils import (
+    QUERY_CACHE_DEFAULT_MAX,
+    QUERY_CACHE_DEFAULT_TTL,
+    TTLCache,
+    cache_key,
+)
 import ast
 import asyncio
 import json
@@ -779,11 +785,17 @@ class ResolverInputTests(unittest.TestCase):
             )
 
     def test_matching_utils_still_imports_without_the_app(self):
-        """It gains ``import os`` for the tunables; it must gain nothing else.
+        """No app import may ever appear here. The stdlib set is allowed to move.
 
         Every test that imports matching_utils directly relies on this, and so
         does the module's stated design: it is the dependency-light home for the
         shared helpers precisely so it can be unit-tested without DB drivers.
+
+        The allowlist grew by ``time`` for the query-rewrite cache's expiry.
+        That is a widening, so the guard that actually matters is asserted
+        separately below rather than being left to the allowlist: the point is
+        "nothing from this app", and an allowlist alone would quietly accept a
+        new app module if somebody added it to the list.
         """
         import ast
 
@@ -793,9 +805,37 @@ class ResolverInputTests(unittest.TestCase):
                 imported.update(a.name.split(".")[0] for a in node.names)
             elif isinstance(node, ast.ImportFrom):
                 imported.add((node.module or "").split(".")[0])
-        self.assertEqual(
-            imported, {"os", "re", "json", "difflib"},
+        self.assertTrue(
+            imported <= {"os", "re", "json", "difflib", "time"},
             f"matching_utils gained a dependency: {sorted(imported)}",
+        )
+
+    def test_matching_utils_imports_no_app_module(self):
+        """The load-bearing half, and the reason for the allowlist existing.
+
+        ``from common import logger`` is the specific thing that has been
+        tempting here: every failure path in this module would want to log, and
+        logging from ``common`` is what makes the module unimportable without
+        the DB drivers — which would silently delete this entire suite, because
+        a module that cannot be imported raises at collection and every test
+        errors rather than one failing.
+        """
+        import ast
+
+        app_modules = {
+            "common", "fact_manager", "diary_manager", "client_manager",
+            "migrate_client_context", "gui", "server", "mcp_tools", "memory",
+            "chunking", "backup", "neo4j", "qdrant_client", "httpx", "fastapi",
+        }
+        imported = set()
+        for node in ast.walk(ast.parse(self.source)):
+            if isinstance(node, ast.Import):
+                imported.update(a.name.split(".")[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                imported.add((node.module or "").split(".")[0])
+        self.assertEqual(
+            imported & app_modules, set(),
+            f"matching_utils imported app modules: {sorted(imported & app_modules)}",
         )
 
 
@@ -1316,6 +1356,252 @@ class ContextNamedInTextTests(unittest.TestCase):
                            ("PPC", "   ")):
             self.assertFalse(context_named_in_text(name, body),
                              msg=f"({name!r}, {body!r}) must be False, not a raise")
+
+class QueryRewriteCacheTests(unittest.TestCase):
+    """The cache is only worth having if it is both bounded and actually expiring.
+
+    The clock is injected rather than slept through, so these pin the boundary
+    exactly instead of racing it: a test that sleeps for the TTL is a test that
+    fails on a loaded CI box and passes on a fast one.
+    """
+
+    def test_a_fresh_entry_is_returned(self):
+        c = TTLCache(ttl=100.0, max_entries=4)
+        c.put("k", ["a"], now=0.0)
+        self.assertEqual(c.get("k", now=99.9), ["a"])
+
+    def test_expiry_is_exclusive_of_the_boundary_and_inclusive_of_it(self):
+        c = TTLCache(ttl=100.0, max_entries=4)
+        c.put("k", ["a"], now=0.0)
+        self.assertEqual(c.get("k", now=100.0), None,
+                         msg="at exactly ttl the entry is stale, not fresh")
+
+    def test_an_expired_entry_is_removed_on_read(self):
+        c = TTLCache(ttl=10.0, max_entries=4)
+        c.put("k", ["a"], now=0.0)
+        c.get("k", now=11.0)
+        self.assertEqual(len(c), 0,
+                         msg="a cache that only evicts on write still holds every "
+                             "query ever asked, which is what the bound prevents")
+
+    def test_the_bound_evicts_the_oldest_first(self):
+        c = TTLCache(ttl=1000.0, max_entries=3)
+        for i, k in enumerate("abc"):
+            c.put(k, [k], now=float(i))
+        c.put("d", ["d"], now=3.0)
+        self.assertEqual(len(c), 3)
+        self.assertEqual(c.get("a", now=4.0), None, msg="oldest must go first")
+        self.assertEqual(c.get("d", now=4.0), ["d"])
+
+    def test_reinserting_a_key_refreshes_its_recency(self):
+        c = TTLCache(ttl=1000.0, max_entries=3)
+        c.put("a", ["a"], now=0.0)
+        c.put("b", ["b"], now=1.0)
+        c.put("c", ["c"], now=2.0)
+        c.put("a", ["a2"], now=3.0)
+        c.put("d", ["d"], now=4.0)
+        self.assertEqual(c.get("a", now=5.0), ["a2"],
+                         msg="a re-put is a use, so it must not be the eviction victim")
+        self.assertEqual(c.get("b", now=5.0), None)
+
+    def test_a_cache_with_no_ttl_or_no_room_is_disabled_and_inert(self):
+        for ttl, mx in ((0.0, 4), (-1.0, 4), (100.0, 0), (100.0, -1)):
+            c = TTLCache(ttl=ttl, max_entries=mx)
+            self.assertFalse(c.enabled, msg=f"ttl={ttl} max={mx} must be disabled")
+            c.put("k", ["a"], now=0.0)
+            self.assertEqual(c.get("k", now=0.0), None,
+                             msg=f"a disabled cache must not serve ttl={ttl} max={mx}")
+            self.assertEqual(len(c), 0,
+                             msg=f"a disabled cache must not retain ttl={ttl} max={mx}")
+
+    def test_clear_empties_it(self):
+        c = TTLCache(ttl=100.0, max_entries=4)
+        c.put("k", ["a"], now=0.0)
+        c.clear()
+        self.assertEqual(len(c), 0)
+
+    def test_defaults_are_the_documented_ones(self):
+        self.assertEqual(TTLCache().ttl, QUERY_CACHE_DEFAULT_TTL)
+        self.assertEqual(TTLCache().max_entries, QUERY_CACHE_DEFAULT_MAX)
+        self.assertTrue(TTLCache().enabled)
+
+    def test_cache_key_is_hashable_for_none_and_unhashable_parts(self):
+        # Filters are optional strings the caller does not control. A stray list
+        # must not raise on the lookup path, where the caller can only get a 500.
+        self.assertIsInstance(cache_key("q", None, None, None, False), tuple)
+        for parts in (("q", ["a", "b"]), ("q", {"k": "v"}), ("q", {1, 2}),
+                      ("q", None, None, None, False)):
+            try:
+                key = cache_key(*parts)
+                hash(key)
+            except TypeError as exc:
+                self.fail(f"cache_key{parts!r} raised TypeError: {exc}")
+
+    def test_cache_key_separates_different_parts(self):
+        base = cache_key("q", "cat", "cl", "ctx", False)
+        for other in (cache_key("q2", "cat", "cl", "ctx", False),
+                      cache_key("q", "cat2", "cl", "ctx", False),
+                      cache_key("q", "cat", "cl2", "ctx", False),
+                      cache_key("q", "cat", "cl", "ctx2", False),
+                      cache_key("q", "cat", "cl", "ctx", True)):
+            self.assertNotEqual(base, other,
+                                msg="two different rewrites must not share a key")
+
+
+FACT_MANAGER_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "fact_manager.py")
+_REWRITE = "rewrite_search_query"
+_REWRITE_HELPERS = ("_expand_query",)
+
+
+def _load_rewrite(cache, responder):
+    """Exec the real rewrite_search_query against a stub LLM.
+
+    `fact_manager.py` cannot be imported without the DB drivers, so the function
+    is lifted with `ast.get_source_segment` — this tests the shipping code. The
+    cache is the real `TTLCache` from matching_utils, so the tests below are
+    about the call site: that it uses the cache, and what it declines to cache.
+    """
+    with open(FACT_MANAGER_PY, "r", encoding="utf-8") as handle:
+        source = handle.read()
+    tree = ast.parse(source)
+
+    chunks = []
+    found = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
+            node.name == _REWRITE or node.name in _REWRITE_HELPERS
+        ):
+            chunks.append(ast.get_source_segment(source, node))
+            found.add(node.name)
+    if _REWRITE not in found:
+        raise AssertionError(f"fact_manager.py no longer defines {_REWRITE}")
+    for name in _REWRITE_HELPERS:
+        if name not in found:
+            raise AssertionError(f"fact_manager.py no longer defines {name}")
+
+    import re
+    from typing import Optional
+
+    class FakeLogger:
+        def __init__(self):
+            self.warnings = []
+
+        def warning(self, msg, *a, **kw):
+            self.warnings.append(str(msg))
+
+        def debug(self, *a, **kw):
+            pass
+
+    ns = {
+        "re": re,
+        "Optional": Optional,
+        "cache_key": cache_key,
+        "QUERY_REWRITE_CACHE": cache,
+        "get_llm_response": responder,
+        "SEARCH_LLM_TIMEOUT": 45.0,
+        "logger": FakeLogger(),
+    }
+    exec("\n\n".join(chunks), ns)
+    return ns
+
+
+class RewriteSearchQueryCallSiteTests(unittest.TestCase):
+    """A test of TTLCache is not a test of its call site.
+
+    The bug this guards is a wrong *call*: a cache that exists, is bounded and
+    expires, and is never consulted. So these drive the real function and count
+    LLM calls.
+    """
+
+    ANSWER = '{"keywords": ["ai adoption", "deutsche bank"]}'
+
+    def _responder(self, answer=None, raises=None):
+        self.calls = []
+
+        async def _r(prompt, system="", model="", num_predict=0, timeout=0.0):
+            self.calls.append(prompt)
+            if raises is not None:
+                raise raises
+            return self.ANSWER if answer is None else answer
+
+        return _r
+
+    def _run(self, cache, responder, query, **kw):
+        ns = _load_rewrite(cache, responder)
+        return asyncio.run(ns[_REWRITE](query, **kw))
+
+    def test_a_repeat_query_does_not_call_the_llm_again(self):
+        cache = TTLCache(ttl=900.0, max_entries=8)
+        responder = self._responder()
+        first = self._run(cache, responder, "who is running the ai adoption wave two")
+        second = self._run(cache, responder, "who is running the ai adoption wave two")
+        self.assertEqual(len(self.calls), 1,
+                         msg=f"expected one LLM call, got {len(self.calls)}")
+        self.assertEqual(first, second)
+
+    def test_the_returned_list_is_a_copy_of_the_cached_one(self):
+        # Callers weight and slice the result. A shared list would let one
+        # caller's in-place append rewrite what the next search sees.
+        cache = TTLCache(ttl=900.0, max_entries=8)
+        responder = self._responder()
+        first = self._run(cache, responder, "who is running the ai adoption wave two")
+        first.append(("poisoned", 1.0))
+        second = self._run(cache, responder, "who is running the ai adoption wave two")
+        self.assertNotIn(("poisoned", 1.0), second,
+                         msg="a caller's in-place edit leaked into the cache")
+
+    def test_the_fallback_is_not_cached(self):
+        # A timeout is transient. Pinning the degraded heuristic result for the
+        # TTL would turn one slow call into a permanently worse search.
+        cache = TTLCache(ttl=900.0, max_entries=8)
+        responder = self._responder(raises=RuntimeError("timed out"))
+        self._run(cache, responder, "who is running the ai adoption wave two")
+        self.assertEqual(len(cache), 0,
+                         msg="a failed rewrite must not be cached")
+
+    def test_an_unparseable_answer_is_not_cached(self):
+        cache = TTLCache(ttl=900.0, max_entries=8)
+        responder = self._responder(answer="I could not do that.")
+        self._run(cache, responder, "who is running the ai adoption wave two")
+        self.assertEqual(len(cache), 0,
+                         msg="no keywords means the fallback ran, so nothing to cache")
+
+    def test_a_different_filter_is_a_different_question(self):
+        cache = TTLCache(ttl=900.0, max_entries=8)
+        responder = self._responder()
+        self._run(cache, responder, "who is running the ai adoption wave two",
+                  client="Deutsche Bank (DB)")
+        self._run(cache, responder, "who is running the ai adoption wave two",
+                  client="EPAM")
+        self.assertEqual(len(self.calls), 2,
+                         msg="the client filter changes the prompt, so it must "
+                             "not share a cache entry")
+
+    def test_a_short_query_is_answered_without_the_llm_at_all(self):
+        cache = TTLCache(ttl=900.0, max_entries=8)
+        responder = self._responder()
+        result = self._run(cache, responder, "correction")
+        self.assertEqual(self.calls, [])
+        self.assertEqual(result, [("correction", 1.0)])
+
+    def test_expand_bypasses_the_short_circuit_and_is_cached_separately(self):
+        cache = TTLCache(ttl=900.0, max_entries=8)
+        responder = self._responder()
+        self._run(cache, responder, "Radoslav", expand=True)
+        self._run(cache, responder, "Radoslav", expand=False)
+        self.assertEqual(len(self.calls), 1,
+                         msg="expand=True and expand=False ask different questions")
+        self.assertEqual(len(cache), 1)
+
+    def test_fenced_json_is_still_parsed(self):
+        cache = TTLCache(ttl=900.0, max_entries=8)
+        responder = self._responder(
+            answer="```json\n" + self.ANSWER + "\n```")
+        result = self._run(cache, responder, "who is running the ai adoption wave two")
+        self.assertIn(("ai adoption", 0.85), result)
+        self.assertEqual(len(cache), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

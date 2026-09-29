@@ -2,6 +2,7 @@ import os
 import re
 import json
 import difflib
+import time
 
 # ---------------------------------------------------------------------------
 # Identity confidence
@@ -686,3 +687,104 @@ async def resolve_people_candidates(names: list[str], content: str,
             # One bad window must not discard the bindings the other windows made.
             continue
     return [candidate_by_id[fact_id] for fact_id in accepted_ids]
+
+
+# ---------------------------------------------------------------------------
+# Query rewrite cache
+#
+# `rewrite_search_query` is on the critical path of every search and costs one
+# LLM call, measured at tens of seconds on a host doing CPU inference. Its
+# input is a small tuple of strings and its output is a list of keyword/weight
+# pairs, so it is the one expensive call in the request path whose answer does
+# not depend on the contents of the vault — a repeat of the same query under
+# the same filters asks the model a question it has already answered, and gets
+# a slightly different answer each time, which is a worse property than being
+# slow.
+#
+# What is deliberately NOT cached: the fallback path. A timeout is transient, so
+# pinning the degraded heuristic result for the TTL would turn one slow call
+# into a permanently worse search. Only a real answer is stored.
+#
+# The clock is a parameter rather than a module global so the expiry behaviour
+# is testable without sleeping, and so a test can pin the exact boundary
+# instead of racing it.
+# ---------------------------------------------------------------------------
+
+QUERY_CACHE_DEFAULT_TTL = 900.0
+QUERY_CACHE_DEFAULT_MAX = 256
+
+
+class TTLCache:
+    """A bounded, expiring key/value store. Not thread-safe by design.
+
+    It holds values derived from a model call, never authoritative state, so the
+    worst a lost update costs is one extra LLM call. ``monotonic`` rather than
+    ``time.time`` because the entries are seconds-to-minutes old and a clock
+    adjustment must not make a fresh entry look expired or an old one new.
+    """
+
+    def __init__(self, ttl: float = QUERY_CACHE_DEFAULT_TTL,
+                 max_entries: int = QUERY_CACHE_DEFAULT_MAX):
+        self.ttl = float(ttl)
+        self.max_entries = max(0, int(max_entries))
+        self._entries: dict = {}
+
+    @property
+    def enabled(self) -> bool:
+        return self.ttl > 0 and self.max_entries > 0
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def get(self, key, now=None, default=None):
+        """The stored value, or ``default``.
+
+        Expired entries are removed on read rather than left to be skipped: a
+        cache that only evicts on write keeps the memory of every query ever
+        asked, which is the thing the bound exists to prevent.
+        """
+        if not self.enabled:
+            return default
+        entry = self._entries.get(key)
+        if entry is None:
+            return default
+        if (self._now(now) - entry[0]) >= self.ttl:
+            self._entries.pop(key, None)
+            return default
+        return entry[1]
+
+    def put(self, key, value, now=None) -> None:
+        if not self.enabled:
+            return
+        now = self._now(now)
+        # Re-inserting moves the key to the end, so the dict's own iteration
+        # order is the recency order and eviction is "oldest first" for free.
+        self._entries.pop(key, None)
+        self._entries[key] = (now, value)
+        while len(self._entries) > self.max_entries:
+            self._entries.pop(next(iter(self._entries)))
+
+    def clear(self) -> None:
+        self._entries.clear()
+
+    @staticmethod
+    def _now(now):
+        return time.monotonic() if now is None else now
+
+
+def cache_key(*parts) -> tuple:
+    """A hashable key from parts that may be ``None`` or unhashable.
+
+    Filters arrive as optional strings and the caller controls none of them, so
+    normalizing here is what keeps a stray list from raising TypeError on the
+    lookup path — where the caller cannot do anything about it except get a 500.
+    """
+    key = []
+    for part in parts:
+        if part is None:
+            key.append(None)
+        elif isinstance(part, (str, int, float, bool, tuple)):
+            key.append(part)
+        else:
+            key.append(str(part))
+    return tuple(key)

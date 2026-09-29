@@ -25,8 +25,10 @@ from client_manager import (
 )
 from matching_utils import (
     MIN_MATCH_CONFIDENCE,
+    TTLCache,
     VECTOR_CEIL,
     VECTOR_FLOOR,
+    cache_key,
     cluster_has_core,
     combine_duplicate_signals,
     identity_confidence,
@@ -50,6 +52,15 @@ from chunking import (
 
 # Max unconfirmed (below top_p) results appended after the confident set.
 WEAK_RESULT_LIMIT = 2
+
+# Search-query rewrite cache. TTL 0 disables it entirely, which is the knob to
+# reach for if a stale client/project filter ever shows up in a cached rewrite
+# rather than adding a per-entry invalidation path for a cache whose whole
+# contents are derived data. Both are `or`-defaults so an empty variable in
+# compose disables or falls back rather than being read as 0.
+QUERY_CACHE_TTL_SECONDS = float(os.getenv("MEM_QUERY_CACHE_TTL") or 900)
+QUERY_CACHE_MAX_ENTRIES = int(os.getenv("MEM_QUERY_CACHE_MAX") or 256)
+QUERY_REWRITE_CACHE = TTLCache(QUERY_CACHE_TTL_SECONDS, QUERY_CACHE_MAX_ENTRIES)
 
 # The graph is drawn by vis.js in the browser, so the practical ceiling is
 # render time rather than memory. A vault of several thousand records produces
@@ -772,10 +783,25 @@ async def rewrite_search_query(query: str, category: Optional[str] = None,
     pass ``expand`` when the exact-name lookup already came back empty, so a
     one-word miss ("Radoslav") can still be broadened while a one-word hit
     ("correction") stays a single cheap embedding.
+
+    The LLM call is cached on the inputs that produce the prompt. The rewrite
+    does not depend on the vault's contents, so the same query under the same
+    filters is the same question; asking again costs tens of seconds and returns
+    a slightly different answer, so a search that is repeated is not
+    reproducible for no benefit. The fallback on failure is deliberately not
+    cached — a timeout is transient and must not be pinned for the TTL.
     """
     q = query.strip()
     if len(q.split()) <= 2 and not expand:
         return [(q, 1.0)]
+
+    key = cache_key(q, category, client, context, bool(expand))
+    cached = QUERY_REWRITE_CACHE.get(key)
+    if cached is not None:
+        # A copy, not the stored list: callers weight and slice this, and a
+        # shared list would let one caller's in-place edit rewrite the cache.
+        logger.debug(f"[rewrite_search_query] cache hit for '{q}'")
+        return list(cached)
 
     filters = ", ".join(
         value for value in (
@@ -813,7 +839,13 @@ async def rewrite_search_query(query: str, category: Optional[str] = None,
                     keywords.append(cleaned)
             if keywords:
                 logger.debug(f"[rewrite_search_query] '{q}' → {keywords}")
-                return [(q, 1.0)] + [(kw, 0.85) for kw in keywords[:4]]
+                variants = [(q, 1.0)] + [(kw, 0.85) for kw in keywords[:4]]
+                QUERY_REWRITE_CACHE.put(key, variants)
+                # A copy on the way out here too, not just on the read path. The
+                # list handed to `put` IS the cached object, so returning it
+                # directly would let the first caller's in-place edit rewrite
+                # what every later search sees.
+                return list(variants)
     except Exception as exc:
         logger.warning(f"[rewrite_search_query] LLM rewrite failed, using heuristic: {type(exc).__name__}: {exc}")
 

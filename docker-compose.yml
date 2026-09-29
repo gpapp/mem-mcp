@@ -105,6 +105,13 @@ services:
       - MEM_SEARCH_LLM_TIMEOUT=${MEM_SEARCH_LLM_TIMEOUT:-45}
       - MEM_LLM_LOG_CHARS=${MEM_LLM_LOG_CHARS:-1000}
 
+      # Search-query rewrite cache. The rewrite costs one LLM call per search
+      # and its answer depends only on (query, filters, expand) -- not on the
+      # vault -- so a repeat asks a question already answered. TTL 0 or MAX 0
+      # disables it, which restores the pre-cache behaviour.
+      - MEM_QUERY_CACHE_TTL=${MEM_QUERY_CACHE_TTL:-900}
+      - MEM_QUERY_CACHE_MAX=${MEM_QUERY_CACHE_MAX:-256}
+
       # Embedding budget and retries. EMBED_MAX_CHARS must stay in step with
       # chunking.EMBED_CEILING, which reads the same variable.
       - MEM_EMBED_RETRIES=${MEM_EMBED_RETRIES:-2}
