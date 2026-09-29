@@ -65,9 +65,25 @@ services:
       - memory-net
     environment:
       - OLLAMA_VULKAN=1
+      # Sized against the one path that is NOT windowed. The extractors all
+      # send a single window (MEM_*_WINDOW are measured in chars, ~3.6 per
+      # token), so a 30k-char diary entry costs ~2000 tokens per call no matter
+      # how long the entry is. The merge draft is the exception: it json.dumps
+      # the full text of every selected record with no cap, so its prompt is
+      # max_cluster x the record length. Measured: facts average 489 chars and
+      # top out at 3055 (~853 tokens), and max_cluster may be up to 20 --
+      # which is already over 16332. Cutting this to 8192 moved the break point
+      # from ~18 clusters to ~8, in exchange for 3 percentage points of GPU
+      # residency (80% -> 83%). Not a trade worth making; if the merge path
+      # ever needs a guarantee, cap it in code rather than shrinking this.
       - OLLAMA_CONTEXT_LENGTH=16332
       - OLLAMA_FLASH_ATTENTION=True
       - OLLAMA_KV_CACHE_TYPE=q8_0
+      # A cold load of the chat model measured 9-20s, paid on the first call
+      # after any idle gap. 30m keeps it warm for a working session and still
+      # releases it overnight -- the card is 4 GB shared with ASR (1.25 GB), so
+      # holding a 3.3 GB model resident indefinitely starves the transcriber.
+      - OLLAMA_KEEP_ALIVE=30m
 
   mem-mcp:
     build: ./mem-mcp
