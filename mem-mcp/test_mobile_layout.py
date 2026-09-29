@@ -220,7 +220,8 @@ class LayoutInlineStyleTests(unittest.TestCase):
     """An inline style beats a stylesheet rule of any specificity."""
 
     def test_no_layout_container_carries_an_inline_style(self):
-        for cls in ("memories-layout", "diary-layout", "graph-layout"):
+        for cls in ("memories-layout", "diary-layout", "graph-layout",
+                    "graph-sidebar", "graph-main"):
             with self.subTest(container=cls):
                 self.assertIsNone(
                     re.search(r'class="%s"[^>]*\bstyle=' % cls, SOURCE),
@@ -230,6 +231,22 @@ class LayoutInlineStyleTests(unittest.TestCase):
 
     def test_the_graph_layout_flex_rule_lives_in_the_stylesheet(self):
         self.assertRegex(CSS, r"\.graph-layout\s*\{[^}]*display:\s*flex")
+
+    def test_the_graph_container_is_styled_and_carries_no_inline_style(self):
+        """`#graph-container` sized the vis canvas from an inline style.
+
+        The mobile block has a height rule for it, and it was inert: an
+        inline `height: 70vh` outranks it at every specificity. vis.js
+        sizes its canvas once from this box, so the rule that never applied
+        was the rule deciding how much room the user has to pan.
+        """
+        self.assertIsNone(
+            re.search(r'id="graph-container"[^>]*\bstyle=', SOURCE),
+            "#graph-container has an inline style, so the mobile height "
+            "rule for it cannot apply",
+        )
+        self.assertRegex(
+            CSS, r"#graph-container\s*\{[^}]*height:",)
 
 
 class MobileBreakpointTests(unittest.TestCase):
@@ -309,10 +326,13 @@ class MobileBreakpointTests(unittest.TestCase):
         # 70vh with min-height 500px is most of a phone's screen, and the
         # canvas keeps whatever width it was constructed at unless vis is
         # told to refit.
-        _assert_declares(self, self.tablet, "#graph-container", "height: 55vh",
-                         "70vh is most of a phone screen")
-        _assert_declares(self, self.tablet, "#graph-container", "min-height: 320px",
-                         "a 500px floor overflows a short viewport")
+        # The exact values are pinned in GraphSizeOnMobileTests, which also
+        # pins the flex basis; asserting them here as well would just be two
+        # tests that have to be edited together.
+        _assert_declares(self, self.tablet, "#graph-container", "height:",
+                         "the desktop 70vh is most of a phone screen")
+        _assert_declares(self, self.tablet, "#graph-container", "min-height:",
+                         "the desktop 500px floor overflows a short viewport")
 
     def test_touch_targets_are_grown_on_a_phone(self):
         _assert_declares(self, self.phone, ".alpha-btn", "width: 36px",
@@ -364,6 +384,60 @@ class GraphTouchTests(unittest.TestCase):
             body.index("network.destroy()"),
         )
 
+
+class GraphSizeOnMobileTests(unittest.TestCase):
+    """The graph canvas has to be given a real height on a phone.
+
+    Two distinct defects produced a narrow band, and neither is visible in
+    the markup:
+
+    * the container was sized by an inline style, so the mobile height rule
+      never applied and the desktop 70vh / 500px floor stood;
+    * `flex: 1` is a *zero* flex basis. In the stacked auto-height column
+      the mobile block creates, that resolves against no available space --
+      the same trap as the zero-basis scroll panes, which had already
+      produced two separate "the tab is just empty" bugs.
+
+    So the height is stated rather than inherited, and the basis is pinned
+    to content.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tablet = _declarations(_media_block(900))
+        cls.base = _declarations(CSS)
+
+    def test_the_container_is_not_a_zero_flex_basis_on_mobile(self):
+        _assert_declares(
+            self, self.tablet, "#graph-container", "flex: 0 0 auto",
+            "flex:1 is a zero basis, which resolves against nothing once "
+            "the layout is a stacked auto-height column")
+
+    def test_the_container_gets_a_usable_share_of_the_screen(self):
+        _assert_declares(
+            self, self.tablet, "#graph-container", "height: 62vh",
+            "the desktop 70vh leaves no room once controls are stacked above it")
+        _assert_declares(
+            self, self.tablet, "#graph-container", "min-height: 420px",
+            "a 62vh share of a short screen is not enough to pan a graph in")
+
+    def test_the_sidebar_is_bounded_so_it_cannot_push_the_graph_off_screen(self):
+        _assert_declares(
+            self, self.tablet, ".graph-sidebar", "max-height: 28vh",
+            "stacked above the graph, an unbounded sidebar of category chips "
+            "leaves only a band of canvas")
+        _assert_declares(
+            self, self.tablet, ".graph-sidebar", "overflow-y: auto",
+            "a bound that cannot scroll clips instead of scrolling")
+
+    def test_the_desktop_sizes_still_come_from_the_stylesheet(self):
+        for selector in (".graph-sidebar", ".graph-main", "#graph-container"):
+            with self.subTest(selector=selector):
+                self.assertTrue(
+                    selector in self.base,
+                    f"{selector} must be a stylesheet rule so the mobile "
+                    f"block can override it; got: {sorted(self.base)}",
+                )
 
 class ClientFilterOnMobileTests(unittest.TestCase):
     """The client filter is a child of the tab bar, not of the nav or a sidebar.

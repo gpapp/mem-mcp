@@ -429,6 +429,15 @@
     /* Was an inline style on the markup, which put it beyond the reach of
        any media query. Declared here so the mobile block can collapse it. */
     .graph-layout { display: flex; gap: 1rem; }
+    /* Both of these were inline styles on the markup, which put them beyond
+       the reach of the mobile block: the sidebar's `width: 200px` made the
+       `width: auto` rule a no-op, and the container's `height: 70vh` made
+       the mobile height rule a no-op. vis.js sizes its canvas from this box,
+       so whatever this says is exactly what the user has to pan around in. */
+    .graph-sidebar { width: 200px; flex-shrink: 0; border-right: 1px solid var(--border); padding-right: 1rem; }
+    .graph-main { flex: 1; display: flex; flex-direction: column; gap: .5rem; min-width: 0; }
+    #graph-container { flex: 1; height: 70vh; min-height: 500px;
+      border: 1px solid var(--border); border-radius: 8px; background: #fff; }
 
     /* ── Mobile ──────────────────────────────────────────────────────────
        Three page layouts are built as fixed-width columns: memories is
@@ -521,7 +530,14 @@
       /* Chip rows run sideways rather than stacking into a tall rail. */
       .chips-container { flex-direction: row !important; flex-wrap: nowrap; overflow-x: auto; }
 
-      #graph-container { height: 55vh; min-height: 320px; }
+      /* The graph gets a real share of the screen rather than whatever the
+         desktop rule left it. Two things are being undone here: the desktop
+         `height: 70vh` is too much once the controls and the sidebar are
+         stacked above it, and `flex: 1` is a *zero* flex basis, which in a
+         stacked auto-height column resolves against nothing -- the same trap
+         as the zero-basis scroll panes, so the height has to be stated. */
+      .graph-sidebar { max-height: 28vh; overflow-y: auto; }
+      #graph-container { flex: 0 0 auto; height: 62vh; min-height: 420px; }
 
       /* A submenu anchored at left:100% lands off the right edge of a
          phone with no way to scroll to it. Static stacks it inline. */
@@ -734,13 +750,13 @@
       </button>
     </div>
     <div class="graph-layout">
-      <div class="graph-sidebar" style="width: 200px; flex-shrink: 0; border-right: 1px solid var(--border); padding-right: 1rem;">
+      <div class="graph-sidebar">
         <div style="font-size:.7rem; font-weight:700; text-transform:uppercase; letter-spacing:.5px; color:var(--muted); padding-bottom:.6rem;">Categories</div>
         <div id="graph-categories-sidebar" class="chips-container" style="flex-direction: column;"></div>
       </div>
-      <div style="flex: 1; display: flex; flex-direction: column; gap: .5rem; min-width: 0;">
+      <div class="graph-main">
         <div id="graph-truncation-note" style="display: none; font-size: .78rem; color: var(--muted); background: var(--bg-subtle, #f8fafc); border: 1px solid var(--border); border-radius: 6px; padding: .5rem .7rem;"></div>
-        <div id="graph-container" style="flex: 1; height: 70vh; min-height: 500px; border: 1px solid var(--border); border-radius: 8px; background: #fff;"></div>
+        <div id="graph-container"></div>
       </div>
     </div>
   </div>
