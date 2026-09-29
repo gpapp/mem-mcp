@@ -3602,8 +3602,11 @@ npm install @modelcontextprotocol/sdk</code></pre>
     const context = document.getElementById('new-project')?.value || '';
     if (!name || !timestamp || !content) { toast('⚠️ Title, Date, and Content are required'); return; }
     const metadata = getDiaryMetaFromEditor();
-      const m = await api.post('memories', {name, text, category: cat, tags, client, context});
-    if (Object.keys(metadata).length) payload.metadata = metadata;
+    // PUT /api/diary/{id} takes the same DiaryCreate body as POST /api/diary.
+    // This used to reference an undeclared `payload` (and a stray api.post copied
+    // in from the memory editor), so the ReferenceError was thrown BEFORE the try
+    // below: no request, no toast, and only a console error.
+    const payload = {id: entryId, name, timestamp, content, metadata};
     try {
       const updated = await api.put('diary/' + entryId, payload);
       const entry = diaryEntries.find(e => e.id === entryId);

@@ -520,5 +520,55 @@ class ClientFilterOnMobileTests(unittest.TestCase):
             "the filter belongs to the right of the tab bar on desktop")
 
 
+class DiarySaveWiringTests(unittest.TestCase):
+    """saveDiaryEdit() shipped referring to an undeclared `payload`.
+
+    The ReferenceError was thrown *before* the try block, so there was no toast
+    and no request: the button did nothing at all. Nothing about that is
+    visible from here — there is no browser — so these assert the properties
+    that regress silently, and the same properties for the new-entry path.
+    """
+
+    def _function(self, name):
+        start = SOURCE.index("async function %s(" % name)
+        end = SOURCE.index("\n  function ", start)
+        if end < start:
+            end = len(SOURCE)
+        return SOURCE[start:end]
+
+    def setUp(self):
+        self.edit = self._function("saveDiaryEdit")
+        self.create = self._function("saveDiary")
+
+    def test_the_edit_path_declares_the_body_it_sends(self):
+        self.assertTrue("const payload = {" in self.edit,
+                        "saveDiaryEdit builds a payload but never declares one")
+        self.assertIn("api.put('diary/' + entryId, payload)", self.edit)
+
+    def test_the_edit_path_did_not_absorb_the_memory_editor(self):
+        # A stray `api.post('memories', {... cat, tags ...})` sat here for
+        # several commits: none of those names exist in this function.
+        self.assertFalse("api.post('memories'" in self.edit,
+                         "the memory editor's save call leaked into saveDiaryEdit")
+        for orphan in ("category: cat", "tags,", "payload.metadata"):
+            self.assertNotIn(orphan, self.edit)
+
+    def test_every_request_in_these_paths_is_inside_a_try(self):
+        # The user-visible half of the bug: an error before `try` is silent,
+        # because the catch that shows the toast never runs.
+        for name, body in (("saveDiaryEdit", self.edit), ("saveDiary", self.create)):
+            guarded = body.index("try {")
+            first = body.find("await api.")
+            self.assertTrue(first != -1, "%s makes no request at all" % name)
+            self.assertLess(guarded, first,
+                            "%s issues a request before its try block" % name)
+
+    def test_a_failed_save_still_says_so(self):
+        for name, body in (("saveDiaryEdit", self.edit), ("saveDiary", self.create)):
+            self.assertIn("catch", body)
+            self.assertIn("toast(", body,
+                          "%s has no toast, so a failure is invisible" % name)
+
+
 if __name__ == "__main__":
     unittest.main()
