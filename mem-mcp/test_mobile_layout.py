@@ -365,5 +365,86 @@ class GraphTouchTests(unittest.TestCase):
         )
 
 
+class ClientFilterOnMobileTests(unittest.TestCase):
+    """The client filter is a child of the tab bar, not of the nav or a sidebar.
+
+    It is invisible on a phone for a reason no amount of restyling the
+    control itself would fix: `.tabs` becomes a horizontal scroller below
+    900px, and the filter is the *last* flex child of that rail, sitting
+    after all seven tab buttons off the right edge of the screen. The
+    scrollbar is hidden, so nothing advertises that it is there -- the
+    markup is present and the control works, it is simply unreachable.
+
+    The fix is to stop the bar being a scroller, wrap it, and give the
+    filter a full-width row of its own. Both halves matter, and the second
+    is the one that is easy to miss: `.cf-panel` is `position: absolute`,
+    so inside a scroller it is clipped to the rail and opens as a sliver.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tablet = _declarations(_media_block(900))
+        cls.base = _declarations(CSS)
+
+    def test_the_filter_is_a_child_of_the_tab_bar_in_the_markup(self):
+        """Pin the structure the bug depends on.
+
+        If the filter is ever moved out of `.tabs`, the wrapping rules
+        below become inert rather than broken, and the panel rule
+        (position: static) is no longer needed. This test is what makes
+        that change visible instead of silent.
+        """
+        tabs = SOURCE.split('<div class="tabs">')[1].split("</div>\n")[0]
+        self.assertIn('id="cf-wrap"', tabs,
+                      "the client filter should still live inside the tab bar")
+        self.assertIn("cf-bar", tabs,
+                      "its wrapper needs the .cf-bar class for the mobile row")
+
+    def test_the_tab_bar_stops_being_a_horizontal_scroller(self):
+        _assert_declares(
+            self, self.tablet, ".tabs", "flex-wrap: wrap",
+            "otherwise the filter is the last thing in a scroller off-screen")
+        _assert_declares(
+            self, self.tablet, ".tabs", "overflow-x: visible",
+            "an absolutely positioned panel is clipped by a scroller")
+
+    def test_the_filter_gets_a_full_width_row_of_its_own(self):
+        _assert_declares(
+            self, self.tablet, ".cf-bar", "order: 99",
+            "puts the filter after the tabs on its own wrapped line")
+        _assert_declares(
+            self, self.tablet, ".cf-bar", "width: 100%",
+            "a full-width row rather than a sliver beside the last tab")
+        _assert_declares(
+            self, self.tablet, ".cf-bar", "margin-left: 0",
+            "the desktop auto margin would fight the wrap")
+
+    def test_the_panel_is_in_flow_so_it_is_not_clipped(self):
+        _assert_declares(
+            self, self.tablet, ".cf-panel", "position: static",
+            "absolute positioning inside the rail would clip it")
+        _assert_declares(
+            self, self.tablet, ".cf-panel", "max-height: 50vh",
+            "an unbounded list would run off the bottom of a phone screen")
+
+    def test_the_control_and_its_items_are_reachable_by_thumb(self):
+        _assert_declares(
+            self, self.tablet, ".cf-btn", "min-height: 40px",
+            "the desktop button is a few pixels tall")
+        # A grouped rule is expanded by _declarations, so each selector is
+        # its own key -- asking for ".cf-item, .cf-ctx" finds nothing and
+        # reports a rule that is present.
+        for selector in (".cf-item", ".cf-ctx"):
+            _assert_declares(
+                self, self.tablet, selector, "min-height: 40px",
+                "the list items are the actual tap targets")
+
+    def test_the_desktop_rule_survives(self):
+        """The mobile fix must not have removed the desktop placement."""
+        _assert_declares(
+            self, self.base, ".cf-bar", "margin-left: auto",
+            "the filter belongs to the right of the tab bar on desktop")
+
+
 if __name__ == "__main__":
     unittest.main()

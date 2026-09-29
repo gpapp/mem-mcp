@@ -417,6 +417,10 @@
     .cf-item.active { background: var(--primary-light); color: var(--primary); font-weight: 600; }
     .cf-item.active::before { content: '✓'; font-size: .75rem; margin-right: -3px; }
     .cf-separator { height: 1px; background: var(--border); margin: 4px 0; }
+    /* The client filter lives in the tab bar, pushed right of the tabs. On
+       desktop that is fine; see the mobile block, which has to give it a
+       row of its own because the bar becomes a horizontal scroller. */
+    .cf-bar { margin-left: auto; display: flex; align-items: center; padding-bottom: .25rem; flex-shrink: 0; }
     .cf-ctx { padding: 5px 12px 5px 26px; font-size: .8rem; color: var(--muted); }
     .cf-ctx:hover { background: var(--primary-light); color: var(--primary); }
     .cf-ctx.active { background: var(--primary-light); color: var(--primary); font-weight: 600; }
@@ -453,6 +457,22 @@
       .tabs { padding: .6rem .5rem .2rem; overflow-x: auto; scrollbar-width: none; }
       .tabs::-webkit-scrollbar { display: none; }
       .tab-btn { flex: 0 0 auto; white-space: nowrap; min-height: 40px; }
+
+      /* The client filter is a child of the tab bar, after all seven tabs.
+         Left as it is on a phone it is the last thing in a horizontal
+         scroller -- present in the DOM, off the right edge of the screen,
+         with no scrollbar to advertise that it is there. So the bar wraps
+         and the filter takes a full-width row of its own below the tabs.
+         `order` does the work: it is the last flex child, and the tab
+         buttons are all order 0 by default. */
+      .tabs { flex-wrap: wrap; overflow-x: visible; row-gap: .3rem; }
+      .cf-bar { order: 99; width: 100%; margin-left: 0; padding-bottom: .1rem; }
+      /* The panel is absolutely positioned. Inside a scroller it would be
+         clipped to the rail and open as a sliver; with the rail no longer a
+         scroller it hangs below the button and can be bounded on its own. */
+      .cf-panel { position: static; min-width: 0; width: 100%; max-height: 50vh; }
+      .cf-btn { max-width: none; width: 100%; min-height: 40px; justify-content: space-between; }
+      .cf-item, .cf-ctx { min-height: 40px; white-space: normal; }
 
       .page { padding: .75rem; }
       #page-memories { padding: .5rem; }
@@ -539,7 +559,7 @@
   <button class="tab-btn" data-tab="clients" onclick="switchTab('clients')">🏢 Clients</button>
   <button class="tab-btn" data-tab="projects" onclick="switchTab('projects')">📁 Projects</button>
   <button class="tab-btn" data-tab="setup" onclick="switchTab('setup')">🔌 Setup</button>
-  <div style="margin-left:auto; display:flex; align-items:center; padding-bottom:.25rem;">
+  <div class="cf-bar">
     <div class="cf-wrap" id="cf-wrap">
       <button class="cf-btn" id="cf-btn" onclick="_cfToggle(event)">All clients</button>
       <div class="cf-panel" id="cf-panel"></div>

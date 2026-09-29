@@ -32,12 +32,12 @@ mem-mcp/
 - **Advanced Metadata** — Facts support rich JSON metadata (tags, source, confidence, etc.).
 - **Knowledge Patterns** — Automatically identifies recurring themes and associations via graph analysis.
 - **Diary** — Narrative entries with Markdown support, LLM-powered keyword extraction, and vector similarity search.
-- **Smart Search** — LLM query rewriting (qwen3.5:0.8b) decomposes natural language into keyword phrases; multi-query expansion merges results from multiple vector searches.
+- **Smart Search** — LLM query rewriting (see `LLM_QUERY_MODEL`) decomposes natural language into keyword phrases; multi-query expansion merges results from multiple vector searches.
 - **Memory Deduplication** — Scope-aware multi-signal similarity clustering (vector, name, alias, email) with weighted fuzzy evidence, core-member filtering, and a guided merge workflow.
 - **LLM-Assisted Resolution** — LLMs review bounded People and duplicate candidates with diary, scope, metadata, and record context; returned IDs are validated before use.
 - **Recoverable Merges** — Neo4j/Qdrant merge cleanup records pending Qdrant deletions and retries them through startup orphan reconciliation when a store is temporarily unavailable.
 - **Dashboard Deduplication** — The Deduplicate tab scans scope-compatible clusters, lets you select the records to merge, generates an editable consolidated draft with the LLM, and requires confirmation before merging.
-- **Dedicated Merge Model** — Dashboard merge drafts use `MEM_MERGE_MODEL` (default `gemma4:e2b`), while search and classification remain on the lightweight query model.
+- **Dedicated Merge Model** — Dashboard merge drafts use `MEM_MERGE_MODEL` (default `gemma4:e2b`), while search and scope classification run on `LLM_QUERY_MODEL` / `MEM_SCOPE_MODEL` (set both to the same model — the scope classifier is the slow path and defaults to the query model).
 - **Skills System** — Pluggable skill workflows (e.g., `process-transcription`, `memory-deduplication`) loaded from Markdown files.
 - **Unified Web UI** — A modern, proxy-aware dashboard to manage memories, view diary history, and explore insights.
 - **Multi-user Isolation** — Secure per-user vaults based on Basic-Auth or proxy headers.
@@ -95,9 +95,12 @@ User identity is resolved automatically from:
 
 1. **Configure secrets**: `cp .env.example .env` and set `MEM_NEO4J_PASSWORD`.
 2. **Launch (CPU)**: `docker-compose up -d`
-3. **Launch (GPU)**: `docker-compose -f docker-compose.yml -f docker-compose.gpu.yml up -d` (requires NVIDIA driver + NVIDIA Container Toolkit)
+3. **Launch (GPU)**: `docker-compose -f docker-compose.yml -f docker-compose.gpu.yml up -d` (requires NVIDIA driver + NVIDIA Container Toolkit). **Verify Ollama actually got the card**: `docker exec ollama ls /dev/nvidia0` must succeed and `docker exec ollama ollama ps` must say `100% GPU`. Without that the app silently runs every LLM call on the CPU, and the symptom is wild latency variance rather than an error.
 4. **Initialize Embedder**: `docker exec ollama ollama pull nomic-embed-text`
-5. **Initialize Query LLM**: `docker exec ollama ollama pull qwen3.5:0.8b`
+5. **Initialize Query + Scope LLM**: `docker exec ollama ollama pull gemma3:4b-it-q4_K_M`
+   (a small 2b model completes fields rather than reasoning about them, which
+   misfiles diary entries; on a 4 GB card this one runs partly on the CPU and
+   pays a load per call, so allow a multi-minute full reclassify)
 6. **Initialize Merge LLM**: `docker exec ollama ollama pull gemma4:e2b`
 7. **After code changes**: rebuild the image with `docker-compose up -d --build mem-mcp` (dependency downloads are cached by BuildKit, so this is fast after the first build)
 
@@ -113,7 +116,7 @@ C:/tools/miniconda3/python.exe -m unittest -v test_matching_regressions.py test_
 Pop-Location
 ```
 
-The suites cover scope-aware duplicate matching, weighted scoring, bridge-cluster rejection, merge target ownership, merge mutation ordering, People candidate resolution, scope-name and `Client:`-header resolution, LLM prompt contracts, the chunking split, embedding retry/fallback behaviour, the Cypher written in each module, snapshot compression, and the diary people/keyword extraction windowing. They do not require the Docker services.
+The suites cover scope-aware duplicate matching, weighted scoring, bridge-cluster rejection, merge target ownership, merge mutation ordering, People candidate resolution, scope-name and `Client:`-header resolution, LLM prompt contracts, the chunking split, embedding retry/fallback behaviour, the Cypher written in each module, snapshot compression, the diary people/keyword extraction windowing, graph scope and capping, the mobile stylesheet, LLM chat timeouts and log content, and that every documented variable actually reaches the container. They do not require the Docker services.
 
 ## Backups
 
@@ -240,5 +243,5 @@ claude mcp add --transport http memory-vault http://<your-host>:8086/mcp --heade
 
 - **Frameworks**: FastAPI, FastMCP
 - **Databases**: Qdrant (Vector), Neo4j (Graph)
-- **AI/ML**: Ollama (nomic-embed-text for embeddings, qwen3.5:0.8b for query rewriting and keyword extraction)
+- **AI/ML**: Ollama (nomic-embed-text for embeddings, `LLM_QUERY_MODEL` for query rewriting, keyword/people extraction and scope classification)
 - **Frontend**: Vanilla JS, Modern CSS3
