@@ -723,7 +723,7 @@
         <textarea id="diary-content" placeholder="Today I…" style="min-height: 250px;"></textarea>
         <div style="margin-top:.75rem; display: flex; justify-content: space-between;">
           <button class="btn btn-ghost" onclick="cancelDiaryEdit()">Cancel</button>
-          <button class="btn btn-primary" onclick="saveDiary()">💾 Save Entry</button>
+          <button class="btn btn-primary" onclick="saveDiary(this)">💾 Save Entry</button>
         </div>
       </div>
       <div id="diary-viewer" class="diary-view-card">
@@ -3527,7 +3527,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
       </div>
       <div style="display:flex; gap:.5rem; justify-content:flex-end; margin-top:1rem; padding-top:.75rem; border-top:1px solid var(--border);">
         <button class="btn btn-ghost" onclick="selectDiaryEntry('${entry.id}')">Cancel</button>
-        <button class="btn btn-primary" onclick="saveDiaryEdit('${entry.id}')">💾 Save</button>
+        <button class="btn btn-primary" onclick="saveDiaryEdit('${entry.id}', this)">💾 Save</button>
       </div>`;
     renderDiaryMetaEditor(entry);
     fillDeProjects(entry.clientId, entry.contextId);
@@ -3593,7 +3593,26 @@ npm install @modelcontextprotocol/sdk</code></pre>
     return meta;
   }
 
-  async function saveDiaryEdit(entryId) {
+  // A diary save is not a quick request: it embeds the text, then extracts
+  // keywords and people names, which is one LLM call per window of the entry.
+  // On a long transcription that is tens of seconds with no feedback, and a
+  // second tap fires a second save. So the button is disabled and relabelled
+  // for the duration, and restored in `finally` — including when the save
+  // throws, which is the case that used to leave it stuck.
+  async function _busy(btn, label, work) {
+    if (!btn) { await work(); return; }
+    const original = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = '⏳ ' + label;
+    try {
+      await work();
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = original;
+    }
+  }
+
+  async function saveDiaryEdit(entryId, btn) {
     const name = document.getElementById('de-name').value.trim();
     await ensureClients();
     const timestamp = document.getElementById('de-timestamp').value;
@@ -3607,7 +3626,8 @@ npm install @modelcontextprotocol/sdk</code></pre>
     // in from the memory editor), so the ReferenceError was thrown BEFORE the try
     // below: no request, no toast, and only a console error.
     const payload = {id: entryId, name, timestamp, content, metadata};
-    try {
+    return _busy(btn, 'Saving…', async () => {
+      try {
       const updated = await api.put('diary/' + entryId, payload);
       const entry = diaryEntries.find(e => e.id === entryId);
       if (entry) { entry.name = updated.name; entry.content = updated.content; entry.timestamp = updated.timestamp; entry.date = updated.timestamp.substring(0,10); entry.metadata = updated.metadata; }
@@ -3623,6 +3643,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
       toast('✅ Diary entry updated');
       selectDiaryEntry(entryId);
     } catch(e) { toast('❌ Error updating entry'); }
+    });
   }
 
   function toggleDiaryLinkForm(entryId) {
@@ -3703,7 +3724,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     editEntry(activeDiaryId);
   }
 
-  async function saveDiary() {
+  async function saveDiary(btn) {
     const id = document.getElementById('diary-id').value;
     const name = document.getElementById('diary-name').value.trim();
     const timestamp = document.getElementById('diary-timestamp').value;
@@ -3714,11 +3735,13 @@ npm install @modelcontextprotocol/sdk</code></pre>
       return;
     }
 
-    try {
-      await api.post('diary', {id, name, timestamp, content});
-      toast('📖 Saved');
-      await loadDiary();
-    } catch(e) { toast('❌ Error saving entry'); }
+    return _busy(btn, 'Saving…', async () => {
+      try {
+        await api.post('diary', {id, name, timestamp, content});
+        toast('📖 Saved');
+        await loadDiary();
+      } catch(e) { toast('❌ Error saving entry'); }
+    });
   }
 
   let duplicateClusters = [];

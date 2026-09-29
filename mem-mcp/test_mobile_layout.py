@@ -569,6 +569,33 @@ class DiarySaveWiringTests(unittest.TestCase):
             self.assertIn("toast(", body,
                           "%s has no toast, so a failure is invisible" % name)
 
+    def test_a_saving_entry_shows_progress(self):
+        # A save embeds the text and then runs keyword and people extraction,
+        # one LLM call per window, so a long entry is tens of seconds of dead
+        # button with no way to tell a slow save from a broken one.
+        for name, body in (("saveDiaryEdit", self.edit), ("saveDiary", self.create)):
+            self.assertIn("_busy(btn", body,
+                          "%s gives no feedback while it saves" % name)
+
+    def test_the_button_is_restored_even_when_the_save_throws(self):
+        # The whole point of `finally`. A restore in the success path alone
+        # leaves the button permanently disabled after one failure, and the
+        # entry then cannot be saved again at all.
+        busy = self._function("_busy")
+        self.assertTrue("finally {" in busy,
+                        "_busy has no finally, so a throw leaves the button disabled")
+        guarded = busy.index("finally {")
+        self.assertIn("btn.disabled = false", busy)
+        self.assertTrue(guarded < busy.rindex("btn.innerHTML = original"),
+                        "the button is only restored on the success path")
+        self.assertIn("btn.disabled = true", busy)
+
+    def test_both_buttons_pass_themselves_in(self):
+        # Without `this` the handler gets no button and _busy is a no-op, which
+        # is a silent regression: the code still looks like it guards the save.
+        for call in ("saveDiary(this)", "saveDiaryEdit('${entry.id}', this)"):
+            self.assertIn(call, SOURCE, "%r does not pass the button" % call)
+
 
 if __name__ == "__main__":
     unittest.main()
