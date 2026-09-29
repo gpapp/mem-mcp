@@ -322,6 +322,13 @@ def _stamp_manual_scope(node_id: str, label: str, user_id: str) -> None:
 
     Computes the current client/context signature for this user and writes it onto
     the node.  Called by db_set_fact_scope and db_set_diary_scope.
+
+    The signature alone is not enough to mean "a human decided this". It is
+    written by the classifier too, byte for byte the same value, so a reclassify
+    could not tell a chosen scope from a guessed one. ``scopeManual`` is that
+    distinction: the boot backfill already skips a linked item, but the full
+    reclassify selects *every* item and rewrites it, so a hand-set scope was
+    silently replaced by a guess. Once this is set, the scope is trusted.
     """
     neo4j_driver = get_neo4j()
     if not neo4j_driver:
@@ -335,7 +342,8 @@ def _stamp_manual_scope(node_id: str, label: str, user_id: str) -> None:
         sig = hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
         with neo4j_driver.session() as s:
             s.run(
-                f"MATCH (n:{label} {{id: $id, userId: $userId}}) SET n.scopeCheckedSig = $sig",
+                f"MATCH (n:{label} {{id: $id, userId: $userId}}) "
+                "SET n.scopeCheckedSig = $sig, n.scopeManual = true",
                 id=node_id, userId=user_id, sig=sig,
             )
     except Exception as exc:

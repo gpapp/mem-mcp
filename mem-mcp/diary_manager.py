@@ -27,7 +27,7 @@ from chunking import (
 )
 from client_manager import (
     link_diary_to_client, link_diary_to_context,
-    _resolve_client_by_id, _resolve_context_by_id,
+    _resolve_client_by_id, _resolve_context_by_id, _stamp_manual_scope,
     infer_scope_from_text, db_get_client_status_map,
     INFERRED_SCOPE_BOOST, INACTIVE_PENALTY
 )
@@ -479,6 +479,12 @@ async def db_save_diary(content: str, user_id: str, timestamp: str, name: str, m
         if context_id:
             await link_diary_to_context(doc_id, context_id, user_id)
 
+        # A client/project handed to the save form is the user's answer, not a
+        # hint. Without this stamp nothing downstream can tell it apart from a
+        # guess, and a full reclassify would clear the links and re-derive them.
+        if client_id or context_id:
+            _stamp_manual_scope(doc_id, "DiaryEntry", user_id)
+
         # Sync linked facts: only modify MENTIONS if explicitly provided
         if linked_facts is not None:
             if linked_facts:
@@ -696,9 +702,13 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
     return entries[:limit]
 
 
-async def db_update_diary(entry_id: str, user_id: str, content: Optional[str] = None, name: Optional[str] = None, timestamp: Optional[str] = None, metadata: Optional[dict] = None, linked_facts: Optional[list] = None) -> bool:
+async def db_update_diary(entry_id: str, user_id: str, content: Optional[str] = None, name: Optional[str] = None, timestamp: Optional[str] = None, metadata: Optional[dict] = None, linked_facts: Optional[list] = None, client_id: Optional[str] = None, context_id: Optional[str] = None) -> bool:
     """Update a diary entry's content, name, timestamp, metadata, and optionally replace linked facts.
     If linked_facts is provided, existing MENTIONS relationships are cleared and new ones are created.
+
+    client_id / context_id set the scope when given; passing neither leaves the
+    entry's existing FOR_CLIENT / IN_CONTEXT links alone. They cannot be cleared
+    through this path -- db_set_diary_scope is the one that drops a side.
     """
     qdrant = await get_qdrant()
     neo4j_driver = get_neo4j()
@@ -708,7 +718,12 @@ async def db_update_diary(entry_id: str, user_id: str, content: Optional[str] = 
     with neo4j_driver.session() as s:
         res = s.run(
             """
-            MATCH (d:DiaryEntry {id: $id, userId: $userId}) RETURN d.content as content, d.name as name, d.timestamp as timestamp, d.metadata as metadata
+            MATCH (d:DiaryEntry {id: $id, userId: $userId})
+            OPTIONAL MATCH (d)-[:FOR_CLIENT]->(c:Client)
+            WITH d, head(collect({id: c.id, name: c.name})) AS cl
+            OPTIONAL MATCH (d)-[:IN_CONTEXT]->(cx:Context)
+            RETURN d.content as content, d.name as name, d.timestamp as timestamp, d.metadata as metadata,
+                   cl.id as clientId, cl.name as clientName, cx.id as contextId, cx.name as contextName
             """,
             id=entry_id, userId=user_id
         )
@@ -723,6 +738,33 @@ async def db_update_diary(entry_id: str, user_id: str, content: Optional[str] = 
         existing_meta = json.loads(raw_meta) if isinstance(raw_meta, str) else (raw_meta or {})
         new_metadata = metadata if metadata is not None else existing_meta
         entry_date = new_ts[:10]
+
+        # Scope is a property of the record, and the links are the source of
+        # truth. The payload below is rebuilt from scratch and the write uses
+        # replace=True, so the four scope keys have to be carried over here or
+        # every edit would erase the entry's client/project from the vector
+        # store: the graph filter would still show it while a client-filtered
+        # search silently stopped returning it.
+        scope = {
+            "clientId": client_id or existing.get("clientId"),
+            "clientName": None,
+            "contextId": context_id or existing.get("contextId"),
+            "contextName": None,
+        }
+        if client_id:
+            info = _resolve_client_by_id(client_id, user_id)
+            scope["clientName"] = info["name"] if info else None
+            if not info:
+                scope["clientId"] = None
+        elif existing.get("clientName"):
+            scope["clientName"] = existing["clientName"]
+        if context_id:
+            info = _resolve_context_by_id(context_id, user_id)
+            scope["contextName"] = info["name"] if info else None
+            if not info:
+                scope["contextId"] = None
+        elif existing.get("contextName"):
+            scope["contextName"] = existing["contextName"]
 
         # Extract/regenerate keywords asynchronously — non-blocking; empty list on failure
         keywords = await extract_diary_keywords(new_name or "", new_content)
@@ -741,6 +783,7 @@ async def db_update_diary(entry_id: str, user_id: str, content: Optional[str] = 
             payload["keywords"] = keywords
         if new_metadata is not None:
             payload["metadata"] = new_metadata
+        payload.update({k: v for k, v in scope.items() if v})
         # replace=True because shortening the text can leave fewer chunks than
         # before, and the stale high-index points would otherwise keep answering
         # searches for text that no longer exists.
@@ -786,6 +829,16 @@ async def db_update_diary(entry_id: str, user_id: str, content: Optional[str] = 
                     """,
                     id=entry_id, userId=user_id, factIds=linked_facts
                 )
+
+        # A scope named on the edit form is a decision like any other, so it is
+        # linked and stamped the same way db_save_diary does it. MERGE, so
+        # re-saving an entry with the scope it already has changes nothing.
+        if client_id:
+            await link_diary_to_client(entry_id, client_id, user_id)
+        if context_id:
+            await link_diary_to_context(entry_id, context_id, user_id)
+        if client_id or context_id:
+            _stamp_manual_scope(entry_id, "DiaryEntry", user_id)
 
     await publish_db_event(user_id, "diary_changed", {"action": "update", "id": entry_id, "date": entry_date})
     # Auto-link People facts mentioned by name (add-only, fire-and-forget)

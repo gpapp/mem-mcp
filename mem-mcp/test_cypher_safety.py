@@ -310,5 +310,159 @@ class ClearScopeQueryTests(unittest.TestCase):
         self.assertIn("clear_scope_links_batch", single_src)
 
 
+class ManualScopeGuardTests(unittest.TestCase):
+    """A scope a human set must survive every pass that re-derives scope.
+
+    The defect was not a wrong answer but an unanswerable one: the full
+    reclassify selected *every* item, cleared its links and asked the model
+    again, so a client/project chosen on the save form was replaced by a guess
+    with no record that it had been chosen. ``scopeManual`` is the marker that
+    says "decided, not derived", and these pin every place that has to honour
+    it — the selection query, the single-item entry point, and both writers
+    that have to set it.
+    """
+
+    def setUp(self):
+        self.queries = {}
+        for path in _python_sources():
+            for lineno, query in _cypher_strings(path):
+                self.queries.setdefault(os.path.basename(path), []).append((lineno, query))
+        with open(os.path.join(HERE, "migrate_client_context.py"), encoding="utf-8") as handle:
+            self.mcc_source = handle.read()
+        with open(os.path.join(HERE, "client_manager.py"), encoding="utf-8") as handle:
+            self.cm_source = handle.read()
+        with open(os.path.join(HERE, "diary_manager.py"), encoding="utf-8") as handle:
+            self.dm_source = handle.read()
+        self.functions = {}
+        for name, source in (("migrate_client_context.py", self.mcc_source),
+                             ("client_manager.py", self.cm_source),
+                             ("diary_manager.py", self.dm_source)):
+            tree = ast.parse(source)
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    self.functions.setdefault(node.name, (source, node))
+
+    def find(self, filename, needle):
+        for lineno, query in self.queries.get(filename, []):
+            if needle in query:
+                return lineno, query
+        self.fail(f"no Cypher containing {needle!r} in {filename}")
+
+    def segment(self, name):
+        source, node = self.functions[name]
+        return ast.get_source_segment(source, node)
+
+    def test_every_full_selection_query_excludes_manually_scoped_items(self):
+        """Derived, not a needle.
+
+        A full reclassify selects every item in the vault, so "the reclassify
+        query has the guard" is really "any query that selects *all* facts or
+        *all* diary entries has the guard" — a property that also covers a
+        query added later. Searching for a literal first and asserting on the
+        match is the trap AGENTS.md warns about: the backfill's query carries
+        the same WHERE clauses, so a needle picked the wrong one and the
+        assertion passed or failed for the wrong reason.
+        """
+        seen = 0
+        for query in self.queries.get("migrate_client_context.py", []):
+            _lineno, text = query
+            selects_everything = (
+                "MATCH (f:Fact {userId: $userId})" in text
+                or "MATCH (d:DiaryEntry {userId: $userId})" in text
+            )
+            if not selects_everything:
+                continue
+            # A query that already filters on the links is the boot backfill,
+            # which cannot touch a linked item by construction.
+            if "FOR_CLIENT]->" in text:
+                continue
+            # Nor is every whole-vault query a threat: the Client-category
+            # migration reads every Fact too, but takes only id and name and
+            # writes no scope. What makes a query dangerous is that it hands
+            # the record *body* to the classifier, which is what
+            # f.text / d.content being RETURNed means.
+            if "AS text" not in text and "AS content" not in text:
+                continue
+            seen += 1
+            self.assertIn("scopeManual", text,
+                          "a query selects the whole vault and would overwrite a chosen scope")
+        self.assertGreaterEqual(seen, 2,
+                                "expected the reclassify's fact and diary selection queries")
+
+    def test_the_skip_is_reported_rather_than_silent(self):
+        """A filter that drops items with no counter is a filter nobody trusts.
+
+        ``total`` is the count the job classifies, so a vault where half the
+        entries are manual reads as "half your diary vanished" with nothing in
+        the status to explain it.
+        """
+        counted = [text for _lineno, text in self.queries.get("migrate_client_context.py", [])
+                   if "scopeManual" in text and "count(" in text]
+        self.assertTrue(counted, "the manual-scope skip is filtered but never counted")
+        self.assertTrue('job["manual_skipped"]' in self.mcc_source)
+
+    def test_single_item_reclassify_refuses_before_it_clears(self):
+        """Order is the whole guard: the clear is what makes it unrecoverable."""
+        for name in ("_reclassify_single_fact", "_reclassify_single_diary"):
+            segment = self.segment(name)
+            guard = segment.find("_assert_not_manual_scope")
+            clear = segment.find("clear_scope_links_async")
+            self.assertNotEqual(guard, -1, f"{name} has no manual-scope guard")
+            self.assertNotEqual(clear, -1, f"{name} no longer clears its links")
+            self.assertLess(guard, clear,
+                            f"{name} clears the links before checking whether they were chosen")
+
+    def test_the_stamp_sets_the_marker_not_only_the_signature(self):
+        """A signature is written by the classifier too, so it proves nothing.
+
+        Both writers stamped byte-identical scopeCheckedSig values, which is
+        why nothing downstream could distinguish a decision from a guess.
+        """
+        segment = self.segment("_stamp_manual_scope")
+        self.assertIn("scopeManual", segment)
+
+    def test_both_diary_writers_mark_a_supplied_scope(self):
+        for name in ("db_save_diary", "db_update_diary"):
+            segment = self.segment(name)
+            self.assertIn("_stamp_manual_scope", segment,
+                          f"{name} links a supplied scope without marking it as chosen")
+
+    def test_the_update_rebuilds_the_payload_with_the_scope_still_in_it(self):
+        """The half that fails quietly.
+
+        The update path builds its Qdrant payload from scratch and writes it
+        with replace=True, so without the merge every edit dropped clientId /
+        contextId from the vector store. The graph filter still showed the
+        entry — the links were untouched — while client-filtered search
+        silently stopped returning it, and nothing errored in between.
+        """
+        segment = self.segment("db_update_diary")
+        for key in ("clientId", "clientName", "contextId", "contextName"):
+            self.assertIn(key, segment, f"db_update_diary no longer carries {key} into the payload")
+        self.assertIn("payload.update", segment)
+        # And the source of that scope has to be the link, not a stale payload.
+        self.assertIn("FOR_CLIENT", segment)
+        self.assertIn("IN_CONTEXT", segment)
+
+    def test_the_edit_endpoint_actually_forwards_the_scope(self):
+        """The field was on the request body and nothing read it.
+
+        A pre-filled client on the edit form was accepted, validated by
+        pydantic, and discarded — so editing an entry unlinked it from the
+        client it was filed under, with no error on either side.
+        """
+        with open(os.path.join(HERE, "gui.py"), encoding="utf-8") as handle:
+            gui = ast.parse(handle.read())
+        endpoint = next(
+            n for n in ast.walk(gui)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and n.name == "api_update_diary_entry"
+        )
+        calls = [ast.unparse(n) for n in ast.walk(endpoint) if isinstance(n, ast.Call)]
+        update = next(c for c in calls if "db_update_diary" in c)
+        self.assertIn("client_id=client_id", update)
+        self.assertIn("context_id=context_id", update)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

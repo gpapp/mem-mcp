@@ -1520,7 +1520,8 @@ def _prune_reclassify_jobs(keep: int = _RECLASSIFY_JOB_HISTORY) -> None:
 def _public_reclassify_job(job) -> dict:
     if not job:
         return {"state": "idle", "total": 0, "done": 0, "linked": 0, "unlinked": 0,
-                "errors": 0, "started_at": None, "finished_at": None, "error": None}
+                "errors": 0, "manual_skipped": 0,
+                "started_at": None, "finished_at": None, "error": None}
     return {k: v for k, v in job.items() if k != "task"}
 
 
@@ -1533,7 +1534,8 @@ def start_reclassify_scope(user_id: str) -> dict:
         logger.warning(f"reclassify [{user_id}]: refused, another maintenance job holds the lock")
         return {"started": False, "job": _public_reclassify_job(job), "conflict": "maintenance"}
     job = {"state": "running", "total": 0, "done": 0, "linked": 0, "unlinked": 0,
-           "errors": 0, "started_at": _utcnow(), "finished_at": None, "error": None}
+           "errors": 0, "manual_skipped": 0,
+           "started_at": _utcnow(), "finished_at": None, "error": None}
     # Prune after inserting: pruning first would evict one entry only to add a
     # new one, leaving the registry permanently one over the limit.
     _RECLASSIFY_JOBS[user_id] = job
@@ -1564,10 +1566,17 @@ async def _reclassify_all_scope(user_id: str, job: dict) -> None:
         sig = _scope_signature(clients)
 
         with neo4j_driver.session() as s:
+            # scopeManual marks a scope a human set (the save form's
+            # client/project, or the scope editor). This run clears every link
+            # it selects and rebuilds it from the text, so including a manual
+            # item would replace a decision with a guess -- silently, and with
+            # no way back. Those items keep their links and are reported in
+            # job["manual_skipped"] rather than dropped from the count.
             facts = list(s.run(
                 """
                 MATCH (f:Fact {userId: $userId})
                 WHERE toLower(f.category) <> 'client'
+                  AND NOT coalesce(f.scopeManual, false)
                 RETURN f.id AS id, f.name AS name, f.text AS text, f.category AS category
                 """,
                 userId=user_id
@@ -1575,10 +1584,27 @@ async def _reclassify_all_scope(user_id: str, job: dict) -> None:
             diaries = list(s.run(
                 """
                 MATCH (d:DiaryEntry {userId: $userId})
+                WHERE NOT coalesce(d.scopeManual, false)
                 RETURN d.id AS id, d.name AS name, d.content AS content, d.keywords AS keywords
                 """,
                 userId=user_id
             ))
+            manual_skipped = int((s.run(
+                """
+                MATCH (n {userId: $userId})
+                WHERE coalesce(n.scopeManual, false)
+                  AND (n:Fact OR n:DiaryEntry)
+                RETURN count(n) AS n
+                """,
+                userId=user_id
+            ).single() or {"n": 0})["n"])
+
+        job["manual_skipped"] = manual_skipped
+        if manual_skipped:
+            logger.info(
+                f"reclassify [{user_id}]: leaving {manual_skipped} manually scoped "
+                f"items untouched"
+            )
 
         job["total"] = len(facts) + len(diaries)
         logger.info(
@@ -1691,11 +1717,42 @@ async def reclassify_single_fact(item_id: str, user_id: str) -> bool:
         release_maintenance(user_id)
 
 
+class ManualScopeError(Exception):
+    """Raised when a reclassify is asked to overwrite a hand-set scope.
+
+    A separate type from ValueError/RuntimeError because the two answers are
+    different problems: ValueError is "no such item" (404) and RuntimeError is
+    "the service could not do it" (503). This one is "the item is protected" —
+    a 409, with the UI offering to clear the scope first.
+    """
+
+
+def _assert_not_manual_scope(item_id: str, label: str, user_id: str, neo4j_driver) -> None:
+    """Refuse to reclassify an item whose scope a human set.
+
+    Clearing here is not recoverable: the run deletes the FOR_CLIENT edge before
+    it classifies, so a refusal has to happen before anything is written.
+    """
+    with neo4j_driver.session() as s:
+        row = s.run(
+            f"MATCH (n:{label} {{id: $id, userId: $userId}}) "
+            "RETURN coalesce(n.scopeManual, false) AS manual",
+            id=item_id, userId=user_id,
+        ).single()
+    if row and row["manual"]:
+        raise ManualScopeError(
+            f"{label} {item_id} has a client/project set manually. "
+            "Clear the client/project first if you want it reclassified."
+        )
+
+
 async def _reclassify_single_fact(item_id: str, user_id: str) -> bool:
     neo4j_driver = get_neo4j()
     qdrant = await get_qdrant()
     if not neo4j_driver or not qdrant:
         raise RuntimeError("DB not available")
+
+    _assert_not_manual_scope(item_id, "Fact", user_id, neo4j_driver)
 
     with neo4j_driver.session() as s:
         rows = list(s.run(
@@ -1750,6 +1807,8 @@ async def _reclassify_single_diary(item_id: str, user_id: str) -> bool:
     if not rows:
         raise ValueError(f"DiaryEntry {item_id!r} not found for user {user_id!r}")
     item = dict(rows[0])
+
+    _assert_not_manual_scope(item_id, "DiaryEntry", user_id, neo4j_driver)
 
     clients = db_list_clients(user_id)
     if not clients:

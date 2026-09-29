@@ -1552,7 +1552,11 @@ npm install @modelcontextprotocol/sdk</code></pre>
     if (job.state === 'running') {
       el.textContent = `🔄 Classifying… ${job.done}/${job.total} (${job.linked} linked)`;
     } else if (job.state === 'done') {
-      el.textContent = `✅ Done — ${job.linked}/${job.total} linked, ${job.unlinked} generic.`;
+      // `total` only counts what was classified, so without the manual count
+      // a vault where most entries have a chosen client reads as if the run
+      // ignored them.
+      const kept = job.manual_skipped ? ` ${job.manual_skipped} left on their set client/project.` : '';
+      el.textContent = `✅ Done — ${job.linked}/${job.total} linked, ${job.unlinked} generic.${kept}`;
       if (btn) btn.disabled = false;
     } else if (job.state === 'error') {
       el.textContent = `⚠️ Failed: ${job.error || 'unknown error'}`;
@@ -3617,8 +3621,6 @@ npm install @modelcontextprotocol/sdk</code></pre>
     await ensureClients();
     const timestamp = document.getElementById('de-timestamp').value;
     const content = document.getElementById('de-content').value.trim();
-    const client = document.getElementById('new-client')?.value || '';
-    const context = document.getElementById('new-project')?.value || '';
     if (!name || !timestamp || !content) { toast('⚠️ Title, Date, and Content are required'); return; }
     const metadata = getDiaryMetaFromEditor();
     // PUT /api/diary/{id} takes the same DiaryCreate body as POST /api/diary.

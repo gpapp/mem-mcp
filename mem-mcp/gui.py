@@ -33,7 +33,7 @@ import memory as mem
 from backup import list_savepoints, start_backup, start_restore, get_backup_status
 from migrate_client_context import (
     start_reclassify_scope, get_reclassify_status,
-    reclassify_single_fact, reclassify_single_diary,
+    reclassify_single_fact, reclassify_single_diary, ManualScopeError,
 )
 from fastapi import Request, HTTPException, FastAPI
 from fastapi.responses import Response, JSONResponse, HTMLResponse, RedirectResponse
@@ -394,6 +394,8 @@ async def api_reclassify_memory(memory_id: str, request: Request):
     user_id = _require_user(request)
     try:
         await reclassify_single_fact(memory_id, user_id)
+    except ManualScopeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except RuntimeError as e:
@@ -438,6 +440,8 @@ async def api_reclassify_diary_entry(entry_id: str, request: Request):
     user_id = _require_user(request)
     try:
         await reclassify_single_diary(entry_id, user_id)
+    except ManualScopeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except RuntimeError as e:
@@ -521,10 +525,22 @@ class DiaryLink(BaseModel):
 
 @web_app.put("/api/diary/{entry_id}", response_class=JSONResponse)
 async def api_update_diary_entry(entry_id: str, request: Request, body: DiaryCreate):
-    """Update a diary entry's content, name, and/or timestamp."""
+    """Update a diary entry's content, name, timestamp and (if given) its scope."""
     try:
         user_id = _require_user(request)
-        ok = await mem.db_update_diary(entry_id, user_id, content=body.content, name=body.name, timestamp=body.timestamp, linked_facts=body.linked_facts, metadata=body.metadata)
+        # Same resolution as POST /api/diary. A scope that arrives on the edit
+        # form used to be dropped on the floor: the field existed on the body
+        # and nothing read it, so editing an entry silently unlinked it from
+        # the client it was filed under.
+        client_id = None
+        context_id = None
+        if body.client:
+            c = mem.db_resolve_client(body.client, user_id)
+            client_id = c["id"] if c else await mem.db_create_client(body.client, user_id)
+        if body.context and client_id:
+            cx = mem.db_resolve_context(body.context, client_id, user_id)
+            context_id = cx["id"] if cx else await mem.db_create_context(body.context, client_id, user_id)
+        ok = await mem.db_update_diary(entry_id, user_id, content=body.content, name=body.name, timestamp=body.timestamp, linked_facts=body.linked_facts, metadata=body.metadata, client_id=client_id, context_id=context_id)
         if not ok:
             raise HTTPException(status_code=404, detail="Diary entry not found or access denied.")
         return {"id": entry_id, "content": body.content, "name": body.name, "timestamp": body.timestamp, "metadata": body.metadata}
