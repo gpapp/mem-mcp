@@ -14,7 +14,6 @@ from common import (
     get_neo4j, get_qdrant, get_llm_response, logger, publish_db_event,
     COLLECTION_NAME, DIARY_COLLECTION,
     SCOPE_MODEL, SCOPE_BACKFILL_ENABLED, SCOPE_BACKFILL_CONCURRENCY,
-    clean_extracted_people_names,
     claim_maintenance, release_maintenance,
 )
 from qdrant_client.models import PointStruct, Filter, FieldCondition, MatchValue
@@ -30,7 +29,6 @@ from matching_utils import (
     client_header_value,
     client_tags_in_text,
     context_named_in_text,
-    resolve_people_candidates,
     resolve_scope_name,
     text_windows,
 )
@@ -1017,169 +1015,22 @@ async def _classify_and_link_fact(item: dict, clients: list, user_id: str, sem: 
     return True
 
 
-# ---------------------------------------------------------------------------
-# People extraction helper: extract person names from diary content and
-# link matching People facts via MENTIONS before scope classification.
-# ---------------------------------------------------------------------------
-_PEOPLE_SYSTEM = (
-    "You are a named-entity extractor. Extract the full names of every person "
-    "explicitly mentioned in the text. "
-    "Return ONLY a JSON array of strings, e.g. [\"Alice Smith\", \"Bob Jones\"]. "
-    "Return [] if no people are mentioned. Never add explanations. "
-    "Ignore speaker labels such as SPEAKER1, SPEAKER 2, and SPEAKER#3; they are not names. "
-    "IMPORTANT: ignore anything in parentheses — it is a role or description, not part of the name. "
-    "For example, 'Alice Smith (host)' → extract only 'Alice Smith'."
-)
-
-
-async def _extract_people_names(content: str) -> list[str]:
-    """Return every person name mentioned anywhere in the diary content.
-
-    Windows the content rather than sending ``content[:2000]``. That prefix form
-    was still here after the twin in diary_manager was fixed, so reclassification
-    linked a different set of people than the save path: on a long entry everyone
-    named after character 2000 was dropped from the MENTIONS edges, silently.
-
-    One LLM call per window, each wrapped in its own try/except so a single bad
-    response cannot discard the names the other windows found, then the union is
-    deduped -- a name inside an overlap region is seen twice.
-    """
-    windows = text_windows(content, SCOPE_TEXT_WINDOW, SCOPE_TEXT_OVERLAP)
-    if not windows:
-        return []
-    logger.debug(
-        f"[people_extract] started (content_len={len(content)}, windows={len(windows)}, "
-        f"model={SCOPE_MODEL})"
-    )
-    if len(windows) > SCOPE_TEXT_WARN_WINDOWS:
-        logger.warning(
-            f"[people_extract] entry is {len(content)} chars, so names are extracted "
-            f"{len(windows)} times -- raise MEM_SCOPE_TEXT_WINDOW to trade recall for cost"
-        )
-    found = []
-    for window in windows:
-        try:
-            raw = await get_llm_response(window, system=_PEOPLE_SYSTEM,
-                                         model=SCOPE_MODEL, num_predict=200)
-            raw = re.sub(r"```[a-z]*\n?", "", raw).strip()
-            m = re.search(r"\[.*\]", raw, re.DOTALL)
-            if not m:
-                logger.debug("[people_extract] model response contained no JSON array")
-                continue
-            names = json.loads(m.group())
-            if isinstance(names, list):
-                found.extend(clean_extracted_people_names(names))
-            else:
-                logger.debug("[people_extract] model response JSON was not a list")
-        except Exception as exc:
-            logger.debug(f"[people_extract] window failed: {exc}")
-    names = clean_extracted_people_names(found)
-    logger.debug(f"[people_extract] completed (count={len(names)})")
-    return names
-
-
-def _existing_auto_people(diary_id: str, user_id: str, neo4j_driver) -> list:
-    """People facts already auto-linked to this entry, as minimal candidate dicts.
-
-    Seeding the candidate set with these keeps reclassification non-destructive.
-    ``db_find_people_matches`` is deliberately strict, so a re-run can fail to
-    re-find a link that is in fact correct. The resolver then sees the full
-    picture and may keep or drop each one, instead of the entry silently losing
-    every auto link it had.
-    """
-    if neo4j_driver is None:
-        return []
-    try:
-        with neo4j_driver.session() as s:
-            rows = list(s.run(
-                """
-                MATCH (d:DiaryEntry {id: $did, userId: $userId})-[r:MENTIONS]->(f:Fact)
-                WHERE coalesce(r.source, 'manual') = 'auto'
-                RETURN f.id AS id, f.name AS name, f.text AS text
-                """,
-                did=diary_id, userId=user_id,
-            ))
-        return [dict(r) for r in rows]
-    except Exception as exc:
-        logger.debug(f"[people_extract] existing-link read failed for {diary_id}: {exc}")
-        return []
-
-
-async def _link_missing_people(diary_id: str, names: list[str], user_id: str,
-                               neo4j_driver, content: str = "") -> int:
-    """Reconcile automatically detected People links for a diary entry."""
-    if neo4j_driver is None:
-        return 0
-    from fact_manager import db_find_people_matches
-
-    people_matches = await db_find_people_matches(names, user_id)
-    # Fold in links that already exist so they are adjudicated, not dropped.
-    found_ids = {p.get("id") for p in people_matches}
-    for existing in _existing_auto_people(diary_id, user_id, neo4j_driver):
-        if existing.get("id") and existing["id"] not in found_ids:
-            people_matches.append(existing)
-            found_ids.add(existing["id"])
-    people_matches = await resolve_people_candidates(
-        names, content, people_matches, get_llm_response
-    )
-    person_ids = [person["id"] for person in people_matches]
-    created = 0
-    with neo4j_driver.session() as s:
-        s.run(
-            """
-            MATCH (d:DiaryEntry {id: $did, userId: $userId})-[r:MENTIONS]->(f:Fact)
-            WHERE coalesce(r.source, 'manual') = 'auto'
-              AND NOT f.id IN $personIds
-            DELETE r
-            """,
-            did=diary_id, userId=user_id, personIds=person_ids,
-        )
-        for person in people_matches:
-            row = s.run(
-                """
-                MATCH (d:DiaryEntry {id: $did, userId: $userId})
-                MATCH (f:Fact {id: $fid, userId: $userId})
-                WHERE NOT (d)-[:MENTIONS]->(f)
-                MERGE (d)-[r:MENTIONS]->(f)
-                SET r.source = 'auto'
-                RETURN count(f) AS n
-                """,
-                did=diary_id, userId=user_id, fid=person["id"],
-            ).single()
-            if row:
-                created += row["n"]
-    if created:
-        logger.debug(f"[people_extract] diary {diary_id}: linked {created} new People fact(s)")
-    return created
-
-
-def _diary_has_mentions(diary_id: str, user_id: str, neo4j_driver) -> bool:
-    """Return True if the diary entry already has at least one MENTIONS edge."""
-    if neo4j_driver is None:
-        return False
-    try:
-        with neo4j_driver.session() as s:
-            row = s.run(
-                "MATCH (d:DiaryEntry {id: $did, userId: $userId})-[:MENTIONS]->() "
-                "RETURN count(*) AS n LIMIT 1",
-                did=diary_id, userId=user_id
-            ).single()
-            return bool(row and row["n"] > 0)
-    except Exception:
-        return False
-
-
 async def _classify_and_link_diary(item: dict, clients: list, user_id: str, sem: asyncio.Semaphore,
                                    neo4j_driver=None, scope_sig=None, scope_snapshot=None) -> bool:
     """Classify one diary entry and create FOR_CLIENT / IN_CONTEXT links. Returns True if linked."""
-    # Reconcile People links even when the entry already has mentions; edits can
-    # remove names or replace one person with another.
-    async with sem:
-        names = await _extract_people_names(item.get("content", "") or "")
-    await _link_missing_people(
-        item["id"], names, user_id, neo4j_driver, item.get("content", "") or ""
-    )
-
+    # Scope only. This function used to re-run participant extraction first, via
+    # a private copy of it that lived here and resolved to SCOPE_MODEL while the
+    # real one (diary_manager._auto_link_people) resolved to EXTRACT_MODEL. Two
+    # copies of the same task on two different models, and the one a reclassify
+    # triggered was not the one the save path used -- so "reclassify scope" was
+    # also rewriting MENTIONS, and rewriting them with the slower model.
+    #
+    # Participant extraction has its own entry points: the save and update paths,
+    # and the UI's "Extract participants" action. Reclassify reads the MENTIONS
+    # edges below (see _fast_diary_scope) but never writes them, so an entry
+    # reclassified here keeps whatever links it already had and the verdict is
+    # decided on the same evidence the save path produced.
+    #
     # Fast path: unanimous MENTIONS client or explicit **Client:** header — no LLM needed.
     client_name, context_name = _fast_diary_scope(item, clients, neo4j_driver, user_id)
     related = []

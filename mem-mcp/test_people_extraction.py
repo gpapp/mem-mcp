@@ -499,3 +499,193 @@ class DegenerateArrayParseTests(unittest.TestCase):
     def test_escaped_quotes_inside_a_name_survive(self):
         self.assertEqual(parse_people_name_array('["Ann \\"Annie\\" Lee"]'),
                          ['Ann "Annie" Lee'])
+
+
+class ReclassifyIsScopeOnlyTests(unittest.TestCase):
+    """A reclassify must not re-run participant extraction.
+
+    ``_classify_and_link_diary`` used to call a *private* copy of people
+    extraction before doing anything else. That copy lived in
+    migrate_client_context.py and resolved to ``SCOPE_MODEL``, while the real
+    one -- ``diary_manager._auto_link_people``, called on save, on update, and
+    by the UI's "Extract participants" -- resolves to ``EXTRACT_MODEL``. So the
+    same task existed twice on two different models, and a user clicking
+    "Reclassify scope" silently rewrote MENTIONS edges using the slower one.
+
+    This is behavioural, not a source check. ``assertNotIn("_extract_people_
+    names", body)`` would pass against the defect the first time it was written
+    and then rot with the refactor, and worse: a twin defined in another module
+    is invisible to a substring guard on this function altogether. The names are
+    bound as stubs that raise if called, so the only way this passes is if the
+    function genuinely does not reach them.
+    """
+
+    MODULE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "migrate_client_context.py")
+
+    def _lift(self, **overrides):
+        with open(self.MODULE, "r", encoding="utf-8") as handle:
+            source = handle.read()
+        target = next(
+            node for node in ast.walk(ast.parse(source))
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "_classify_and_link_diary"
+        )
+        segment = ast.get_source_segment(source, target)
+
+        def _forbidden(*_a, **_k):
+            raise AssertionError(
+                "reclassify called people extraction; it must classify scope only"
+            )
+
+        namespace = {
+            # The lifted body is an async def, so it closes over asyncio.
+            "asyncio": asyncio,
+            "_extract_people_names": _forbidden,
+            "_link_missing_people": _forbidden,
+            "_auto_link_people": _forbidden,
+            "db_find_people_matches": _forbidden,
+            "resolve_people_candidates": _forbidden,
+        }
+        namespace.update(overrides)
+        exec(segment, namespace)  # noqa: S102 - executing our own source
+        return namespace["_classify_and_link_diary"]
+
+    def test_a_reclassify_never_reaches_a_people_extractor(self):
+        # Every collaborator the function needs for the *scope* verdict is
+        # stubbed so the body runs to completion without a database. The
+        # unanimous-MENTIONS fast path is the interesting one: it READS the
+        # edges people extraction writes, so a stubbed match on it proves the
+        # read survives the write's removal.
+        linked = {"value": False}
+
+        class _Sem:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc):
+                return False
+
+        def _fast(*_a, **_k):
+            return ("EPAM", None)
+
+        async def _stamp(*_a, **_k):
+            return None
+
+        def _write(*_a, **_k):
+            # _write_related_links is sync (migrate_client_context.py:501).
+            # An async stub here is awaited-never, and the resulting
+            # RuntimeWarning is the only thing that says so.
+            return None
+
+        async def _classify_scope_full(_body, _clients):
+            return ("EPAM", None, [], True)
+
+        def _resolve(name, *rest):
+            # db_resolve_client / db_resolve_context are sync; making the stub
+            # async would fail on a subscript rather than on the thing under
+            # test, which hides the real assertion.
+            return {"id": "c1", "name": name}
+
+        async def _link_diary(*_a, **_k):
+            return None
+
+        async def _link_ctx(*_a, **_k):
+            return None
+
+        def _enriched(*_a, **_k):
+            return "entry text"
+
+        fn = self._lift(
+            sem=_Sem, _fast_diary_scope=_fast,
+            _enriched_diary_text=_enriched,
+            classify_scope_full=_classify_scope_full,
+            _stamp_scope_checked=_stamp,
+            _write_related_links=_write,
+            db_resolve_client=_resolve,
+            db_resolve_context=_resolve,
+            link_diary_to_client=_link_diary,
+            link_diary_to_context=_link_ctx,
+            _related_clients_for=lambda *_a, **_k: [],
+            logger=_Recorder(),
+        )
+
+        item = {"id": "d1", "content": "Alice Smith and Bob Jones met.",
+                "name": "entry", "keywords": []}
+        linked["value"] = asyncio.run(fn(item, [{"name": "EPAM"}], "u1", _Sem(), None, None, None))
+        self.assertTrue(linked["value"],
+                        msg="the stubbed scope path stopped linking, so this test "
+                            "is no longer exercising the reclassify body")
+
+    def test_the_duplicate_extractors_are_gone_from_the_module(self):
+        """The twin itself, not just its call site.
+
+        Both copies were removed rather than one of them. Leaving a dead
+        private copy of an extractor that routes to the wrong model is an
+        invitation to wire it back up, and the model routing would be the
+        subtle part -- it would still pass every behavioural test, because
+        nobody would be calling it.
+        """
+        with open(self.MODULE, "r", encoding="utf-8") as handle:
+            source = handle.read()
+        for name in ("_PEOPLE_SYSTEM", "_extract_people_names",
+                     "_link_missing_people", "_existing_auto_people",
+                     "_diary_has_mentions"):
+            needle = f"def {name}"
+            self.assertFalse(needle in source, f"{name} is still defined here")
+            needle = f"{name} ="
+            self.assertFalse(needle in source, f"{name} is still assigned here")
+
+    def test_the_real_extractor_is_still_reachable_from_the_save_path(self):
+        """The other half of the fix: extraction must not have been removed.
+
+        Deleting the twin is only correct while diary_manager still owns the
+        job. A future edit that removes both leaves an entry whose MENTIONS
+        edges are never written, and no test in this file would notice -- the
+        windowing tests lift diary_manager's own function and would keep
+        passing on a code path nothing calls.
+        """
+        with open(DIARY_MANAGER, "r", encoding="utf-8") as handle:
+            diary = handle.read()
+        self.assertTrue("async def _auto_link_people(" in diary,
+                        msg="diary_manager no longer owns people extraction")
+        for caller, path in (("_auto_link_people(doc_id", diary),
+                             ("_auto_link_people(entry_id", diary)):
+            self.assertTrue(caller in path,
+                            msg=f"the save/update path no longer calls {caller}")
+
+    def test_reclassify_still_reads_mentions_as_scope_evidence(self):
+        """Scope classification depends on MENTIONS, so it must keep reading them.
+
+        This is why deleting the write is safe rather than a regression: the
+        unanimous-MENTIONS fast path in _fast_diary_scope is the strongest
+        signal the classifier gets, and clear_scope_links_batch deletes only
+        FOR_CLIENT and IN_CONTEXT. The evidence a reclassify reads is written
+        by the save path and survives the clear.
+        """
+        with open(self.MODULE, "r", encoding="utf-8") as handle:
+            source = handle.read()
+        tree = ast.parse(source)
+        fast = next(
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "_fast_diary_scope"
+        )
+        segment = ast.get_source_segment(source, fast)
+        self.assertTrue("MENTIONS" in segment,
+                        msg="_fast_diary_scope no longer reads MENTIONS edges")
+
+        clear = next(
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "clear_scope_links_batch"
+        )
+        clear_src = ast.get_source_segment(source, clear)
+        self.assertTrue("FOR_CLIENT|IN_CONTEXT" in clear_src,
+                        msg="the scope clear no longer names both edge types")
+        self.assertFalse("MENTIONS" in clear_src,
+                         msg="the scope clear must not delete MENTIONS -- that "
+                             "would destroy the evidence the fast path reads")
+
+
+if __name__ == "__main__":
+    unittest.main()

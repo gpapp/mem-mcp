@@ -587,7 +587,23 @@ class ScopeClassificationInputTests(unittest.TestCase):
 
     def test_the_windowing_helper_is_actually_used(self):
         self.assertFalse("from matching_utils import" not in self.source, "import block missing")
-        self.assertEqual(self.source.count("text_windows("), 2)
+        # Assert on the classifier's call site by name, not on a count of
+        # "text_windows(" across the module. The count used to be 2 and one of
+        # the two was a private copy of people extraction that reclassification
+        # triggered -- deleted, because a reclassify must classify scope only.
+        # A bare count would have kept passing had the twin still been there
+        # and the classifier's own call been the one removed.
+        self.assertTrue(
+            "text_windows(item_text, SCOPE_TEXT_WINDOW, SCOPE_TEXT_OVERLAP)" in self.source,
+            "the scope classifier no longer windows the item text",
+        )
+        # And the people extractor must not have crept back: it belongs to
+        # diary_manager, reached from the save and update paths only.
+        self.assertFalse(
+            "_extract_people_names" in self.source,
+            "participant extraction is back in the reclassify module; it has "
+            "its own entry points and a different model",
+        )
 
 
 # ---------------------------------------------------------------------------
