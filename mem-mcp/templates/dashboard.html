@@ -873,8 +873,11 @@ npm install @modelcontextprotocol/sdk</code></pre>
   // Server-owned cap (gui.py MERGE_MAX_CLUSTER). Passed in rather than repeated
   // as a literal so the input's max, the check below and the server's 400
   // cannot drift apart -- they are the same number. Kept inside a string
-  // literal because every other Jinja value in this script is; a bare
-  // {{...}} would not survive `node --check` on the extracted script.
+  // literal because every other Jinja value in this script is; a bare Jinja
+  // expression would not survive `node --check` on the extracted script.
+  // Never write Jinja's doubled braces in a comment here, even to describe
+  // them: Jinja parses those too, and an ellipsis inside is a syntax error
+  // that takes the whole page down at render time.
   const MERGE_MAX_CLUSTER = Number("{{MERGE_MAX_CLUSTER}}");
   const api = {
     get:    (url)       => fetch(`${apiBase}/${url}`).then(r => r.ok ? r.json() : Promise.reject(r)),

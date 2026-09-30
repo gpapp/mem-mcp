@@ -52,6 +52,84 @@ def _reachable():
     return set(_INTERPOLATED.findall(compose)) | set(_ASSIGNED.findall(compose))
 
 
+TEMPLATES = os.path.join(_HERE, "templates")
+# Every key get_gui() builds: _get_auth_context()'s four, plus the two it adds.
+DASHBOARD_CTX = {
+    "AUTH_USER": "u", "AUTH_PASS": "p", "AUTH_BASE64": "dTpw",
+    "MCP_URL": "/mem-mcp/mcp", "BASE_URL": "/mem-mcp",
+    "MERGE_MAX_CLUSTER": 12,
+}
+# `{{ NAME }}` where NAME is a bare identifier. Anything else between the
+# doubled braces is an EXPRESSION, and Jinja parses those in comments too.
+_JINJA_EXPR = re.compile(r"\{\{(.*?)\}\}", re.S)
+
+
+class DashboardRenderTests(unittest.TestCase):
+    """The dashboard must actually render.
+
+    `MERGE_MAX_CLUSTER` reached the template, `DedupUnderSetupTests` asserted
+    the context key, and the input's max attribute was correct -- and the app
+    still would not start. `get_gui` calls `_render("dashboard", **ctx)`, and a
+    comment explaining how to avoid Jinja syntax contained `{{...}}`, which Jinja
+    parses as an expression; the ellipsis made it a TemplateSyntaxError and the
+    whole page failed to render. 431 tests were green.
+
+    Nothing here is visible to py_compile, because the template is not Python.
+    The check that was missing is the simplest one available: hand the file to
+    the same engine the server uses and see that it comes out.
+    """
+
+    def test_the_dashboard_renders_with_the_context_get_gui_builds(self):
+        try:
+            from jinja2 import Environment, FileSystemLoader
+        except ImportError:
+            self.skipTest("jinja2 not installed; the lexical guard below still runs")
+
+        env = Environment(loader=FileSystemLoader(TEMPLATES))
+        try:
+            out = env.get_template("dashboard.html").render(**DASHBOARD_CTX)
+        except Exception as exc:  # noqa: BLE001 -- the point is that none escape
+            self.fail(f"dashboard.html does not render: "
+                      f"{type(exc).__name__}: {exc}")
+        self.assertTrue(len(out) > 1000, msg="rendered page is implausibly small")
+
+    def test_merge_max_cluster_reaches_the_rendered_page(self):
+        """The knob must be substituted, not left as literal braces."""
+        try:
+            from jinja2 import Environment, FileSystemLoader
+        except ImportError:
+            self.skipTest("jinja2 not installed")
+        env = Environment(loader=FileSystemLoader(TEMPLATES))
+        out = env.get_template("dashboard.html").render(**DASHBOARD_CTX)
+        self.assertIn('Number("12")', out,
+                      msg="MERGE_MAX_CLUSTER did not reach the client-side cap")
+        self.assertNotIn("{{MERGE_MAX_CLUSTER}}", out,
+                         msg="MERGE_MAX_CLUSTER reached the page unsubstituted")
+
+    def test_no_doubled_braces_holding_an_expression(self):
+        """Dependency-free guard, so it runs even without jinja2.
+
+        A bare `{{...}}` in prose reads as harmless -- it is in a comment, or in
+        a string literal, or it is obviously talking about the syntax rather
+        than using it. Jinja does not distinguish: it lexes every `{{` in the
+        file, so any of those takes the page down. Only bare identifiers are
+        allowed between the braces.
+        """
+        for name in sorted(os.listdir(TEMPLATES)):
+            if not name.endswith(".html"):
+                continue
+            src = _read(os.path.join(TEMPLATES, name))
+            for expr in _JINJA_EXPR.findall(src):
+                if not re.fullmatch(r"\s*[A-Za-z_][A-Za-z0-9_]*\s*", expr):
+                    line = src[:src.find("{{" + expr)].count("\n") + 1
+                    self.fail(
+                        f"{name}:{line} has {{{{{expr.strip()}}}}} between doubled "
+                        f"braces, which Jinja evaluates as an expression. Only a "
+                        f"bare identifier may appear there -- never an ellipsis, "
+                        f"not even inside a comment."
+                    )
+
+
 class EnvWiringTests(unittest.TestCase):
     def setUp(self):
         self.declared = _declared()
