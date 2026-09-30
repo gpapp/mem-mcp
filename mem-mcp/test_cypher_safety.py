@@ -464,5 +464,209 @@ class ManualScopeGuardTests(unittest.TestCase):
         self.assertIn("context_id=context_id", update)
 
 
+class MergeDraftBudgetTests(unittest.TestCase):
+    """The merge draft's prompt is the one uncapped prompt in the app.
+
+    Everything else that talks to Ollama sends a single window. The merge draft
+    json.dumps the full text of every selected record, so its size is
+    max_cluster x record length with nothing to stop it. Two separate ceilings
+    follow from that and both used to be fiction: num_predict was 900 (below
+    what a 4-record merge spends) and max_cluster was advertised up to 20 (a
+    prompt that no output budget can fit alongside).
+    """
+
+    def setUp(self):
+        with open(os.path.join(HERE, "gui.py"), encoding="utf-8") as handle:
+            self.src = handle.read()
+        self.tree = ast.parse(self.src)
+        self.draft = next(
+            n for n in ast.walk(self.tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and n.name == "api_generate_duplicate_draft"
+        )
+
+    def test_the_output_budget_covers_a_measured_merge(self):
+        """900 was below the 2,776 tokens a 4-record merge actually spends.
+
+        The model ran out of budget mid-JSON, never emitted the closing brace,
+        and the `re.search(r"\\{.*\\}")` parse found nothing — so the only
+        symptom was a 502 with no cause. Assert the literal is gone and the
+        knob is used, rather than asserting a number that will drift.
+        """
+        calls = [ast.unparse(n) for n in ast.walk(self.draft) if isinstance(n, ast.Call)]
+        llm = next(c for c in calls if "get_llm_response" in c)
+        self.assertIn("num_predict=MERGE_DRAFT_NUM_PREDICT", llm,
+                      msg="the draft must use the sized budget, not a literal")
+        self.assertNotIn("num_predict=900", llm)
+        self.assertFalse("num_predict=900" in self.src,
+                         msg="the 900-token budget is back somewhere in gui.py")
+
+    def test_the_budget_default_is_the_measured_value(self):
+        """Pin the default, because a wrong default reintroduces the 502."""
+        assign = next(
+            n for n in self.tree.body
+            if isinstance(n, ast.Assign)
+            and any(getattr(t, "id", None) == "MERGE_DRAFT_NUM_PREDICT" for t in n.targets)
+        )
+        self.assertIn("4000", ast.unparse(assign.value),
+                      msg="measured 2,776 tokens for 4 records; 4000 is the floor")
+
+    def test_an_oversized_selection_is_refused_before_the_llm_call(self):
+        """A selection too large to serve is a 400, not an unexplained failure.
+
+        The guard has to run *before* the call. A check placed after it would
+        still be a check, and the test would still pass, while the request
+        still went out to be truncated.
+        """
+        self.assertTrue(
+            any(isinstance(n, ast.Raise) for n in ast.walk(self.draft)),
+            msg="no guard rejects an over-budget selection",
+        )
+        raise_line, call_line = None, None
+        for n in ast.walk(self.draft):
+            if isinstance(n, ast.Raise):
+                exc = n.exc
+                if isinstance(exc, ast.Call) and "HTTPException" in ast.unparse(exc.func):
+                    detail = ast.unparse(exc)
+                    if "tokens" in detail and "draft" in detail:
+                        raise_line = n.lineno
+            if isinstance(n, ast.Call) and "get_llm_response" in ast.unparse(n):
+                call_line = n.lineno
+        self.assertIsNotNone(raise_line, msg="the over-budget guard is missing")
+        self.assertIsNotNone(call_line)
+        self.assertLess(raise_line, call_line,
+                        msg="the guard must run before the LLM call, not after it")
+
+    def test_the_guard_is_not_written_as_a_dead_comparison(self):
+        """`if estimated > 0` is a comparison that can never fire.
+
+        This is the same shape as the `$ids` bug: a condition that reads like
+        a guard and evaluates to a constant. Derived from the AST, not grepped,
+        so a renamed local cannot quietly disarm it.
+        """
+        compares = [n for n in ast.walk(self.draft) if isinstance(n, ast.Compare)]
+        budget_guards = []
+        for cmp_node in compares:
+            src = ast.unparse(cmp_node)
+            if "MERGE_CONTEXT_TOKENS" in src and "MERGE_DRAFT_NUM_PREDICT" in src:
+                budget_guards.append(cmp_node)
+        self.assertTrue(budget_guards,
+                        msg="no comparison combines the prompt estimate, the output "
+                            "budget and the context ceiling")
+        for cmp_node in budget_guards:
+            sides = [cmp_node.left] + list(cmp_node.comparators)
+            for side in sides:
+                for sub in ast.walk(side):
+                    self.assertNotIsInstance(
+                        sub, ast.Constant,
+                        msg="a literal on either side of the budget comparison makes "
+                            "it a constant that never fires")
+
+    def test_the_advertised_cluster_range_matches_the_measured_ceiling(self):
+        """The 2-20 range was a lie: 20 records is a 13,123-token prompt."""
+        scan = next(
+            n for n in ast.walk(self.tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and n.name == "api_find_duplicates"
+        )
+        segment = ast.unparse(scan)
+        self.assertIn("MERGE_MAX_CLUSTER", segment,
+                      msg="the cap must be the constant, not a literal 20")
+        self.assertFalse(
+            re.search(r"max_cluster\s*(?:<=|>=|<|>)\s*20\b", segment),
+            msg="the old 20-record cap is back",
+        )
+        self.assertFalse("must be between 2 and 20" in self.src,
+                         msg="the old error message still promises 20")
+
+    def test_the_template_and_the_server_read_one_cap(self):
+        """A literal 20 in the input attribute is a silent drift from the server.
+
+        The input's max, the client-side check and the server-side 400 are
+        three places stating the same number. Passing it through the template
+        context is what keeps them from disagreeing, which is the failure a
+        user sees as "the UI allows 20 and the server refuses it".
+        """
+        self.assertIn('ctx["MERGE_MAX_CLUSTER"] = MERGE_MAX_CLUSTER', self.src)
+        with open(os.path.join(HERE, "templates", "dashboard.html"), encoding="utf-8") as handle:
+            html = handle.read()
+        self.assertIn('max="{{MERGE_MAX_CLUSTER}}"', html)
+        self.assertIn("maxCluster > MERGE_MAX_CLUSTER", html)
+        self.assertFalse(
+            re.search(r'id="dedup-max-cluster"[^>]*\bmax="20"', html),
+            msg="the input still advertises 20 clusters",
+        )
+
+
+class DedupUnderSetupTests(unittest.TestCase):
+    """Deduplicate moved from the top-level tab rail into the Setup page.
+
+    Two failure modes, both silent. A leftover `switchTab('deduplicate')`
+    dereferences a page div that no longer exists, and because that runs
+    inside init() the whole page comes up dead. And `activeTab` is persisted
+    in localStorage, so a returning user still has 'deduplicate' saved even
+    once the button is gone.
+    """
+
+    def setUp(self):
+        with open(os.path.join(HERE, "templates", "dashboard.html"), encoding="utf-8") as handle:
+            self.html = handle.read()
+        self.script = "\n".join(
+            re.findall(r"<script>(.*?)</script>", self.html, re.S))
+
+    def test_the_dedup_tab_is_gone_from_the_rail(self):
+        self.assertNotIn('id="page-deduplicate"', self.html,
+                         msg="the standalone dedup page is still present")
+        self.assertNotIn("switchTab('deduplicate')", self.html,
+                         msg="a tab button or link still points at the removed page")
+
+    def test_the_dedup_controls_live_inside_the_setup_page(self):
+        """Containment, not adjacency — being near Setup is not being in it."""
+        start = self.html.index('<div id="page-setup"')
+        depth, end = 0, None
+        for match in re.finditer(r"<div\b|</div>", self.html[start:]):
+            depth += 1 if match.group(0) != "</div>" else -1
+            if depth == 0:
+                end = start + match.end()
+                break
+        self.assertIsNotNone(end, msg="could not find the end of the setup page")
+        setup = self.html[start:end]
+        for control in ("dedup-max-cluster", "dedup-threshold", "dedup-category",
+                        "dedup-scan-btn", "dedup-status", "dedup-clusters"):
+            self.assertIn(control, setup,
+                          msg=f"{control} is not inside the Setup page")
+
+    def test_a_stale_persisted_tab_cannot_kill_init(self):
+        """The tab name outlives the tab, in localStorage, across deploys.
+
+        switchTab used to do `document.getElementById('page-' + tab).classList`
+        on whatever came out of storage. A null there is a TypeError thrown
+        from init(), which is a blank page rather than a wrong tab.
+        """
+        self.assertTrue(
+            re.search(r"const\s+page\s*=\s*document\.getElementById\('page-'\s*\+\s*tab\)",
+                      self.script),
+            msg="switchTab must look the page up before dereferencing it",
+        )
+        self.assertIn("if (!page)", self.script,
+                      msg="a missing page must be handled, not assumed away")
+        self.assertIn("saveSessionState()", self.script,
+                      msg="the fallback must be persisted, or it returns every reload")
+
+    def test_entering_setup_still_primes_the_dedup_panel(self):
+        """Moving the panel means moving its lazy first-render with it.
+
+        The empty state used to be primed by a `tab === 'deduplicate'` branch.
+        Drop the branch while moving the markup and the panel renders as a
+        blank div until the user presses Scan — which looks like a broken
+        button, because pressing it works.
+        """
+        self.assertIn("renderDuplicateEmptyState", self.script)
+        self.assertTrue(
+            re.search(r"tab\s*===\s*'setup'[\s\S]{0,400}renderDuplicateEmptyState", self.script),
+            msg="entering Setup no longer primes the dedup empty state",
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

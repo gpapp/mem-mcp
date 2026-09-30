@@ -128,6 +128,18 @@ services:
       - MEM_QUERY_CACHE_TTL=${MEM_QUERY_CACHE_TTL:-900}
       - MEM_QUERY_CACHE_MAX=${MEM_QUERY_CACHE_MAX:-256}
 
+      # Merge-draft budget. The only LLM call whose prompt is uncapped: it
+      # json.dumps the full text of every selected record, so it is sized
+      # against the context window rather than a window. NUM_PREDICT was 900,
+      # below the 2,776 tokens a 4-record merge actually spends -- the JSON was
+      # cut off mid-object and surfaced as an unexplained 502.
+      # CONTEXT_TOKENS must stay in step with OLLAMA_CONTEXT_LENGTH above.
+      # MAX_CLUSTER is measured, not guessed: 20 records is 13,123 prompt
+      # tokens, which no output budget can fit alongside.
+      - MEM_MERGE_NUM_PREDICT=${MEM_MERGE_NUM_PREDICT:-4000}
+      - MEM_MERGE_CONTEXT_TOKENS=${MEM_MERGE_CONTEXT_TOKENS:-16332}
+      - MEM_MERGE_MAX_CLUSTER=${MEM_MERGE_MAX_CLUSTER:-12}
+
       # Embedding budget and retries. EMBED_MAX_CHARS must stay in step with
       # chunking.EMBED_CEILING, which reads the same variable.
       - MEM_EMBED_RETRIES=${MEM_EMBED_RETRIES:-2}

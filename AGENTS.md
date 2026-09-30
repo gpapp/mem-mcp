@@ -447,12 +447,48 @@ Search diary entries from the sidebar.
 - API endpoint: `GET /api/diary/search?q=<text>&limit=10&top_p=0.4`
 
 ### Dashboard Deduplication
-The dashboard's **Deduplicate** tab provides a review-first merge workflow.
+Setup → **🧹 Deduplicate memories** provides a review-first merge workflow. It is a section of the
+**Settings** page, not a top-level tab: the tab rail held eight tabs and this one is a maintenance
+task, not a daily view. The six controls (`#dedup-category`, `#dedup-threshold`,
+`#dedup-max-cluster`, `#dedup-scan-btn`, `#dedup-status`, `#dedup-clusters`) live inside
+`#page-setup`'s single `.card`, between the Maintenance and Backup sections.
 
 - Scan a category with a configurable similarity threshold and maximum cluster size.
 - Select the records to merge, choose the master, and use the LLM to generate an editable merged title and text draft from only those records.
 - Merges require explicit confirmation and use the same ownership validation and recovery marker as the MCP `merge_facts` tool.
 - GUI endpoints: `GET /api/duplicates`, `POST /api/duplicates/draft`, and `POST /api/duplicates/merge`.
+
+**Moving a page out of the tab rail has a persistence hazard.** `activeTab` is saved to
+`localStorage` under `mem_vault_session_state`, so anyone who left the Deduplicate tab open has
+`'deduplicate'` in their saved state forever. A `switchTab` that does
+`document.getElementById('page-' + tab).classList.add('active')` then dereferences `null` and takes
+the whole page down on load. `switchTab` now resolves the element first and falls back to
+`memories` with a `console.warn`. Do not reintroduce the direct dereference, and keep
+`renderDuplicateEmptyState()` in the `if (tab === 'setup')` branch — without it the panel is a
+blank div until Scan is pressed, which reads as a broken button.
+
+**The merge path is budgeted in two directions, and both bounds were wrong.** `num_predict=900` sat
+below what a merge actually spends: nemotron-3-nano:4b used **2,776** tokens for four records, so
+the closing brace was never emitted, `re.search(r"\{.*\}")` found nothing, and the only symptom was
+a 502. It is now `MERGE_DRAFT_NUM_PREDICT` (4000). In the other direction, `max_cluster` was
+validated 2–20 while a 20-cluster of long facts is a **13,123**-token prompt against a 16,332
+context — unservable at *any* output budget, so the advertised range was a lie. It is now
+`MERGE_MAX_CLUSTER` (12, ~3.5k headroom) and `api_generate_duplicate_draft` refuses an
+over-budget selection with a 400 naming the record count and the estimate, instead of letting
+Ollama truncate.
+
+- The char/token ratio **drifts**: 3.21 at 6.7k chars, 3.31 at 43.5k. A ratio that is safe on a
+  small prompt is not safe on a large one, so `MERGE_PROMPT_CHARS_PER_TOKEN` is 3.0 — rounded
+  down, because the guard must over-estimate tokens, not under-estimate them.
+- `MERGE_CONTEXT_TOKENS` must track `OLLAMA_CONTEXT_LENGTH` in `docker-compose.yml`. They are
+  separate knobs because one is read by Ollama and the other by the app, and a silent divergence
+  means the guard protects a context window that is not the real one.
+- `MERGE_MAX_CLUSTER` reaches the template via `ctx["MERGE_MAX_CLUSTER"]` in `get_gui`, so the
+  input's `max` attribute, the client-side check and the server's 400 cannot drift apart.
+- `MergeDraftBudgetTests` and `DedupUnderSetupTests` in `test_cypher_safety.py` pin all of this
+  from the AST, including that the budget comparison has no `ast.Constant` on either side (an
+  `if estimated > 0` reads like a guard and never fires) and that the guard's line number precedes
+  the `get_llm_response` call.
 
 ### Backup & Restore
 Setup → Maintenance → **Backup & Restore** manages the savepoints.

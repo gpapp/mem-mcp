@@ -48,6 +48,36 @@ web_app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET, session_coo
 
 HTPASSWD_PATH = os.getenv("HTPASSWD_PATH", os.path.join(os.path.dirname(__file__), "htpasswd"))
 
+# Merge-draft output budget. The draft is the ONE LLM call that json.dumps the
+# full text of every selected record with no cap, so it is sized against the
+# context window rather than against a window. Measured on real facts at
+# num_predict=4000, nemotron-3-nano:4b spent 2,776 tokens on a 4-record merge
+# (min == max over 5 runs -- temperature is 0.0, so the run is deterministic).
+# The old 900 was below the floor: the model ran out of budget mid-JSON, the
+# closing brace was never emitted, and `re.search(r"\{.*\}")` matched nothing,
+# so a 502 was the only symptom. Raise this and the failure returns.
+MERGE_DRAFT_NUM_PREDICT = int(os.getenv("MEM_MERGE_NUM_PREDICT") or 4000)
+
+# Must track OLLAMA_CONTEXT_LENGTH on the ollama service. The draft prompt is
+# uncapped by design, so *some* bound has to live in code -- the alternative is
+# a selection that is arithmetically impossible to serve.
+MERGE_CONTEXT_TOKENS = int(os.getenv("MEM_MERGE_CONTEXT_TOKENS") or 16332)
+
+# Conservative chars-per-token for the budget check. Measured on this vault's
+# real merge prompts: 3.21 at 6.7k chars, 3.31 at 43.5k -- the ratio *drifts
+# down* as the prompt grows, so a ratio that is safe on small prompts is not
+# safe on large ones. Rounded down to 3.0 so the estimate errs toward
+# rejecting a request that would not have fit anyway. This is a budget guard,
+# not a tokenizer; being wrong here costs a clear 400, not a silent truncation.
+MERGE_PROMPT_CHARS_PER_TOKEN = 3.0
+
+# The advertised max_cluster range used to be 2-20, which is a lie: at 20
+# records the prompt measured 13,123 tokens, and with any real output budget
+# that exceeds the 16,332 ceiling for every model. Measured prompt tokens for
+# cumulative prefixes of the 20 longest facts: 12 -> 8,813, 18 -> 12,167,
+# 20 -> 13,123. 12 leaves ~3.5k of headroom for output at the 4k budget.
+MERGE_MAX_CLUSTER = int(os.getenv("MEM_MERGE_MAX_CLUSTER") or 12)
+
 def _verify_htpasswd(username: str, password: str) -> bool:
     try:
         if not os.path.exists(HTPASSWD_PATH):
@@ -259,8 +289,17 @@ async def api_find_duplicates(
 ):
     """Find scope-compatible duplicate clusters for the current user."""
     try:
-        if not 2 <= max_cluster <= 20:
-            raise HTTPException(status_code=400, detail="max_cluster must be between 2 and 20")
+        if not 2 <= max_cluster <= MERGE_MAX_CLUSTER:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"max_cluster must be between 2 and {MERGE_MAX_CLUSTER}. "
+                    "Larger clusters are arithmetically impossible to serve: the "
+                    "merge draft sends the full text of every selected record in "
+                    "one uncapped prompt, and past this size the prompt alone "
+                    "exceeds the model's context window."
+                ),
+            )
         if not 0.0 <= threshold <= 1.0:
             raise HTTPException(status_code=400, detail="threshold must be between 0 and 1")
         return await mem.db_find_duplicates(
@@ -351,8 +390,28 @@ async def api_generate_duplicate_draft(request: Request, body: MemoryMergeDraft)
         f"SELECTED RECORDS:\n{json.dumps(prompt_records, ensure_ascii=True, default=str)}"
     )
     try:
+        # Refuse an over-budget selection instead of letting it fail as a 502.
+        # The prompt is uncapped by construction, so a large enough selection is
+        # a client error with a known remedy (merge in smaller batches), not an
+        # LLM failure. Estimated, not tokenized -- see MERGE_PROMPT_CHARS_PER_TOKEN.
+        estimated_prompt_tokens = int(len(prompt) / MERGE_PROMPT_CHARS_PER_TOKEN)
+        if estimated_prompt_tokens + MERGE_DRAFT_NUM_PREDICT > MERGE_CONTEXT_TOKENS:
+            fits = int(
+                (MERGE_CONTEXT_TOKENS - MERGE_DRAFT_NUM_PREDICT)
+                * MERGE_PROMPT_CHARS_PER_TOKEN
+            )
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"These {len(fact_ids)} records are too large to merge in one draft "
+                    f"(~{estimated_prompt_tokens} prompt tokens, leaving no room to write). "
+                    f"Select fewer records -- about {fits} characters of source text fits "
+                    f"in a single draft at the current settings."
+                ),
+            )
         raw = await mem.get_llm_response(
-            prompt, system=system, model=mem.MERGE_MODEL, num_predict=900
+            prompt, system=system, model=mem.MERGE_MODEL,
+            num_predict=MERGE_DRAFT_NUM_PREDICT,
         )
         match = re.search(r"\{.*\}", raw or "", re.DOTALL)
         if not match:
@@ -1225,5 +1284,8 @@ async def get_gui(request: Request):
         return RedirectResponse(url=mem.BASE_URL or "/", status_code=302)
     ctx = _get_auth_context(request)
     ctx["BASE_URL"] = mem.BASE_URL or "/"
+    # One source of truth for the cluster cap: the input's max attribute, the
+    # client-side validation and the server-side 400 must not disagree.
+    ctx["MERGE_MAX_CLUSTER"] = MERGE_MAX_CLUSTER
     html = _render("dashboard", **ctx)
     return HTMLResponse(content=html)

@@ -569,7 +569,6 @@
 
 <div class="tabs">
   <button class="tab-btn active" data-tab="memories" onclick="switchTab('memories')">📝 Memories</button>
-  <button class="tab-btn" data-tab="deduplicate" onclick="switchTab('deduplicate')">🧹 Deduplicate</button>
   <button class="tab-btn" data-tab="diary" onclick="switchTab('diary')">📖 Diary</button>
   <button class="tab-btn" data-tab="graph" onclick="switchTab('graph')">🕸️ Graph</button>
   <button class="tab-btn" data-tab="clients" onclick="switchTab('clients')">🏢 Clients</button>
@@ -659,34 +658,6 @@
     </div>
 
   </div>
-</div>
-
-<!-- ═══ DEDUPLICATE PAGE ═══ -->
-<div id="page-deduplicate" class="page">
-  <div class="card">
-    <h2 style="margin-top:0;">🧹 Deduplicate memories</h2>
-    <p style="font-size:.85rem;color:var(--muted);margin-bottom:1rem;">
-      Find scope-compatible duplicate clusters, review every record, then confirm each merge manually.
-      <strong>Merge drafts keep all information from every selected record.</strong>
-    </p>
-    <div class="dedup-toolbar">
-      <div>
-        <label for="dedup-category">Category</label>
-        <input id="dedup-category" value="People" placeholder="People">
-      </div>
-      <div>
-        <label for="dedup-threshold">Similarity threshold</label>
-        <input id="dedup-threshold" type="number" min="0" max="1" step=".05" value=".75">
-      </div>
-      <div>
-        <label for="dedup-max-cluster">Max cluster size</label>
-        <input id="dedup-max-cluster" type="number" min="2" max="20" step="1" value="4">
-      </div>
-      <button id="dedup-scan-btn" class="btn btn-primary" onclick="scanDuplicates()">🔎 Scan</button>
-    </div>
-    <div id="dedup-status" style="margin-top:.75rem;font-size:.85rem;color:var(--muted);"></div>
-  </div>
-  <div id="dedup-clusters"></div>
 </div>
 
 <!-- ═══ DIARY PAGE ═══ -->
@@ -846,6 +817,31 @@ npm install @modelcontextprotocol/sdk</code></pre>
     </div>
 
     <div style="margin-top: 2rem; padding-top: 1.5rem; border-top: 1px solid var(--border);">
+      <h3 style="margin-top:0;">🧹 Deduplicate memories</h3>
+      <p style="font-size: 0.9rem; color: var(--muted); margin-bottom: 1rem;">
+        Find scope-compatible duplicate clusters, review every record, then confirm each merge manually.
+        <strong>Merge drafts keep all information from every selected record.</strong>
+      </p>
+      <div class="dedup-toolbar">
+        <div>
+          <label for="dedup-category">Category</label>
+          <input id="dedup-category" value="People" placeholder="People">
+        </div>
+        <div>
+          <label for="dedup-threshold">Similarity threshold</label>
+          <input id="dedup-threshold" type="number" min="0" max="1" step=".05" value=".75">
+        </div>
+        <div>
+          <label for="dedup-max-cluster">Max cluster size</label>
+          <input id="dedup-max-cluster" type="number" min="2" max="{{MERGE_MAX_CLUSTER}}" step="1" value="4">
+        </div>
+        <button id="dedup-scan-btn" class="btn btn-primary" onclick="scanDuplicates()">🔎 Scan</button>
+      </div>
+      <div id="dedup-status" style="margin-top:.75rem;font-size:.85rem;color:var(--muted);"></div>
+      <div id="dedup-clusters"></div>
+    </div>
+
+    <div style="margin-top: 2rem; padding-top: 1.5rem; border-top: 1px solid var(--border);">
       <h3 style="margin-top:0;">💾 Backup &amp; Restore</h3>
       <p style="font-size: 0.9rem; color: var(--muted); margin-bottom: 1rem;">
         A savepoint is a copy of the <strong>whole vault</strong> — the graph plus both vector
@@ -874,6 +870,12 @@ npm install @modelcontextprotocol/sdk</code></pre>
   marked.use({ gfm: true, breaks: true });
 
   const apiBase = "{{BASE_URL}}/api";
+  // Server-owned cap (gui.py MERGE_MAX_CLUSTER). Passed in rather than repeated
+  // as a literal so the input's max, the check below and the server's 400
+  // cannot drift apart -- they are the same number. Kept inside a string
+  // literal because every other Jinja value in this script is; a bare
+  // {{...}} would not survive `node --check` on the extracted script.
+  const MERGE_MAX_CLUSTER = Number("{{MERGE_MAX_CLUSTER}}");
   const api = {
     get:    (url)       => fetch(`${apiBase}/${url}`).then(r => r.ok ? r.json() : Promise.reject(r)),
     post:   (url, body) => fetch(`${apiBase}/${url}`, {method:'POST',  headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}).then(r => r.ok ? r.json() : Promise.reject(r)),
@@ -1143,6 +1145,15 @@ npm install @modelcontextprotocol/sdk</code></pre>
   }
 
   function switchTab(tab) {
+    // A tab name persisted in localStorage can outlive the tab itself — the
+    // Deduplicate page moved under Setup, so anyone who left it open has
+    // 'deduplicate' saved here. Dereferencing a page div that no longer exists
+    // would throw and take init() down with it, so unknown tabs fall back.
+    const page = document.getElementById('page-' + tab);
+    if (!page) {
+      console.warn('Unknown tab "' + tab + '" in session state; falling back to memories');
+      tab = 'memories';
+    }
     activeTab = tab;
     document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
     document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
@@ -1151,12 +1162,15 @@ npm install @modelcontextprotocol/sdk</code></pre>
       if (b.dataset.tab === tab) b.classList.add('active');
     });
     if (tab === 'memories' && !memories.length) loadMemories();
-    if (tab === 'deduplicate' && !duplicateClusters.length) renderDuplicateEmptyState();
     if (tab === 'diary' && !diaryEntries.length) loadDiary();
     if (tab === 'graph' && !graphLoaded) loadGraph();
     if (tab === 'clients') loadClients();
     if (tab === 'projects') { loadClients(); loadProjects(); }
-    if (tab === 'setup') { loadReclassifyStatus(); loadSavepoints(); }
+    if (tab === 'setup') {
+      loadReclassifyStatus();
+      loadSavepoints();
+      if (!duplicateClusters.length) renderDuplicateEmptyState();
+    }
     saveSessionState();
   }
 
@@ -3759,8 +3773,8 @@ npm install @modelcontextprotocol/sdk</code></pre>
     const maxCluster = Number(document.getElementById('dedup-max-cluster').value);
     const btn = document.getElementById('dedup-scan-btn');
     const status = document.getElementById('dedup-status');
-    if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1 || !Number.isInteger(maxCluster) || maxCluster < 2 || maxCluster > 20) {
-      toast('⚠️ Check the threshold and cluster size');
+    if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1 || !Number.isInteger(maxCluster) || maxCluster < 2 || maxCluster > MERGE_MAX_CLUSTER) {
+      toast(`⚠️ Check the threshold and cluster size (max ${MERGE_MAX_CLUSTER})`);
       return;
     }
     btn.disabled = true;
