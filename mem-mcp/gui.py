@@ -40,7 +40,8 @@ from fastapi.responses import Response, JSONResponse, HTMLResponse, RedirectResp
 from pydantic import BaseModel
 from starlette.middleware.sessions import SessionMiddleware
 from memory import SESSION_SECRET, SESSION_MAX_AGE # Import from memory.py
-from matching_utils import execute_merge, format_people_merge_text
+from matching_utils import (MergeDraftTooLarge, execute_merge,
+                             format_people_merge_text, merge_draft_output_budget)
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from sse_starlette.sse import EventSourceResponse
 web_app = FastAPI(title="Memory Vault GUI")
@@ -48,15 +49,27 @@ web_app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET, session_coo
 
 HTPASSWD_PATH = os.getenv("HTPASSWD_PATH", os.path.join(os.path.dirname(__file__), "htpasswd"))
 
-# Merge-draft output budget. The draft is the ONE LLM call that json.dumps the
-# full text of every selected record with no cap, so it is sized against the
-# context window rather than against a window. Measured on real facts at
-# num_predict=4000, nemotron-3-nano:4b spent 2,776 tokens on a 4-record merge
-# (min == max over 5 runs -- temperature is 0.0, so the run is deterministic).
-# The old 900 was below the floor: the model ran out of budget mid-JSON, the
-# closing brace was never emitted, and `re.search(r"\{.*\}")` matched nothing,
-# so a 502 was the only symptom. Raise this and the failure returns.
-MERGE_DRAFT_NUM_PREDICT = int(os.getenv("MEM_MERGE_NUM_PREDICT") or 4000)
+# The draft is the ONE LLM call that json.dumps the full text of every selected
+# record with no cap, so its output budget cannot come from a window either. It
+# comes from what the context has left: merge_draft_output_budget() returns
+# context - prompt and the caller passes that straight to num_predict.
+#
+# This used to be a constant, and the constant was the bug. Measured on real
+# facts, nemotron-3-nano:4b spends 2,776 output tokens on a four-record draft
+# and 5,657 on twelve (temperature 0.0, so min == max over runs). A constant of
+# 4,000 served the four-record case it was measured on and truncated the
+# twelve-record one: the model ran out of budget mid-JSON, never emitted the
+# closing brace, `re.search(r"\{.*\}")` matched nothing, and the guard that was
+# meant to prevent it had only checked that the *prompt* fit. The 900 it
+# replaced failed the same way, one cluster smaller. Do not reinstate a literal
+# budget here -- the output need scales with the selection, so a constant is
+# either too small for the largest allowed cluster or wastefully large for the
+# smallest.
+#
+# This floor buys no extra budget. It is what turns "this cannot finish" into a
+# refusal: below it no draft can complete, so the answer is a 400 naming the
+# record count, not a 502 that reads as an LLM fault.
+MERGE_DRAFT_MIN_NUM_PREDICT = int(os.getenv("MEM_MERGE_MIN_NUM_PREDICT") or 3000)
 
 # Must track OLLAMA_CONTEXT_LENGTH on the ollama service. The draft prompt is
 # uncapped by design, so *some* bound has to live in code -- the alternative is
@@ -71,11 +84,16 @@ MERGE_CONTEXT_TOKENS = int(os.getenv("MEM_MERGE_CONTEXT_TOKENS") or 16332)
 # not a tokenizer; being wrong here costs a clear 400, not a silent truncation.
 MERGE_PROMPT_CHARS_PER_TOKEN = 3.0
 
-# The advertised max_cluster range used to be 2-20, which is a lie: at 20
-# records the prompt measured 13,123 tokens, and with any real output budget
-# that exceeds the 16,332 ceiling for every model. Measured prompt tokens for
-# cumulative prefixes of the 20 longest facts: 12 -> 8,813, 18 -> 12,167,
-# 20 -> 13,123. 12 leaves ~3.5k of headroom for output at the 4k budget.
+# The advertised max_cluster range used to be 2-20, which is a lie -- and it is
+# the *answer* that stops being servable first, not the prompt. Measured prompt
+# tokens for cumulative prefixes of the 20 longest facts: 4 -> 3,783, 8 -> 6,393,
+# 12 -> 8,801, 18 -> 12,167, 20 -> 13,123. Against the 16,332 ceiling that
+# leaves 7,531 at twelve records, and a twelve-record draft measures 5,657
+# output tokens, so the largest allowed selection completes with room to spare.
+# Eighteen records would leave 4,165 against an output need that grows with the
+# selection -- a truncation wearing a number. The cap is enforced on the draft
+# request too, not only on the scan, since the draft endpoint is a separate POST
+# and used to accept any number of records.
 MERGE_MAX_CLUSTER = int(os.getenv("MEM_MERGE_MAX_CLUSTER") or 12)
 
 def _verify_htpasswd(username: str, password: str) -> bool:
@@ -340,6 +358,16 @@ async def api_generate_duplicate_draft(request: Request, body: MemoryMergeDraft)
     fact_ids = list(dict.fromkeys(str(fact_id).strip() for fact_id in body.factIds if str(fact_id).strip()))
     if len(fact_ids) < 2:
         raise HTTPException(status_code=400, detail="Select at least two records")
+    if len(fact_ids) > MERGE_MAX_CLUSTER:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Select at most {MERGE_MAX_CLUSTER} records for one draft. Past "
+                "that, the prompt and the answer together exceed the model's "
+                "context window, and the draft is truncated mid-JSON instead of "
+                "returned. This is the same cap the scan uses -- split the cluster."
+            ),
+        )
 
     records = [mem.db_get_fact_by_id(fact_id, user_id) for fact_id in fact_ids]
     if any(record is None for record in records):
@@ -394,24 +422,18 @@ async def api_generate_duplicate_draft(request: Request, body: MemoryMergeDraft)
         # The prompt is uncapped by construction, so a large enough selection is
         # a client error with a known remedy (merge in smaller batches), not an
         # LLM failure. Estimated, not tokenized -- see MERGE_PROMPT_CHARS_PER_TOKEN.
-        estimated_prompt_tokens = int(len(prompt) / MERGE_PROMPT_CHARS_PER_TOKEN)
-        if estimated_prompt_tokens + MERGE_DRAFT_NUM_PREDICT > MERGE_CONTEXT_TOKENS:
-            fits = int(
-                (MERGE_CONTEXT_TOKENS - MERGE_DRAFT_NUM_PREDICT)
-                * MERGE_PROMPT_CHARS_PER_TOKEN
-            )
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"These {len(fact_ids)} records are too large to merge in one draft "
-                    f"(~{estimated_prompt_tokens} prompt tokens, leaving no room to write). "
-                    f"Select fewer records -- about {fits} characters of source text fits "
-                    f"in a single draft at the current settings."
-                ),
-            )
+        # The helper returns the whole remainder, so the budget the guard checked
+        # and the budget the model is given cannot drift apart: the call cannot
+        # be reached unless the helper returned.
+        num_predict = merge_draft_output_budget(
+            len(prompt),
+            context_tokens=MERGE_CONTEXT_TOKENS,
+            min_predict=MERGE_DRAFT_MIN_NUM_PREDICT,
+            chars_per_token=MERGE_PROMPT_CHARS_PER_TOKEN,
+        )
         raw = await mem.get_llm_response(
             prompt, system=system, model=mem.MERGE_MODEL,
-            num_predict=MERGE_DRAFT_NUM_PREDICT,
+            num_predict=num_predict,
         )
         match = re.search(r"\{.*\}", raw or "", re.DOTALL)
         if not match:
@@ -428,6 +450,20 @@ async def api_generate_duplicate_draft(request: Request, body: MemoryMergeDraft)
         if not name or not text:
             raise ValueError("LLM returned an incomplete draft")
         return {"factIds": fact_ids, "mergedName": name, "mergedText": text}
+    except MergeDraftTooLarge as exc:
+        # Must precede the ValueError handler below: MergeDraftTooLarge is a
+        # ValueError, so the wrong order silently turns this refusal back into
+        # the 502 it exists to avoid.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"These {len(fact_ids)} records are too large to merge in one draft "
+                f"(~{exc.prompt_tokens} prompt tokens leave {exc.available} to write "
+                f"with, and a complete draft needs {exc.min_predict}). Select fewer "
+                f"records -- about {exc.source_chars} characters of source text fits "
+                f"in a single draft at the current settings."
+            ),
+        )
     except (ValueError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=502, detail=f"Could not generate merge draft: {exc}")
     except RuntimeError as e:

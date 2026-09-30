@@ -130,13 +130,18 @@ services:
 
       # Merge-draft budget. The only LLM call whose prompt is uncapped: it
       # json.dumps the full text of every selected record, so it is sized
-      # against the context window rather than a window. NUM_PREDICT was 900,
-      # below the 2,776 tokens a 4-record merge actually spends -- the JSON was
-      # cut off mid-object and surfaced as an unexplained 502.
+      # against the context window rather than a window. There is no
+      # output-budget knob on purpose: the budget is what the context leaves
+      # after the prompt, because the answer scales with the selection (2,776
+      # output tokens measured for 4 records, 5,657 for 12). A fixed value was
+      # either too small for the largest cluster -- JSON cut off mid-object and
+      # surfaced as an unexplained 502 -- or wastefully large for the smallest.
+      # MIN_NUM_PREDICT is the refusal floor, not the budget: below it a draft
+      # cannot complete, so the request is refused with a 400 instead of 502.
       # CONTEXT_TOKENS must stay in step with OLLAMA_CONTEXT_LENGTH above.
-      # MAX_CLUSTER is measured, not guessed: 20 records is 13,123 prompt
-      # tokens, which no output budget can fit alongside.
-      - MEM_MERGE_NUM_PREDICT=${MEM_MERGE_NUM_PREDICT:-4000}
+      # MAX_CLUSTER is measured, not guessed: at 12 records the prompt is 8,801
+      # tokens, leaving 7,531 to write with against a measured 5,657.
+      - MEM_MERGE_MIN_NUM_PREDICT=${MEM_MERGE_MIN_NUM_PREDICT:-3000}
       - MEM_MERGE_CONTEXT_TOKENS=${MEM_MERGE_CONTEXT_TOKENS:-16332}
       - MEM_MERGE_MAX_CLUSTER=${MEM_MERGE_MAX_CLUSTER:-12}
 

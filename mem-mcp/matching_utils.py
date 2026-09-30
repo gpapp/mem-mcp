@@ -544,6 +544,51 @@ async def execute_merge(
     return normalized_master, normalized_duplicates
 
 
+class MergeDraftTooLarge(ValueError):
+    """A merge draft's prompt leaves too little context to write an answer.
+
+    Carries the numbers the caller needs for the message, so the arithmetic
+    lives here once instead of being formatted at the call site.
+    """
+
+    def __init__(self, prompt_tokens: int, available: int,
+                 min_predict: int, source_chars: int):
+        super().__init__(
+            f"~{prompt_tokens} prompt tokens leave {available} for output, "
+            f"below the {min_predict} a complete draft needs"
+        )
+        self.prompt_tokens = prompt_tokens
+        self.available = available
+        self.min_predict = min_predict
+        self.source_chars = source_chars
+
+
+def merge_draft_output_budget(prompt_chars: int, *, context_tokens: int,
+                              min_predict: int, chars_per_token: float) -> int:
+    """Return the output-token budget for a merge draft of this prompt size.
+
+    The budget is what the context has left over after the prompt, not a fixed
+    number, and that is the whole point. Measured on real facts,
+    nemotron-3-nano:4b spends 2,776 output tokens on a four-record draft and
+    5,657 on twelve (temperature 0.0, so a run is deterministic). Any constant
+    below the largest allowed selection truncates the JSON before its closing
+    brace, and a draft that stops mid-JSON is reported as a 502 -- an LLM fault
+    for what is really an over-budget request with a known remedy.
+
+    `min_predict` is the floor under which the request is refused instead. It
+    buys no extra budget; it turns "this cannot possibly finish" into a refusal
+    with the record count and the char budget in the message.
+    """
+    prompt_tokens = int(prompt_chars / chars_per_token)
+    available = context_tokens - prompt_tokens
+    if available < min_predict:
+        raise MergeDraftTooLarge(
+            prompt_tokens, available, min_predict,
+            int(available * chars_per_token),
+        )
+    return available
+
+
 def scopes_compatible(left: dict, right: dict) -> bool:
     left_client = normalize_identity(left.get("clientName"))
     right_client = normalize_identity(right.get("clientName"))

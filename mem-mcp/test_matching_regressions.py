@@ -27,6 +27,8 @@ from matching_utils import (
     cluster_has_core,
     combine_duplicate_signals,
     execute_merge,
+    merge_draft_output_budget,
+    MergeDraftTooLarge,
     format_people_merge_text,
     identity_confidence,
     looks_like_person_name,
@@ -1638,6 +1640,97 @@ class RewriteSearchQueryCallSiteTests(unittest.TestCase):
         result = self._run(cache, responder, "who is running the ai adoption wave two")
         self.assertIn(("ai adoption", 0.85), result)
         self.assertEqual(len(cache), 1)
+
+
+class MergeDraftBudgetTests(unittest.TestCase):
+    """The merge draft's output budget is what the context has left over.
+
+    This one used to be a constant in gui.py, sized from a four-record run, and
+    that was the bug: measured on real facts, nemotron-3-nano:4b spends 2,776
+    output tokens on four records and 5,657 on twelve, so the 4,000-token budget
+    truncated the twelve-record draft before its closing brace. The parse then
+    found nothing and an over-budget request came back as a 502.
+
+    These tests call the helper, because the property being pinned is
+    arithmetic on measured numbers, and no source assertion can see arithmetic.
+    """
+
+    # Measured on real facts, in tokens: the prompt size of cumulative prefixes
+    # of the 20 longest facts, and what the draft actually cost to write.
+    PROMPT_TOKENS_4 = 3_783
+    PROMPT_TOKENS_12 = 8_801
+    OUTPUT_TOKENS_4 = 2_776
+    OUTPUT_TOKENS_12 = 5_657
+    CHARS_PER_TOKEN = 3.0
+    CONTEXT_TOKENS = 16_332
+
+    def _budget(self, prompt_tokens, min_predict=3_000):
+        return merge_draft_output_budget(
+            int(prompt_tokens * self.CHARS_PER_TOKEN),
+            context_tokens=self.CONTEXT_TOKENS,
+            min_predict=min_predict,
+            chars_per_token=self.CHARS_PER_TOKEN,
+        )
+
+    def test_the_budget_covers_what_the_largest_allowed_selection_costs(self):
+        """The regression: 12 records is what MERGE_MAX_CLUSTER advertises.
+
+        A constant at 4,000 passed a four-record run and failed here, and the
+        guard that should have caught it only checked that the prompt fit.
+        """
+        budget = self._budget(self.PROMPT_TOKENS_12)
+        self.assertGreaterEqual(
+            budget, self.OUTPUT_TOKENS_12,
+            msg="the budget for the largest allowed selection does not cover "
+                "the draft that selection actually costs; it will truncate "
+                "mid-JSON and surface as a 502",
+        )
+
+    def test_a_four_record_draft_still_fits_with_room_to_spare(self):
+        budget = self._budget(self.PROMPT_TOKENS_4)
+        self.assertGreaterEqual(budget, self.OUTPUT_TOKENS_4)
+
+    def test_the_budget_is_the_whole_remainder(self):
+        """No hidden ceiling: whatever the context has left is what it gets.
+
+        A cap here would reintroduce the original defect for the large
+        selections that are the reason the budget is dynamic.
+        """
+        budget = self._budget(500)
+        self.assertEqual(budget, self.CONTEXT_TOKENS - 500)
+
+    def test_it_refuses_a_selection_with_no_room_to_write(self):
+        """Below the floor nothing can finish, so it is a refusal, not a 502."""
+        prompt_tokens = self.CONTEXT_TOKENS - 1_000
+        with self.assertRaises(MergeDraftTooLarge) as caught:
+            self._budget(prompt_tokens, min_predict=3_000)
+        error = caught.exception
+        self.assertEqual(error.prompt_tokens, prompt_tokens)
+        self.assertEqual(error.available, 1_000)
+        self.assertEqual(error.min_predict, 3_000)
+        self.assertEqual(
+            error.source_chars, 3_000,
+            msg="the message quotes how much source text fits, so it has to be "
+                "the budget that would have been left",
+        )
+
+    def test_the_floor_itself_is_allowed(self):
+        """The boundary is inclusive: at exactly the floor it can still write."""
+        self.assertEqual(
+            self._budget(self.CONTEXT_TOKENS - 3_000, min_predict=3_000), 3_000
+        )
+        with self.assertRaises(MergeDraftTooLarge):
+            # one more token of prompt, so one token less to write with
+            self._budget(self.CONTEXT_TOKENS - 2_999, min_predict=3_000)
+
+    def test_the_refusal_is_a_value_error(self):
+        """It has to be, so an unhandled one cannot escape as a 500.
+
+        The cost of that is handler ordering in the caller: a ValueError is
+        caught before the more specific subclass. That is asserted in
+        test_cypher_safety.MergeDraftBudgetTests, where the caller lives.
+        """
+        self.assertTrue(issubclass(MergeDraftTooLarge, ValueError))
 
 
 if __name__ == "__main__":

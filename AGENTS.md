@@ -488,15 +488,39 @@ the whole page down on load. `switchTab` now resolves the element first and fall
 `renderDuplicateEmptyState()` in the `if (tab === 'setup')` branch — without it the panel is a
 blank div until Scan is pressed, which reads as a broken button.
 
-**The merge path is budgeted in two directions, and both bounds were wrong.** `num_predict=900` sat
-below what a merge actually spends: nemotron-3-nano:4b used **2,776** tokens for four records, so
-the closing brace was never emitted, `re.search(r"\{.*\}")` found nothing, and the only symptom was
-a 502. It is now `MERGE_DRAFT_NUM_PREDICT` (4000). In the other direction, `max_cluster` was
-validated 2–20 while a 20-cluster of long facts is a **13,123**-token prompt against a 16,332
-context — unservable at *any* output budget, so the advertised range was a lie. It is now
-`MERGE_MAX_CLUSTER` (12, ~3.5k headroom) and `api_generate_duplicate_draft` refuses an
-over-budget selection with a 400 naming the record count and the estimate, instead of letting
-Ollama truncate.
+**The merge path is budgeted in two directions, and a constant budget is wrong in the one
+direction nobody checks.** The merge draft is the only call whose prompt is uncapped, so its size
+is `max_cluster` × record length. Two generations of this bug, both a *fixed* `num_predict`:
+**900**, below what a four-record merge actually spends (nemotron-3-nano:4b used **2,776** tokens),
+and then **4,000**, sized from that same four-record run, which served it and truncated a
+twelve-record draft that costs **5,657**. The failure is always the same shape: the model runs out
+of budget mid-JSON, never emits the closing brace, `re.search(r"\{.*\}")` matches nothing, and an
+over-budget request comes back as a **502** — an LLM fault for something with a known remedy.
+**The output need scales with the selection, so a constant is either too small for the largest
+allowed cluster or wastefully large for the smallest. There is deliberately no output-budget knob.**
+The budget is whatever the context has left after the prompt, computed by
+`merge_draft_output_budget()` in `matching_utils.py` and passed straight to `num_predict`, so the
+budget the guard checked and the budget the model is given cannot drift apart — the request
+cannot be issued unless the helper returned. `MEM_MERGE_NUM_PREDICT` became
+`MEM_MERGE_MIN_NUM_PREDICT` (3000), which is the **refusal floor, not the budget**: below it no
+draft can complete, so the selection is refused with a 400 naming the record count, the estimate
+and how much source text would fit, rather than attempted.
+
+`max_cluster` was validated 2–20, which is a lie, and it is now `MERGE_MAX_CLUSTER` (12) — but
+the reason has changed, and the old reason was the wrong one. Measured prompt tokens for cumulative
+prefixes of the 20 longest facts: 4 → 3,783, 8 → 6,393, 12 → 8,801, 18 → 12,167,
+20 → 13,123. The **answer** runs out before the prompt does: at 12 the remainder is 7,531
+against a measured 5,657, so the largest allowed selection completes with room to spare; at 18 the
+remainder is 4,165 against an output need that grows with the selection. The cap is also enforced
+in `api_generate_duplicate_draft`, which is a separate POST and used to accept any number of
+records — the cap the UI advertised was not the cap the draft honoured.
+
+**`MergeDraftTooLarge` is a `ValueError`, so the `except` order is load-bearing.** It converts the
+refusal to a 400, and the generic `except (ValueError, json.JSONDecodeError)` below it is the 502.
+Reorder them and the guard still reads as present, still runs, and every over-budget request is
+reported as a model failure — the exact failure it was added to prevent. The caller-side test
+asserts both facts together, because neither is sufficient alone, and requires exactly one handler
+per caught name so "which one runs first" has one answer.
 
 - The char/token ratio **drifts**: 3.21 at 6.7k chars, 3.31 at 43.5k. A ratio that is safe on a
   small prompt is not safe on a large one, so `MERGE_PROMPT_CHARS_PER_TOKEN` is 3.0 — rounded
@@ -506,10 +530,33 @@ Ollama truncate.
   means the guard protects a context window that is not the real one.
 - `MERGE_MAX_CLUSTER` reaches the template via `ctx["MERGE_MAX_CLUSTER"]` in `get_gui`, so the
   input's `max` attribute, the client-side check and the server's 400 cannot drift apart.
-- `MergeDraftBudgetTests` and `DedupUnderSetupTests` in `test_cypher_safety.py` pin all of this
-  from the AST, including that the budget comparison has no `ast.Constant` on either side (an
-  `if estimated > 0` reads like a guard and never fires) and that the guard's line number precedes
-  the `get_llm_response` call.
+- The merge budget is split across the two suites on purpose, and the split follows what each can
+  see. `MergeDraftBudgetTests` in `test_matching_regressions.py` **calls**
+  `merge_draft_output_budget()` against the measured numbers — at 12 records the budget must cover
+  the 5,657 tokens that draft costs, the whole remainder must be returned with no hidden ceiling,
+  and the floor must be inclusive at exactly `min_predict` and refuse one token below it. A guard
+  that cannot fire fails those; an AST shape check would not have. The dead-comparison lint this
+  replaced (`if estimated > 0` reads like a guard and never fires) is now covered behaviourally.
+  `MergeDraftBudgetTests` in `test_cypher_safety.py` then pins only the **call site**, which the
+  helper's own tests cannot see: that `num_predict` is the helper's return value, bound exactly
+  once, on a line above the `get_llm_response` call; that the `except MergeDraftTooLarge` handler
+  precedes the generic `ValueError` one and there is exactly one handler per caught name; and that
+  the record cap in the draft endpoint is a comparison with no `ast.Constant` on either side that
+  drives a 400. A first version of the handler-order test took the *last* matching index, so
+  re-injecting a duplicate generic handler made it pass; and a first version of the cap test only
+  asserted the constant appears in the function, which a message quoting the cap satisfies even
+  when the check itself is `if False`. Both are the `assertIn`-checks-a-token lesson again.
+  `MergeDraftEndpointTests` there **runs** the endpoint instead: it lifts
+  `api_generate_duplicate_draft` with `ast.get_source_segment` (gui.py is not importable here) and
+  drives it against a stub model, so the pair of properties neither of the other two can see is
+  asserted directly — a twelve-record selection is handed at least the 5,657 tokens that draft
+  costs, and that budget is exactly `context - prompt_tokens` rather than a second computation of
+  it; an over-budget selection raises a **400** without the request being issued at all; and
+  thirteen records is refused by the count guard even though the text would fit. Re-injecting the
+  old `num_predict = 4000` fails three of them, which is what makes this the test that would have
+  caught the defect rather than one that describes it.
+- `DedupUnderSetupTests` in `test_cypher_safety.py` pins that the six dedup controls live inside
+  `#page-setup` and that no `switchTab('deduplicate')` survives.
 
 ### Backup & Restore
 Setup → Maintenance → **Backup & Restore** manages the savepoints.

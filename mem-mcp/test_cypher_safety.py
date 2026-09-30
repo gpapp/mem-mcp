@@ -12,10 +12,13 @@ This catches that class of error. It is not a substitute for running the query.
 """
 
 import ast
+import asyncio
 import os
 import re
 import sys
 import unittest
+
+from matching_utils import MergeDraftTooLarge
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -465,14 +468,19 @@ class ManualScopeGuardTests(unittest.TestCase):
 
 
 class MergeDraftBudgetTests(unittest.TestCase):
-    """The merge draft's prompt is the one uncapped prompt in the app.
+    """How the merge draft's caller spends the budget the helper hands it.
 
-    Everything else that talks to Ollama sends a single window. The merge draft
-    json.dumps the full text of every selected record, so its size is
-    max_cluster x record length with nothing to stop it. Two separate ceilings
-    follow from that and both used to be fiction: num_predict was 900 (below
-    what a 4-record merge spends) and max_cluster was advertised up to 20 (a
-    prompt that no output budget can fit alongside).
+    The draft prompt is the one uncapped prompt in the app, so its size is
+    max_cluster x record length with nothing to stop it. The output budget used
+    to be a constant sized from a four-record run, which served that run and
+    truncated a twelve-record one mid-JSON -- a 502 with no cause, on a request
+    that was really over budget and had a known remedy.
+
+    The arithmetic now lives in matching_utils.merge_draft_output_budget, and is
+    tested there by calling it, because the property is arithmetic on measured
+    numbers. What is left here is the call site, which a test of the helper
+    cannot see: that the model is given the helper's return value, and that the
+    refusal survives the except chain on its way out.
     """
 
     def setUp(self):
@@ -484,83 +492,159 @@ class MergeDraftBudgetTests(unittest.TestCase):
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
             and n.name == "api_generate_duplicate_draft"
         )
+        self.calls = [n for n in ast.walk(self.draft) if isinstance(n, ast.Call)]
 
-    def test_the_output_budget_covers_a_measured_merge(self):
-        """900 was below the 2,776 tokens a 4-record merge actually spends.
+    def _llm_call(self):
+        return next(c for c in self.calls if "get_llm_response" in ast.unparse(c.func))
 
-        The model ran out of budget mid-JSON, never emitted the closing brace,
-        and the `re.search(r"\\{.*\\}")` parse found nothing — so the only
-        symptom was a 502 with no cause. Assert the literal is gone and the
-        knob is used, rather than asserting a number that will drift.
+    def test_the_budget_is_the_context_remainder_not_a_literal(self):
+        """num_predict must be the helper's return value, and must be computed
+        before the call.
+
+        Both halves matter. A literal reappears the moment someone sizes a run
+        from a selection that is not the largest one; and an assignment after
+        the call would leave the guard checking a budget the model never got.
         """
-        calls = [ast.unparse(n) for n in ast.walk(self.draft) if isinstance(n, ast.Call)]
-        llm = next(c for c in calls if "get_llm_response" in c)
-        self.assertIn("num_predict=MERGE_DRAFT_NUM_PREDICT", llm,
-                      msg="the draft must use the sized budget, not a literal")
-        self.assertNotIn("num_predict=900", llm)
-        self.assertFalse("num_predict=900" in self.src,
-                         msg="the 900-token budget is back somewhere in gui.py")
+        call = self._llm_call()
+        kwarg = next(kw for kw in call.keywords if kw.arg == "num_predict")
+        self.assertIsInstance(
+            kwarg.value, ast.Name,
+            msg="num_predict must be the budget the helper returned, not a "
+                "literal and not an inline expression",
+        )
+        bindings = [
+            n for n in ast.walk(self.draft)
+            if isinstance(n, ast.Assign)
+            and any(getattr(t, "id", None) == kwarg.value.id for t in n.targets)
+        ]
+        self.assertEqual(
+            len(bindings), 1,
+            msg="the budget must be computed once; a second assignment means "
+                "the value the model is given may not be the one that was checked",
+        )
+        binding = bindings[0]
+        self.assertIsInstance(
+            binding.value, ast.Call, msg="the budget must come from the helper"
+        )
+        self.assertIn(
+            "merge_draft_output_budget", ast.unparse(binding.value.func),
+            msg="the budget must be derived from the context, not a constant",
+        )
+        self.assertLess(
+            binding.lineno, call.lineno,
+            msg="the budget has to be resolved before the request goes out",
+        )
+        self.assertNotRegex(
+            self.src, r"num_predict\s*=\s*\d",
+            msg="a literal num_predict is back in gui.py",
+        )
+        self.assertNotIn(
+            "MERGE_DRAFT_NUM_PREDICT", self.src,
+            msg="the fixed budget is back; the answer scales with the selection",
+        )
 
-    def test_the_budget_default_is_the_measured_value(self):
-        """Pin the default, because a wrong default reintroduces the 502."""
+    def test_the_floor_default_is_the_measured_minimum(self):
+        """Pin the floor default: 2,776 tokens is what the smallest draft costs."""
         assign = next(
             n for n in self.tree.body
             if isinstance(n, ast.Assign)
-            and any(getattr(t, "id", None) == "MERGE_DRAFT_NUM_PREDICT" for t in n.targets)
+            and any(getattr(t, "id", None) == "MERGE_DRAFT_MIN_NUM_PREDICT"
+                    for t in n.targets)
         )
-        self.assertIn("4000", ast.unparse(assign.value),
-                      msg="measured 2,776 tokens for 4 records; 4000 is the floor")
+        self.assertIn("3000", ast.unparse(assign.value),
+                      msg="measured 2,776 output tokens for 4 records; 3000 is "
+                          "the floor under which nothing can finish")
 
-    def test_an_oversized_selection_is_refused_before_the_llm_call(self):
-        """A selection too large to serve is a 400, not an unexplained failure.
+    def test_the_refusal_is_not_swallowed_by_the_502_handler(self):
+        """MergeDraftTooLarge is a ValueError, so handler order decides the status.
 
-        The guard has to run *before* the call. A check placed after it would
-        still be a check, and the test would still pass, while the request
-        still went out to be truncated.
+        Each fact alone is harmless and together they are the original bug: a
+        ValueError subclass caught by the generic ValueError handler comes back
+        as the 502 that the refusal exists to prevent, and the guard looks like
+        it is there.
         """
         self.assertTrue(
-            any(isinstance(n, ast.Raise) for n in ast.walk(self.draft)),
-            msg="no guard rejects an over-budget selection",
+            issubclass(MergeDraftTooLarge, ValueError),
+            msg="the refusal must be a ValueError so an unhandled one is not a 500",
         )
-        raise_line, call_line = None, None
-        for n in ast.walk(self.draft):
-            if isinstance(n, ast.Raise):
-                exc = n.exc
-                if isinstance(exc, ast.Call) and "HTTPException" in ast.unparse(exc.func):
-                    detail = ast.unparse(exc)
-                    if "tokens" in detail and "draft" in detail:
-                        raise_line = n.lineno
-            if isinstance(n, ast.Call) and "get_llm_response" in ast.unparse(n):
-                call_line = n.lineno
-        self.assertIsNotNone(raise_line, msg="the over-budget guard is missing")
-        self.assertIsNotNone(call_line)
-        self.assertLess(raise_line, call_line,
-                        msg="the guard must run before the LLM call, not after it")
+        try_blocks = [n for n in ast.walk(self.draft) if isinstance(n, ast.Try)]
+        self.assertEqual(
+            len(try_blocks), 1,
+            msg="the endpoint must have exactly one guarded block; the handler "
+                "order being pinned is that block's",
+        )
+        try_block = try_blocks[0]
+        catches = {}
+        for index, handler in enumerate(try_block.handlers):
+            caught = ast.unparse(handler.type) if handler.type else ""
+            names = {caught, *re.findall(r"[A-Za-z_][A-Za-z_0-9]*", caught)}
+            for name in names:
+                catches.setdefault(name, []).append(index)
+        self.assertEqual(
+            len(catches.get("MergeDraftTooLarge", [])), 1,
+            msg="exactly one handler may convert the refusal, or 'which one runs "
+                "first' stops being a question with one answer",
+        )
+        self.assertEqual(
+            len(catches.get("ValueError", [])), 1,
+            msg="exactly one handler may catch ValueError; a second one means "
+                "the order assertion below is measuring the wrong pair",
+        )
+        self.assertIn("ValueError", catches, msg="the 502 handler is gone")
+        self.assertLess(
+            catches["MergeDraftTooLarge"][0], catches["ValueError"][0],
+            msg="the specific refusal is caught after the generic ValueError "
+                "handler, so it surfaces as the 502 it exists to avoid",
+        )
 
-    def test_the_guard_is_not_written_as_a_dead_comparison(self):
-        """`if estimated > 0` is a comparison that can never fire.
+    def test_the_count_cap_is_enforced_where_the_records_are_sent(self):
+        """api_find_duplicates caps the scan; the draft is a separate POST.
 
-        This is the same shape as the `$ids` bug: a condition that reads like
-        a guard and evaluates to a constant. Derived from the AST, not grepped,
-        so a renamed local cannot quietly disarm it.
+        It used to accept any number of records and rely on the char budget
+        alone, so the cap the UI advertises was not the cap the draft honoured.
+
+        The assertion is on the comparison that drives a raise, not on the
+        constant appearing somewhere in the function: a message that quotes the
+        cap satisfies a substring check even when the check itself is `if False`.
         """
-        compares = [n for n in ast.walk(self.draft) if isinstance(n, ast.Compare)]
-        budget_guards = []
-        for cmp_node in compares:
-            src = ast.unparse(cmp_node)
-            if "MERGE_CONTEXT_TOKENS" in src and "MERGE_DRAFT_NUM_PREDICT" in src:
-                budget_guards.append(cmp_node)
-        self.assertTrue(budget_guards,
-                        msg="no comparison combines the prompt estimate, the output "
-                            "budget and the context ceiling")
-        for cmp_node in budget_guards:
-            sides = [cmp_node.left] + list(cmp_node.comparators)
-            for side in sides:
-                for sub in ast.walk(side):
-                    self.assertNotIsInstance(
-                        sub, ast.Constant,
-                        msg="a literal on either side of the budget comparison makes "
-                            "it a constant that never fires")
+        guards = [
+            n for n in ast.walk(self.draft)
+            if isinstance(n, ast.If)
+            and "MERGE_MAX_CLUSTER" in ast.unparse(n.test)
+            and "fact_ids" in ast.unparse(n.test)
+        ]
+        self.assertEqual(
+            len(guards), 1,
+            msg="the draft endpoint must refuse a selection larger than the cap "
+                "the scan uses, in exactly one place",
+        )
+        guard = guards[0]
+        for side in [guard.test.left, *guard.test.comparators]:
+            for sub in ast.walk(side):
+                self.assertNotIsInstance(
+                    sub, ast.Constant,
+                    msg="a literal in the cap comparison makes it a constant "
+                        "that never fires",
+                )
+        raises = [
+            n for n in ast.walk(guard)
+            if isinstance(n, ast.Raise)
+            and isinstance(n.exc, ast.Call)
+            and "HTTPException" in ast.unparse(n.exc.func)
+            and "400" in ast.unparse(n.exc)
+        ]
+        self.assertEqual(
+            len(raises), 1,
+            msg="the cap must refuse the request with a 400, not merely be read",
+        )
+        self.assertIn(
+            "MERGE_MAX_CLUSTER", ast.unparse(next(
+                n for n in ast.walk(self.tree)
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and n.name == "api_find_duplicates"
+            )),
+            msg="the cap must be the constant, not a literal",
+        )
 
     def test_the_advertised_cluster_range_matches_the_measured_ceiling(self):
         """The 2-20 range was a lie: 20 records is a 13,123-token prompt."""
@@ -596,6 +680,151 @@ class MergeDraftBudgetTests(unittest.TestCase):
             re.search(r'id="dedup-max-cluster"[^>]*\bmax="20"', html),
             msg="the input still advertises 20 clusters",
         )
+
+
+class MergeDraftEndpointTests(unittest.TestCase):
+    """api_generate_duplicate_draft, actually run against a stub model.
+
+    The other two suites check the arithmetic and the call site separately, and
+    neither sees what the endpoint hands the model or what a user gets back when
+    the selection is too big. Both are properties of running it. gui.py cannot be
+    imported here (httpx, the drivers, FastAPI), so the function is lifted out
+    of the source with ast.get_source_segment and executed against stubs.
+
+    This is the test that would have caught the original defect: at 4,000 fixed
+    output tokens a twelve-record selection was served a budget below what the
+    draft costs, and the request went out to be truncated.
+    """
+
+    CONTEXT_TOKENS = 16_332
+    CHARS_PER_TOKEN = 3.0
+    MIN_NUM_PREDICT = 3_000
+    OUTPUT_TOKENS_12 = 5_657  # what a twelve-record draft measures
+
+    class _HTTPException(Exception):
+        def __init__(self, status_code, detail):
+            super().__init__(detail)
+            self.status_code = status_code
+            self.detail = detail
+
+    def _runner(self, text_chars, category="Notes"):
+        """Exec the lifted endpoint; returns (run, calls)."""
+        with open(os.path.join(HERE, "gui.py"), encoding="utf-8") as handle:
+            source = handle.read()
+        tree = ast.parse(source)
+        func = next(
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.AsyncFunctionDef)
+            and n.name == "api_generate_duplicate_draft"
+        )
+        calls = []
+
+        async def fake_llm(prompt, system=None, model=None, num_predict=0):
+            calls.append({"prompt": prompt, "num_predict": num_predict})
+            return '{"name": "Merged", "text": "merged body"}'
+
+        class _Mem:
+            MERGE_MODEL = "stub-model"
+
+            def db_get_fact_by_id(self, fact_id, user_id):
+                return {"id": fact_id, "name": "note " + fact_id,
+                        "text": "x" * text_chars, "category": category,
+                        "metadata": {}}
+
+            async def get_llm_response(self, prompt, system=None, model=None,
+                                       num_predict=0):
+                return await fake_llm(prompt, system=system, model=model,
+                                      num_predict=num_predict)
+
+        class _Body:
+            def __init__(self, fact_ids):
+                self.factIds = fact_ids
+
+        namespace = {
+            "HTTPException": self._HTTPException,
+            "MemoryMergeDraft": _Body,
+            "Request": object,
+            "asyncio": __import__("asyncio"),
+            "format_people_merge_text": lambda *a: "formatted",
+            "json": __import__("json"),
+            "mem": _Mem(),
+            "re": __import__("re"),
+            "merge_draft_output_budget": __import__("matching_utils").merge_draft_output_budget,
+            "MergeDraftTooLarge": __import__("matching_utils").MergeDraftTooLarge,
+            "MERGE_MAX_CLUSTER": 12,
+            "MERGE_CONTEXT_TOKENS": self.CONTEXT_TOKENS,
+            "MERGE_DRAFT_MIN_NUM_PREDICT": self.MIN_NUM_PREDICT,
+            "MERGE_PROMPT_CHARS_PER_TOKEN": self.CHARS_PER_TOKEN,
+            "_require_user": lambda request: "test-user",
+            "_service_unavailable": lambda exc: exc,
+        }
+        # The route decorator comes with the lifted source and refers to the
+        # FastAPI app; it has no bearing on what the function does.
+        func.decorator_list = []
+        exec(compile(ast.Module(body=[func], type_ignores=[]), "gui.py", "exec"),
+             namespace)
+        endpoint = namespace["api_generate_duplicate_draft"]
+        return endpoint, calls
+
+    def _draft(self, count, text_chars, category="Notes"):
+        endpoint, calls = self._runner(text_chars, category)
+        body = type("B", (), {"factIds": ["f%d" % i for i in range(count)]})()
+        return asyncio.run(endpoint(object(), body)), calls
+
+    def test_a_twelve_record_draft_is_given_a_budget_that_can_finish_it(self):
+        """The regression, end to end: 12 records is the advertised maximum."""
+        result, calls = self._draft(12, 2_150)
+        self.assertEqual(len(calls), 1, msg="the draft request never went out")
+        self.assertGreaterEqual(
+            calls[0]["num_predict"], self.OUTPUT_TOKENS_12,
+            msg="the model was handed less than this selection's draft costs, so "
+                "it will stop mid-JSON and the parse will report a 502",
+        )
+        self.assertEqual(
+            calls[0]["num_predict"],
+            self.CONTEXT_TOKENS
+            - int(len(calls[0]["prompt"]) / self.CHARS_PER_TOKEN),
+            msg="the budget must be exactly what the context left over, not a "
+                "second, slightly different computation of it",
+        )
+        self.assertEqual(result["mergedName"], "Merged")
+
+    def test_a_small_draft_still_works(self):
+        result, calls = self._draft(2, 400)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(result["factIds"], ["f0", "f1"])
+
+    def test_an_oversized_selection_is_a_400_naming_the_remedy(self):
+        """Not a 502: the request is never issued, and the message says why."""
+        endpoint, calls = self._runner(40_000)
+        body = type("B", (), {"factIds": ["f%d" % i for i in range(12)]})()
+        with self.assertRaises(self._HTTPException) as caught:
+            asyncio.run(endpoint(object(), body))
+        self.assertEqual(caught.exception.status_code, 400)
+        self.assertEqual(calls, [], msg="an over-budget selection was sent anyway")
+        for expected in ("12 records", "characters"):
+            self.assertIn(expected, caught.exception.detail)
+
+    def test_thirteen_records_is_refused_even_though_the_text_would_fit(self):
+        """The count cap is its own guard, not a side effect of the char budget."""
+        endpoint, calls = self._runner(10)
+        body = type("B", (), {"factIds": ["f%d" % i for i in range(13)]})()
+        with self.assertRaises(self._HTTPException) as caught:
+            asyncio.run(endpoint(object(), body))
+        self.assertEqual(caught.exception.status_code, 400)
+        self.assertIn("at most 12", caught.exception.detail)
+        self.assertEqual(calls, [])
+
+    def test_one_record_is_refused(self):
+        endpoint, calls = self._runner(400)
+        with self.assertRaises(self._HTTPException) as caught:
+            asyncio.run(endpoint(object(), type("B", (), {"factIds": ["f0"]})()))
+        self.assertEqual(caught.exception.status_code, 400)
+        self.assertEqual(calls, [])
+
+    def test_a_people_draft_is_formatted_through_the_schema(self):
+        result, calls = self._draft(2, 400, category="People")
+        self.assertEqual(result["mergedText"], "formatted")
 
 
 class DedupUnderSetupTests(unittest.TestCase):
