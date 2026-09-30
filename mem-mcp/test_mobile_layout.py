@@ -628,6 +628,74 @@ class DiaryColumnOrderTests(unittest.TestCase):
         self.assertNotIn('id="diary-dates-list"', rail)
 
 
+class DiaryFillsThePageTests(unittest.TestCase):
+    """The diary tab has to use the whole screen, and two separate rules can
+    silently take that away again.
+
+    `.page` is `max-width: 1100px; margin: 0 auto` — right for a form page,
+    wrong for a three-pane reading screen, which is why `#page-memories` has
+    always overridden it and `#page-diary` did not. That leaves a gutter on
+    both sides.
+
+    The second is the `calc(100vh - Npx)` on the pane. N is the chrome above
+    the pane, and the chrome includes this page's own padding — so the two
+    defects compound: widen the page but leave N alone and the row is now
+    *shorter* than the space it has, showing a dead band at the bottom. There
+    is no browser here to see either, so they are pinned from the stylesheet.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.base = _declarations(CSS)
+
+    def test_the_diary_page_is_not_capped_or_centred(self):
+        merged = _decls(self.base, "#page-diary")
+        self.assertTrue(
+            "max-width: none" in merged,
+            "#page-diary still inherits `.page`'s 1100px cap, so the three "
+            f"columns are squeezed into the middle of the screen; got: {merged.strip()!r}",
+        )
+        self.assertTrue(
+            "margin: 0 auto" not in merged,
+            f"#page-diary re-centres itself; got: {merged.strip()!r}",
+        )
+
+    def test_the_pane_height_budget_matches_the_page_padding(self):
+        """The subtracted constant must be the same chrome the page actually has.
+
+        `.memories-layout` and `.diary-layout` sit under identical chrome —
+        same nav, same tab rail, and the same page padding — so their budgets
+        must be equal. They were not: the diary one subtracted 180px, sized for
+        the 1.5rem page padding that full-bleed removed, which is where the
+        remaining band of dead space came from.
+        """
+        def budget(selector):
+            merged = _decls(self.base, selector)
+            found = re.search(r"height:\s*calc\(100vh\s*-\s*(\d+)px\)", merged)
+            self.assertIsNotNone(found, f"{selector} has no 100vh budget: {merged!r}")
+            return int(found.group(1))
+
+        self.assertEqual(
+            budget(".diary-layout"), budget(".memories-layout"),
+            "the diary and memory panes sit under the same chrome, so a "
+            "different subtracted constant means one of them is not filling "
+            "the page",
+        )
+
+    def test_the_diary_and_memory_pages_pad_alike(self):
+        """The budget equality above is only meaningful if the padding matches."""
+        diary = _decls(self.base, "#page-diary")
+        memories = _decls(self.base, "#page-memories")
+        pad = re.search(r"padding:\s*([^;]+);", diary)
+        self.assertIsNotNone(pad, diary)
+        self.assertEqual(
+            pad.group(1).strip(),
+            re.search(r"padding:\s*([^;]+);", memories).group(1).strip(),
+            "the two full-bleed pages must pad alike, or the shared 100vh "
+            "budget above is comparing two different chromes",
+        )
+
+
 class DiarySaveWiringTests(unittest.TestCase):
     """saveDiaryEdit() shipped referring to an undeclared `payload`.
 

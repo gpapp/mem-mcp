@@ -47,7 +47,14 @@
     /* ── Layout ── */
     .page { display: none; padding: 1.5rem; max-width: 1100px; margin: 0 auto; }
     .page.active { display: block; }
+    /* Full-bleed pages. `.page` caps at 1100px and centres itself, which is
+       right for the form pages and wrong for the three-pane screens: it
+       leaves a gutter on both sides and a matching band of dead space below,
+       because the pane height is subtracted from the *viewport*, not from the
+       capped content box. Memories and Diary are the reading screens, so they
+       take the whole estate. */
     #page-memories { max-width: none; padding: .75rem 1rem; }
+    #page-diary { max-width: none; padding: .75rem 1rem; }
 
     /* ── Deduplication Page ── */
     .dedup-toolbar { display: flex; gap: .75rem; align-items: flex-end; flex-wrap: wrap; }
@@ -334,7 +341,12 @@
        .diary-main is load-bearing -- a flex item's default `min-width: auto`
        refuses to shrink below its content, so one long transcription would
        widen the detail pane and squeeze the two rails instead of wrapping. */
-    .diary-layout { display: flex; gap: 1rem; height: calc(100vh - 180px); min-height: 500px; }
+    /* The subtracted constant is the chrome above the pane -- nav, the tab
+       rail and this page's own padding -- not a guess: 180 was sized for the
+       old `.page` padding of 1.5rem (48px) and left ~50px of dead band at the
+       bottom once the page went full-bleed. It now matches
+       `.memories-layout`, which is the same chrome with the same padding. */
+    .diary-layout { display: flex; gap: 1rem; height: calc(100vh - 140px); min-height: 500px; }
     .diary-list-col { width: 340px; flex-shrink: 0; min-width: 0; background: var(--surface);
                       border: 1px solid var(--border); border-radius: var(--radius);
                       overflow: hidden; display: flex; flex-direction: column; }
