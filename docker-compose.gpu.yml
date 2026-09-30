@@ -1,9 +1,37 @@
 services:
   ollama:
+    # OLLAMA_VULKAN=1 and OLLAMA_IGPU_ENABLE=1 together make the Intel iGPU
+    # usable *alongside* CUDA, not instead of it. Verified: both devices are
+    # enumerated (CUDA0 compute=7.5 GTX 1650, Vulkan0 compute=0.0 HD 630), and
+    # OLLAMA_IGPU_ENABLE is required -- without it Ollama logs
+    # "dropping integrated GPU; to enable, set OLLAMA_IGPU_ENABLE=1" and the
+    # device is invisible.
+    #
+    # OLLAMA_LLM_LIBRARY is deliberately NOT set to vulkan. It forces the
+    # backend rather than offering a second one: measured with it, nemotron
+    # loaded on Vulkan0 and nvidia-smi reported 1 MiB used and no processes,
+    # i.e. the GTX 1650 was bypassed entirely. Leave it unset so each model
+    # lands on a device by its own fit.
+    environment:
+#      - OLLAMA_LLM_LIBRARY=vulkan
+      - OLLAMA_VULKAN=1
+      - OLLAMA_IGPU_ENABLE=1
+      - NVIDIA_DRIVER_CAPABILITIES=all
+    # 2. Grant the container access to the host GPU devices
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
               count: all
-              capabilities: [gpu]
+              capabilities: [gpu, utility, compute]
+    # 3. Expose direct device nodes so the container can see the iGPU.
+    #    This is the whole DRM directory rather than one render node because
+    #    render node numbering is not stable across reboots. Duplicate of
+    #    docker-compose.yml on purpose: the iGPU is worth having even on a
+    #    host where the CUDA reservation has been dropped.
+    devices:
+      - "/dev/dri:/dev/dri"
+      - "/dev/nvidia0:/dev/nvidia0"
+      - "/dev/nvidiactl:/dev/nvidiactl"
+      - "/dev/nvidia-modeset:/dev/nvidia-modeset"

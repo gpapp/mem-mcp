@@ -64,7 +64,6 @@ services:
     networks:
       - memory-net
     environment:
-      - OLLAMA_VULKAN=1
       # Sized against the one path that is NOT windowed. The extractors all
       # send a single window (MEM_*_WINDOW are measured in chars, ~3.6 per
       # token), so a 30k-char diary entry costs ~2000 tokens per call no matter
