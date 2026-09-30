@@ -29,6 +29,29 @@ _FOREACH_RE = re.compile(r"FOREACH\s*\(\s*(\w+)\s+IN\s+(.*?)\s*\|\s*(.*?)\)", re
 _CYPHER_RE = re.compile(r"\b(MATCH|MERGE|CREATE|DELETE|DETACH|REMOVE|RETURN|CALL)\b")
 
 
+def _docstring_nodes(tree):
+    """The `ast.Constant` nodes that are a docstring, at any nesting depth.
+
+    A docstring is prose that happens to quote a query, and a quoted query is
+    not a query: it is never sent to Neo4j. Linting them is a false positive
+    that only ever gets "fixed" by rewording a comment — and the check is about
+    Cypher, not English, so the comment is the wrong place to be careful.
+    """
+    found = set()
+    holders = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+    for node in ast.walk(tree):
+        if not isinstance(node, holders):
+            continue
+        body = getattr(node, "body", None)
+        if not body:
+            continue
+        first = body[0]
+        if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
+                and isinstance(first.value.value, str)):
+            found.add(id(first.value))
+    return found
+
+
 def _cypher_strings(path):
     """Every string constant in the file that looks like a Cypher statement."""
     with open(path, "r", encoding="utf-8") as handle:
@@ -37,8 +60,11 @@ def _cypher_strings(path):
         tree = ast.parse(source)
     except SyntaxError:  # pragma: no cover - py_compile is the gate for this
         return
+    docstrings = _docstring_nodes(tree)
     for node in ast.walk(tree):
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if id(node) in docstrings:
+                continue
             if _CYPHER_RE.search(node.value):
                 yield node.lineno, node.value
         elif isinstance(node, ast.JoinedStr):
@@ -404,16 +430,112 @@ class ManualScopeGuardTests(unittest.TestCase):
         self.assertTrue(counted, "the manual-scope skip is filtered but never counted")
         self.assertTrue('job["manual_skipped"]' in self.mcc_source)
 
-    def test_single_item_reclassify_refuses_before_it_clears(self):
-        """Order is the whole guard: the clear is what makes it unrecoverable."""
+    def test_single_item_reclassify_clears_the_marker_before_it_clears(self):
+        """Order, still -- but the failure it prevents has changed sides.
+
+        This used to be a *refusal* ordered before the clear, because clearing
+        is unrecoverable. Now the single-item path drops the marker instead, and
+        a crash between the two statements is the thing to avoid. If the links
+        were cleared first and the marker survived, the item would be left with
+        no scope at all AND the flag that makes every later reclassify skip it
+        -- unrecoverable without a direct Cypher edit, and invisible because a
+        skipped item looks exactly like a correctly-unscoped one.
+
+        So the marker goes first: the worst case is then an item that is merely
+        no longer protected, which the next reclassify can still fix.
+        """
         for name in ("_reclassify_single_fact", "_reclassify_single_diary"):
             segment = self.segment(name)
-            guard = segment.find("_assert_not_manual_scope")
-            clear = segment.find("clear_scope_links_async")
-            self.assertNotEqual(guard, -1, f"{name} has no manual-scope guard")
-            self.assertNotEqual(clear, -1, f"{name} no longer clears its links")
-            self.assertLess(guard, clear,
-                            f"{name} clears the links before checking whether they were chosen")
+            clear_marker = segment.find("_clear_manual_scope")
+            clear_links = segment.find("clear_scope_links_async")
+            self.assertNotEqual(clear_marker, -1, f"{name} does not clear the manual marker")
+            self.assertNotEqual(clear_links, -1, f"{name} no longer clears its links")
+            self.assertLess(clear_marker, clear_links,
+                            f"{name} clears the links before dropping the marker that protects them")
+
+    def test_the_single_item_path_no_longer_refuses_a_hand_set_scope(self):
+        """The 409 is gone, and with it the exception that only it raised.
+
+        A single-item reclassify is one person clicking "reclassify this" on one
+        record. Refusing it protected a scope the same person had just
+        overridden, and the only route to a reclassify was to clear the scope by
+        hand first -- the destructive step the marker exists to make deliberate.
+        The full reclassify still skips manual items; that one is unattended.
+        """
+        for name in ("_reclassify_single_fact", "_reclassify_single_diary"):
+            segment = self.segment(name)
+            self.assertFalse(
+                "_assert_not_manual_scope" in segment,
+                f"{name} still refuses instead of clearing the marker")
+        self.assertNotIn("ManualScopeError", self.mcc_source,
+                         "the exception has no raiser left")
+        with open(os.path.join(HERE, "gui.py"), encoding="utf-8") as handle:
+            gui = handle.read()
+        self.assertNotIn("ManualScopeError", gui,
+                         "gui.py still imports and catches an exception nothing raises")
+
+    def test_the_marker_clear_is_a_remove_not_a_set(self):
+        """`SET n.scopeManual = true` here would be a no-op with the worst timing.
+
+        The clear has to actually unset the flag. Setting it to false would work
+        today, but it leaves a property that reads as meaningful, and once a
+        value is always written, an absent property and an explicit false stop
+        being distinguishable -- which is the same distinction the coalesce lint
+        above exists to make reliable.
+        """
+        segment = self.segment("_clear_manual_scope")
+        self.assertIn("REMOVE n.scopeManual", segment,
+                      "the marker is not being removed, so the skip query still matches it")
+        self.assertNotIn("scopeManual =", segment,
+                         "the clear assigns the marker instead of removing it")
+
+    def test_every_scopeManual_read_treats_an_unset_property_as_false(self):
+        """The property is absent on every node written before it existed.
+
+        `coalesce` is not decoration. Neo4j has no boolean type here: an unset
+        property reads as `null`, and `NOT null` is `null`, not `true` -- so a
+        bare `AND NOT n.scopeManual` **excludes** the row rather than including
+        it. That is a WHERE clause silently dropping every item the marker was
+        never written on, which is all of them, and the reclassify would report
+        success having done nothing.
+
+        The failure directions differ per read site, which is why this is a lint
+        over every read rather than a note:
+          - skip query, bare NOT   -> null -> row excluded  (vault silently skipped)
+          - count query, bare      -> null -> not counted    (manual_skipped under-reports)
+          - RETURN alias, bare     -> null -> falsy in Python (the safe direction, by luck)
+
+        Only reads are linted. A write is not a read: `SET n.scopeManual = true`
+        is the stamp, and `REMOVE n.scopeManual` is this fix -- neither is
+        subject to the coalesce rule, and a lint that flagged them would be
+        flagging the code it is meant to protect. A write is told apart by shape
+        rather than by position, because a single query holds both: an
+        assignment target is always followed by `=`, and a read never is.
+        """
+        reads = 0
+        for filename, entries in self.queries.items():
+            for lineno, text in entries:
+                if "scopeManual" not in text:
+                    continue
+                for m in re.finditer(r"scopeManual", text):
+                    before = text[max(0, m.start() - 80):m.start()]
+                    tight = text[m.end():m.end() + 2]   # is it an assignment?
+                    wide = text[m.end():m.end() + 40]    # is it a coalesce arg?
+                    if re.search(r"REMOVE\s+[A-Za-z_]\w*\.$", before):
+                        continue  # a removal
+                    if re.match(r"\s*=(?!=)", tight):
+                        continue  # an assignment target: the stamp
+                    reads += 1
+                    self.assertRegex(
+                        before, r"coalesce\(\s*[A-Za-z_]\w*\.$",
+                        f"{filename}:{lineno} reads scopeManual outside a coalesce(..., false); "
+                        f"an unset property is null, and `NOT null` excludes the row")
+                    self.assertRegex(
+                        wide, r"^\s*,\s*false\s*\)",
+                        f"{filename}:{lineno} coalesces scopeManual to something other than "
+                        f"false, so an absent property does not mean 'not manual'")
+        self.assertGreaterEqual(reads, 3,
+                                "expected the skip, count and RETURN reads to still exist")
 
     def test_the_stamp_sets_the_marker_not_only_the_signature(self):
         """A signature is written by the classifier too, so it proves nothing.

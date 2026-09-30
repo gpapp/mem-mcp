@@ -33,7 +33,7 @@ import memory as mem
 from backup import list_savepoints, start_backup, start_restore, get_backup_status
 from migrate_client_context import (
     start_reclassify_scope, get_reclassify_status,
-    reclassify_single_fact, reclassify_single_diary, ManualScopeError,
+    reclassify_single_fact, reclassify_single_diary,
 )
 from fastapi import Request, HTTPException, FastAPI
 from fastapi.responses import Response, JSONResponse, HTMLResponse, RedirectResponse
@@ -258,6 +258,23 @@ def _service_unavailable(exc: Exception) -> HTTPException:
         f"api 503: {type(exc).__name__}: {exc}", exc_info=exc
     )
     return HTTPException(status_code=503, detail=str(exc))
+
+
+def _conflict(exc: Exception) -> HTTPException:
+    """Log a 409 that is about to be raised, and build the response.
+
+    The same argument as _service_unavailable, one status code over. A 409 is
+    a refusal rather than a failure, so this is not an error — but the reason
+    is data-dependent and unrecoverable from the access log, which records
+    only the status.
+
+    INFO, not ERROR: these are the guard working as designed, and putting
+    them in the error stream would bury the failures it is read alongside.
+    """
+    logging.getLogger("memory-vault").info(
+        f"api 409: {type(exc).__name__}: {exc}"
+    )
+    return HTTPException(status_code=409, detail=str(exc))
 
 
 @web_app.put("/api/memories/{memory_id}", response_class=JSONResponse)
@@ -489,8 +506,6 @@ async def api_reclassify_memory(memory_id: str, request: Request):
     user_id = _require_user(request)
     try:
         await reclassify_single_fact(memory_id, user_id)
-    except ManualScopeError as e:
-        raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except RuntimeError as e:
@@ -535,8 +550,6 @@ async def api_reclassify_diary_entry(entry_id: str, request: Request):
     user_id = _require_user(request)
     try:
         await reclassify_single_diary(entry_id, user_id)
-    except ManualScopeError as e:
-        raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except RuntimeError as e:
@@ -806,7 +819,7 @@ async def api_update_client(client_id: str, request: Request, body: ClientUpdate
             try:
                 renamed = await mem.db_rename_client(client_id, body.name, user_id)
             except ValueError as e:
-                raise HTTPException(status_code=409, detail=str(e))
+                raise _conflict(e)
             if not renamed:
                 raise HTTPException(status_code=404, detail="Client not found or access denied.")
             result["name"] = body.name.strip()
@@ -831,7 +844,7 @@ async def api_rename_context(context_id: str, request: Request, body: ContextUpd
         try:
             renamed = await mem.db_rename_context(context_id, body.name, _require_user(request))
         except ValueError as e:
-            raise HTTPException(status_code=409, detail=str(e))
+            raise _conflict(e)
         if not renamed:
             raise HTTPException(status_code=404, detail="Project not found or access denied.")
         return {"id": context_id, "name": body.name.strip()}

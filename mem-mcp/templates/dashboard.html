@@ -309,6 +309,24 @@
     .diary-search-result .result-snippet { margin-top: .2rem; font-size: .8rem; color: var(--muted);
                                            white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
+    /* Link-to-memory picker. Was a <select> holding one <option> per fact, so
+       a vault of any size was a list nobody could search. `flex: 0 0 auto` is
+       load-bearing: this is a vertical scroller, and a zero flex basis inside
+       a height:auto column is the trap the mobile layout tests exist for. */
+    .pane-link-results { flex: 0 0 auto; max-height: 220px; overflow-y: auto;
+                         border: 1px solid var(--border); border-radius: 6px; }
+    .pane-link-results:empty { display: none; }
+    .pane-link-result { padding: .45rem .6rem; cursor: pointer; font-size: .85rem;
+                        border-bottom: 1px solid var(--bg); transition: all .15s; }
+    .pane-link-result:last-child { border-bottom: none; }
+    .pane-link-result:hover, .pane-link-result.active { background: var(--bg); color: var(--primary); }
+    .pane-link-result .result-snippet { font-size: .75rem; color: var(--muted); margin-top: .15rem;
+                                        white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .pane-link-result.is-linked { opacity: .5; cursor: not-allowed; }
+    .pane-link-chosen { display: flex; align-items: center; gap: .4rem; font-size: .8rem;
+                        color: var(--primary); background: var(--bg); padding: .4rem .6rem;
+                        border-radius: 6px; border: 1px solid var(--border); }
+
     /* ── Diary Layout ── */
     .diary-layout { display: flex; gap: 1.5rem; height: calc(100vh - 180px); min-height: 500px; }
     .diary-sidebar { width: 220px; flex-shrink: 0; background: var(--surface); border: 1px solid var(--border);
@@ -894,12 +912,40 @@ npm install @modelcontextprotocol/sdk</code></pre>
     const s = qs.toString();
     return `${apiBase}/${url}${s ? '?' + s : ''}`;
   }
+  // A rejected api call used to hand back the bare Response, so the only thing
+  // a caller could read was `e.status`. The reason lives in the body, and the
+  // body is consumed lazily, so every 409 and 503 arrived as a bare status and
+  // the UI could only say "failed" -- a rename conflict and a reclassify lock
+  // are different problems and the toast could not tell them apart. Parse the
+  // body once and reject with an object that keeps `status` (nine call sites
+  // branch on it) and adds `detail`.
+  async function apiFail(r) {
+    let detail = '';
+    try {
+      const body = await r.clone().json();
+      if (body && body.detail) detail = String(body.detail);
+    } catch (_) { /* not JSON, or no body -- the status is all we have */ }
+    const err = new Error(detail || r.statusText || `HTTP ${r.status}`);
+    err.status = r.status;
+    err.detail = detail;
+    return Promise.reject(err);
+  }
   const api = {
-    get:    (url, params) => fetch(apiUrl(url, params)).then(r => r.ok ? r.json() : Promise.reject(r)),
-    post:   (url, body) => fetch(`${apiBase}/${url}`, {method:'POST',  headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}).then(r => r.ok ? r.json() : Promise.reject(r)),
-    put:    (url, body) => fetch(`${apiBase}/${url}`, {method:'PUT',   headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}).then(r => r.ok ? r.json() : Promise.reject(r)),
-    delete: (url, body) => fetch(`${apiBase}/${url}`, {method:'DELETE', headers:{'Content-Type':'application/json'}, body: body ? JSON.stringify(body) : undefined}).then(r => r.ok ? r.json() : Promise.reject(r)),
+    get:    (url, params) => fetch(apiUrl(url, params)).then(r => r.ok ? r.json() : apiFail(r)),
+    post:   (url, body) => fetch(`${apiBase}/${url}`, {method:'POST',  headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}).then(r => r.ok ? r.json() : apiFail(r)),
+    put:    (url, body) => fetch(`${apiBase}/${url}`, {method:'PUT',   headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}).then(r => r.ok ? r.json() : apiFail(r)),
+    delete: (url, body) => fetch(`${apiBase}/${url}`, {method:'DELETE', headers:{'Content-Type':'application/json'}, body: body ? JSON.stringify(body) : undefined}).then(r => r.ok ? r.json() : apiFail(r)),
   };
+
+  // Prefer the server's reason over a generic failure string. The server builds
+  // these deliberately -- "Another maintenance operation is running" names the
+  // remedy -- so replacing one with "failed" discards the only actionable text
+  // in the exchange. Longer than the default 2.5s: a real message needs reading.
+  function toastApiError(e, fallback) {
+    const detail = (e && e.detail) || '';
+    toast(detail ? '⚠️ ' + detail : ('⚠️ ' + (fallback || 'Request failed')),
+          detail ? 7000 : 2500);
+  }
 
   function logout() {
     if (!confirm('Logout?')) return;
@@ -1441,7 +1487,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
       toast('✅ Client created');
       if (inp) inp.value = '';
       await loadClients();
-    } catch(e) { toast(e && e.status === 409 ? '⚠️ Client name already exists' : '⚠️ Could not create client'); }
+    } catch(e) { toastApiError(e, e && e.status === 409 ? 'Client name already exists' : 'Could not create client'); }
   }
 
   async function createContext() {
@@ -1457,7 +1503,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
       if (inp) inp.value = '';
       await loadClients();
       if (activeTab === 'projects') loadProjects();
-    } catch(e) { toast(e && e.status === 409 ? '⚠️ Project name already exists for this client' : '⚠️ Could not create project'); }
+    } catch(e) { toastApiError(e, e && e.status === 409 ? 'Project name already exists for this client' : 'Could not create project'); }
   }
 
   async function deleteClient(id) {
@@ -1517,7 +1563,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
       toast('✏️ Client renamed');
       await loadClients();
       await loadMemories();
-    } catch(e) { toast(e && e.status === 409 ? '⚠️ That client name already exists' : '⚠️ Could not rename client'); }
+    } catch(e) { toastApiError(e, e && e.status === 409 ? 'That client name already exists' : 'Could not rename client'); }
   }
 
   async function renameContext(id) {
@@ -1533,7 +1579,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
       await loadClients();
       if (activeTab === 'projects') loadProjects();
       await loadMemories();
-    } catch(e) { toast(e && e.status === 409 ? '⚠️ That project name already exists for this client' : '⚠️ Could not rename project'); }
+    } catch(e) { toastApiError(e, e && e.status === 409 ? 'That project name already exists for this client' : 'Could not rename project'); }
   }
 
   function showFactInMemories(id) {
@@ -1579,7 +1625,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
       renderReclassify(job);
       pollReclassify();
     } catch(e) {
-      if (e && e.status === 409) { toast('Reclassification already running'); pollReclassify(); }
+      if (e && e.status === 409) { toastApiError(e, 'Reclassification already running'); pollReclassify(); }
       else toast('⚠️ Could not start reclassification');
     }
   }
@@ -1754,7 +1800,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     } catch(e) {
       // 409 = a reclassify or an earlier backup already holds the lock.
       // startBackupPolling reads the current status and self-terminates.
-      if (e && e.status === 409) { toast('A maintenance job is already running'); startBackupPolling(); }
+      if (e && e.status === 409) { toastApiError(e, 'A maintenance job is already running'); startBackupPolling(); }
       else toast('⚠️ Could not start backup');
     }
   }
@@ -1771,7 +1817,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
       renderBackupStatus(await api.post(`backup/restore/${encodeURIComponent(id)}`, {}));
       startBackupPolling();
     } catch(e) {
-      if (e && e.status === 409) { toast('A maintenance job is already running'); startBackupPolling(); }
+      if (e && e.status === 409) { toastApiError(e, 'A maintenance job is already running'); startBackupPolling(); }
       else toast('⚠️ Could not start restore');
     }
   }
@@ -2209,9 +2255,13 @@ npm install @modelcontextprotocol/sdk</code></pre>
         </div>
         <div id="pane-link-form-${m.id}" style="display:none; flex-direction:column; gap:.5rem; padding:.75rem; background:var(--bg); border-radius:6px; border:1px solid var(--border);">
           <div style="font-size:.8rem; font-weight:600; color:var(--muted);">Link to another memory</div>
-          <select id="pane-link-target-${m.id}" style="width:100%;">
-            ${memories.filter(x => x.id !== m.id).map(x => `<option value="${x.id}">${escHtml(x.name || x.text.substring(0,50))}</option>`).join('')}
-          </select>
+          <input type="search" id="pane-link-q-${m.id}" placeholder="Search memories…" autocomplete="off"
+                 oninput="paneLinkSearch('${m.id}')" onkeydown="paneLinkKeys('${m.id}', event)">
+          <div id="pane-link-results-${m.id}" class="pane-link-results"></div>
+          <div id="pane-link-chosen-${m.id}" class="pane-link-chosen" style="display:none;">
+            <span id="pane-link-chosen-name-${m.id}" style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"></span>
+            <button class="btn btn-ghost btn-sm" onclick="paneLinkClear('${m.id}')">Change</button>
+          </div>
           <input id="pane-link-rel-${m.id}" placeholder="Relationship type (e.g. KNOWS)">
           <div style="display:flex; gap:.5rem; justify-content:flex-end;">
             <button class="btn btn-ghost btn-sm" onclick="document.getElementById('pane-link-form-${m.id}').style.display='none'">Cancel</button>
@@ -2422,7 +2472,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
       if (selectedFactId === item.id) renderFactPane(item);
       renderMemories(); renderCategorySidebar();
       toast('✅ Scope updated');
-    } catch(e) { toast('⚠️ Reclassify failed'); }
+    } catch(e) { toastApiError(e, 'Reclassify failed'); }
   }
 
   // --- Diary entry hamburger menu ---
@@ -2469,7 +2519,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
       if (activeDiaryId === entry.id) renderDiaryEntryView(entry);
       renderDiarySidebar(); renderDiaryMonthPager();
       toast('✅ Scope updated');
-    } catch(e) { toast('⚠️ Reclassify failed'); }
+    } catch(e) { toastApiError(e, 'Reclassify failed'); }
   }
 
   // --- Extract participants modal ---
@@ -2604,7 +2654,135 @@ npm install @modelcontextprotocol/sdk</code></pre>
 
   function togglePaneLinkForm(id) {
     const el = document.getElementById('pane-link-form-' + id);
-    if (el) el.style.display = el.style.display === 'none' ? 'flex' : 'none';
+    if (!el) return;
+    const opening = el.style.display === 'none';
+    el.style.display = opening ? 'flex' : 'none';
+    // The form is re-rendered by renderFactPane, so the chosen target lives in
+    // the DOM only while the form is. Re-seeding on open means a closed form
+    // never comes back holding a target picked in a previous visit -- and
+    // re-seeding on *every* open would throw away a pick made a second ago.
+    if (opening) {
+      _paneLink[id] = { q: '', targetId: null, results: [], active: 0 };
+      const input = document.getElementById('pane-link-q-' + id);
+      if (input) input.value = '';
+      paneLinkRender(id);
+    }
+  }
+
+  // --- Link-to-memory picker ---
+  //
+  // Was a <select> with one <option> per fact, so the only way to find a
+  // target was to scroll an unsearchable list, and a fact could only be linked
+  // to the alphabetically-adjacent entry. Now a typeahead over `memories`,
+  // which the page already holds in full -- so this is instant and needs no
+  // endpoint, unlike the diary box's vector search. That is deliberate: a
+  // link picker has to resolve to ONE record, and a soft semantic match is a
+  // liability when the next action writes a permanent edge.
+  //
+  // Matching is deliberately the same expression renderMemories() uses, so the
+  // same query finds the same thing in both places.
+  const _PANE_LINK_LIMIT = 12;
+  let _paneLink = {};
+
+  function _paneLinkState(id) {
+    if (!_paneLink[id]) _paneLink[id] = { q: '', targetId: null, results: [], active: 0 };
+    return _paneLink[id];
+  }
+
+  function paneLinkCandidates(id, q) {
+    const needle = (q || '').trim().toLowerCase();
+    const source = memories.find(x => x.id === id);
+    // Anything already joined to this fact by any direction: a second edge of
+    // the same type is a duplicate, and the old dropdown offered them freely.
+    const linked = new Set((source && source.links || []).map(l => l.target_id));
+    linked.add(id);
+    const out = [];
+    for (const m of memories) {
+      if (linked.has(m.id)) continue;
+      const name = (m.name || '').toLowerCase();
+      if (needle && !m.text.toLowerCase().includes(needle) && !name.includes(needle)
+          && !String(m.category || '').toLowerCase().includes(needle)) continue;
+      out.push(m);
+      if (out.length >= 200) break;
+    }
+    out.sort((a, b) => ((a.name || a.text || '') + ' ' + (a.name || ''))
+                      .toLowerCase().localeCompare(((b.name || b.text || '') + ' ' + (b.name || '')).toLowerCase()));
+    return out.slice(0, _PANE_LINK_LIMIT);
+  }
+
+  function paneLinkSearch(id) {
+    const st = _paneLinkState(id);
+    const input = document.getElementById('pane-link-q-' + id);
+    st.q = input ? input.value : '';
+    st.results = paneLinkCandidates(id, st.q);
+    st.active = 0;
+    paneLinkRender(id);
+  }
+
+  function paneLinkRender(id) {
+    const st = _paneLinkState(id);
+    const box = document.getElementById('pane-link-results-' + id);
+    const chosen = document.getElementById('pane-link-chosen-' + id);
+    const chosenName = document.getElementById('pane-link-chosen-name-' + id);
+    if (chosen) {
+      chosen.style.display = st.targetId ? 'flex' : 'none';
+      if (st.targetId && chosenName) {
+        const t = memories.find(x => x.id === st.targetId);
+        chosenName.textContent = t ? (t.name || (t.text || '').substring(0, 60)) : st.targetId;
+      }
+    }
+    if (!box) return;
+    if (st.targetId) { box.innerHTML = ''; return; }
+    if (!st.results.length) {
+      box.innerHTML = st.q.trim()
+        ? '<p class="empty" style="padding:.5rem .6rem; font-size:.8rem;">No matching memories.</p>'
+        : '';
+      return;
+    }
+    box.innerHTML = st.results.map((m, i) => {
+      const name = m.name || (m.text || '').substring(0, 60);
+      const snippet = m.name ? (m.text || '').replace(/\s+/g, ' ').trim().substring(0, 70) : '';
+      return `<div class="pane-link-result${i === st.active ? ' active' : ''}" onclick="paneLinkPick('${id}', '${m.id}')">
+        <div>${escHtml(name)}</div>
+        ${snippet ? `<div class="result-snippet">${escHtml(snippet)}…</div>` : ''}
+      </div>`;
+    }).join('');
+  }
+
+  function paneLinkPick(id, targetId) {
+    const st = _paneLinkState(id);
+    st.targetId = targetId;
+    st.q = '';
+    st.results = [];
+    const input = document.getElementById('pane-link-q-' + id);
+    if (input) input.value = '';
+    paneLinkRender(id);
+  }
+
+  function paneLinkClear(id) {
+    const st = _paneLinkState(id);
+    st.targetId = null;
+    const input = document.getElementById('pane-link-q-' + id);
+    if (input) { input.value = ''; input.focus(); }
+    paneLinkSearch(id);
+  }
+
+  function paneLinkKeys(id, ev) {
+    const st = _paneLinkState(id);
+    if (st.targetId) return;
+    if (ev.key === 'ArrowDown' || ev.key === 'ArrowUp') {
+      ev.preventDefault();
+      if (!st.results.length) return;
+      const n = st.results.length;
+      st.active = (st.active + (ev.key === 'ArrowDown' ? 1 : n - 1)) % n;
+      paneLinkRender(id);
+    } else if (ev.key === 'Enter') {
+      const pick = st.results[st.active];
+      if (pick) { ev.preventDefault(); paneLinkPick(id, pick.id); }
+    } else if (ev.key === 'Escape') {
+      const input = document.getElementById('pane-link-q-' + id);
+      if (input && input.value) { input.value = ''; paneLinkSearch(id); }
+    }
   }
 
   async function copyToClipboard(text) {
@@ -2665,16 +2843,18 @@ npm install @modelcontextprotocol/sdk</code></pre>
   }
 
   async function savePaneLink(id) {
-    const targetId = document.getElementById('pane-link-target-' + id).value;
-    const relType  = document.getElementById('pane-link-rel-' + id).value.trim();
-    if (!targetId || !relType) { toast('⚠️ Relationship type required'); return; }
+    const st = _paneLinkState(id);
+    const relType = document.getElementById('pane-link-rel-' + id).value.trim();
+    if (!st.targetId) { toastApiError({detail:'Pick a target memory from the search results first.'}, 'Relationship type required'); return; }
+    if (!relType) { toastApiError({detail:'Relationship type required.'}, 'Relationship type required'); return; }
     try {
-      await api.post('memories/link', {sourceId: id, targetId, relType});
+      await api.post('memories/link', {sourceId: id, targetId: st.targetId, relType});
       toast('🔗 Linked');
+      _paneLink[id] = { q: '', targetId: null, results: [], active: 0 };
       await loadMemories();
       const m = memories.find(x => x.id === id);
       if (m) renderFactPane(m);
-    } catch(e) { toast('❌ Error linking'); }
+    } catch(e) { toastApiError(e, 'Error linking'); }
   }
 
   function showLinkEdit(badgeSource, badgeTarget, relType, targetLabel, apiSource, apiTarget) {

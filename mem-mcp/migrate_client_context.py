@@ -1568,32 +1568,24 @@ async def reclassify_single_fact(item_id: str, user_id: str) -> bool:
         release_maintenance(user_id)
 
 
-class ManualScopeError(Exception):
-    """Raised when a reclassify is asked to overwrite a hand-set scope.
+def _clear_manual_scope(item_id: str, label: str, user_id: str, neo4j_driver) -> None:
+    """Drop the 'a human set this' marker, because a human just asked to redo it.
 
-    A separate type from ValueError/RuntimeError because the two answers are
-    different problems: ValueError is "no such item" (404) and RuntimeError is
-    "the service could not do it" (503). This one is "the item is protected" —
-    a 409, with the UI offering to clear the scope first.
-    """
+    The marker exists so a *bulk* reclassify cannot silently replace a scope
+    someone chose. A single-item reclassify is the opposite case: it is one
+    person, looking at one record, clicking "reclassify this" — an explicit
+    decision to discard what they set before and let the model answer again.
+    Refusing that (it was a 409) protected a scope the same person had just
+    overridden, and the only remedy was to clear the scope by hand first, which
+    is the destructive step the marker was meant to make deliberate.
 
-
-def _assert_not_manual_scope(item_id: str, label: str, user_id: str, neo4j_driver) -> None:
-    """Refuse to reclassify an item whose scope a human set.
-
-    Clearing here is not recoverable: the run deletes the FOR_CLIENT edge before
-    it classifies, so a refusal has to happen before anything is written.
+    So the marker is cleared here rather than honoured. The full reclassify
+    still skips manual items — it is unattended, and nobody is there to mean it.
     """
     with neo4j_driver.session() as s:
-        row = s.run(
-            f"MATCH (n:{label} {{id: $id, userId: $userId}}) "
-            "RETURN coalesce(n.scopeManual, false) AS manual",
+        s.run(
+            f"MATCH (n:{label} {{id: $id, userId: $userId}}) REMOVE n.scopeManual",
             id=item_id, userId=user_id,
-        ).single()
-    if row and row["manual"]:
-        raise ManualScopeError(
-            f"{label} {item_id} has a client/project set manually. "
-            "Clear the client/project first if you want it reclassified."
         )
 
 
@@ -1603,7 +1595,7 @@ async def _reclassify_single_fact(item_id: str, user_id: str) -> bool:
     if not neo4j_driver or not qdrant:
         raise RuntimeError("DB not available")
 
-    _assert_not_manual_scope(item_id, "Fact", user_id, neo4j_driver)
+    _clear_manual_scope(item_id, "Fact", user_id, neo4j_driver)
 
     with neo4j_driver.session() as s:
         rows = list(s.run(
@@ -1659,7 +1651,7 @@ async def _reclassify_single_diary(item_id: str, user_id: str) -> bool:
         raise ValueError(f"DiaryEntry {item_id!r} not found for user {user_id!r}")
     item = dict(rows[0])
 
-    _assert_not_manual_scope(item_id, "DiaryEntry", user_id, neo4j_driver)
+    _clear_manual_scope(item_id, "DiaryEntry", user_id, neo4j_driver)
 
     clients = db_list_clients(user_id)
     if not clients:

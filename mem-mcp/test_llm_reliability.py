@@ -24,6 +24,7 @@ the shipping code, not a copy of it.
 import ast
 import asyncio
 import os
+import re
 import unittest
 
 COMMON_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "common.py")
@@ -183,6 +184,22 @@ def _ok(content="ok"):
     return lambda url, body, n: FakeResponse(
         200, {"message": {"content": content}}
     )
+
+
+def _def_segment(source, name):
+    """One top-level function, up to the next top-level construct.
+
+    Slicing to the next `\\ndef ` is wrong: a function followed by the
+    two-blank-line PEP8 top-level gap has no `\\ndef ` after it, so the
+    slice runs to end-of-file. An `assertIn` cannot tell -- it passes on a
+    segment far too long -- and only an `assertNotIn` notices, by then
+    scanning the rest of the file.
+    """
+    start = source.find(f"def {name}(")
+    if start == -1:
+        return ""
+    m = re.compile(r"^(?:@|def |class |async def )", re.M).search(source, start + 1)
+    return source[start:m.start()] if m else source[start:]
 
 
 # ---------------------------------------------------------------------------
@@ -517,9 +534,9 @@ class ServiceUnavailableLoggingTests(unittest.TestCase):
 
     def test_the_helper_logs_before_it_builds_the_response(self):
         source = self._gui_source()
-        start = source.find("def _service_unavailable(")
-        self.assertNotEqual(start, -1, msg="the 503 logging helper is missing")
-        segment = source[start:source.find("\ndef ", start + 10)]
+        self.assertIn("def _service_unavailable(",
+                      source, msg="the 503 logging helper is missing")
+        segment = _def_segment(source, "_service_unavailable")
         self.assertIn("error", segment, msg=(
             "the helper must log the reason; a 503 with no logged cause is what "
             "made this failure take a log dive to explain"
@@ -529,9 +546,108 @@ class ServiceUnavailableLoggingTests(unittest.TestCase):
     def test_the_helper_returns_an_exception_rather_than_raising(self):
         """`raise _service_unavailable(e)` needs a return, not a bare raise."""
         source = self._gui_source()
-        start = source.find("def _service_unavailable(")
-        segment = source[start:source.find("\ndef ", start + 10)]
+        segment = _def_segment(source, "_service_unavailable")
         self.assertIn("return HTTPException(", segment)
+
+
+# ---------------------------------------------------------------------------
+# gui.py + dashboard.html: a 409 must say why, on both ends
+# ---------------------------------------------------------------------------
+class ConflictLoggingTests(unittest.TestCase):
+    """The 409 sibling of the 503 rule above, plus the half that makes it reach
+    the user at all.
+
+    A 409 on a single-item reclassify is what prompted this: the access log said
+    `409 Conflict` and nothing else, and the browser said "Reclassify failed".
+    The server had built an actionable message the whole time --
+    "Fact ... has a client/project set manually. Clear the client/project first"
+    -- and it was discarded at *both* ends independently, so neither the log nor
+    the screen could show it.
+
+    Both halves are asserted, because fixing one alone leaves the user exactly
+    as informed as before: logging the reason nobody can read, or showing a
+    reason the server never emitted.
+    """
+
+    TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "templates", "dashboard.html")
+
+    def _gui_source(self):
+        with open(GUI_PY, "r", encoding="utf-8") as handle:
+            return handle.read()
+
+    def _html(self):
+        with open(self.TEMPLATE, "r", encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_no_bare_409_without_logging_survives(self):
+        source = self._gui_source()
+        self.assertNotIn("raise HTTPException(status_code=409, detail=str(e))", source)
+
+    def test_every_409_goes_through_the_helper(self):
+        self.assertGreater(self._gui_source().count("raise _conflict(e)"), 0,
+                           msg="no 409 routes through the logging helper at all")
+
+    def test_the_helper_logs_and_returns_rather_than_raising(self):
+        source = self._gui_source()
+        self.assertIn("def _conflict(", source,
+                      msg="the 409 logging helper is missing")
+        segment = _def_segment(source, "_conflict")
+        self.assertIn("info(", segment,
+                      msg="a 409 with no logged cause is a bare status in the access log")
+        self.assertIn("HTTPException(status_code=409", segment)
+        self.assertIn("return HTTPException(", segment)
+
+    def test_the_helper_logs_at_info_not_error(self):
+        """A refusal is the guard working. ERROR would bury it in real failures."""
+        source = self._gui_source()
+        segment = _def_segment(source, "_conflict")
+        self.assertNotIn(".error(", segment,
+                         "a 409 is an expected refusal, not a failure")
+
+    def test_a_rejected_call_carries_the_servers_detail(self):
+        """`Promise.reject(r)` handed back a bare Response.
+
+        The reason lives in the JSON body, so `.status` worked and nothing else
+        did. The body is consumed lazily, so it cannot be recovered later by a
+        caller that did not know to ask for it.
+        """
+        html = self._html()
+        self.assertFalse(
+            "Promise.reject(r)" in html,
+            "a failed api call is rejecting with the bare Response again, so the "
+            "detail in the body is unreachable")
+        self.assertIn("async function apiFail(", html)
+        self.assertIn("err.detail = detail;", html,
+                      "apiFail must attach the parsed detail for callers to read")
+        self.assertIn("err.status = r.status;", html,
+                      "nine call sites branch on e.status, so it must survive")
+
+    def test_every_api_verb_goes_through_the_shared_failure_path(self):
+        """A new verb added with the old idiom silently drops its reason again."""
+        html = self._html()
+        for verb in ("get", "post", "put", "delete"):
+            line = re.search(rf"^\s*{verb}:\s*(.+)$", html, re.M)
+            self.assertIsNotNone(line, f"the api object no longer defines {verb}")
+            self.assertIn("apiFail(r)", line.group(1),
+                          f"api.{verb} does not route its failure through apiFail")
+
+    def test_the_reclassify_toasts_show_the_reason(self):
+        html = self._html()
+        self.assertNotIn("toast('⚠️ Reclassify failed')", html,
+                         "the reclassify handlers still throw the reason away")
+        self.assertEqual(html.count("toastApiError(e, 'Reclassify failed')"), 2,
+                         "both the fact and the diary reclassify handler must surface it")
+
+    def test_toast_api_error_falls_back_when_there_is_no_detail(self):
+        """Preferring the server's text must not make the common case silent."""
+        html = self._html()
+        start = html.find("function toastApiError(")
+        self.assertNotEqual(start, -1, msg="toastApiError is missing")
+        end = html.find("\n  }", start)
+        segment = html[start:end]
+        self.assertIn("e.detail", segment, "the server's detail is never read")
+        self.assertIn("fallback", segment, "there is no message for a detail-less failure")
 
 
 if __name__ == "__main__":
