@@ -301,7 +301,7 @@ Tests live in `mem-mcp/test_llm_reliability.py`, using the same `ast.get_source_
 - **Three request fields decide whether a live retest measures anything at all.** Scoring the classifier by hand-crafting an Ollama request gave four empty answers in a row, which reads as "the prompt broke the model". It had not: `get_llm_response` sends `"think": False`, and without it `nemotron-3-nano:4b` spends the entire `num_predict` budget on a `thinking` block and returns `content: ""` with `done_reason: "length"`. It also pins `temperature: 0.0`. A harness that omits any of the three is not testing the prompt, and its failure mode is indistinguishable from a model regression. Check `done_reason` before believing an empty answer.
 - **A model can be *argued* into a client it was never offered, and the retry is not obvious.** The old prompt called an explicit `**Client:**` header "authoritative". On an MBAG RFI whose header reads `## Client: Daimler AG (MBAG)`, the model returned that name verbatim — which is the end customer, not one of the stored clients — so `resolve_scope_name` matched nothing and the item was stamped unscoped. The severity is what makes it worth fixing: the header rule looked protective and instead deleted the scope for every customer-named document, and the loss is silent because a null is a normal outcome the UI renders the same as any other.
 - **Cypher cannot be parsed locally** — there is no Neo4j and no driver in this environment, so a syntax error ships to production and surfaces as `neo4j.exceptions.CypherSyntaxError` on first execution. `test_cypher_safety.py` exists because of this: it extracts every Cypher string constant and f-string fragment and lints `FOREACH (v IN <list> | ...)` for a variable referenced inside its own list. A `FOREACH (x IN ... ELSE [x] END | DELETE x)` is a parse error, not a runtime one, and it was the reason every full reclassify aborted on its first call. The suite also pins the scope-clear query's shape. Add to it when you add a query. It skips **docstrings**: a docstring is prose that happens to quote a query, and linting it is a false positive that only ever gets "fixed" by rewording a comment, when the check is about Cypher and not English.
-  - **Every desktop scroll pane here is a flex item with a zero flex basis**, and the mobile block has to release *all* of them, not the one you happen to be looking at. `flex: 1` (and `flex: 1 1 0` with an explicit `min-height: 0` on `#diary-dates-list`) is basis 0. Stacked, the parent column is `height: auto`, a scroll container is sized from that basis, the parent resolves against zero, and the content renders into a box with no height — no error, nothing to scroll, the tab just looks empty. The fix needs **both** halves, `flex: 0 0 auto` *and* `overflow-y: visible`; either alone reproduces it. This bit twice, one level apart: the memories pane was released and `.diary-main` was not, then `.diary-main` was released and `#diary-dates-list` — the date/search-results list, not a detail pane — was not, so searching returned nothing visible while the entries pane looked fine. The sidebars then become the bounded scroll region (`max-height` + `overflow-y: auto`), giving one scroll area per sidebar rather than a nested one. `test_mobile_layout.py::StackedPaneVisibilityTests` derives the whole class from the stylesheet — any full-width selector that declares vertical scrolling *and* a zero flex basis — so a new tab cannot silently repeat this. The same test class is the worked example of **assert presence before asserting a negative**: an earlier version only checked that `overflow-y: auto` was *absent*, and `_decls` returns `""` for a missing selector, so deleting the rule outright made it pass.
+  - **Every desktop scroll pane here is a flex item with a zero flex basis**, and the mobile block has to release *all* of them, not the one you happen to be looking at. `flex: 1` (and `flex: 1 1 0` with an explicit `min-height: 0` on `#diary-dates-list`) is basis 0. Stacked, the parent column is `height: auto`, a scroll container is sized from that basis, the parent resolves against zero, and the content renders into a box with no height — no error, nothing to scroll, the tab just looks empty. The fix needs **both** halves, `flex: 0 0 auto` *and* `overflow-y: visible`; either alone reproduces it. This bit twice, one level apart: the memories pane was released and `.diary-main` was not, then `.diary-main` was released and `#diary-dates-list` — the date/search-results list, not a detail pane — was not, so searching returned nothing visible while the entries pane looked fine. The sidebars then become the bounded scroll region (`max-height` + `overflow-y: auto`), giving one scroll area per sidebar rather than a nested one. `test_mobile_layout.py::StackedPaneVisibilityTests` derives the whole class from the stylesheet — any full-width selector that declares vertical scrolling *and* a zero flex basis — so a new tab cannot silently repeat this. The same test class is the worked example of **assert presence before asserting a negative**: an earlier version only checked that `overflow-y: auto` was *absent*, and `_decls` returns `""` for a missing selector, so deleting the rule outright made it pass. Two diary columns are bounded now, not one — see "Diary Screen Layout".
   - **CSS is not validated by anything here, and an inline style beats a media query.** The three page layouts are fixed-width columns — memories `180px + 280px + flex`, diary `220px + flex`, graph `200px + flex` — and each pane sits inside `height: calc(100vh - Npx)` with its own `overflow-y: auto`, so on touch the *page* cannot scroll: you drag inside a pane that may be one line tall. `test_mobile_layout.py` pins the `@media (max-width: 900px)` / `640px` rules that fix both. Four things it is protecting, each of which fails silently:
   - **An inline `style` on `.graph-layout` disables the entire mobile block.** Inline styles win at every specificity, so one re-added attribute reverts the graph to two 200px columns with no error anywhere. The `display: flex` lives in the stylesheet for exactly this reason.
   - **`input, textarea, select { font-size: 16px }` is a functional fix, not a style preference.** Below 16px iOS zooms the viewport on focus and the zoom cannot be undone without a reload, so the form never recovers its layout.
@@ -493,10 +493,44 @@ Modify or delete links between memories directly from the UI.
   - `loadDiary` is lazy (the diary tab fetches on first visit), so a picker opened on the Memories tab has an empty `diaryEntries`. `ensureDiaryEntries()` fetches the list *without* `loadDiary`'s side effects (it selects an entry and re-renders the sidebar, month pager and graph category sidebar) and de-duplicates concurrent calls.
   - An entry already linked to the fact needs no separate exclusion: it arrives in `source.links` as an incoming `MENTIONS`, so the existing `linked` set already covers it. A second MENTIONS to the same fact is a duplicate, not a new link.
 
-### Diary Search
-Search diary entries from the sidebar.
+### Diary Screen Layout
 
-- Type in the **Search entries…** box at the top of the diary sidebar
+Three columns, **right-anchored**. `.diary-layout` is a flex *row*, so the DOM order is
+the visual order and it is the design:
+
+| column | width | holds |
+|---|---|---|
+| `.diary-main` | `flex: 1`, `min-width: 0` | the selected entry (viewer or editor) |
+| `.diary-list-col` | 340px | the filtered entry list — `＋ New`, a count, `#diary-dates-list` |
+| `.diary-sidebar` | 250px | search box, then the month pager and the month grid |
+
+The calendar and search rail is last, so it lands top-right. Three properties are
+load-bearing, and each is pinned by `test_mobile_layout.py::DiaryColumnOrderTests`:
+
+- **`min-width: 0` on `.diary-main`.** A flex item's default `min-width: auto` refuses
+  to shrink below its content, so one long transcription would widen the detail pane and
+  squeeze both rails instead of wrapping.
+- **`#diary-dates-list` moved out of `.diary-sidebar`.** It is the zero-basis scroller
+  (`flex: 1 1 0` + `min-height: 0`) that the mobile block releases, and it is also the
+  `IntersectionObserver` root for the lazy batches. Leaving it inside a bounded rail
+  would nest two scroll regions, and the count would then be bounded twice.
+- **`.diary-date-item.active` marks its *left* edge.** The list is no longer the leftmost
+  column, so the old `border-right` pointed at the detail pane instead of away from it.
+
+`setDiaryListCount()` writes `N` or `N of M` into `#diary-list-count` on every render
+(`renderDiarySidebar` and `renderDiarySearchResults`), which is the one number the list
+itself cannot show: what the current month or search narrowed away.
+
+On a phone the columns stack, and DOM order is visual order, so the mobile block
+re-ranks them with `order`: rail first, then the entry list, then the entry they select.
+Without it the tab opens on an empty detail card with both pickers below the fold. Both
+diary columns are bounded (`max-height` + `overflow-y: auto`) below 900px, which is why
+`StackedPaneVisibilityTests` carries two diary selectors rather than one.
+
+### Diary Search
+Search diary entries from the calendar rail.
+
+- Type in the **Search entries…** box at the top of the diary rail (right-hand column)
 - Instant client-side substring filter runs as you type
 - After 400 ms a server-side **vector similarity search** (`GET /api/diary/search?q=`) fires and updates results
 - Clicking a result navigates to that date's entries

@@ -149,15 +149,20 @@ class StackedPaneVisibilityTests(unittest.TestCase):
                     )
 
     def test_the_sidebars_are_the_only_bounded_scroll_region(self):
-        """The inner lists are released, so the sidebar must scroll.
+        """The inner lists are released, so their column must scroll.
 
         With `.memories-list-scroll` and `#diary-dates-list` content-sized,
-        a `max-height` on the sidebar does nothing on its own -- the content
-        would spill out of an un-scrolling box. Each sidebar is the bounded
+        a `max-height` on the column does nothing on its own -- the content
+        would spill out of an un-scrolling box. Each column is the bounded
         scroll region instead, which is also why there is only one scroll
-        area per sidebar rather than a nested one.
+        area per column rather than a nested one.
+
+        The diary has two bounded columns now: the entry list, and the
+        calendar rail above it. A single `.diary-sidebar` entry would leave
+        one of them unbounded, and an unbounded column of stacked entries
+        pushes the detail pane off the bottom of the screen.
         """
-        for selector in (".memories-list-col", ".diary-sidebar"):
+        for selector in (".memories-list-col", ".diary-sidebar", ".diary-list-col"):
             with self.subTest(selector=selector):
                 merged = _decls(self.tablet, selector)
                 self.assertTrue(merged.strip(), f"{selector} is not restated")
@@ -256,11 +261,12 @@ class MobileBreakpointTests(unittest.TestCase):
         self.phone = _declarations(self.phone_body)
 
     def test_every_fixed_width_column_collapses(self):
-        # The layouts are 180+280+flex, 220+flex and 200+flex. Anything left
-        # at its desktop width overflows a 360px viewport.
+        # The layouts are 180+280+flex, flex+340+250 and 200+flex. Anything
+        # left at its desktop width overflows a 360px viewport -- the diary's
+        # two rails are 590px on their own.
         for selector in (
             ".memories-sidebar", ".memories-list-col", ".diary-sidebar",
-            ".graph-sidebar",
+            ".diary-list-col", ".graph-sidebar",
         ):
             with self.subTest(selector=selector):
                 _assert_declares(
@@ -518,6 +524,108 @@ class ClientFilterOnMobileTests(unittest.TestCase):
         _assert_declares(
             self, self.base, ".cf-bar", "margin-left: auto",
             "the filter belongs to the right of the tab bar on desktop")
+
+
+class DiaryColumnOrderTests(unittest.TestCase):
+    """The diary tab is three columns, and only one order of them is the design.
+
+    `.diary-layout` is a flex *row*, so the DOM order is the visual order:
+    the entry being read, then the filtered entry list, then the calendar and
+    search rail on the right. Nothing errors if the rails are swapped or the
+    detail pane is pinned narrow -- the tab still renders, and still selects an
+    entry -- it is simply not the screen that was asked for, and there is no
+    browser here to see the difference.
+
+    So these pin the three things a reorder would silently undo: which element
+    each column is, what order they sit in, and that the detail pane is the
+    flexible one rather than one of the fixed rails.
+    """
+
+    COLUMNS = ('class="diary-main"', 'class="diary-list-col"', 'class="diary-sidebar"')
+
+    @classmethod
+    def setUpClass(cls):
+        cls.base = _declarations(CSS)
+        layout = SOURCE.split('<div class="diary-layout">')[1].split('<div id="page-graph"')[0]
+        cls.layout = layout
+
+    def test_the_three_columns_are_in_the_intended_order(self):
+        positions = []
+        for column in self.COLUMNS:
+            idx = self.layout.find(column)
+            self.assertNotEqual(idx, -1, f"{column} is not in the diary layout")
+            positions.append(idx)
+        self.assertEqual(
+            positions, sorted(positions),
+            "the diary layout must read detail, then entry list, then the "
+            "calendar rail -- a flex row renders DOM order left to right",
+        )
+
+    def test_the_calendar_rail_is_last_so_it_lands_top_right(self):
+        self.assertIn(
+            'id="diary-month-dates"', self.layout,
+            "the month grid has to be in the rail that is last in the row",
+        )
+        # Search is a filter on the list, so it goes above the calendar: the
+        # rail is the top-right of the screen and the field should be the
+        # thing already under the cursor there.
+        self.assertLess(
+            self.layout.find('id="diary-search-input"'),
+            self.layout.find('id="diary-month-dates"'),
+            "search sits above the calendar in the rail",
+        )
+
+    def test_the_entry_list_is_wider_than_the_calendar_rail(self):
+        """The list is what the user reads at; the rail is a control surface."""
+        def width(selector):
+            merged = _decls(self.base, selector)
+            found = re.search(r"width:\s*(\d+)px", merged)
+            self.assertIsNotNone(found, f"{selector} has no fixed width: {merged!r}")
+            return int(found.group(1))
+
+        self.assertGreater(
+            width(".diary-list-col"), width(".diary-sidebar"),
+            "the filtered entry list was asked to be wider than the rail",
+        )
+
+    def test_the_detail_pane_takes_the_leftover_width(self):
+        merged = _decls(self.base, ".diary-main")
+        self.assertIn("flex: 1", merged, merged)
+        # A flex item's default `min-width: auto` refuses to shrink below its
+        # content, so one long transcription would widen the detail pane and
+        # squeeze the rails instead of wrapping.
+        self.assertIn("min-width: 0", merged, merged)
+
+    def test_the_pickers_come_before_the_entry_on_a_phone(self):
+        """Stacked, DOM order is visual order -- and the detail pane is first.
+
+        On a phone that means opening the tab on an empty card with the
+        calendar and the entry list below the fold. `order` re-ranks them so
+        the pickers come first, which is what makes the stacked column usable
+        rather than merely correct.
+        """
+        tablet = _declarations(_media_block(900))
+        for selector in (".diary-sidebar", ".diary-list-col", ".diary-main"):
+            with self.subTest(selector=selector):
+                merged = _decls(tablet, selector)
+                self.assertTrue(
+                    "order:" in merged,
+                    f"{selector} is not re-ranked on a phone, so the stacked "
+                    f"column opens on the detail pane; got: {merged.strip()!r}",
+                )
+
+    def test_the_list_column_holds_the_scroller_not_the_rail(self):
+        """`#diary-dates-list` is the zero-basis scroller the mobile block releases.
+
+        It moved out of `.diary-sidebar` and into `.diary-list-col`. If it were
+        still in the rail, the rail's bounded `max-height` scroll region and
+        the list's own released scroller would nest, and the entry list would
+        be bounded twice.
+        """
+        list_col = self.layout.split('class="diary-list-col"')[1].split('class="diary-sidebar"')[0]
+        self.assertIn('id="diary-dates-list"', list_col)
+        rail = self.layout.split('class="diary-sidebar"')[1]
+        self.assertNotIn('id="diary-dates-list"', rail)
 
 
 class DiarySaveWiringTests(unittest.TestCase):
