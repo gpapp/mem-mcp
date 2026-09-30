@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from common import get_neo4j, get_qdrant, logger, COLLECTION_NAME, DIARY_COLLECTION
+from matching_utils import plan_search_scope
 
 # ---------------------------------------------------------------------------
 # Scope ranking tunables (shared by fact_manager and diary_manager)
@@ -197,6 +198,30 @@ def db_get_client_status_map(user_id: str) -> dict:
             if name:
                 status[name.lower()] = _effective_active(dict(c))
     return status
+
+
+def db_plan_search_scope(client: Optional[str], context: Optional[str], user_id: str) -> dict:
+    """Resolve a search's requested client/context to canonical stored names.
+
+    Returns ``{"client", "context", "clientEvidence", "contextEvidence",
+    "unresolvedClient", "unresolvedContext", "knownClients"}``.
+
+    A name that cannot be resolved is reported, not raised: it means the search
+    gets no scope signal, not that the search returns nothing. Known spellings
+    come back in the result so the tool can tell the caller what it did have.
+    """
+    clients = db_list_clients(user_id)
+    resolved_client, resolved_context, client_evidence, context_evidence = \
+        plan_search_scope(client, context, clients)
+    return {
+        "client": resolved_client,
+        "context": resolved_context,
+        "clientEvidence": client_evidence,
+        "contextEvidence": context_evidence,
+        "unresolvedClient": client if client and not resolved_client else None,
+        "unresolvedContext": context if context and not resolved_context else None,
+        "knownClients": [c["name"] for c in clients if c.get("name")],
+    }
 
 
 async def db_set_client_active(client_id: str, active: bool, user_id: str) -> bool:

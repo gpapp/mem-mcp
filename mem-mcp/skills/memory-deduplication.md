@@ -13,7 +13,7 @@ Use the `find_duplicates` tool to scan the memory for clusters of similar items.
 - **Threshold**: Adjust the similarity threshold (default 0.75).
 - **Result**: You will receive a list of clusters with an `avg_similarity` score and a basic recommendation.
 
-> **Client caution:** the same person or project name can legitimately exist under **different clients** (e.g. "Tim" at SAP vs "Tim" at Deutsche Bank). Before merging, check each record's client scope — same name + different client is **not** a duplicate. When in doubt, search with the `client` parameter to compare within one scope first.
+> **Client caution:** the same person or project name can legitimately exist under **different clients** (e.g. "Tim" at SAP vs "Tim" at Deutsche Bank). Before merging, check each record's client scope — same name + different client is **not** a duplicate. When in doubt, search with the `client` parameter (optionally with `context`) to compare within one scope first: it **prioritises** that scope rather than filtering, so records from elsewhere still come back, ranked lower and labelled with their scope tier (`assigned` / `relevant` / `inferred` / `unrelated`). Client abbreviations resolve — `"DB"` finds `Deutsche Bank (DB)`; call `list_clients` for exact spellings. Two records that surface under the **same** scope tier are the ones actually competing; a tier difference is itself the reason not to merge.
 
 ### 2. Analyze Each Cluster
 Use the `suggest_merge` tool for each cluster.

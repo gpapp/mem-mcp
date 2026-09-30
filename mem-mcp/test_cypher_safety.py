@@ -1019,5 +1019,118 @@ class DedupUnderSetupTests(unittest.TestCase):
         )
 
 
+class ScopeIsRankedNotFilteredTests(unittest.TestCase):
+    """`client`/`context` must rank search results, never delete them.
+
+    The search path used to *filter* by scope, in two places at once: a Qdrant
+    `FieldCondition` on the payload key `clientName`, and a Cypher `EXISTS((f)
+    -[:FOR_CLIENT]->(:Client {name: $clientName}))`. Both compared a raw user
+    string against the *stored* name, so `"DB"` against the node `Deutsche Bank
+    (DB)` matched nothing and the search returned an empty list with no error.
+    The filter was also self-defeating: the out-of-scope candidates it removed
+    are precisely the ones `scope_strength` ranks below the in-scope ones, and
+    the `+0.3` boosts that ran afterwards could therefore never fire.
+
+    So these are the wrong-query-shaped guards here, not the search-function
+    guards: the property being wrong is that the filter exists at all, and
+    `assertNotIn("clientName")` over a whole file would also match the payload
+    *reads* that are legitimate.
+    """
+
+    FILTERS = ("clientName", "contextName")
+
+    def _sources(self):
+        for path in _python_sources():
+            with open(path, encoding="utf-8") as handle:
+                yield os.path.basename(path), ast.parse(handle.read())
+
+    def test_no_vector_filter_on_the_stored_scope_payload_keys(self):
+        checked = 0
+        for filename, tree in self._sources():
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+                    continue
+                if node.func.id != "FieldCondition":
+                    continue
+                checked += 1
+                # `FieldCondition("userId", match=...)` and
+                # `FieldCondition(key="userId", ...)` are both in the tree, so
+                # resolve the key from whichever form was written — the removed
+                # scope filters used the positional one, and a positional-only
+                # reader is a test that passes on the bug.
+                key_node = node.args[0] if node.args else next(
+                    (kw.value for kw in node.keywords if kw.arg == "key"), None)
+                name = key_node.value if isinstance(key_node, ast.Constant) else None
+                self.assertNotIn(
+                    name, self.FILTERS,
+                    msg=(f"{filename}:{node.lineno} filters Qdrant on the stored "
+                         f"scope payload key {name!r} — scope must rank, not exclude"),
+                )
+        self.assertGreater(checked, 0, msg="no FieldCondition found; the lint is not running")
+
+    def test_the_exact_match_pass_has_no_scope_predicate(self):
+        """The Neo4j name/alias pass must return every candidate, scoped or not.
+
+        `db_search_memories` is the function whose own docstring promises scope
+        never removes a result, so the guarantee is pinned there rather than on
+        the string `"$clientName"` — which is also what the broken query
+        contained, and `assertIn("$clientName", query)` passed on it happily.
+        """
+        with open(os.path.join(HERE, "fact_manager.py"), encoding="utf-8") as handle:
+            source = handle.read()
+        tree = ast.parse(source)
+        functions = {n.name: n for n in ast.walk(tree)
+                     if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        segment = ast.get_source_segment(source, functions["db_search_memories"])
+        # The query is assembled from fragments, so look at the whole function
+        # for the predicate shapes rather than at one literal.
+        for needle in ("$clientName", "$contextName", "FOR_CLIENT]->(:Client",
+                       "IN_CONTEXT]->(:Context"):
+            self.assertFalse(
+                needle in segment,
+                msg=(f"db_search_memories builds a scope filter on {needle!r}; scope "
+                     "ranks results and never removes them"),
+            )
+        # The scope is still read — it just comes from the ranking block.
+        self.assertIn("db_plan_search_scope", segment)
+        self.assertIn("scope_strength", segment)
+
+    def test_the_relevant_to_read_covers_facts_and_diary_entries(self):
+        _, query = self._relevant_to_query()
+        self.assertIn("(n:Fact OR n:DiaryEntry)", query,
+                      msg=(":Fact alone drops every diary entry, which is exactly "
+                           "where RELEVANT_TO is the only scope evidence"))
+        self.assertIn("RELEVANT_TO", query)
+
+    def test_the_relevant_to_read_distinguishes_a_context_target(self):
+        _, query = self._relevant_to_query()
+        self.assertRegex(query, r"CASE\s+WHEN\s+rc:Context\s+THEN\s+'context'")
+        self.assertFalse(
+            re.search(r"OPTIONAL MATCH \(n\)-\[:RELEVANT_TO\]->\((\w+):Client\)", query),
+            msg="RELEVANT_TO may target a Context; matching :Client drops project links",
+        )
+
+    def _relevant_to_query(self):
+        """The one batched read, not the three existing RELEVANT_TO reads.
+
+        Two other queries already collect RELEVANT_TO targets for a *detail*
+        view (`db_get_fact` and the diary detail read), and they legitimately
+        return a whole record rather than a ranking map. The batched read is
+        identified by the id-list predicate and the `AS relevant` alias, which is
+        why the selector is a shape and not the relationship name.
+        """
+        queries = []
+        for path in _python_sources():
+            for lineno, query in _cypher_strings(path):
+                if "n.id IN $ids" in query and "RELEVANT_TO]->(rc)" in query \
+                        and "AS relevant" in query:
+                    queries.append((os.path.basename(path), query))
+        self.assertEqual(
+            len(queries), 1,
+            msg=f"expected exactly one batched RELEVANT_TO read, found {len(queries)}",
+        )
+        return queries[0]
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

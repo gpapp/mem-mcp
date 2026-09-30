@@ -41,15 +41,26 @@ from matching_utils import (
     vector_confidence,
 )
 from matching_utils import (
+    SCOPE_ASSIGNED,
+    SCOPE_CONTEXT_WEIGHT,
     SCOPE_EVIDENCE_CONTAINS,
     SCOPE_EVIDENCE_EXACT,
     SCOPE_EVIDENCE_FUZZY,
     SCOPE_EVIDENCE_NONE,
     SCOPE_EVIDENCE_TOKENS,
+    SCOPE_INFERRED,
+    SCOPE_RELEVANT,
+    SCOPE_TIER_ASSIGNED,
+    SCOPE_TIER_INFERRED,
+    SCOPE_TIER_RELEVANT,
+    SCOPE_UNSCOPED,
     client_header_value,
     client_tags_in_text,
     context_named_in_text,
+    plan_search_scope,
     resolve_scope_name,
+    scope_axis_tier,
+    scope_strength,
 )
 
 
@@ -1029,15 +1040,39 @@ class ScopePromptTests(unittest.TestCase):
         self.assertIn("what the work is FOR", self.system)
 
     def test_the_related_field_is_part_of_the_contract(self):
+        # The prose assertions read the assembled prompt, not the source: a
+        # sentence split across two adjacent string literals is invisible to a
+        # substring search over the raw text, which is a property of how the
+        # literal is wrapped rather than of the prompt.
         self.assertIn('\\"related\\"', self.system)
-        self.assertIn("second subject", self.system)
+        self.assertIn("second subject", self.prompt)
 
     def test_the_context_list_order_is_not_a_ranking(self):
         """It answered EPAM/PPC, and PPC is simply first in EPAM's list."""
         self.assertIn("not a ranking", self.system)
 
-    def test_an_explicit_client_header_is_still_authoritative(self):
-        self.assertIn("authoritative", self.system)
+    def test_a_client_header_is_evidence_but_not_an_answer(self):
+        """The header rule was inverted, and deliberately.
+
+        "**Client:** Daimler AG (MBAG)" in an RFI names the end CUSTOMER, and the
+        old prompt called that declaration "authoritative -- use it and do not
+        override it". So the model returned it verbatim, `resolve_scope_name`
+        matched it against nothing (it is not a stored client), and the item was
+        stamped with **no client at all** -- permanently, because a stamped null
+        is never revisited. Measured: the client rule now answers EPAM, which is
+        the client the work is actually delivered for.
+
+        The header is still real evidence; what changed is that it may not be the
+        answer. Pin the new sentence, and pin that "authoritative" is gone, so a
+        re-edit cannot quietly restore the rule that lost the scope.
+        """
+        self.assertFalse(
+            "authoritative" in self.system,
+            msg="the header is evidence, not an answer; calling it authoritative "
+                "made every customer-named document resolve to no client at all",
+        )
+        self.assertIn("names the end CUSTOMER", self.prompt)
+        self.assertIn("Never return the header's name by itself", self.prompt)
 
 
 class RelatedLinkWiringTests(unittest.TestCase):
@@ -1252,10 +1287,19 @@ class NullableScopePromptTests(unittest.TestCase):
         )
 
     def test_a_client_with_no_contexts_is_not_a_dead_end(self):
+        # The placeholder was '(none)' on the client's line; the format is now a
+        # "contexts" array, and an empty one says the same thing structurally.
+        # Either wording works; what matters is that a contextless client is
+        # described as a valid choice rather than a dead end.
         self.assertTrue(
-            "'(none)' is a normal, valid choice" in self.prompt,
+            "is a normal, valid choice" in self.prompt,
             msg="SAP SE has no contexts and EPAM has three; without this the "
                 "model picks whichever client can supply a context name",
+        )
+        self.assertFalse(
+            "'(none)'" in self.prompt,
+            msg="the prompt still describes a '(none)' line, but the client "
+                "list is a JSON array now -- the two descriptions contradict",
         )
 
     def test_choosing_a_contextless_client_forces_a_null_context(self):
@@ -1288,9 +1332,10 @@ class NullableScopePromptTests(unittest.TestCase):
 
     def test_the_context_must_come_from_the_chosen_clients_own_line(self):
         self.assertTrue(
-            "Never take a project from another client's line" in self.prompt,
+            "Never take a project from another client's array" in self.prompt,
             msg="the observed failure was SAP SE answered with DB AI Adoption, "
-                "which is Deutsche Bank's project and was never on SAP SE's line",
+                "which is Deutsche Bank's project and was never in SAP SE's "
+                "contexts array",
         )
 
     def test_the_old_placeholder_is_gone_from_the_prompt(self):
@@ -1731,6 +1776,214 @@ class MergeDraftBudgetTests(unittest.TestCase):
         test_cypher_safety.MergeDraftBudgetTests, where the caller lives.
         """
         self.assertTrue(issubclass(MergeDraftTooLarge, ValueError))
+
+
+# ---------------------------------------------------------------------------
+# Scope-priority search
+#
+# These call the real functions rather than reading their source: the defect this
+# replaces returned nothing at all for a client written the way a human writes
+# it ("DB"), and a source assertion about a comparison operator would not notice
+# a name that resolves to the wrong client.
+# ---------------------------------------------------------------------------
+
+# The real vault's scope list, taken from the graph export (7 clients, 6
+# projects). The tests that use it are reproducing measured production data, not
+# an idealised fixture -- "Deutsche Bank (DB)" declares "DB", "SAP" and "SAP SE"
+# are two separate stored nodes, and only three projects have any edges at all.
+REAL_SCOPE_TREE = [
+    {"name": "Deutsche Bank (DB)", "contexts": [
+        {"name": "AI Enablement Hub"}, {"name": "DB AI Adoption"}]},
+    {"name": "SAP SE", "contexts": [{"name": "EA Handover"}]},
+    {"name": "Valantic FSA", "contexts": []},
+    {"name": "White Cube", "contexts": []},
+    {"name": "SAP", "contexts": []},
+    {"name": "LC Security", "contexts": []},
+    {"name": "EPAM", "contexts": [
+        {"name": "MBAG"}, {"name": "MUFG"}, {"name": "PPC"}]},
+]
+
+# Verbatim from the vault. Both are FOR_CLIENT "Deutsche Bank (DB)" with NO
+# IN_CONTEXT edge -- the classifier dropped the project because this very guard
+# said the text did not support it -- so the only thing that separates them for
+# a DB AI Adoption search is the text itself.
+LOCHAS_TEXT = (
+    "**Role:** Managing Director (MD) — Senior leader, direct report to Christian "
+    "Reno (DB CIO) / **Company/Team:** Deutsche Bank (DB) — Private Bank / "
+    "**Domain:** AI adoption, organizational strategy, Private Bank / Technology, "
+    "Data Platforms / **Notes:** Key senior stakeholder for the PBAI adoption "
+    "program. Approver for the 'AI Adoption Office' investment and staffing "
+    "proposal. Also referenced as 'John Locas' in some contexts (spelling variant)."
+)
+PORTER_TEXT = (
+    "Deutsche Bank regional architecture manager for US. Manages three architects "
+    "in the US who came from finance business analyst background. Described as "
+    "having 'dead weight' that is useless but means well."
+)
+
+
+class ScopePlanningTests(unittest.TestCase):
+    """The client/context a search asked for, resolved to stored spellings."""
+
+    def test_a_declared_abbreviation_resolves(self):
+        """The case that used to return an empty list.
+
+        ``resolve_scope_name`` drops any input under SCOPE_NAME_MIN_CHARS, so
+        "DB" was never a candidate. The stored name declares the abbreviation, so
+        matching it exactly is both precise and cheap.
+        """
+        client, _ctx, client_ev, _ = plan_search_scope("DB", None, REAL_SCOPE_TREE)
+        self.assertEqual(client, "Deutsche Bank (DB)")
+        self.assertEqual(client_ev, SCOPE_EVIDENCE_EXACT)
+
+    def test_a_full_name_resolves_to_the_stored_spelling(self):
+        client, _ctx, _ev, _ = plan_search_scope("Deutsche Bank", None, REAL_SCOPE_TREE)
+        self.assertEqual(client, "Deutsche Bank (DB)")
+
+    def test_a_project_resolves_too(self):
+        client, ctx, _c, ctx_ev = plan_search_scope("db", "AI Adoption", REAL_SCOPE_TREE)
+        self.assertEqual(client, "Deutsche Bank (DB)")
+        self.assertEqual(ctx, "DB AI Adoption")
+        self.assertNotEqual(ctx_ev, SCOPE_EVIDENCE_NONE)
+
+    def test_a_project_of_another_client_is_refused(self):
+        """Pairing them is the cross-client guess the classifier is documented as
+        making; the plan has to not repeat it."""
+        client, ctx, _c, ctx_ev = plan_search_scope("EPAM", "DB AI Adoption", REAL_SCOPE_TREE)
+        self.assertEqual(client, "EPAM")
+        self.assertIsNone(ctx)
+        self.assertEqual(ctx_ev, SCOPE_EVIDENCE_NONE)
+
+    def test_sap_and_sap_se_stay_distinct(self):
+        """Two stored nodes, and the resolver picks the one asked for."""
+        self.assertEqual(plan_search_scope("SAP", None, REAL_SCOPE_TREE)[0], "SAP")
+        self.assertEqual(plan_search_scope("SAP SE", None, REAL_SCOPE_TREE)[0], "SAP SE")
+
+    def test_an_unknown_name_is_no_signal_not_an_error(self):
+        client, ctx, client_ev, ctx_ev = plan_search_scope("Nonesuch", "Nonesuch", REAL_SCOPE_TREE)
+        self.assertIsNone(client)
+        self.assertIsNone(ctx)
+        self.assertEqual(client_ev, SCOPE_EVIDENCE_NONE)
+        self.assertEqual(ctx_ev, SCOPE_EVIDENCE_NONE)
+
+    def test_a_claimed_by_two_clients_is_not_guessed_at(self):
+        tree = [
+            {"name": "First Bank (FB)", "contexts": []},
+            {"name": "Second Bank (FB)", "contexts": []},
+        ]
+        client, _ctx, ev, _ = plan_search_scope("FB", None, tree)
+        self.assertIsNone(client)
+        self.assertEqual(ev, SCOPE_EVIDENCE_NONE)
+
+
+class ScopeStrengthTests(unittest.TestCase):
+    """One number per record, and it ranks rather than filters."""
+
+    def _strength(self, *args, **kwargs):
+        return scope_strength(*args, **kwargs)
+
+    def test_nothing_requested_means_no_scope_signal(self):
+        self.assertEqual(self._strength(None, None, result_client="EPAM", record_text="x"), 0.0)
+
+    def test_a_context_is_the_finer_discriminator(self):
+        """Same client, one has the project: the project decides."""
+        with_ctx = self._strength("Deutsche Bank (DB)", "DB AI Adoption",
+                                  result_client="Deutsche Bank (DB)",
+                                  result_context="DB AI Adoption")
+        without = self._strength("Deutsche Bank (DB)", "DB AI Adoption",
+                                 result_client="Deutsche Bank (DB)")
+        self.assertGreater(with_ctx, without)
+        self.assertEqual(with_ctx, SCOPE_ASSIGNED * (1 + SCOPE_CONTEXT_WEIGHT))
+
+    def test_assigned_beats_relevant_beats_inferred(self):
+        assigned = scope_axis_tier("Deutsche Bank (DB)", "Deutsche Bank (DB)", (), "")
+        relevant = scope_axis_tier("Deutsche Bank (DB)", None, ("Deutsche Bank (DB)",), "")
+        inferred = scope_axis_tier("Deutsche Bank (DB)", None, (), "we met Deutsche Bank (DB) today")
+        self.assertEqual([assigned, relevant, inferred],
+                         [SCOPE_TIER_ASSIGNED, SCOPE_TIER_RELEVANT, SCOPE_TIER_INFERRED])
+        self.assertGreater(SCOPE_ASSIGNED, SCOPE_RELEVANT)
+        self.assertGreater(SCOPE_RELEVANT, SCOPE_INFERRED)
+
+    def test_unrelated_is_a_weak_hit_not_a_miss(self):
+        """A misclassified record stays findable -- that was the explicit ask."""
+        wrong_client = self._strength("EPAM", None, result_client="SAP SE", record_text="SAP SE work")
+        unscoped = self._strength("EPAM", None)
+        self.assertEqual(wrong_client, SCOPE_UNSCOPED)
+        self.assertEqual(unscoped, SCOPE_UNSCOPED)
+        self.assertGreater(SCOPE_UNSCOPED, 0.0)
+
+    def test_a_relevant_only_record_outranks_an_unrelated_one(self):
+        """The classifier writes RELEVANT_TO *before* it gives up on a primary, so
+        a clientName-only partition would demote exactly these."""
+        only_relevant = self._strength("Deutsche Bank (DB)", None,
+                                       relevant_client_names=["Deutsche Bank (DB)"])
+        self.assertEqual(only_relevant, SCOPE_RELEVANT)
+        self.assertGreater(only_relevant, self._strength("Deutsche Bank (DB)", None,
+                                                        result_client="SAP SE"))
+
+
+class ScopeSeparatesTheJohnsTests(unittest.TestCase):
+    """The reported case, on the vault's actual text.
+
+    Both records are assigned to Deutsche Bank (DB) and neither has an
+    IN_CONTEXT edge, so client scope alone ties them. The project is what the
+    user asked to discriminate on, and its presence in the text is the only
+    evidence either has.
+    """
+
+    def test_only_lochas_text_names_the_project(self):
+        self.assertTrue(context_named_in_text("DB AI Adoption", LOCHAS_TEXT))
+        self.assertFalse(context_named_in_text("DB AI Adoption", PORTER_TEXT))
+
+    def test_the_other_project_neither_text_names(self):
+        """Guards against the inference passing for the wrong reason."""
+        self.assertFalse(context_named_in_text("AI Enablement Hub", LOCHAS_TEXT))
+        self.assertFalse(context_named_in_text("AI Enablement Hub", PORTER_TEXT))
+
+    def test_lochas_wins_the_db_ai_adoption_search(self):
+        lochas = scope_strength("Deutsche Bank (DB)", "DB AI Adoption",
+                                result_client="Deutsche Bank (DB)",
+                                record_text=LOCHAS_TEXT)
+        porter = scope_strength("Deutsche Bank (DB)", "DB AI Adoption",
+                                result_client="Deutsche Bank (DB)",
+                                record_text=PORTER_TEXT)
+        self.assertGreater(lochas, porter)
+
+    def test_the_sap_search_puts_both_johns_on_the_floor(self):
+        """Asked for SAP: both DB records are equally irrelevant, and the SAP
+        record wins on its own assignment."""
+        bonin = scope_strength("SAP SE", None, result_client="SAP SE", record_text="SAP (SGSC) Diligent")
+        lochas = scope_strength("SAP SE", None, result_client="Deutsche Bank (DB)",
+                                record_text=LOCHAS_TEXT)
+        self.assertEqual(bonin, SCOPE_ASSIGNED)
+        self.assertEqual(lochas, SCOPE_UNSCOPED)
+        self.assertGreater(bonin, lochas)
+
+
+class ScopeStaysOutOfConfidenceTests(unittest.TestCase):
+    """`identity_confidence` is a max(), so any scope term inside it outranks
+    identity evidence and authorises a merge against the wrong record."""
+
+    def test_identity_confidence_takes_no_scope_argument(self):
+        import inspect
+        params = inspect.signature(identity_confidence).parameters
+        for name in ("client", "context", "scope", "scope_strength", "requested_client"):
+            self.assertNotIn(
+                name, params,
+                f"identity_confidence grew a {name!r} parameter; it returns "
+                f"max(identity_strength, vector_confidence), so a scope term here "
+                f"would report a record with no name match as a confirmed identity",
+            )
+
+    def test_an_in_scope_record_with_no_name_match_stays_unconfirmed(self):
+        # A high raw vector alone saturates vector_confidence, so the assertion is
+        # about the two together: whatever the embedding says, a record whose name
+        # does not match is not a confirmed identity, and the write gate refuses it.
+        confidence, evidence = identity_confidence(
+            "Radoslav", name="John Lochas", raw_vector=0.55)
+        self.assertLess(confidence, 1.0)
+        self.assertNotEqual(evidence, EVIDENCE_EXACT)
+        self.assertFalse(people_match_allowed("Radoslav", {"name": "John Lochas", "raw_score": 0.55}, 0.4))
 
 
 if __name__ == "__main__":

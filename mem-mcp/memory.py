@@ -39,5 +39,6 @@ from client_manager import (
     db_set_client_active, db_set_client_cross, db_rename_client, db_rename_context,
     db_set_fact_scope, db_set_diary_scope, db_client_items, db_context_items,
     db_delete_client, db_delete_context, db_get_client_status_map,
+    db_plan_search_scope,
     infer_scope_from_text
 )

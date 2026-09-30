@@ -62,6 +62,21 @@ def _format_fact_md(fact: dict) -> str:
     if confidence is not None:
         evidence = fact.get("evidence") or "-"
         meta_parts.append(f"✅ confidence: `{float(confidence):.2f}` ({evidence})")
+    # Scope is a separate axis from confidence and is shown as such. Folding it
+    # into the confidence number is what this line exists to avoid: confidence
+    # answers "is this the same record?", scope answers "did it match the client
+    # I asked for?", and a record can be the right one filed under the wrong scope.
+    scope = fact.get("scope") or {}
+    if scope.get("strength"):
+        parts = []
+        if scope.get("requestedClient"):
+            parts.append(scope["requestedClient"])
+        if scope.get("requestedContext"):
+            parts.append(scope["requestedContext"])
+        meta_parts.append(
+            f"🗂️ scope: {scope.get('clientTier') or 'unrelated'}"
+            + (f" ({' · '.join(parts)})" if parts else "")
+        )
     if fact_id:
         meta_parts.append(f"🔑 `{fact_id}`")
     if meta_parts:
@@ -87,6 +102,23 @@ def _format_facts_md(facts: list) -> str:
     weak = [f for f in facts if f.get("weak")]
     blocks = [_format_fact_md(f) for f in confident]
     body = "\n\n---\n\n".join(blocks)
+    # An unresolved scope name used to return an empty result set with no
+    # explanation, which reads as "the client has no records". It is silent
+    # because a filter cannot tell the caller it matched nothing -- so say so
+    # here, naming what was asked and what does exist.
+    notes = []
+    scope = (facts[0] or {}).get("scope") or {}
+    for key, label in (("unresolvedClient", "client"), ("unresolvedContext", "context")):
+        raw = scope.get(key)
+        if raw:
+            known = ", ".join(scope.get("knownClients") or []) or "none"
+            notes.append(
+                f"_Requested {label} `{raw}` did not match any stored scope, so no scope "
+                f"prioritisation was applied and the ranking is by match quality alone. "
+                f"Known clients: {known}._"
+            )
+    if notes:
+        body = "\n\n".join(notes) + ("\n\n" + body if body else "")
     if not weak:
         return body
     warning = (
@@ -170,8 +202,18 @@ async def search_facts(query: str, category: Optional[str] = None, limit: int = 
       top_p: minimum confidence (0-1, default 0.5). Raise to 0.75 to require an
         exact name/alias/first+last, lower to 0.35 to include fuzzy name hits
       names_only: if True, returns only fact names as newline-separated list
-      client: optional client name to scope results (e.g. "Deutsche Bank")
-      context: optional context name within the client (e.g. "SAP Implementation")
+      client: optional client to PRIORITISE (e.g. "Deutsche Bank", or "DB" — the
+        abbreviation declared in "Deutsche Bank (DB)" resolves automatically).
+        This never filters: records filed under another client, or under none,
+        still come back, ranked lower.
+      context: optional project within the client (e.g. "DB AI Adoption"). It is
+        resolved only against that client's own projects and weighted double,
+        because a project is the finer discriminator.
+
+    Scope results show `🎯 scope: <tier> (<client> · <context>)`, where tier is
+    assigned (FOR_CLIENT / IN_CONTEXT edge) > relevant (RELEVANT_TO edge) >
+    inferred (named in the text). Unrelated and misclassified records still rank
+    — weakly — rather than disappearing. Call `list_clients` for exact spellings.
 
     Strategy: If the first search returns weak results, try shorter/simpler queries.
     For people, use first name only. For projects, use the project name directly.
@@ -181,6 +223,20 @@ async def search_facts(query: str, category: Optional[str] = None, limit: int = 
     facts = await mem.db_search_memories(query, _current_user(), limit, category, top_p, client, context)
     if names_only:
         return "\n".join(f.get("name", "") or f.get("text", "")[:50] for f in facts if f.get("name") and not f.get("weak"))
+    if not facts and (client or context):
+        # An empty result is indistinguishable from "nothing is stored" unless we
+        # say that the scope name itself did not resolve. Resolved again here
+        # only on this path, so the normal search pays for one lookup.
+        scope = mem.db_plan_search_scope(client, context, _current_user())
+        known = ", ".join(scope.get("knownClients") or []) or "none"
+        asked = [f"{k} `{v}`" for k, v in (("client", scope.get("unresolvedClient")),
+                                           ("context", scope.get("unresolvedContext"))) if v]
+        if asked:
+            return (
+                f"_No facts found._ Requested {' and '.join(asked)} did not match any stored scope, "
+                f"so no scope prioritisation was applied. Known clients: {known}. "
+                f"Call `list_clients` for exact spellings._"
+            )
     return _format_facts_md(facts)
 
 @mcp.tool()
@@ -321,10 +377,13 @@ async def diary_search_entries(query: str, limit: int = 3, top_p: float = 0.4, c
       query: topic keywords or date string
       limit: max results (default 3)
       top_p: similarity threshold (default 0.4)
+      client: optional client to PRIORITISE (abbreviations resolve, e.g. "DB").
+        Never filters — other clients' entries still return, ranked lower.
+      context: optional project within the client, weighted double.
 
     Returns list of entries with: id, timestamp, date, name, content, score, mentions,
-    keywords, clientName, clientId, contextName, contextId, metadata.
-    Use 'id' with diary_delete_entry or diary_save_entry to modify entries.
+    keywords, clientName, clientId, contextName, contextId, metadata, scopeStrength,
+    scope. Use 'id' with diary_delete_entry or diary_save_entry to modify entries.
     """
     return await mem.db_search_diary(query, _current_user(), limit, top_p, client, context)
 

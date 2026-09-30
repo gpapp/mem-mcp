@@ -175,6 +175,8 @@ search_facts("<First Name>", category="People", top_p=0.4)
 
 If the person's first+last name doesn't match, try querying by their first or last name individually before falling back to broader terms.
 
+When the transcript names a client, pass it as `client` (and the project as `context`, if the text gives one) to disambiguate **same-first-name, different-client** people — a bare "John" can match a colleague at the client and someone at another. This ranks the client's records first without hiding the others, so you still see the cross-client candidate and can put it to the human. Read each hit's `scope` tier: `assigned` means the record is filed under that client, `inferred` only that the text mentions it.
+
 Use the **`question` tool** for names that need a human decision. One question per ambiguous name; batch unambiguous names into a single question with multiple options.
 
 Example question shape:
@@ -380,7 +382,7 @@ Use `add_fact` for storing facts and `update_fact` for extending existing ones. 
 - Pass the confirmed `client` (and `context` when set) to **every** `add_fact` call — client-specific people, projects, decisions, and actions all get scoped.
 - Shared/generic facts (public technologies, general principles with no client relevance) → omit `client` so they stay global.
 - If the confirmed client is new → call `create_client("<name>")` first, then use the name in all subsequent writes (auto-create handles the rest, but explicit creation confirms intent).
-- When searching for existing records in this phase, pass `client` to `search_facts` so matches prefer the meeting's client scope.
+- When searching for existing records in this phase, pass `client` to `search_facts` so matches prefer the meeting's client scope. It **prioritises, never filters** — records filed elsewhere still come back, ranked lower. Abbreviations resolve (`"DB"` → `Deutsche Bank (DB)`); call `list_clients` if unsure of the spelling.
 
 ### 13. Link
 

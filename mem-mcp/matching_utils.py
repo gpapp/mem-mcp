@@ -274,6 +274,231 @@ def resolve_scope_name(raw: object, names: object,
     return (best_name, best_evidence)
 
 
+# ---------------------------------------------------------------------------
+# Search scope prioritisation
+#
+# ``search_facts``/``diary_search_entries`` accept a client and a project. They
+# used to pass those through as hard filters -- an ``EXISTS`` clause in Cypher
+# and a ``FieldCondition`` on the Qdrant payload key -- which was wrong twice
+# over. It was case-sensitive and byte-exact, so "DB" never matched the node
+# named "Deutsche Bank (DB)" and the tool silently returned *nothing*; and a
+# filter removes the other candidates before the score boost runs, so the boost
+# that was supposed to prefer the requested scope applied to an already
+# single-client result set and could not reorder anything.
+#
+# Scope therefore *prioritises*. Every candidate survives, and a separate
+# ``scope_strength`` value ranks them. Two rules make that ranking honest:
+#
+#   - Context outweighs client (SCOPE_CONTEXT_WEIGHT). The client is the coarse
+#     bucket; the project is what actually distinguishes "the DB person" from
+#     "the SAP person".
+#   - Assigned beats relevant beats inferred, per axis. ``FOR_CLIENT``/
+#     ``IN_CONTEXT`` edges are what the classifier decided; ``RELEVANT_TO`` is a
+#     secondary association; a name appearing in the record's own text is the
+#     weakest signal and is all that is left for a record whose classifier
+#     verdict was dropped. The John case needs that third tier: neither John has
+#     an IN_CONTEXT edge, and only one of them names the project in his text.
+#
+# The floor is deliberately non-zero. A record scoped to a *different* client,
+# or to none at all, still gets a weak hit: a misclassified item should be
+# findable rather than invisible, and ``score``/``confidence`` still separate it
+# from a genuine in-scope record.
+# ---------------------------------------------------------------------------
+SCOPE_ASSIGNED = 1.0
+SCOPE_RELEVANT = 0.45
+SCOPE_INFERRED = 0.30
+SCOPE_CONTEXT_WEIGHT = 2.0
+SCOPE_UNSCOPED = 0.10
+
+SCOPE_TIER_NONE = "none"
+SCOPE_TIER_ASSIGNED = "assigned"
+SCOPE_TIER_RELEVANT = "relevant"
+SCOPE_TIER_INFERRED = "inferred"
+
+
+def _name_in_text(name: object, text: object) -> bool:
+    """True when the item's own words actually contain this stored name.
+
+    Same idea as ``context_named_in_text`` but written against a whole client
+    name. Normalized-token subset matching is wrong for clients: "Deutsche Bank
+    (DB)" normalizes with its parentheses intact and needs all three tokens, so
+    a body that says only "Deutsche Bank" fails. Containment on the normalized
+    string is the right test for a stored multi-word proper noun.
+    """
+    normalized = normalize_identity(name)
+    if not normalized:
+        return False
+    return normalized in normalize_identity(text)
+
+
+def scope_axis_tier(requested: object, assigned_name: object,
+                    relevant_names: object, record_text: object) -> str:
+    """Classify one scope axis (client or context) for one record.
+
+    Returns ``assigned`` / ``relevant`` / ``inferred`` / ``none``. Assigned is
+    the stored edge; relevant is a RELEVANT_TO association; inferred is the
+    record's own text naming the scope, which is the only signal available when
+    the classifier's verdict was dropped for being unsupported by the text.
+    """
+    if not requested:
+        return SCOPE_TIER_NONE
+    target = normalize_identity(requested)
+    if target and normalize_identity(assigned_name) == target:
+        return SCOPE_TIER_ASSIGNED
+    for name in (relevant_names or []):
+        if normalize_identity(name) == target:
+            return SCOPE_TIER_RELEVANT
+    if _name_in_text(requested, record_text):
+        return SCOPE_TIER_INFERRED
+    return SCOPE_TIER_NONE
+
+
+def scope_context_tier(requested: object, assigned_name: object,
+                       relevant_names: object, record_text: object = "") -> str:
+    """Classify the context axis for one record.
+
+    Same shape as ``scope_axis_tier``, but the inferred tier uses
+    ``context_named_in_text`` (normalized token subset) rather than containment:
+    a project name is a phrase of ordinary words that a body may hyphenate or
+    re-case, and this is the tier that separates two records which share a client
+    and differ only in whether their own text names the project.
+    """
+    if not requested:
+        return SCOPE_TIER_NONE
+    target = normalize_identity(requested)
+    if target and normalize_identity(assigned_name) == target:
+        return SCOPE_TIER_ASSIGNED
+    for name in (relevant_names or []):
+        if normalize_identity(name) == target:
+            return SCOPE_TIER_RELEVANT
+    if context_named_in_text(requested, record_text or ""):
+        return SCOPE_TIER_INFERRED
+    return SCOPE_TIER_NONE
+
+
+_TIER_VALUE = {
+    SCOPE_TIER_ASSIGNED: SCOPE_ASSIGNED,
+    SCOPE_TIER_RELEVANT: SCOPE_RELEVANT,
+    SCOPE_TIER_INFERRED: SCOPE_INFERRED,
+    SCOPE_TIER_NONE: 0.0,
+}
+
+
+def scope_strength(requested_client: object, requested_context: object,
+                   result_client: object = None, result_context: object = None,
+                   relevant_client_names: object = None,
+                   relevant_context_names: object = None,
+                   record_text: object = "") -> float:
+    """How well one record matches the scope a search asked for.
+
+    Returns a value in ``[SCOPE_UNSCOPED, SCOPE_ASSIGNED * (1 + SCOPE_CONTEXT_WEIGHT)]``
+    and nothing else -- this is a *ranking* input, never a filter and never a
+    confidence. ``confidence`` deliberately stays identity-only: it is built as
+    ``max(identity_strength, vector_confidence)``, so a scope term folded in
+    there would outrank identity evidence and report ``confidence: 1.00
+    (name_conflict)``, which is self-contradictory to display and would
+    authorise a merge/link/update against a record that is not the one asked
+    about.
+
+    A record with no scope signal at all still returns ``SCOPE_UNSCOPED`` rather
+    than 0.0, so "assigned to another client" and "never scoped" rank equal and
+    ``score``/``confidence`` decide between them.
+    """
+    if not requested_client and not requested_context:
+        return 0.0
+
+    client_tier = scope_axis_tier(requested_client, result_client,
+                                  relevant_client_names, record_text)
+    context_tier = scope_context_tier(requested_context, result_context,
+                                      relevant_context_names, record_text)
+
+    total = _TIER_VALUE[client_tier] + _TIER_VALUE[context_tier] * SCOPE_CONTEXT_WEIGHT
+    return total if total > 0.0 else SCOPE_UNSCOPED
+
+
+# An abbreviation a stored name declares for itself: "Deutsche Bank (DB)" says
+# DB. Matched exactly against the normalized raw input, and only when the raw
+# input looks like an abbreviation rather than a word -- that exactness is the
+# whole point, since the fuzzy ladder drops any name under
+# SCOPE_NAME_MIN_CHARS and would otherwise never reach a two-letter one.
+_PAREN_ABBREV_RE = re.compile(r"[([]\s*([A-Za-z0-9&./_-]{2,12})\s*[)\]]")
+
+
+def declared_abbreviations(name: object) -> list:
+    """Every self-declared abbreviation inside a stored scope name."""
+    out = []
+    for match in _PAREN_ABBREV_RE.finditer(str(name or "")):
+        value = match.group(1).strip()
+        if value:
+            out.append(value)
+    return out
+
+
+def _resolve_by_abbreviation(raw: object, names: object) -> tuple:
+    """Resolve a short input against the abbreviations the names declare.
+
+    Returns ``(None, SCOPE_EVIDENCE_NONE)`` when zero or more than one name
+    claims it -- an abbreviation claimed by two clients is exactly the
+    ambiguity ``resolve_scope_name`` refuses to guess at.
+    """
+    target = normalize_identity(raw)
+    if not target:
+        return (None, SCOPE_EVIDENCE_NONE)
+    hits = [name for name in (names or [])
+            if any(normalize_identity(a) == target for a in declared_abbreviations(name))]
+    if len(hits) != 1:
+        return (None, SCOPE_EVIDENCE_NONE)
+    return (hits[0], SCOPE_EVIDENCE_EXACT)
+
+
+def plan_search_scope(client: object, context: object, clients: object) -> tuple:
+    """Resolve the client/context a search asked for into canonical stored names.
+
+    ``clients`` is a list of ``{"name": ..., "contexts": [{"name": ...}, ...]}``
+    (the shape ``db_list_clients`` already returns).
+
+    Resolution order for the client is abbreviation first, then
+    ``resolve_scope_name``. The context is resolved **only against the resolved
+    client's own projects**: a project that belongs to a different client is not
+    this client's project, and pairing them is the cross-client guess the
+    classifier is already documented as making.
+
+    Returns ``(client_name, context_name, client_evidence, context_evidence)``.
+    Unresolvable or ambiguous input yields ``None`` and ``SCOPE_EVIDENCE_NONE``
+    rather than raising, because a name the tool cannot resolve means *no scope
+    signal*, never *no results*.
+    """
+    client_names = [c.get("name") for c in (clients or []) if c.get("name")]
+
+    resolved_client = None
+    client_evidence = SCOPE_EVIDENCE_NONE
+    if client:
+        resolved_client, client_evidence = _resolve_by_abbreviation(client, client_names)
+        if not resolved_client:
+            resolved_client, client_evidence = resolve_scope_name(client, client_names)
+
+    context_names = []
+    if resolved_client:
+        for c in (clients or []):
+            if c.get("name") == resolved_client:
+                context_names = [x.get("name") for x in (c.get("contexts") or [])
+                                 if x.get("name")]
+                break
+    elif context:
+        # No client resolved: fall back to every project, still by stored name.
+        context_names = [x.get("name") for c in (clients or [])
+                         for x in (c.get("contexts") or []) if x.get("name")]
+
+    resolved_context = None
+    context_evidence = SCOPE_EVIDENCE_NONE
+    if context and context_names:
+        resolved_context, context_evidence = _resolve_by_abbreviation(context, context_names)
+        if not resolved_context:
+            resolved_context, context_evidence = resolve_scope_name(context, context_names)
+
+    return (resolved_client, resolved_context, client_evidence, context_evidence)
+
+
 def text_windows(content, window=0, overlap=0):
     """Split text into overlapping windows so an LLM pass can see all of it.
 

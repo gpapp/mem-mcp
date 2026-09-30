@@ -10,9 +10,21 @@ error.
 """
 
 import ast
+import asyncio
 import os
 import re
+import time
 import unittest
+from typing import Optional
+
+from matching_utils import (
+    SCOPE_UNSCOPED,
+    identity_confidence,
+    plan_search_scope,
+    scope_axis_tier,
+    scope_context_tier,
+    scope_strength,
+)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FACT_MANAGER = os.path.join(HERE, "fact_manager.py")
@@ -685,3 +697,259 @@ class GraphScopeParamTests(unittest.TestCase):
                       self.fm.split("def _scope_and_cap_graph")[0][-400:])
         self.assertIn("return _filter_neighborhood_scope(nodes, client_id, context_id, unassigned)",
                       self.fm)
+
+
+# --- End-to-end scope ranking -------------------------------------------------
+#
+# `db_search_memories` is lifted whole and driven against stubs, because the
+# property under test is the one no single helper can show: the two Johns are
+# both returned, in the order the caller asked for, and the one that wins on
+# scope wins *despite* scoring lower. Every way this is wrong is silent -- a
+# filter would return fewer records, a sort key in the wrong place would return
+# them in vector order, and neither raises.
+
+LOCHAS_TEXT = (
+    "**Role:** Managing Director (MD) - Senior leader, direct report to Christian Reno "
+    "(DB CIO) / **Company/Team:** Deutsche Bank (DB) - Private Bank / **Domain:** AI "
+    "adoption, organizational strategy, Private Bank / Technology, Data Platforms / "
+    "**Notes:** Key senior stakeholder for the PBAI adoption program. Approver for the "
+    "'AI Adoption Office' investment and staffing proposal. Also referenced as "
+    "'John Locas' in some contexts (spelling variant)."
+)
+PORTER_TEXT = (
+    "Deutsche Bank regional architecture manager for US. Manages three architects in "
+    "the US who came from finance business analyst background."
+)
+BONIN_TEXT = (
+    "**Role:** Diligent Account Owner / **Company:** SAP (SGSC) / "
+    "**Email:** joao.bonin@sap.com / **Domain:** Software vendor account management"
+)
+RUEDIGER_TEXT = "Attended the SAP SE steering committee; listed as John on the attendee list."
+
+SCOPE_TREE = [
+    {"id": "c-db", "name": "Deutsche Bank (DB)", "active": True,
+     "contexts": [{"id": "x-ai", "name": "AI Enablement Hub", "active": True},
+                  {"id": "x-adopt", "name": "DB AI Adoption", "active": True}]},
+    {"id": "c-sapse", "name": "SAP SE", "active": False,
+     "contexts": [{"id": "x-handover", "name": "EA Handover", "active": True}]},
+    {"id": "c-sap", "name": "SAP", "active": True, "contexts": []},
+    {"id": "c-epam", "name": "EPAM", "active": True,
+     "contexts": [{"id": "x-ppc", "name": "PPC", "active": True},
+                  {"id": "x-mufg", "name": "MUFG", "active": True}]},
+    {"id": "c-wc", "name": "White Cube", "active": True, "contexts": []},
+    {"id": "c-lc", "name": "LC Security", "active": True, "contexts": []},
+    {"id": "c-val", "name": "Valantic FSA", "active": True, "contexts": []},
+]
+
+
+def _point(node_id, score, payload):
+    return type("P", (), {"id": node_id, "score": score, "payload": payload})()
+
+
+# Porter deliberately outscores Lochas on the vector axis: if scope did not
+# outrank score, this table would come back the wrong way round.
+JOHN_POINTS = [
+    _point("f-porter", 0.74, {
+        "text": PORTER_TEXT, "name": "John Benjamin Porter", "category": "People",
+        "clientName": "Deutsche Bank (DB)",
+        "metadata": {"first_name": "John Benjamin", "last_name": "Porter",
+                     "company": "Deutsche Bank"}}),
+    _point("f-lochas", 0.71, {
+        "text": LOCHAS_TEXT, "name": "John Lochas", "category": "People",
+        "clientName": "Deutsche Bank (DB)",
+        "metadata": {"first_name": "John", "last_name": "Lochas"}}),
+    _point("f-bonin", 0.70, {
+        "text": BONIN_TEXT, "name": "Joao Bonin", "category": "People",
+        "clientName": "SAP SE",
+        "metadata": {"first_name": "Joao", "last_name": "Bonin",
+                     "company": "SAP (SGSC)", "aliases": ["SAP"]}}),
+    _point("f-ruediger", 0.68, {
+        "text": RUEDIGER_TEXT, "name": "Ruediger John", "category": "People",
+        "clientName": "SAP SE",
+        "metadata": {"first_name": "Ruediger", "last_name": "John"}}),
+]
+
+# One record whose ONLY scope evidence is a RELEVANT_TO edge -- the shape the
+# classifier writes when it cannot pick a primary client.
+RELEVANT_TO_DB = {"f-lochas-rev": {"clients": ["Deutsche Bank (DB)"], "contexts": []}}
+
+
+class ScopePrioritySearchTests(unittest.TestCase):
+    """The user's own case: 'John' is two DB people; the scope decides which."""
+
+    def search(self, client=None, context=None, points=None, relevant=None,
+               category="People"):
+        from test_matching_regressions import REAL_SCOPE_TREE  # same vault shape
+        relevant = RELEVANT_TO_DB if relevant is None else relevant
+
+        class _Session:
+            def __enter__(self_inner):
+                return self_inner
+
+            def __exit__(self_inner, *exc):
+                return False
+
+            def run(self_inner, *args, **kwargs):
+                return []
+
+        class _Driver:
+            def session(self_inner):
+                return _Session()
+
+        async def _vector(*args, **kwargs):
+            return list(JOHN_POINTS if points is None else points)
+
+        async def _hydrate(*args, **kwargs):
+            return None
+
+        def _plan(client_arg, context_arg, user_id):
+            c, x, ce, xe = plan_search_scope(client_arg, context_arg, REAL_SCOPE_TREE)
+            return {"client": c, "context": x, "clientEvidence": ce, "contextEvidence": xe,
+                    "unresolvedClient": client_arg if not c else None,
+                    "unresolvedContext": context_arg if not x else None,
+                    "knownClients": [n for n, _ in REAL_SCOPE_TREE]}
+
+        namespace = {
+            "Optional": Optional, "time": time,
+            "get_qdrant": _sync(_Stub()), "get_neo4j": lambda: _Driver(),
+            "looks_like_person_name": lambda q: True,
+            "db_plan_search_scope": _plan,
+            "rewrite_search_query": _sync([("John", 1.0)]),
+            "CHUNK_FETCH_MULTIPLIER": 3, "WEAK_RESULT_LIMIT": 2,
+            "INACTIVE_PENALTY": 0.4, "INFERRED_SCOPE_BOOST": 0.3,
+            "_single_vector_search": _vector, "_hydrate_chunk_texts": _hydrate,
+            "_boost_result_score": lambda r, q: r.score,
+            "parent_of": lambda pid, payload: str(pid),
+            "_db_relevant_scope": lambda driver, uid, ids: relevant,
+            "db_get_client_status_map": lambda uid: {
+                "deutsche bank (db)": True, "sap se": False, "sap": True,
+                "epam": True, "white cube": True, "lc security": True,
+                "valantic fsa": True},
+            "scope_strength": scope_strength, "scope_axis_tier": scope_axis_tier,
+            "scope_context_tier": scope_context_tier,
+            "infer_scope_from_text": lambda q, uid: (None, ""),
+            "identity_confidence": identity_confidence,
+            "log_search_stats": lambda **kwargs: None,
+        }
+        fn = _lift_into("db_search_memories", namespace)
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(
+                fn("John", "memories", limit=10, category=category, top_p=0.0,
+                   client=client, context=context))
+        finally:
+            loop.close()
+
+    # -- the user's case ------------------------------------------------------
+
+    def test_both_johns_are_still_returned(self):
+        """Scope prioritises; it never removes. This is the whole contract."""
+        results = self.search(client="DB", context="AI Adoption")
+        names = [r["name"] for r in results]
+        self.assertIn("John Lochas", names)
+        self.assertIn("John Benjamin Porter", names)
+        # And the out-of-scope records are not deleted either -- a misclassified
+        # entry must still be findable, just last.
+        self.assertIn("Joao Bonin", names)
+        self.assertEqual(len(results), len(JOHN_POINTS))
+
+    def test_the_db_project_puts_lochas_first_despite_a_lower_score(self):
+        results = self.search(client="DB", context="AI Adoption")
+        porter = next(r for r in results if r["name"] == "John Benjamin Porter")
+        lochas = next(r for r in results if r["name"] == "John Lochas")
+        self.assertLess(lochas["score"], porter["score"],
+                        "the fixture no longer proves scope outranks the vector")
+        self.assertEqual([r["name"] for r in results][0], "John Lochas")
+        self.assertGreater(lochas["scopeStrength"], porter["scopeStrength"])
+        self.assertEqual(lochas["scopeContextTier"], "inferred")
+        self.assertEqual(lochas["scopeClientTier"], "assigned")
+
+    def test_the_client_alone_still_leaves_the_two_johns_ordered_by_score(self):
+        """With no project there is nothing to separate them, so score decides."""
+        results = self.search(client="DB")
+        top_two = [r["name"] for r in results[:2]]
+        self.assertEqual(top_two, ["John Benjamin Porter", "John Lochas"])
+
+    def test_a_sap_search_surfaces_the_sap_people_first(self):
+        results = self.search(client="SAP SE")
+        names = [r["name"] for r in results]
+        self.assertLess(names.index("Joao Bonin"), names.index("Ruediger John"))
+        # Both DB people come back, but both are behind the SAP pair.
+        self.assertEqual(names[2:], ["John Benjamin Porter", "John Lochas"],
+                         "a DB record should rank below the SAP records")
+        bonin = next(r for r in results if r["name"] == "Joao Bonin")
+        self.assertEqual(bonin["scopeClientTier"], "assigned")
+
+    def test_an_inactive_client_demotes_records_but_keeps_its_own(self):
+        """`SAP SE` is pinned inactive, and the caller named it on purpose.
+
+        The penalty exists so an unscoped search surfaces live work. Demoting
+        the client the caller explicitly asked for would answer with less than
+        was requested -- and Joao Bonin, the record this whole feature was built
+        for, lives under it.
+        """
+        results = self.search(client="SAP SE")
+        for r in results:
+            if r["name"] == "Joao Bonin":
+                self.assertNotIn("SAP SE", str(r["score"]))
+        bonin = next(r for r in results if r["name"] == "Joao Bonin")
+        self.assertAlmostEqual(bonin["score"], 0.70, places=6,
+                               msg="the inactive penalty was applied to the requested client")
+
+    def test_a_null_primary_record_is_still_found_by_its_relevant_link(self):
+        """RELEVANT_TO is the only scope evidence a null-primary record has.
+
+        The classifier writes those links before it gives up on a primary, so a
+        partition that reads only `clientName` demotes exactly the records that
+        need the help.
+        """
+        point = _point("f-lochas-rev", 0.55, {
+            "text": "PBAI steering update, notes circulated.", "name": "AI Adoption notes",
+            "category": "Work", "clientName": None, "metadata": {}})
+        results = self.search(client="DB", context="AI Adoption",
+                              points=[point], relevant=RELEVANT_TO_DB,
+                              category="Work")
+        first = results[0]
+        self.assertEqual(first["name"], "AI Adoption notes")
+        self.assertEqual(first["scopeClientTier"], "relevant")
+        self.assertGreater(first["scopeStrength"], SCOPE_UNSCOPED)
+
+    def test_an_unresolved_client_is_reported_and_removes_nothing(self):
+        """A typo must not read as "no results"."""
+        results = self.search(client="Deutsche Bankk")
+        self.assertEqual(len(results), len(JOHN_POINTS))
+        self.assertEqual(results[0]["scope"]["requestedClient"], None)
+        self.assertEqual(results[0]["scope"]["unresolvedClient"], "Deutsche Bankk")
+        self.assertTrue(results[0]["scope"]["knownClients"])
+
+    def test_no_requested_scope_leaves_the_ordering_untouched(self):
+        results = self.search()
+        self.assertEqual([r["name"] for r in results],
+                         ["John Benjamin Porter", "John Lochas", "Joao Bonin",
+                          "Ruediger John"])
+        self.assertTrue(all(r["scopeStrength"] == 0.0 for r in results))
+
+
+class _Stub:
+    def __bool__(self):
+        return True
+
+
+def _sync(value):
+    async def _f(*args, **kwargs):
+        return value
+    return _f
+
+
+def _lift_into(name, namespace):
+    """Exec `name` from fact_manager.py into a caller-supplied namespace."""
+    with open(FACT_MANAGER, "r", encoding="utf-8") as handle:
+        source = handle.read()
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            segment = ast.get_source_segment(source, node)
+            assert segment, f"could not lift the source of {name}"
+            exec(compile(segment, FACT_MANAGER, "exec"), namespace)
+            return namespace[name]
+    raise AssertionError(f"{name} not found in {FACT_MANAGER}")

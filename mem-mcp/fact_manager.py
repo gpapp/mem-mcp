@@ -21,12 +21,13 @@ from client_manager import (
     db_resolve_client, db_resolve_context,
     link_fact_to_client, link_fact_to_context,
     _resolve_client_by_id, _resolve_context_by_id,
-    infer_scope_from_text, db_get_client_status_map,
+    infer_scope_from_text, db_get_client_status_map, db_plan_search_scope,
     INFERRED_SCOPE_BOOST, INACTIVE_PENALTY
 )
 from matching_utils import (
     MIN_MATCH_CONFIDENCE,
     TTLCache,
+    EVIDENCE_CONFLICT,
     VECTOR_CEIL,
     VECTOR_FLOOR,
     cache_key,
@@ -35,6 +36,9 @@ from matching_utils import (
     identity_confidence,
     looks_like_person_name,
     people_match_allowed,
+    scope_axis_tier,
+    scope_context_tier,
+    scope_strength,
     scopes_compatible,
     validate_merge_ids,
 )
@@ -949,22 +953,25 @@ async def _hydrate_chunk_texts(qdrant, entries: list) -> None:
         entry["matchedChunk"] = payload.get("chunkText")
 
 
-async def _single_vector_search(qdrant, query: str, user_id: str, category: Optional[str], fetch_limit: int, top_p: float, client: Optional[str] = None, context: Optional[str] = None) -> list:
+async def _single_vector_search(qdrant, query: str, user_id: str, category: Optional[str], fetch_limit: int, top_p: float) -> list:
     """Run a single vector search against Qdrant. Returns raw results before boosting.
 
     ``top_p`` is a normalized confidence floor, not a raw cosine threshold: the
     embedder's useful band starts well above 0, so filtering here only discards
     results that could not pass the confidence gate after boosting. Passing 0.0
     disables the pre-filter and lets the caller decide.
+
+    There is deliberately no client/context filter here. Scope is a *ranking*
+    input, so filtering on ``clientName``/``contextName`` at this stage would
+    delete exactly the out-of-scope candidates that ``scope_strength`` needs in
+    order to rank the in-scope ones, and it compared a raw user-supplied string
+    against the stored name, so "DB" matched nothing and the tool answered with
+    silence rather than a lower-ranked list.
     """
     vec = await get_embedding(query)
     conditions = [FieldCondition(key="userId", match=MatchValue(value=user_id))]
     if category:
         conditions.append(FieldCondition(key="category", match=MatchValue(value=category.strip().capitalize())))
-    if client:
-        conditions.append(FieldCondition(key="clientName", match=MatchValue(value=client.strip())))
-    if context:
-        conditions.append(FieldCondition(key="contextName", match=MatchValue(value=context.strip())))
 
     filt = Filter(must=conditions)
     # Translate the confidence floor into the narrowest equivalent raw threshold.
@@ -1063,14 +1070,75 @@ def _boost_result_score(point, query_lower: str) -> float:
     return score
 
 
-async def db_search_memories(query: str, user_id: str, limit: int = 5, category: Optional[str] = None, top_p: float = 0.4, client: Optional[str] = None, context: Optional[str] = None) -> list:
-    """Search facts, ranking by score and filtering by normalized confidence.
+def _db_relevant_scope(neo4j_driver, user_id: str, record_ids: list) -> dict:
+    """``{record_id: {"clients": [...], "contexts": [...]}}`` from RELEVANT_TO edges.
 
-    Two independent rankings are combined. ``score`` is the legacy blended value
-    (vector similarity plus additive name heuristics) and is kept unchanged for
-    ranking and back-compat. ``confidence`` is a normalized 0-1 value derived by
-    ``identity_confidence`` and is what ``top_p`` filters on, because the blended
-    score is not a similarity and cannot be thresholded meaningfully.
+    Read in one batched query per search rather than denormalised into the Qdrant
+    payload, because it works on the data that exists right now (358 edges today)
+    and it keeps the chunk-family rules out of it entirely.
+
+    Both halves of the query are load-bearing and neither is guessable from the
+    surrounding code:
+
+    - ``(n:Fact OR n:DiaryEntry)``. A plain ``MATCH (n:Fact ...)`` returns
+      nothing for a diary entry, which would silently drop the RELEVANT_TO signal
+      for every entry -- exactly the records whose only scope evidence is a
+      RELEVANT_TO link, since the classifier writes those before it gives up on a
+      primary.
+    - ``CASE WHEN rc:Context THEN 'context' ELSE 'client' END``. RELEVANT_TO is
+      allowed to target a Client *or* a Context. A reader that assumed ``:Client``
+      would put a project name in the client list and the tier would be scored
+      against the wrong axis.
+
+    A failure here degrades to "no relevant links", which is a weaker ranking and
+    never a lost result.
+    """
+    out = {}
+    if not record_ids:
+        return out
+    try:
+        with neo4j_driver.session() as s:
+            result = s.run(
+                """
+                MATCH (n {userId: $userId})
+                WHERE n.id IN $ids AND (n:Fact OR n:DiaryEntry)
+                OPTIONAL MATCH (n)-[:RELEVANT_TO]->(rc)
+                RETURN n.id AS id,
+                       collect(DISTINCT {name: rc.name,
+                                         kind: CASE WHEN rc:Context THEN 'context' ELSE 'client' END}) AS relevant
+                """,
+                userId=user_id, ids=list(record_ids),
+            )
+            for r in result:
+                clients, contexts = [], []
+                for item in r["relevant"] or []:
+                    if not item or not item.get("name"):
+                        continue
+                    (contexts if item.get("kind") == "context" else clients).append(item["name"])
+                out[r["id"]] = {"clients": clients, "contexts": contexts}
+    except Exception as exc:
+        logger.warning(f"RELEVANT_TO lookup failed, ranking without secondary scope: {exc}")
+    return out
+
+
+async def db_search_memories(query: str, user_id: str, limit: int = 5, category: Optional[str] = None, top_p: float = 0.4, client: Optional[str] = None, context: Optional[str] = None) -> list:
+    """Search facts, ranking by scope then score, filtered by normalized confidence.
+
+    Three independent rankings are combined. ``scopeStrength`` is the scope the
+    caller asked for (``client``/``context``), resolved to canonical stored names
+    and compared per record by ``scope_strength``. ``score`` is the legacy
+    blended value (vector similarity plus additive name heuristics) and is kept
+    unchanged for ranking and back-compat. ``confidence`` is a normalized 0-1
+    value derived by ``identity_confidence`` and is what ``top_p`` filters on,
+    because the blended score is not a similarity and cannot be thresholded
+    meaningfully.
+
+    Scope **prioritises and never excludes**. A record filed under another client,
+    or under none at all, still comes back -- it simply ranks below a record that
+    matches the requested scope, and its own score decides among equals. Filtering
+    on scope instead was silently lossy twice: an unresolvable name returned an
+    empty list, and the boost that was supposed to reorder the rest ran after the
+    filter had already deleted it.
 
     Results at or above ``top_p`` come first. Results below it are returned after
     the confident set, flagged ``weak: True`` and capped, so recall is preserved
@@ -1083,6 +1151,13 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
         raise RuntimeError("Databases not connected.")
 
     name_like = (category or "").strip().lower() == "people" and looks_like_person_name(query)
+
+    # 0. Resolve the requested scope to canonical stored names. An unresolvable
+    # name means "no scope signal", not "no results" -- it is reported on the
+    # results so the caller can see the spelling that was asked for was ignored.
+    scope = db_plan_search_scope(client, context, user_id)
+    want_client = scope["client"]
+    want_context = scope["context"]
 
     # 1. Neo4j exact/substring match on name or aliases
     # We do a quick lookup for nodes containing the query
@@ -1105,10 +1180,11 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
             """
         if category:
             cypher += " AND toLower(f.category) = toLower($category)"
-        if client:
-            cypher += " AND EXISTS((f)-[:FOR_CLIENT]->(:Client {name: $clientName, userId: $userId}))"
-        if context:
-            cypher += " AND EXISTS((f)-[:IN_CONTEXT]->(:Context {name: $contextName, userId: $userId}))"
+        # No FOR_CLIENT/IN_CONTEXT EXISTS clause here. This exact-match pass used
+        # to be filtered by scope, which meant an unresolvable client name (or
+        # the abbreviation "DB" against the node "Deutsche Bank (DB)") silently
+        # emptied this set before the vector pass could even run. Scope now
+        # ranks; it never removes.
         cypher += " OPTIONAL MATCH (f)-[:FOR_CLIENT]->(fc:Client)"
         cypher += " OPTIONAL MATCH (f)-[:IN_CONTEXT]->(fx:Context)"
         cypher += " RETURN f, fc.name AS clientName, fx.name AS contextName ORDER BY f.name LIMIT 25"
@@ -1116,10 +1192,6 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
         params = {"userId": user_id, "query_str": query}
         if category:
             params["category"] = category.strip()
-        if client:
-            params["clientName"] = client.strip()
-        if context:
-            params["contextName"] = context.strip()
 
         neo_result = s.run(cypher, **params)
         for r in neo_result:
@@ -1183,11 +1255,14 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
     # Long queries go through the LLM rewriter. Short queries only get expanded
     # when the exact-name lookup found nothing, so a name-shaped miss is retried
     # while an ordinary hit stays a single embedding.
+    # The rewriter gets the *resolved* names: it echoes them into the query
+    # variants, and an unresolvable raw string ("DB" against the node
+    # "Deutsche Bank (DB)") would contribute no usable terms.
     query_variants = await rewrite_search_query(
         query,
         category=category,
-        client=client,
-        context=context,
+        client=want_client,
+        context=want_context,
         expand=not exact_matches,
     )
     # A chunked record occupies one fetch slot per chunk, so the raw limit has to
@@ -1198,7 +1273,7 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
     all_vector_results = {}  # record id -> best result across all variants
 
     for variant_query, weight in query_variants:
-        raw_points = await _single_vector_search(qdrant, variant_query, user_id, category, fetch_limit, top_p, client, context)
+        raw_points = await _single_vector_search(qdrant, variant_query, user_id, category, fetch_limit, top_p)
 
         for r in raw_points:
             boosted_score = _boost_result_score(r, variant_query.lower())
@@ -1245,39 +1320,57 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
     if category:
         final_list = [r for r in final_list if r.get("category", "").lower() == category.lower()]
 
-    # Apply client/context scoring (names live top-level; fall back to metadata).
-    # Explicit scope boosts; inferred scope is a weaker boost-only fallback;
-    # inactive clients are penalized in unscoped (global) search only.
-    if client:
+    # Scope ranking. This is a separate number from `score` and a separate
+    # concern from `confidence`: it says how well the record matches the scope
+    # that was ASKED FOR, not how well it matches the query, and it removes
+    # nothing. `confidence` stays identity-only -- `identity_confidence` returns
+    # `max(identity_strength, vector_confidence)`, so a scope term folded in there
+    # would outrank identity evidence and report a record with no name match at
+    # all as a confirmed identity match.
+    relevant_by_id = _db_relevant_scope(neo4j_driver, user_id, [r["id"] for r in final_list])
+    status_map = db_get_client_status_map(user_id)
+    for r in final_list:
+        meta = r.get("metadata") or {}
+        cname = r.get("clientName") or meta.get("clientName", "")
+        xname = r.get("contextName") or meta.get("contextName", "")
+        relevant = relevant_by_id.get(r["id"], {})
+        r["scopeStrength"] = scope_strength(
+            want_client,
+            want_context,
+            result_client=cname,
+            result_context=xname,
+            relevant_client_names=relevant.get("clients", ()),
+            relevant_context_names=relevant.get("contexts", ()),
+            record_text=r.get("text") or "",
+        )
+        r["scopeClientTier"] = scope_axis_tier(
+            want_client, cname, relevant.get("clients", ()), r.get("text") or "")
+        r["scopeContextTier"] = scope_context_tier(
+            want_context, xname, relevant.get("contexts", ()), r.get("text") or "")
+
+    # Inactive clients are demoted in an unscoped search, and in a scoped one
+    # too -- but never when the scope asked for IS that client. A client pinned
+    # inactive by hand still holds its records, and a caller who named it
+    # explicitly has said what they want; demoting them there would make the
+    # search answer with less than the user asked for.
+    if status_map:
         for r in final_list:
-            cname = r.get("clientName") or r.get("metadata", {}).get("clientName", "")
-            if (cname or "").lower() == client.lower():
-                r["score"] += 0.3
-    else:
-        # Fetch status map first so inactive clients skip the inferred boost too.
-        status_map = db_get_client_status_map(user_id)
-        # A name-shaped query cannot name a client, so skip the inference round
-        # trip entirely on the highest-volume search shape.
-        inferred_client = None
-        if not name_like:
-            inferred_client, _ = infer_scope_from_text(query, user_id)
+            cname = (r.get("clientName") or (r.get("metadata") or {}).get("clientName", "") or "").lower()
+            if not cname or cname == (want_client or "").lower():
+                continue
+            if status_map.get(cname) is False:
+                r["score"] -= INACTIVE_PENALTY
+
+    # Query-inferred scope is a score boost, not a ranking signal: it fires when
+    # the QUERY text names a client and the caller asked for no scope. A
+    # name-shaped query cannot name a client, so it skips the round trip.
+    if not want_client and not name_like:
+        inferred_client, _ = infer_scope_from_text(query, user_id)
         if inferred_client:
             for r in final_list:
-                cname = r.get("clientName") or r.get("metadata", {}).get("clientName", "")
-                cname_lower = (cname or "").lower()
-                # Don't boost inactive clients even if the query text mentions them.
-                if cname_lower == inferred_client.lower() and status_map.get(cname_lower) is not False:
+                cname = (r.get("clientName") or (r.get("metadata") or {}).get("clientName", "") or "").lower()
+                if cname == inferred_client.lower() and status_map.get(cname) is not False:
                     r["score"] += INFERRED_SCOPE_BOOST
-        if status_map:
-            for r in final_list:
-                cname = (r.get("clientName") or r.get("metadata", {}).get("clientName", "") or "").lower()
-                if cname and status_map.get(cname) is False:
-                    r["score"] -= INACTIVE_PENALTY
-    if context:
-        for r in final_list:
-            xname = r.get("contextName") or r.get("metadata", {}).get("contextName", "")
-            if (xname or "").lower() == context.lower():
-                r["score"] += 0.3
 
     # Normalized identity confidence drives thresholding; score drives ranking.
     for r in final_list:
@@ -1294,7 +1387,7 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
         r["confidence"] = round(confidence, 3)
         r["evidence"] = evidence
 
-    final_list.sort(key=lambda x: (x["score"], x["confidence"]), reverse=True)
+    final_list.sort(key=lambda x: (x["scopeStrength"], x["score"], x["confidence"]), reverse=True)
     confident = [r for r in final_list if r["confidence"] >= top_p]
     weak = [r for r in final_list if r["confidence"] < top_p]
 
@@ -1302,6 +1395,18 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
     for r in weak[:WEAK_RESULT_LIMIT]:
         r["weak"] = True
         results.append(r)
+
+    for r in results:
+        r["scope"] = {
+            "requestedClient": want_client,
+            "requestedContext": want_context,
+            "strength": r["scopeStrength"],
+            "clientTier": r["scopeClientTier"],
+            "contextTier": r["scopeContextTier"],
+            "unresolvedClient": scope["unresolvedClient"],
+            "unresolvedContext": scope["unresolvedContext"],
+            "knownClients": scope["knownClients"],
+        }
 
     log_search_stats(
         query=query,
@@ -1320,6 +1425,7 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
                 "score": r["score"],
                 "confidence": r["confidence"],
                 "evidence": r["evidence"],
+                "scopeStrength": r["scopeStrength"],
                 "weak": bool(r.get("weak")),
             }
             for r in results[:5]

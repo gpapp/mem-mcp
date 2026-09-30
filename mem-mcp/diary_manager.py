@@ -19,6 +19,9 @@ from common import (
 from matching_utils import (
     parse_people_name_array,
     resolve_people_candidates,
+    scope_axis_tier,
+    scope_context_tier,
+    scope_strength,
     text_windows,
 )
 from chunking import (
@@ -32,7 +35,7 @@ from chunking import (
 from client_manager import (
     link_diary_to_client, link_diary_to_context,
     _resolve_client_by_id, _resolve_context_by_id, _stamp_manual_scope,
-    infer_scope_from_text, db_get_client_status_map,
+    infer_scope_from_text, db_get_client_status_map, db_plan_search_scope,
     INFERRED_SCOPE_BOOST, INACTIVE_PENALTY
 )
 
@@ -543,26 +546,36 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
     Uses LLM query rewriting for multi-variant search and boosts results whose
     stored keywords match the query terms.
 
-    Optional client/context parameters filter results to specific client or context scope.
+    ``client``/``context`` **prioritise and never exclude**, exactly as in
+    ``db_search_memories``: they are resolved to canonical stored names and turned
+    into a ``scopeStrength`` ranking, while every entry stays a candidate. A
+    ``FieldCondition`` on ``clientName`` did both wrong things at once -- it
+    compared a raw user string against the stored name (so ``"DB"`` matched
+    nothing at all and the search came back empty), and it deleted the very
+    entries ``scopeStrength`` needs in order to rank the rest.
     """
-    from fact_manager import rewrite_search_query
+    from fact_manager import rewrite_search_query, _db_relevant_scope
 
     qdrant = await get_qdrant()
     neo4j_driver = get_neo4j()
     if not qdrant or not neo4j_driver:
         raise RuntimeError("Database connections not established.")
 
+    # 0. Resolve the requested scope up front, so the query rewriter and the
+    #    ranking both work off the stored spellings rather than whatever the
+    #    caller typed. An unresolvable name resolves to None, which means "no
+    #    scope signal" -- never "no results".
+    scope = db_plan_search_scope(client, context, user_id)
+    want_client = scope["client"]
+    want_context = scope["context"]
+
     # 1. Rewrite query into keyword variants for better semantic coverage
-    query_variants = await rewrite_search_query(query, client=client, context=context)
+    query_variants = await rewrite_search_query(query, client=want_client, context=want_context)
     # A chunked entry contributes one point per chunk, so each entry can appear
     # several times in a single result set. Over-fetch or a long entry crowds
     # every other entry out of the window before the merge below can collapse it.
     fetch_limit = max(limit * 4 * CHUNK_FETCH_MULTIPLIER, 20)
     conditions = [FieldCondition(key="userId", match=MatchValue(value=user_id))]
-    if client:
-        conditions.append(FieldCondition(key="clientName", match=MatchValue(value=client.strip())))
-    if context:
-        conditions.append(FieldCondition(key="contextName", match=MatchValue(value=context.strip())))
     filt = Filter(must=conditions)
 
     # 2. Multi-variant vector search — merge by best score per entry
@@ -615,7 +628,54 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
             if entry_id not in all_results or score > all_results[entry_id]["score"]:
                 all_results[entry_id] = {"point": r, "score": score}
 
-    # 3. Apply top_p threshold after merging all variants
+    # 3. Scope ranking, before the top_p cut. Ordering has to happen first so the
+    #    limit is spent on the entries the caller asked for; the threshold still
+    #    runs on the blended `score` alone, which is this path's existing
+    #    (inconsistent with fact search) behaviour and is deliberately unchanged.
+    relevant_by_id = _db_relevant_scope(neo4j_driver, user_id, list(all_results.keys()))
+    status_map = db_get_client_status_map(user_id)
+    for rid, v in all_results.items():
+        p = v["point"].payload or {}
+        meta = p.get("metadata") or {}
+        cname = p.get("clientName") or meta.get("clientName", "")
+        xname = p.get("contextName") or meta.get("contextName", "")
+        rel = relevant_by_id.get(rid, {})
+        text = p.get("content") or p.get("chunkText") or p.get("name") or ""
+        v["scopeStrength"] = scope_strength(
+            want_client,
+            want_context,
+            result_client=cname,
+            result_context=xname,
+            relevant_client_names=rel.get("clients", ()),
+            relevant_context_names=rel.get("contexts", ()),
+            record_text=text,
+        )
+        v["scopeClientTier"] = scope_axis_tier(want_client, cname, rel.get("clients", ()), text)
+        v["scopeContextTier"] = scope_context_tier(want_context, xname, rel.get("contexts", ()), text)
+
+    # Inactive clients are demoted -- unless the requested scope IS that client,
+    # in which case the caller has said what they want and a hand-pinned inactive
+    # status must not empty the answer.
+    if status_map:
+        for v in all_results.values():
+            p = v["point"].payload or {}
+            cname = (p.get("clientName") or (p.get("metadata") or {}).get("clientName", "") or "").lower()
+            if not cname or cname == (want_client or "").lower():
+                continue
+            if status_map.get(cname) is False:
+                v["score"] -= INACTIVE_PENALTY
+
+    # Query-inferred scope is a score boost, not a ranking signal: it fires only
+    # when the query text names a client and the caller asked for no scope.
+    if not want_client:
+        inferred_client, _ = infer_scope_from_text(query, user_id)
+        if inferred_client:
+            for v in all_results.values():
+                p = v["point"].payload or {}
+                cname = (p.get("clientName") or (p.get("metadata") or {}).get("clientName", "") or "").lower()
+                if cname == inferred_client.lower() and status_map.get(cname) is not False:
+                    v["score"] += INFERRED_SCOPE_BOOST
+
     passing = {rid: v for rid, v in all_results.items() if v["score"] >= top_p}
 
     # The best-scoring chunk of a long entry is usually not chunk 0, and only
@@ -676,41 +736,26 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
             "contextName": r.payload.get("contextName"),
             "metadata": r.payload.get("metadata") or {},
             "mentions": mentions,
+            "scopeStrength": v.get("scopeStrength", 0.0),
+            "scope": {
+                "requestedClient": want_client,
+                "requestedContext": want_context,
+                "strength": v.get("scopeStrength", 0.0),
+                "clientTier": v.get("scopeClientTier"),
+                "contextTier": v.get("scopeContextTier"),
+                "unresolvedClient": scope["unresolvedClient"],
+                "unresolvedContext": scope["unresolvedContext"],
+            },
         }
         if v.get("matchedChunk"):
             entry["matchedChunk"] = v["matchedChunk"]
         entries.append(entry)
 
-    # Apply client/context scoring. Explicit scope boosts; inferred scope is a
-    # weaker boost-only fallback; inactive clients penalized in global search only.
-    if client:
-        for e in entries:
-            cname = e.get("clientName") or e.get("metadata", {}).get("clientName", "")
-            if (cname or "").lower() == client.lower():
-                e["score"] += 0.3
-    else:
-        # Fetch status map first so inactive clients skip the inferred boost too.
-        status_map = db_get_client_status_map(user_id)
-        inferred_client, _ = infer_scope_from_text(query, user_id)
-        if inferred_client:
-            for e in entries:
-                cname = e.get("clientName") or e.get("metadata", {}).get("clientName", "")
-                cname_lower = (cname or "").lower()
-                # Don't boost inactive clients even if the query text mentions them.
-                if cname_lower == inferred_client.lower() and status_map.get(cname_lower) is not False:
-                    e["score"] += INFERRED_SCOPE_BOOST
-        if status_map:
-            for e in entries:
-                cname = (e.get("clientName") or e.get("metadata", {}).get("clientName", "") or "").lower()
-                if cname and status_map.get(cname) is False:
-                    e["score"] -= INACTIVE_PENALTY
-    if context:
-        for e in entries:
-            xname = e.get("contextName") or e.get("metadata", {}).get("contextName", "")
-            if (xname or "").lower() == context.lower():
-                e["score"] += 0.3
-
-    entries.sort(key=lambda x: x["score"], reverse=True)
+    # Scope is the primary key and score the tiebreak within a scope tier, so the
+    # limit is spent on the entries the caller asked for rather than on whichever
+    # vector similarity happened to lead. Everything still returns: an entry
+    # assigned elsewhere only ranks lower.
+    entries.sort(key=lambda x: (x["scopeStrength"], x["score"]), reverse=True)
     return entries[:limit]
 
 

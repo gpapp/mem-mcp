@@ -81,7 +81,7 @@ No memory writes happen in this phase.
 
 Across **all** digests:
 
-1. Resolve people and client/context against memory (`search_facts` by name-only, `list_clients`).
+1. Resolve people and client/context against memory (`search_facts` by name-only, `list_clients`). Pass the tentatively identified `client` (and `context`) to `search_facts` when there is one — it prioritises that scope rather than filtering, so the same-first-name/different-client candidates still surface for the human gate.
 2. **Auto-approve** confident single matches (name + role/company aligns) — log the decision, do not ask.
 3. Collect every genuine ambiguity from every file: unknown names, no-match people, client/context for ambiguous meetings, plus all `UNRESOLVED` timestamps and `CONFLICT` resolutions from Phase 0.
 4. Ask **one** consolidated `question` call (multiple questions, lettered options, `custom: false`) covering all of them.
