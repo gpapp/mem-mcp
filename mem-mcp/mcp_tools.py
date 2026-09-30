@@ -499,6 +499,7 @@ async def suggest_merge(cluster_json: str):
         raw_review = await mem.get_llm_response(
             review_prompt,
             system=review_system,
+            model=mem.SCOPE_MODEL,
             num_predict=500,
         )
         match = re.search(r"\{.*\}", raw_review, re.DOTALL)

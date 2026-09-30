@@ -14,7 +14,7 @@ from qdrant_client.models import PointStruct, Filter, FieldCondition, MatchValue
 import re
 from common import (
     get_qdrant, get_neo4j, logger, get_embedding, get_llm_response, publish_db_event,
-    DIARY_COLLECTION, QDRANT_URL, clean_extracted_people_names
+    DIARY_COLLECTION, QDRANT_URL, clean_extracted_people_names, EXTRACT_MODEL
 )
 from matching_utils import (
     parse_people_name_array,
@@ -180,7 +180,8 @@ async def extract_diary_keywords(name: str, content: str) -> list:
         # a fragment of, and the name is one of the better keywords anyway.
         text = f"{name}\n{window}" if name else window
         try:
-            raw = await get_llm_response(text, system=_KEYWORD_EXTRACT_SYSTEM)
+            raw = await get_llm_response(text, system=_KEYWORD_EXTRACT_SYSTEM,
+                                         model=EXTRACT_MODEL)
             raw = re.sub(r"```[a-z]*\n?", "", raw).strip()
             json_match = re.search(r'\{[^{}]*"keywords"[^{}]*\}', raw, re.DOTALL)
             if not json_match:
@@ -282,6 +283,7 @@ async def _extract_people_names(content: str) -> list:
     for index, window in enumerate(windows):
         try:
             raw = await get_llm_response(window, system=_PEOPLE_EXTRACT_SYSTEM,
+                                         model=EXTRACT_MODEL,
                                          num_predict=PEOPLE_EXTRACT_MAX_TOKENS)
             names = parse_people_name_array(raw)
             if names is None:

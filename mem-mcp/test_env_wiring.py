@@ -130,6 +130,95 @@ class DashboardRenderTests(unittest.TestCase):
                     )
 
 
+class ModelRoleRoutingTests(unittest.TestCase):
+    """Which chat model each role actually calls.
+
+    The four chat roles are deliberately not one knob: extraction is
+    high-volume and mechanical, judgement is low-volume and consequential, and
+    they measured best with different models on this host. Every role that does
+    not pass `model=` silently inherits LLM_QUERY_MODEL, so a role can be moved
+    onto the wrong model by someone adding an argument, or by someone deleting
+    one, with no error anywhere -- the call still succeeds, it just quietly
+    produces worse output.
+
+    A test of the helper is not a test of the call site: `EXTRACT_MODEL` being
+    correct in common.py says nothing about whether diary_manager actually
+    passes it. So these assert on the call sites.
+    """
+
+    def _call_sites(self, filename, needle):
+        """The get_llm_response(...) calls in a module, as source text."""
+        path = os.path.join(_HERE, filename)
+        with open(path, "r", encoding="utf-8") as handle:
+            src = handle.read().replace("\r\n", "\n")
+        return [m.group() for m in re.finditer(
+            r"get_llm_response\((?:[^()]|\([^()]*\))*\)", src)]
+
+    def test_the_extraction_roles_pass_the_extract_model(self):
+        """Diary keywords and people names are extraction roles.
+
+        These were the two that measured granite's win: 99.0% keyword precision
+        with 0 invented terms against nemotron's 79.7% with 5, and people-name
+        F1 0.938 against 0.920, at 2.3-4.2x the speed.
+        """
+        for module, label in (("diary_manager.py", "diary extractors"),
+                              ("fact_manager.py", "search rewrite")):
+            calls = self._call_sites(module, "EXTRACT_MODEL")
+            self.assertTrue(calls, msg=f"{label}: no get_llm_response calls found")
+            self.assertTrue(
+                any("model=EXTRACT_MODEL" in c for c in calls),
+                msg=(f"{label}: no call passes model=EXTRACT_MODEL, so it inherits "
+                     f"LLM_QUERY_MODEL and the measured extraction win is lost.\n"
+                     f"calls found:\n" + "\n".join(calls)))
+
+    def test_the_extraction_roles_pass_it_on_every_extraction_call(self):
+        """Both diary extractors must pass it, not just one.
+
+        Half a split is the failure that survives review: the keyword call is
+        moved and the people call is missed, and both look correct in the diff.
+        """
+        # Match the CALL, not the prompt's definition. Finding the constant's
+        # name finds its assignment first -- which is a prompt string hundreds
+        # of lines from the call that uses it, so the first version of this test
+        # failed against correct code.
+        for system_name in ("_KEYWORD_EXTRACT_SYSTEM", "_PEOPLE_EXTRACT_SYSTEM"):
+            calls = [c for c in self._call_sites("diary_manager.py", system_name)
+                     if f"system={system_name}" in c]
+            self.assertTrue(calls, msg=f"no call passes {system_name}")
+            for call in calls:
+                self.assertIn("model=EXTRACT_MODEL", call,
+                              msg=(f"the {system_name} call does not pass "
+                                   f"model=EXTRACT_MODEL, so it inherits "
+                                   f"LLM_QUERY_MODEL"))
+
+    def test_merge_review_uses_a_judgement_model(self):
+        """Duplicate adjudication goes to the scope model, not the extract model.
+
+        Measured: on a genuine duplicate nemotron answered "merge" and granite
+        answered "review". Merging is the expensive mistake here and never
+        merging is the recoverable one, so this role does not get the faster
+        model just because it is faster.
+        """
+        calls = self._call_sites("mcp_tools.py", "SCOPE_MODEL")
+        self.assertTrue(
+            any("model=mem.SCOPE_MODEL" in c for c in calls),
+            msg=("the merge-review call does not pass a judgement model; "
+                 "it inherits LLM_QUERY_MODEL"))
+
+    def test_the_split_does_not_silently_collapse(self):
+        """EXTRACT_MODEL must be able to differ, and must default sanely.
+
+        If this read `EXTRACT_MODEL = LLM_QUERY_MODEL` with no env override,
+        every call-site test above would still pass while the split did nothing.
+        """
+        with open(os.path.join(_HERE, "common.py"), encoding="utf-8") as handle:
+            common = handle.read()
+        self.assertTrue('os.getenv("MEM_EXTRACT_MODEL")' in common,
+                        msg="MEM_EXTRACT_MODEL is not read from the environment")
+        self.assertTrue("or LLM_QUERY_MODEL" in common,
+                        msg="EXTRACT_MODEL has no default, so an unset knob crashes")
+
+
 class EnvWiringTests(unittest.TestCase):
     def setUp(self):
         self.declared = _declared()

@@ -1500,6 +1500,11 @@ def _load_rewrite(cache, responder):
         "QUERY_REWRITE_CACHE": cache,
         "get_llm_response": responder,
         "SEARCH_LLM_TIMEOUT": 45.0,
+        # rewrite_search_query names the extraction model explicitly now. A
+        # NameError on this name is swallowed by the function's own except and
+        # silently degraded to the heuristic fallback, so without this stub entry
+        # the cache tests would keep passing while testing nothing.
+        "EXTRACT_MODEL": "stub-extract-model",
         "logger": FakeLogger(),
     }
     exec("\n\n".join(chunks), ns)
@@ -1518,9 +1523,11 @@ class RewriteSearchQueryCallSiteTests(unittest.TestCase):
 
     def _responder(self, answer=None, raises=None):
         self.calls = []
+        self.models = []
 
         async def _r(prompt, system="", model="", num_predict=0, timeout=0.0):
             self.calls.append(prompt)
+            self.models.append(model)
             if raises is not None:
                 raise raises
             return self.ANSWER if answer is None else answer
@@ -1539,6 +1546,20 @@ class RewriteSearchQueryCallSiteTests(unittest.TestCase):
         self.assertEqual(len(self.calls), 1,
                          msg=f"expected one LLM call, got {len(self.calls)}")
         self.assertEqual(first, second)
+
+    def test_the_search_rewrite_calls_the_extraction_model(self):
+        """Search rewriting moved onto MEM_EXTRACT_MODEL; prove it took.
+
+        Counted off the value the stub was actually handed, not read from the
+        source: the rewrite sits in front of the user, and the model that
+        measured 2.3-4.2x faster is the whole reason it was moved. Silently
+        inheriting the query model again would keep returning correct keywords
+        and cost the user a slower search, with nothing failing.
+        """
+        cache = TTLCache(ttl=900.0, max_entries=8)
+        responder = self._responder()
+        self._run(cache, responder, "who is running the ai adoption wave two")
+        self.assertEqual(self.models, ["stub-extract-model"])
 
     def test_the_returned_list_is_a_copy_of_the_cached_one(self):
         # Callers weight and slice the result. A shared list would let one

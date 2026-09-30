@@ -216,6 +216,19 @@ MERGE_MODEL = os.getenv("MEM_MERGE_MODEL") or "gemma4:e2b"
 # Model used for server-side scope classification (client/context backfill).
 # Override with MEM_SCOPE_MODEL if a more capable model is available in Ollama.
 SCOPE_MODEL = os.getenv("MEM_SCOPE_MODEL") or LLM_QUERY_MODEL
+# Model for EXTRACTION roles: diary keywords, people names, search rewriting.
+# Split out because extraction and judgement want different models, and one
+# knob cannot be right for both. Extraction is high-volume and mechanical, so it
+# wants the fastest model that will not invent terms; judgement is low-volume
+# and consequential, so it wants the model that does not guess. Measured on this
+# host: granite3.3:2b beat nemotron-3-nano:4b on keyword precision (99.0% vs
+# 79.7%), invented keywords (0 vs 5) and people-name F1 (0.938 vs 0.920), while
+# being 2.3-4.2x faster. Nemotron kept judgement roles: it answered `merge` on a
+# true duplicate where granite answered `review`, and it is the only one of the
+# two to return zero null scope verdicts -- a null is stamped with
+# scopeCheckedSig and never revisited, so it is permanent, not a retry.
+# Defaults to LLM_QUERY_MODEL, so an operator who sets nothing changes nothing.
+EXTRACT_MODEL = os.getenv("MEM_EXTRACT_MODEL") or LLM_QUERY_MODEL
 # Set MEM_SCOPE_BACKFILL=0 to skip the LLM scope backfill pass at startup.
 SCOPE_BACKFILL_ENABLED = os.getenv("MEM_SCOPE_BACKFILL", "1") == "1"
 SCOPE_BACKFILL_CONCURRENCY = int(os.getenv("MEM_SCOPE_CONCURRENCY", "3"))
@@ -369,7 +382,8 @@ def _ollama_model_matches(installed, wanted: str) -> bool:
 
 async def ensure_ollama_models() -> None:
     """Ensure every configured Ollama model is available before startup work."""
-    models = list(dict.fromkeys((EMBED_MODEL, LLM_QUERY_MODEL, SCOPE_MODEL, MERGE_MODEL)))
+    models = list(dict.fromkeys((EMBED_MODEL, LLM_QUERY_MODEL, EXTRACT_MODEL,
+                                 SCOPE_MODEL, MERGE_MODEL)))
     if not wait_for_service(OLLAMA_URL, "Ollama"):
         raise RuntimeError(f"Ollama is not reachable at {OLLAMA_URL}")
 

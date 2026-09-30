@@ -13,7 +13,9 @@ from qdrant_client.models import PointStruct, Filter, FieldCondition, MatchValue
 
 from common import (
     get_qdrant, get_neo4j, logger, get_embedding, get_llm_response, publish_db_event,
-    log_search_stats, COLLECTION_NAME, DIARY_COLLECTION, SEARCH_LLM_TIMEOUT)
+    log_search_stats, COLLECTION_NAME, DIARY_COLLECTION, SEARCH_LLM_TIMEOUT,
+    EXTRACT_MODEL,
+)
 from client_manager import (
     db_create_client, db_create_context, db_list_clients,
     db_resolve_client, db_resolve_context,
@@ -829,7 +831,8 @@ async def rewrite_search_query(query: str, category: Optional[str] = None,
     prompt = f"SEARCH FILTERS: {filters}\nQUERY: {q}"
     try:
         import json as _json
-        raw = await get_llm_response(prompt, system=system, timeout=SEARCH_LLM_TIMEOUT)
+        raw = await get_llm_response(prompt, system=system, model=EXTRACT_MODEL,
+                                   timeout=SEARCH_LLM_TIMEOUT)
         # Strip optional markdown code fences
         raw = re.sub(r"```[a-z]*\n?", "", raw).strip()
         json_match = re.search(r'\{[^{}]*"keywords"[^{}]*\}', raw, re.DOTALL)

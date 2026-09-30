@@ -90,6 +90,10 @@ def _lift_keyword_extractor(llm, recorder=None, **overrides):
         "get_llm_response": llm,
         "_clean_keywords": clean,
         "_KEYWORD_EXTRACT_SYSTEM": "stub system prompt",
+        # The function passes this explicitly now that extraction has its own
+        # model. The stub LLM asserts on `model`, so a NameError here would be
+        # indistinguishable from a broken extractor.
+        "EXTRACT_MODEL": "stub-extract-model",
         "re": re,
         "json": json,
     }
@@ -306,14 +310,19 @@ class KeywordWindowTests(unittest.TestCase):
 
     def setUp(self):
         self.prompts = []
+        self.models = []
         self.recorder = _Recorder()
         # 12k chars of non-repetitive content -> three 6k windows.
         self.body = "".join(f"paragraph {i:06d}. " for i in range(800))
         self.marker = "HEDRON-ATLAS-PILOT"
 
     def _extractor(self, responder, **overrides):
-        async def llm(prompt, system=None, num_predict=None):
+        async def llm(prompt, system=None, num_predict=None, model=None, timeout=None):
+            # The call site now names the extraction model explicitly, so the
+            # stub must accept it. It also asserts below that the model it is
+            # handed is the extraction one and not a leftover default.
             self.prompts.append(prompt)
+            self.models.append(model)
             return responder(prompt, len(self.prompts))
 
         return _lift_keyword_extractor(llm, self.recorder, **overrides)
@@ -327,6 +336,20 @@ class KeywordWindowTests(unittest.TestCase):
         out = asyncio.run(extract("Tuesday", "Alice called Bob about the migration."))
         self.assertEqual(len(self.prompts), 1)
         self.assertEqual(out, ["atlas"])
+
+    def test_the_extraction_model_is_the_one_actually_called(self):
+        """Behavioural, not a source check: the model is read off the call.
+
+        The stub records the `model=` it was handed, so this asserts the real
+        value rather than that the source mentions the constant. Keyword
+        extraction is the role that moved onto MEM_EXTRACT_MODEL; if the call
+        site silently reverts to inheriting LLM_QUERY_MODEL the extraction still
+        works and still returns keywords, just with the slower, more inventive
+        model -- and nothing else in the suite would notice.
+        """
+        extract = self._extractor(lambda p, n: self._reply("atlas"))
+        asyncio.run(extract("Tuesday", "Alice called Bob about the migration."))
+        self.assertEqual(self.models, ["stub-extract-model"])
 
     def test_every_window_is_sent_to_the_model(self):
         extract = self._extractor(lambda p, n: self._reply())
@@ -476,7 +499,3 @@ class DegenerateArrayParseTests(unittest.TestCase):
     def test_escaped_quotes_inside_a_name_survive(self):
         self.assertEqual(parse_people_name_array('["Ann \\"Annie\\" Lee"]'),
                          ['Ann "Annie" Lee'])
-
-
-if __name__ == "__main__":
-    unittest.main()
