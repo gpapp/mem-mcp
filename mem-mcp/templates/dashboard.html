@@ -375,7 +375,7 @@
                                            padding: 1.5rem; box-shadow: var(--shadow); }
     /* The detail pane takes the leftover width, so let the prose use it
        instead of hugging the left edge of a very wide card. */
-    .diary-view-content { max-width: 60rem; }
+    .diary-view-content { }
 
     pre { background: #1f2937; color: #f3f4f6; padding: 1rem; border-radius: 8px; overflow-x: auto; font-size: .85rem; }
 
@@ -728,6 +728,29 @@
 <!-- ═══ DIARY PAGE ═══ -->
 <div id="page-diary" class="page">
   <div class="diary-layout">
+    <div class="diary-sidebar">
+      <div class="diary-sidebar-header">
+        <span>Calendar</span>
+      </div>
+      <div class="diary-search-box">
+        <input type="search" id="diary-search-input" placeholder="Search entries…" oninput="onDiarySearch(this.value)" autocomplete="off">
+      </div>
+      <div class="diary-month-pager">
+        <button class="btn-month" onclick="prevMonth()">◀</button>
+        <span class="diary-month-label" id="diary-month-label" onclick="onDiaryMonthClick()"></span>
+        <button class="btn-month" onclick="nextMonth()">▶</button>
+        <button class="btn-month" onclick="goToToday()" title="Jump to today">📅</button>
+      </div>
+      <div class="diary-month-dates" id="diary-month-dates"></div>
+    </div>
+    <div class="diary-list-col">
+      <div class="diary-list-head">
+        <span>Entries</span>
+        <span class="diary-list-count" id="diary-list-count"></span>
+        <button class="btn btn-primary btn-sm" onclick="showDiaryEditor()">＋ New</button>
+      </div>
+      <div id="diary-dates-list"></div>
+    </div>
     <div class="diary-main">
       <div id="diary-editor" class="diary-editor-card" style="display:none;">
         <input type="hidden" id="diary-id">
@@ -748,29 +771,6 @@
       <div id="diary-viewer" class="diary-view-card">
         <div id="diary-view-content" class="diary-view-content empty">Select an entry from the list.</div>
       </div>
-    </div>
-    <div class="diary-list-col">
-      <div class="diary-list-head">
-        <span>Entries</span>
-        <span class="diary-list-count" id="diary-list-count"></span>
-        <button class="btn btn-primary btn-sm" onclick="showDiaryEditor()">＋ New</button>
-      </div>
-      <div id="diary-dates-list"></div>
-    </div>
-    <div class="diary-sidebar">
-      <div class="diary-sidebar-header">
-        <span>Calendar</span>
-      </div>
-      <div class="diary-search-box">
-        <input type="search" id="diary-search-input" placeholder="Search entries…" oninput="onDiarySearch(this.value)" autocomplete="off">
-      </div>
-      <div class="diary-month-pager">
-        <button class="btn-month" onclick="prevMonth()">◀</button>
-        <span class="diary-month-label" id="diary-month-label" onclick="onDiaryMonthClick()"></span>
-        <button class="btn-month" onclick="nextMonth()">▶</button>
-        <button class="btn-month" onclick="goToToday()" title="Jump to today">📅</button>
-      </div>
-      <div class="diary-month-dates" id="diary-month-dates"></div>
     </div>
   </div>
 </div>

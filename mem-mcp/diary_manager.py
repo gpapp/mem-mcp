@@ -1063,13 +1063,16 @@ def db_list_diary(user_id: str) -> list:
             WITH d, cl, ctx
             OPTIONAL MATCH (d)-[:MENTIONS]->(f:Fact)
             OPTIONAL MATCH (d)-[:RELEVANT_TO]->(rc)
+            WHERE rc IS NULL OR rc:Client OR rc:Context
             RETURN d.id as id, d.date as date, d.content as content, d.timestamp as timestamp, d.name as name,
                    d.metadata as metadata, d.keywords as keywords,
                    cl.name as clientName, cl.id as clientId,
                    ctx.name as contextName, ctx.id as contextId,
                    collect(DISTINCT {id: f.id, text: f.text, name: f.name}) as mentions,
                    collect(DISTINCT {id: rc.id, name: rc.name,
-                                     kind: CASE WHEN rc:Context THEN 'context' ELSE 'client' END}) as relevantClients
+                                     kind: CASE WHEN rc:Context THEN 'context' ELSE 'client' END}) as relevantClients,
+                   [x IN [(d)-[:RELATED_TO]-(e:DiaryEntry) | {id: e.id, name: e.name, date: e.date,
+                                                                timestamp: e.timestamp}] WHERE x.id <> d.id] as entryLinks
             ORDER BY d.date DESC, d.timestamp DESC
             """,
             userId=user_id,
@@ -1089,6 +1092,11 @@ def db_list_diary(user_id: str) -> list:
                 "contextName": r.get("contextName"),
                 "contextId": r.get("contextId"),
                 "relevantClients": [rc for rc in r["relevantClients"] if rc.get("id")],
+                "entryLinks": [
+                    {"id": el["id"], "name": el.get("name"), "date": el.get("date"),
+                     "timestamp": format_ts_for_picker(el.get("timestamp"))}
+                    for el in (r.get("entryLinks") or []) if el.get("id")
+                ],
             } for r in result
         ]
 

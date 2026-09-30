@@ -473,6 +473,7 @@ async def db_link_facts(source_id: str, target_id: str, rel_type: str, metadata:
     Handles:
     - Fact ↔ Fact → bidirectional REL_TYPE (existing behavior)
     - DiaryEntry → Fact → unidirectional MENTIONS
+    - DiaryEntry ↔ DiaryEntry → bidirectional RELATED_TO (fixed type)
     """
     neo4j_driver = get_neo4j()
     if not neo4j_driver:
@@ -545,14 +546,34 @@ async def db_link_facts(source_id: str, target_id: str, rel_type: str, metadata:
             )
             await publish_db_event(user_id, "diary_changed", {"action": "link", "id": target_id})
 
+        elif a_label == "DiaryEntry" and b_label == "DiaryEntry":
+            # Bidirectional entry-to-entry. The type is fixed: RELATED_TO is
+            # never pruned by sync_orphans (which only prunes MENTIONS from a
+            # DiaryEntry to a non-Fact), so unlike MENTIONS this survives a boot.
+            for sid, tid in ((source_id, target_id), (target_id, source_id)):
+                s.run(
+                    """
+                    MATCH (a:DiaryEntry {id: $sid, userId: $userId})
+                    MATCH (b:DiaryEntry {id: $tid, userId: $userId})
+                    MERGE (a)-[r:RELATED_TO]->(b)
+                    SET r += $metadata
+                    """,
+                    sid=sid, tid=tid, userId=user_id, metadata=metadata
+                )
+            await publish_db_event(user_id, "diary_changed", {"action": "link", "id": source_id})
+            await publish_db_event(user_id, "diary_changed", {"action": "link", "id": target_id})
+
         else:
-            raise RuntimeError(f"Cannot link {a_label} to {b_label}: only Fact↔Fact and DiaryEntry↔Fact are supported")
+            raise RuntimeError(
+                f"Cannot link {a_label} to {b_label}: only Fact↔Fact, "
+                "DiaryEntry↔Fact and DiaryEntry↔DiaryEntry are supported"
+            )
 
 
 async def db_unlink_facts(source_id: str, target_id: str, rel_type: str, user_id: str):
     """Remove a relationship between two nodes in Neo4j.
 
-    Handles Fact↔Fact and DiaryEntry↔Fact (MENTIONS).
+    Handles Fact↔Fact, DiaryEntry↔Fact (MENTIONS) and DiaryEntry↔DiaryEntry (RELATED_TO).
     """
     neo4j_driver = get_neo4j()
     if not neo4j_driver:
@@ -631,8 +652,24 @@ async def db_unlink_facts(source_id: str, target_id: str, rel_type: str, user_id
             )
             await publish_db_event(user_id, "diary_changed", {"action": "unlink", "id": target_id})
 
+        elif a_label == "DiaryEntry" and b_label == "DiaryEntry":
+            # RELATED_TO is stored in both directions, so both go.
+            for sid, tid in ((source_id, target_id), (target_id, source_id)):
+                s.run(
+                    """
+                    MATCH (a:DiaryEntry {id: $sid, userId: $userId})-[r:RELATED_TO]->(b:DiaryEntry {id: $tid, userId: $userId})
+                    DELETE r
+                    """,
+                    sid=sid, tid=tid, userId=user_id
+                )
+            await publish_db_event(user_id, "diary_changed", {"action": "unlink", "id": source_id})
+            await publish_db_event(user_id, "diary_changed", {"action": "unlink", "id": target_id})
+
         else:
-            raise RuntimeError(f"Cannot unlink {a_label} to {b_label}: only Fact↔Fact and DiaryEntry↔Fact are supported")
+            raise RuntimeError(
+                f"Cannot unlink {a_label} to {b_label}: only Fact↔Fact, "
+                "DiaryEntry↔Fact and DiaryEntry↔DiaryEntry are supported"
+            )
 
 
 def db_get_neighborhood(fact_id: str, depth: int, rel_types: List[str], user_id: str,

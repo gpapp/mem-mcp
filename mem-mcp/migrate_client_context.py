@@ -373,54 +373,7 @@ async def sync_qdrant_scope():
 # never invent new ones.
 # ---------------------------------------------------------------------------
 _SCOPE_SYSTEM = (
-    "You are a scope classifier. Given a memory item and a list of known clients "
-    "(each with its contexts), decide which single client the item belongs to, "
-    "and optionally which context within that client. "
-    "Return ONLY a JSON object: {\"client\": \"<exact client name, or null>\", "
-    "\"context\": \"<exact context name, or null>\", "
-    "\"related\": [\"<other client name the item is also genuinely about>\"]}. "
-    "Rules: use exact names from the list, never invent names; "
-    "context must belong to the chosen client; "
-    "return nulls when the item is generic/shared knowledge or matches no client. "
-    "IMPORTANT: if the item content contains an explicit '**Client:**' or 'Client:' header, "
-    "that declaration is authoritative — use it and do not override it with content keywords. "
-    "IMPORTANT: decide the client from what the work is FOR. When an item is "
-    "someone's own organisation's work -- their colleagues, their systems, their "
-    "engagement -- then their organisation IS the client, even though they are "
-    "also the people named on the item. Being named on an item is not evidence "
-    "against being its client. "
-    "IMPORTANT: the MENTIONS and RELATED sections describe the PEOPLE and FACTS "
-    "the item refers to. A tag on one of them is WHO THAT PERSON IS, which is "
-    "real evidence: if an item is about an organisation's own people and their "
-    "work, their employer is the client, and a tag naming that employer agrees "
-    "with the item rather than competing with it. "
-    "IMPORTANT: a null value is a real, correct, expected answer — not a failure "
-    "and not something to avoid. Most items name no client and most name no "
-    "project, so nulls are the common case; return one whenever the evidence "
-    "does not actually point somewhere. Never fill a field to avoid leaving it "
-    "empty, because a null is recoverable and a guess is stamped. "
-    "IMPORTANT: context (project) selection must be conservative — only assign a context when "
-    "the item content explicitly and directly relates to that specific project. "
-    "Do NOT assign a context simply because it is the only one available for the chosen client; "
-    "if the item is about the client in general or could belong to any of their projects, "
-    "return null for context. The order contexts are listed in is not a ranking — "
-    "never pick one because it comes first. If the item names no project at all, "
-    "null is the only correct answer. "
-    "IMPORTANT: pick the client first, then read its context from that same "
-    "line. The context must be one of the projects listed after the client you "
-    "chose, or null. Never take a project from another client's line — the two "
-    "lines are unrelated lists. A client whose line ends in '(none)' has no "
-    "project at all, so choosing it forces context to be null. "
-    "IMPORTANT: a client whose line ends in '(none)' is a normal, valid choice, "
-    "not a dead end. If you choose such a client, the context MUST be null; it "
-    "has no project to name and there is nothing to copy from its line. Do not "
-    "prefer a client merely because it can supply a context name that the other "
-    "option cannot. "
-    "Put a client in \"related\" when the item is genuinely about that client too "
-    "(it is a second subject, or a system that client owns and this item discusses). "
-    "Do not put the chosen client in \"related\", and do not put a client there "
-    "merely because one of its employees attended — that is the same error as "
-    "picking them as the client. Return [] when there are none."
+    "You are a scope classifier. Given a memory item and a list of known clients (each with its contexts), decide which single client the item belongs to, and optionally which context within that client. Return ONLY a JSON object: {\"client\": \"<exact client name, or null>\", \"context\": \"<exact context name, or null>\", \"related\": [\"<other client name the item is also genuinely about>\"]}. Rules: use exact names from the list, never invent names; context must belong to the chosen client; return nulls when the item is generic/shared knowledge or matches no client. IMPORTANT: a '**Client:**' or 'Client:' header in the item is evidence of who the work is for, but it very often names the end CUSTOMER, who is often not on this list. Never return the header's name by itself; if it is not on the list, choose the listed client the work is actually delivered for, or null if you cannot tell. IMPORTANT: decide the client from what the work is FOR. When an item is someone's own organisation's work -- their colleagues, their systems, their engagement -- then their organisation IS the client, even though they are also the people named on the item. Being named on an item is not evidence against being its client. IMPORTANT: the MENTIONS and RELATED sections describe the PEOPLE and FACTS the item refers to. A tag on one of them is WHO THAT PERSON IS, which is real evidence: if an item is about an organisation's own people and their work, their employer is the client, and a tag naming that employer agrees with the item rather than competing with it. IMPORTANT: a null value is a real, correct, expected answer — not a failure and not something to avoid. Most items name no client and most name no project, so nulls are the common case; return one whenever the evidence does not actually point somewhere. Never fill a field to avoid leaving it empty, because a null is recoverable and a guess is stamped. IMPORTANT: context (project) selection must be conservative — only assign a context when the item content explicitly and directly relates to that specific project. Do NOT assign a context simply because it is the only one available for the chosen client; if the item is about the client in general or could belong to any of their projects, return null for context. The order contexts are listed in is not a ranking — never pick one because it comes first. If the item names no project at all, null is the only correct answer. IMPORTANT: pick the client first, then read its context from that same object. The context must be one of the entries in that object's \"contexts\" array, or null. Never take a project from another client's array — the arrays are unrelated lists. An empty \"contexts\" array means that client has no project at all, so choosing it forces context to be null. IMPORTANT: a client whose \"contexts\" array is empty is a normal, valid choice, not a dead end. If you choose such a client, the context MUST be null; it has no project to name and there is nothing to copy from its array. Do not prefer a client merely because it can supply a context name that the other option cannot. Put a client in \"related\" when the item is genuinely about that client too (it is a second subject, or a system that client owns and this item discusses). Do not put the chosen client in \"related\", and do not put a client there merely because one of its employees attended — that is the same error as picking them as the client. Return [] when there are none."
 )
 
 
@@ -612,23 +565,24 @@ async def _classify_scope(item_text: str, clients: list) -> tuple:
     scope_lines = []
     for c in clients:
         ctxs = [x["name"] for x in c.get("contexts", []) if x.get("name")]
-        # Contexts sit on the client's OWN line, and a client with no projects
-        # says so in its own words.
+        # Contexts sit on the client's OWN entry, and a client with no projects
+        # says so structurally.
         #
-        # Two earlier forms both produced a context belonging to a DIFFERENT
-        # client. `[contexts: a, b]` on a separate bracket, and the even older
-        # `(no contexts)` placeholder, both let the model lift any project line
-        # out of the list and attach it to whichever client it picked — the
-        # evidence for that pairing was never on one line, so nothing told it
-        # otherwise. Measured on the SAP RAM/GRC entry: SAP SE is the right
-        # client and has no projects, and the bracket form answered
-        # {"client": "SAP SE", "context": "DB AI Adoption"} — a Deutsche Bank
-        # project. Prose rules did not fix it in four separate variants. The
-        # model copies evidence, and the pairing has to be visible in it.
-        line = f"- {c['name']}"
-        line += f": {', '.join(ctxs)}" if ctxs else ": (none)"
-        scope_lines.append(line)
-    scope_block = "\n".join(scope_lines)
+        # Three earlier forms all produced a context belonging to a DIFFERENT
+        # client. `[contexts: a, b]` on a separate bracket, the even older
+        # `(no contexts)` placeholder, and a prose line "- Client: a, b" each let
+        # the model lift any project out of the list and attach it to whichever
+        # client it picked — the evidence for that pairing was never
+        # structurally bound, so nothing stopped it. Measured on the SAP RAM/GRC
+        # entry: SAP SE is the right client and has no projects, and every form
+        # answered {"client": "SAP SE", "context": "DB AI Adoption"} — a Deutsche
+        # Bank project. Prose rules did not fix it in four separate variants.
+        # The model copies evidence, and the pairing has to be visible in it;
+        # JSON states the pairing rather than describing it, and an empty array
+        # is unambiguous where "(none)" had to be explained in prose twice.
+        scope_lines.append(json.dumps(
+            {"client": c["name"], "contexts": ctxs}, ensure_ascii=False))
+    scope_block = "[" + ", ".join(scope_lines) + "]"
 
     # No truncation here. The caller has already split the item into windows,
     # so this prompt is bounded by the window size rather than by a slice that
