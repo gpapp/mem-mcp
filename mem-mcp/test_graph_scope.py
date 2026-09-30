@@ -431,3 +431,257 @@ class ReturnAliasTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UnassignedScopeTests(unittest.TestCase):
+    """`unassigned` selects on the *absence* of a client link.
+
+    The other three scopes are all positive membership tests: a record passes
+    when it is joined to a named client, project, or a client in a set. There is
+    no node for an unlinked record to be joined to, so "records with no client"
+    is the one scope that cannot be expressed that way -- it has to invert the
+    test, and it has to say so in the signature rather than as a sentinel
+    ``client_id``. A sentinel would be a value on a parameter whose every other
+    value is a real node id, and would silently match nothing.
+    """
+
+    def scope(self, nodes, fact_clients=None, fact_contexts=None, diary_scope=None,
+              client_id="", context_id=""):
+        node_map = {n["id"]: n for n in nodes}
+        return _scope_and_cap_graph(
+            node_map, [], fact_clients or {}, fact_contexts or {},
+            diary_scope or {}, client_id, context_id, 0, True,
+        )
+
+    def test_a_linked_fact_is_excluded(self):
+        result = self.scope([fact("a"), fact("b")], fact_clients={"a": {"c1"}})
+        self.assertNotIn("a", ids(result))
+
+    def test_an_unlinked_fact_is_kept(self):
+        result = self.scope([fact("a"), fact("b")], fact_clients={"a": {"c1"}})
+        self.assertIn("b", ids(result))
+
+    def test_a_fact_absent_from_the_map_entirely_counts_as_unassigned(self):
+        """No entry means no FOR_CLIENT edge, which is what unassigned selects.
+
+        This is the direction that matters: treating "missing" as "in scope for
+        everyone" is what the old positive test did, and it is correct there --
+        a missing edge fails the client test. Inverting must not carry that
+        assumption over, or every record the pass failed to see would appear
+        under Unassigned.
+        """
+        result = self.scope([fact("ghost")], fact_clients={})
+        self.assertIn("ghost", ids(result))
+
+    def test_a_diary_entry_with_a_client_is_excluded(self):
+        nodes = [diary("d1"), diary("d2")]
+        node_map = {n["id"]: n for n in nodes}
+        result = _scope_and_cap_graph(
+            node_map, [], {}, {}, {"d1": ["c1", ""], "d2": ["", ""]}, "", "", 0, True,
+        )
+        self.assertNotIn("d1", ids(result))
+        self.assertIn("d2", ids(result))
+
+    def test_a_diary_entry_missing_from_the_scope_map_counts_as_unassigned(self):
+        result = self.scope([diary("d1")], diary_scope={})
+        self.assertIn("d1", ids(result))
+
+    def test_client_and_context_nodes_are_dropped(self):
+        """No record in scope is linked to one, so they render as orphan dots.
+
+        The general rule keeps Client and Context nodes so a client-scoped graph
+        is not client-less. That reasoning is about *preserving* the node that
+        is the filter's subject; here there is no such node, and keeping all of
+        them draws a screen of unconnected clients.
+        """
+        result = self.scope([fact("a"), client_node("c1", "Acme"),
+                             context_node("x1", "Atlas"), category_node("g1", "Work")])
+        self.assertNotIn("c1", ids(result))
+        self.assertNotIn("x1", ids(result))
+
+    def test_category_nodes_are_kept(self):
+        """They are shared across the whole vault and still label what is shown."""
+        result = self.scope([fact("a"), category_node("g1", "Work")])
+        self.assertIn("g1", ids(result))
+
+    def test_the_edges_left_dangling_are_dropped(self):
+        """Otherwise an edge to a removed client node survives into the response."""
+        nodes = [fact("a"), client_node("c1", "Acme")]
+        node_map = {n["id"]: n for n in nodes}
+        result = _scope_and_cap_graph(
+            node_map, [edge("a", "c1", "FOR_CLIENT")], {"a": set()}, {}, {},
+            "", "", 0, True,
+        )
+        self.assertEqual(result["edges"], [])
+
+    def test_unassigned_ignores_a_client_id_rather_than_conflating_them(self):
+        """Both set is not a valid reading; the flag is the selection.
+
+        Guards against a future "treat a missing client_id as unassigned" edit,
+        which would silently turn the default (no filter) into a filter.
+        """
+        nodes = [fact("a")]
+        node_map = {n["id"]: n for n in nodes}
+        unscoped = _scope_and_cap_graph(node_map, [], {"a": set()}, {}, {}, "", "", 0, False)
+        self.assertIn("a", ids(unscoped))
+
+    def test_the_cap_still_applies(self):
+        nodes = [fact(f"f{i}") for i in range(5)] + [fact("linked")]
+        node_map = {n["id"]: n for n in nodes}
+        result = _scope_and_cap_graph(
+            node_map, [], {"linked": {"c1"}}, {}, {}, "", "", 2, True,
+        )
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["total"], 5)
+        self.assertEqual(len([n for n in result["nodes"] if n["label"] == "Fact"]), 2)
+
+
+class UnassignedNeighborhoodTests(unittest.TestCase):
+    """`unassigned` has no scope node, so none is preserved.
+
+    ``_filter_neighborhood_scope`` normally keeps the Client and Context nodes
+    matching the filter, because a client-scoped graph without that client on it
+    looks broken. There is no "the client these records are *not* filed under",
+    so every one of them goes.
+    """
+
+    def test_client_and_context_nodes_are_dropped(self):
+        nodes = [fact("a"), client_node("c1", "Acme"), context_node("x1", "Atlas")]
+        kept = {n["id"] for n in _filter_neighborhood_scope(nodes, "", "", True)}
+        self.assertEqual(kept, {"a"})
+
+    def test_the_record_survives(self):
+        kept = {n["id"] for n in _filter_neighborhood_scope([fact("a")], "", "", True)}
+        self.assertIn("a", kept)
+
+    def test_it_is_distinct_from_a_neighbourhood_with_no_scope(self):
+        """Both args empty is the *unfiltered* case, and must stay unfiltered.
+
+        `unassigned` and "no scope at all" differ only by the flag, so a missing
+        one here would make Unassigned a no-op on "Show all connected" -- which
+        is how a half-wired filter presents: the main graph is right and the
+        expand button quietly ignores the scope.
+        """
+        nodes = [fact("a"), client_node("c1", "Acme")]
+        unfiltered = {n["id"] for n in _filter_neighborhood_scope(nodes, "", "", False)}
+        unassigned = {n["id"] for n in _filter_neighborhood_scope(nodes, "", "", True)}
+        self.assertIn("c1", unfiltered)
+        self.assertNotIn("c1", unassigned)
+
+
+class GraphScopeParamTests(unittest.TestCase):
+    """`unassigned` is a query param, and it has to be a real one.
+
+    The params this function produces are dropped on the floor unless three
+    separate things line up: the JS builds them, `api.get` actually sends them,
+    and the endpoint declares them. A break anywhere is silent -- the graph
+    renders, just unscoped, which is indistinguishable from the filter not
+    working.
+    """
+
+    TEMPLATE = os.path.join(HERE, "templates", "dashboard.html")
+
+    def setUp(self):
+        with open(self.TEMPLATE, "r", encoding="utf-8") as handle:
+            self.html = handle.read()
+        with open(FACT_MANAGER, "r", encoding="utf-8") as handle:
+            self.fm = handle.read()
+        with open(os.path.join(HERE, "gui.py"), "r", encoding="utf-8") as handle:
+            self.gui = handle.read()
+
+    def _app_script(self):
+        """The one real <script> block, by attribute.
+
+        Splitting on a bare "<script>" is ambiguous: the page also carries
+        `type="text/markdown"` sample blocks, so an index-based split hands one
+        of those to the next step.
+        """
+        blocks = re.findall(r'<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>',
+                            self.html, re.S)
+        assert len(blocks) == 1, f"expected exactly one inline app script, got {len(blocks)}"
+        return blocks[0]
+
+    @staticmethod
+    def _js_function(src, name):
+        """The body of a JS function, by brace counting.
+
+        Deliberately not ast.parse: this is JavaScript and that is Python's
+        parser, where a `//` comment is a floor-division operator and the first
+        line of this very script is one. Node is not a dependency of this suite.
+        """
+        start = src.index(f"function {name}(")
+        i = src.index("{", start)
+        depth = 0
+        while True:
+            ch = src[i]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return src[start:i + 1]
+            i += 1
+
+    def test_the_filter_travels_as_its_own_param_not_a_fake_client_id(self):
+        self.assertTrue(
+            "if (clientFilter === 'unassigned') params.unassigned = 1;" in self.html,
+            "graphScopeParams no longer sends the unassigned flag",
+        )
+        # The negative half: params.clientId must not be reachable when the
+        # filter is the sentinel, or "unassigned" is sent as a node id and
+        # matches no client. Checked on the extracted function rather than by
+        # slicing the file around a string, which passes on any reformatting.
+        #
+        # The shape is an if/else-if: the first arm takes the sentinel, the
+        # second assigns the id. What must hold is that the id arm cannot see
+        # 'unassigned' -- either it excludes the literal, or it is unreachable.
+        body = self._js_function(self._app_script(), "graphScopeParams")
+        sentinel_arm = body.index("clientFilter === 'unassigned'")
+        id_arm = body.index("params.clientId = clientFilter")
+        self.assertLess(sentinel_arm, id_arm,
+                        "the id is assigned before the sentinel is handled")
+        self.assertIn("else if", body[sentinel_arm:id_arm],
+                      "the id assignment is not in the branch after the sentinel")
+        # And the id arm must not also match the sentinel.
+        id_branch = body[body.rindex("else if", sentinel_arm, id_arm):id_arm]
+        self.assertNotIn("'unassigned'", id_branch,
+                         "the clientId branch can still fire for the sentinel")
+
+    def test_api_get_sends_the_params_it_is_handed(self):
+        """The reason the server-side scope was dead in the first place.
+
+        `api.get` took one argument, so all four graph call sites handed it a
+        second that was discarded, and `/api/graph` never received
+        `clientId`/`contextId` at all. A source assertion on the call sites
+        passes against that file -- the calls are all there.
+        """
+        self.assertTrue(
+            "get:    (url, params) => fetch(apiUrl(url, params))" in self.html,
+            "api.get takes a second argument it does not forward",
+        )
+        self.assertTrue("function apiUrl(url, params)" in self.html,
+                        "the query string is never built")
+        self.assertTrue("new URLSearchParams()" in self.html,
+                        "apiUrl does not encode the params")
+
+    def test_the_endpoint_declares_the_param(self):
+        for fn in ("api_get_graph", "api_get_neighbors", "api_focus_graph"):
+            with self.subTest(fn=fn):
+                self.assertIn(f"def {fn}(", self.gui)
+                self.assertRegex(
+                    self.gui, rf"def {fn}\([^)]*unassigned: int = 0",
+                    f"{fn} does not declare the unassigned query param",
+                )
+
+    def test_the_server_function_accepts_and_uses_it(self):
+        for fn in ("db_get_graph", "db_get_neighborhood"):
+            with self.subTest(fn=fn):
+                self.assertRegex(
+                    self.fm, rf"def {fn}\([^)]*unassigned: bool = False",
+                    f"{fn} does not accept unassigned",
+                )
+        # And it reaches the policy, rather than being accepted and dropped.
+        self.assertIn("client_id, context_id, limit, unassigned,",
+                      self.fm.split("def _scope_and_cap_graph")[0][-400:])
+        self.assertIn("return _filter_neighborhood_scope(nodes, client_id, context_id, unassigned)",
+                      self.fm)

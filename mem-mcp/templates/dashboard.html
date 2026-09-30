@@ -879,8 +879,23 @@ npm install @modelcontextprotocol/sdk</code></pre>
   // them: Jinja parses those too, and an ellipsis inside is a syntax error
   // that takes the whole page down at render time.
   const MERGE_MAX_CLUSTER = Number("{{MERGE_MAX_CLUSTER}}");
+  // `get` took a single argument, so every call that passed a params object
+  // had it silently dropped -- including all four graph calls, which meant
+  // /api/graph never received clientId/contextId and the server-side scope
+  // filter never ran. The list-level post-filter below was the only thing
+  // filtering the graph, and it cannot express the *absence* of a link.
+  function apiUrl(url, params) {
+    if (!params) return `${apiBase}/${url}`;
+    const qs = new URLSearchParams();
+    for (const [k, v] of Object.entries(params)) {
+      if (v === null || v === undefined || v === '') continue;
+      qs.append(k, v);
+    }
+    const s = qs.toString();
+    return `${apiBase}/${url}${s ? '?' + s : ''}`;
+  }
   const api = {
-    get:    (url)       => fetch(`${apiBase}/${url}`).then(r => r.ok ? r.json() : Promise.reject(r)),
+    get:    (url, params) => fetch(apiUrl(url, params)).then(r => r.ok ? r.json() : Promise.reject(r)),
     post:   (url, body) => fetch(`${apiBase}/${url}`, {method:'POST',  headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}).then(r => r.ok ? r.json() : Promise.reject(r)),
     put:    (url, body) => fetch(`${apiBase}/${url}`, {method:'PUT',   headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}).then(r => r.ok ? r.json() : Promise.reject(r)),
     delete: (url, body) => fetch(`${apiBase}/${url}`, {method:'DELETE', headers:{'Content-Type':'application/json'}, body: body ? JSON.stringify(body) : undefined}).then(r => r.ok ? r.json() : Promise.reject(r)),
@@ -897,7 +912,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
   let activeCategory = null;
   let activeLetterFilter = null;
   let hideInactiveClients = false;  // kept for session-state back-compat (mapped to clientFilter)
-  let clientFilter = 'all';  // 'all' | 'active' | <clientId>
+  let clientFilter = 'all';  // 'all' | 'active' | 'unassigned' | <clientId>
   let contextFilter = null;  // null | <contextId> — only active when clientFilter is a clientId
   let clientActiveMap = {};
   let clientListCache = [];
@@ -905,6 +920,12 @@ npm install @modelcontextprotocol/sdk</code></pre>
   // Shared scope predicate used by renderMemories / renderCategorySidebar.
   function memPassesScope(m) {
     if (clientFilter === 'all') return true;
+    if (clientFilter === 'unassigned') {
+      // Only the primary link. A RELEVANT_TO client does not count: the item is
+      // genuinely not filed under anyone, which is what the classifier failed to
+      // place and what a reclassify is for.
+      return !m.clientId;
+    }
     if (clientFilter === 'active') {
       // Generic facts (no client) always pass; only known-inactive clients are hidden.
       return !m.clientId || clientActiveMap[m.clientId] !== false;
@@ -1192,6 +1213,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     if (!btn) return;
     if (clientFilter === 'all')    { btn.textContent = 'All clients'; btn.title = ''; }
     else if (clientFilter === 'active') { btn.textContent = 'Active only'; btn.title = ''; }
+    else if (clientFilter === 'unassigned') { btn.textContent = 'Unassigned'; btn.title = 'Records with no client'; }
     else {
       const c = clientListCache.find(x => x.id === clientFilter);
       const cName = c ? c.name : clientFilter;
@@ -1218,6 +1240,11 @@ npm install @modelcontextprotocol/sdk</code></pre>
     };
     addItem('all',    '', 'All clients',         clientFilter === 'all', false);
     addItem('active', '', 'Active clients only',  clientFilter === 'active', false);
+    // "Active clients only" is not this. That keeps everything except
+    // known-inactive clients, and a record with no client passes it, so
+    // unclassified items are mixed in with the classified ones. This is the
+    // only view that isolates them.
+    addItem('unassigned', '', 'Unassigned (no client)', clientFilter === 'unassigned', false);
     if (clientListCache.length) {
       html += '<div class="cf-separator"></div>';
       for (const c of clientListCache) {
@@ -1272,6 +1299,11 @@ npm install @modelcontextprotocol/sdk</code></pre>
     renderCategorySidebar();
     renderDiaryMonthPager();
     renderDiarySidebar();
+    // The graph is a separate fetch, and it used to be left alone here: pick a
+    // client while the Graph tab is open and the canvas kept showing the
+    // previous scope until the tab was revisited, which is indistinguishable
+    // from the filter not working.
+    if (activeTab === 'graph') loadGraph();
     saveSessionState();
   }
 
@@ -3928,9 +3960,14 @@ npm install @modelcontextprotocol/sdk</code></pre>
 // The graph used to ignore the client/project selection entirely, so a scoped
 // session still drew the whole vault. 'all' and 'active' are list-level
 // shorthands, not node ids, so they must not be sent as one.
+//
+// 'unassigned' is a third shorthand, and it is sent as its own boolean rather
+// than as a clientId: "no client" is not a node id, and inventing one would put
+// a value on a parameter whose every other value is a real id.
 function graphScopeParams() {
   const params = {};
-  if (clientFilter && clientFilter !== 'all' && clientFilter !== 'active') params.clientId = clientFilter;
+  if (clientFilter === 'unassigned') params.unassigned = 1;
+  else if (clientFilter && clientFilter !== 'all' && clientFilter !== 'active') params.clientId = clientFilter;
   if (contextFilter) params.contextId = contextFilter;
   return params;
 }
@@ -3941,6 +3978,10 @@ function graphScopeClientIds() {
   if (clientFilter === 'active') {
     return clientListCache.filter(c => c.active !== false && c.active !== 0).map(c => c.id);
   }
+  // Under 'unassigned' there is no wanted-client set. Returning the sentinel
+  // here would make the post-filter below look for a Client node with that id,
+  // find nothing, and drop every record -- the opposite of the intent.
+  if (clientFilter === 'unassigned') return [];
   if (clientFilter && clientFilter !== 'all') return [clientFilter];
   return [];
 }
@@ -3966,6 +4007,13 @@ async function loadGraph() {
       // it here: a record is in scope when it is joined to one of the wanted
       // client or context nodes. Direction-agnostic, because an edge is drawn
       // from either end depending on its arrow setting.
+      //
+      // This runs only for the list-level shorthands. A specific clientId is
+      // now actually sent (api.get used to drop its params), so the server has
+      // already filtered and applied the node cap to the scoped set -- without
+      // that, the cap would be computed over the whole vault and the most
+      // connected records could crowd out the ones the user asked for.
+      const unassignedScope = clientFilter === 'unassigned';
       const wantedClients = new Set(graphScopeClientIds());
       const wantedContexts = new Set(contextFilter ? [contextFilter] : []);
       const labelById = {};
@@ -3977,7 +4025,7 @@ async function loadGraph() {
             const la = labelById[a], lb = labelById[b];
             const wanted = (la === 'Client' && wantedClients.has(a))
                         || (la === 'Context' && wantedContexts.has(a));
-            if (wanted && lb === 'Fact') {
+            if (wanted && (lb === 'Fact' || lb === 'DiaryEntry')) {
               if (!scopeMembers.has(a)) scopeMembers.set(a, new Set());
               scopeMembers.get(a).add(b);
             }
@@ -3985,7 +4033,8 @@ async function loadGraph() {
         }
       }
       const inSelectedScope = (n) => {
-        if (n.label !== 'Fact') return true;
+        if (n.label !== 'Fact' && n.label !== 'DiaryEntry') return true;
+        if (unassignedScope) return true;   // the server filtered; see above
         if (!scopeMembers.size) return true;
         for (const ids of scopeMembers.values()) if (ids.has(n.id)) return true;
         return false;

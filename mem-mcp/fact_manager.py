@@ -13,8 +13,7 @@ from qdrant_client.models import PointStruct, Filter, FieldCondition, MatchValue
 
 from common import (
     get_qdrant, get_neo4j, logger, get_embedding, get_llm_response, publish_db_event,
-    log_search_stats, COLLECTION_NAME, DIARY_COLLECTION, SEARCH_LLM_TIMEOUT
-)
+    log_search_stats, COLLECTION_NAME, DIARY_COLLECTION, SEARCH_LLM_TIMEOUT)
 from client_manager import (
     db_create_client, db_create_context, db_list_clients,
     db_resolve_client, db_resolve_context,
@@ -631,7 +630,8 @@ async def db_unlink_facts(source_id: str, target_id: str, rel_type: str, user_id
 
 
 def db_get_neighborhood(fact_id: str, depth: int, rel_types: List[str], user_id: str,
-                        client_id: str = "", context_id: str = "") -> list:
+                        client_id: str = "", context_id: str = "",
+                        unassigned: bool = False) -> list:
     """Everything within ``depth`` hops of a fact, not just other facts.
 
     The old query ended in ``(neighbor:Fact)``, so "Show all connected" on a
@@ -700,16 +700,23 @@ def db_get_neighborhood(fact_id: str, depth: int, rel_types: List[str], user_id:
                 "rel": (r["rels"] or [None])[-1],
                 "distance": r["distance"],
             })
-        return _filter_neighborhood_scope(nodes, client_id, context_id)
+        return _filter_neighborhood_scope(nodes, client_id, context_id, unassigned)
 
 
-def _filter_neighborhood_scope(nodes, client_id, context_id):
+def _filter_neighborhood_scope(nodes, client_id, context_id, unassigned=False):
     """Keep only the Client/Context nodes matching the active scope.
 
     A Client or Context node *is* the scope, so it survives the filter it is not
     the subject of: when the graph is scoped to one client, that client's node
     must still be drawn or the result looks broken.
+
+    ``unassigned`` has no scope node to preserve, so every Client and Context
+    node goes. The record-level filtering for that mode happens in
+    ``_scope_and_cap_graph``; this function only sees the neighbourhood, and a
+    neighbour set containing clients would quietly re-add what the graph omitted.
     """
+    if unassigned:
+        return [n for n in nodes if n["label"] not in ("Client", "Context")]
     if not client_id and not context_id:
         return nodes
     return [
@@ -1980,7 +1987,8 @@ async def db_merge_memories(master_id: str, duplicate_ids: List[str], user_id: s
     })
 
 
-def db_get_graph(user_id: str, client_id: str = "", context_id: str = "", limit: int = 0) -> dict:
+def db_get_graph(user_id: str, client_id: str = "", context_id: str = "", limit: int = 0,
+                 unassigned: bool = False) -> dict:
     """Return the knowledge graph for a user (nodes and edges), optionally scoped.
 
     ``client_id`` / ``context_id`` restrict *records* — Facts and Diary entries —
@@ -1989,6 +1997,11 @@ def db_get_graph(user_id: str, client_id: str = "", context_id: str = "", limit:
     denormalised ``clientId`` property, because that property is written by the
     classifier and can lag the relationship. Category, Client and Context nodes
     are always kept so a filtered graph stays connected.
+
+    ``unassigned`` selects the inverse — records with *no* client link. It is the
+    "what has the classifier not placed yet?" view, and it is the one scope a
+    positive id test cannot express: an unlinked record has no Client node for
+    the graph to be filtered against. See ``_scope_and_cap_graph``.
 
     ``limit`` caps how many records are returned, largest-degree first, so a big
     vault cannot hand vis.js more than it can draw. The response carries
@@ -2217,12 +2230,12 @@ def db_get_graph(user_id: str, client_id: str = "", context_id: str = "", limit:
 
         return _scope_and_cap_graph(
             node_map, edges, fact_clients, fact_contexts, diary_scope,
-            client_id, context_id, limit,
+            client_id, context_id, limit, unassigned,
         )
 
 
 def _scope_and_cap_graph(node_map, edges, fact_clients, fact_contexts, diary_scope,
-                         client_id, context_id, limit):
+                         client_id, context_id, limit, unassigned=False):
     """Drop out-of-scope records, cap the size, and drop the edges left dangling.
 
     Split out of ``db_get_graph`` so the policy is readable on its own. Every
@@ -2231,10 +2244,24 @@ def _scope_and_cap_graph(node_map, edges, fact_clients, fact_contexts, diary_sco
     reading one yields None for every record. Membership by edge is also what
     makes a just-unlinked fact leave the view immediately rather than on the
     next reclassify.
+
+    ``unassigned`` inverts the record test: keep only records with *no* client.
+    It is a separate flag rather than a sentinel ``client_id`` because that
+    would be a value on a parameter whose every other value is a node id, and
+    the only two real ways to say "not a client" are "no client" and "several
+    clients" — neither of which is an id. Inverting is also the only way to
+    *select* on absence: a record with no FOR_CLIENT edge has no Client node to
+    key on, so the positive edge-membership test this function otherwise uses
+    cannot express it.
     """
     def in_scope(node):
         label = node.get("label")
         if label == "Fact":
+            if unassigned:
+                # A Fact's client set is empty exactly when it is unlinked.
+                if fact_clients.get(node["id"], ()):
+                    return False
+                return True
             if client_id and client_id not in fact_clients.get(node["id"], ()):
                 return False
             if context_id and context_id not in fact_contexts.get(node["id"], ()):
@@ -2242,6 +2269,8 @@ def _scope_and_cap_graph(node_map, edges, fact_clients, fact_contexts, diary_sco
             return True
         if label == "DiaryEntry":
             d_client, d_context = diary_scope.get(node["id"], ("", ""))
+            if unassigned:
+                return not d_client
             if client_id and client_id != d_client:
                 return False
             if context_id and context_id != d_context:
@@ -2249,6 +2278,14 @@ def _scope_and_cap_graph(node_map, edges, fact_clients, fact_contexts, diary_sco
             return True
         # Category / Client / Context nodes: keep them, a filtered graph with no
         # client node in it reads as "this client has no facts".
+        #
+        # Not under `unassigned`. There the rule is backwards -- no record in
+        # scope is linked to a client, so keeping every Client and Context node
+        # draws a screen of orphan dots with no edges, which reads as a broken
+        # graph. Category nodes stay: they are shared across the whole vault and
+        # still label what is on screen.
+        if unassigned and label in ("Client", "Context"):
+            return False
         return True
 
     scoped = [n for n in node_map.values() if in_scope(n)]

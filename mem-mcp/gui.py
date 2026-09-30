@@ -1031,7 +1031,8 @@ async def api_get_insights(request: Request):
 
 
 @web_app.get("/api/graph", response_class=JSONResponse)
-async def api_get_graph(request: Request, clientId: str = "", contextId: str = "", limit: int = 0):
+async def api_get_graph(request: Request, clientId: str = "", contextId: str = "", limit: int = 0,
+                        unassigned: int = 0):
     """The whole knowledge graph, optionally scoped to one client or project.
 
     The scope travels as a query param because it is part of what the user is
@@ -1044,13 +1045,15 @@ async def api_get_graph(request: Request, clientId: str = "", contextId: str = "
             client_id=clientId,
             context_id=contextId,
             limit=limit,
+            unassigned=bool(unassigned),
         )
     except RuntimeError as e:
         raise _service_unavailable(e)
 
 
 @web_app.get("/api/graph/neighbors/{fact_id}", response_class=JSONResponse)
-async def api_get_neighbors(request: Request, fact_id: str, clientId: str = "", contextId: str = ""):
+async def api_get_neighbors(request: Request, fact_id: str, clientId: str = "", contextId: str = "",
+                           unassigned: int = 0):
     """Neighbours of a fact, honouring the client's active scope.
 
     "Show all connected" runs under the same client/project selection as the
@@ -1060,14 +1063,15 @@ async def api_get_neighbors(request: Request, fact_id: str, clientId: str = "", 
     try:
         return mem.db_get_neighborhood(
             fact_id, depth=1, rel_types=None, user_id=_require_user(request),
-            client_id=clientId, context_id=contextId,
+            client_id=clientId, context_id=contextId, unassigned=bool(unassigned),
         )
     except RuntimeError as e:
         raise _service_unavailable(e)
 
 
 @web_app.get("/api/graph/focus/{fact_id}", response_class=JSONResponse)
-async def api_focus_graph(request: Request, fact_id: str, clientId: str = "", contextId: str = ""):
+async def api_focus_graph(request: Request, fact_id: str, clientId: str = "", contextId: str = "",
+                          unassigned: int = 0):
     try:
         user_id = _require_user(request)
         fact = mem.db_get_fact_by_id(fact_id, user_id)
@@ -1076,7 +1080,7 @@ async def api_focus_graph(request: Request, fact_id: str, clientId: str = "", co
 
         neighbors = mem.db_get_neighborhood(
             fact_id, depth=1, rel_types=None, user_id=user_id,
-            client_id=clientId, context_id=contextId,
+            client_id=clientId, context_id=contextId, unassigned=bool(unassigned),
         )
 
         # Group connections by relationship type
