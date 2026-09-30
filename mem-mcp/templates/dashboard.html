@@ -880,7 +880,6 @@ npm install @modelcontextprotocol/sdk</code></pre>
   </div>
 </div>
 
-<datalist id="fact-datalist-dropdown"></datalist>
 <div id="toast"></div>
 
 <script>
@@ -1866,8 +1865,6 @@ npm install @modelcontextprotocol/sdk</code></pre>
       memories = await api.get('memories');
       document.getElementById('search-query').value = lastSearchQuery;
       document.getElementById('sort-order').value = lastSortOrder;
-      const fdl = document.getElementById('fact-datalist-dropdown');
-      if (fdl) fdl.innerHTML = memories.map(m => `<option value="${m.id}">${escHtml(m.name || (m.text||'').substring(0,30))}</option>`).join('');
       renderMemories();
       renderCategorySidebar();
       renderGraphCategorySidebar();
@@ -3476,7 +3473,14 @@ npm install @modelcontextprotocol/sdk</code></pre>
           <button class="btn btn-ghost btn-sm" onclick="toggleDiaryLinkForm('${entry.id}')">🔗 Link to fact</button>
         </div>
         <div id="dlink-form-${entry.id}" style="display:none; margin-top:.5rem; padding:.5rem; background:var(--bg); border-radius:6px; border:1px solid var(--border);">
-          <input id="dlink-target-${entry.id}" list="fact-datalist-dropdown" placeholder="Search fact..." style="width:100%; padding:.3rem .5rem; border:1px solid var(--border); border-radius:4px; font-size:.8rem; margin-bottom:.3rem;">
+          <input type="search" id="dlink-q-${entry.id}" placeholder="Search memories…" autocomplete="off"
+                 style="width:100%; padding:.3rem .5rem; border:1px solid var(--border); border-radius:4px; font-size:.8rem; margin-bottom:.3rem;"
+                 oninput="dlinkSearch('${entry.id}')" onkeydown="dlinkKeys('${entry.id}', event)">
+          <div id="dlink-results-${entry.id}" class="pane-link-results"></div>
+          <div id="dlink-chosen-${entry.id}" class="pane-link-chosen" style="display:none; margin-bottom:.3rem;">
+            <span id="dlink-chosen-name-${entry.id}" style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:.8rem;"></span>
+            <button class="btn btn-ghost btn-sm" onclick="dlinkClear('${entry.id}')">Change</button>
+          </div>
           <div style="display:flex; gap:.3rem;">
             <button class="btn btn-primary btn-sm" onclick="saveDiaryLink('${entry.id}')">Link</button>
             <button class="btn btn-ghost btn-sm" onclick="toggleDiaryLinkForm('${entry.id}')">Cancel</button>
@@ -3751,7 +3755,14 @@ npm install @modelcontextprotocol/sdk</code></pre>
           <button class="btn btn-ghost btn-sm" onclick="toggleDiaryLinkForm('${entry.id}')">🔗 Link to fact</button>
         </div>
         <div id="dlink-form-${entry.id}" style="display:none; margin-top:.5rem; padding:.5rem; background:var(--bg); border-radius:6px; border:1px solid var(--border);">
-          <input id="dlink-target-${entry.id}" list="fact-datalist-dropdown" placeholder="Search fact..." style="width:100%; padding:.3rem .5rem; border:1px solid var(--border); border-radius:4px; font-size:.8rem; margin-bottom:.3rem;">
+          <input type="search" id="dlink-q-${entry.id}" placeholder="Search memories…" autocomplete="off"
+                 style="width:100%; padding:.3rem .5rem; border:1px solid var(--border); border-radius:4px; font-size:.8rem; margin-bottom:.3rem;"
+                 oninput="dlinkSearch('${entry.id}')" onkeydown="dlinkKeys('${entry.id}', event)">
+          <div id="dlink-results-${entry.id}" class="pane-link-results"></div>
+          <div id="dlink-chosen-${entry.id}" class="pane-link-chosen" style="display:none; margin-bottom:.3rem;">
+            <span id="dlink-chosen-name-${entry.id}" style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:.8rem;"></span>
+            <button class="btn btn-ghost btn-sm" onclick="dlinkClear('${entry.id}')">Change</button>
+          </div>
           <div style="display:flex; gap:.3rem;">
             <button class="btn btn-primary btn-sm" onclick="saveDiaryLink('${entry.id}')">Link</button>
             <button class="btn btn-ghost btn-sm" onclick="toggleDiaryLinkForm('${entry.id}')">Cancel</button>
@@ -3879,12 +3890,142 @@ npm install @modelcontextprotocol/sdk</code></pre>
 
   function toggleDiaryLinkForm(entryId) {
     const el = document.getElementById('dlink-form-' + entryId);
-    if (el) el.style.display = el.style.display === 'none' ? 'block' : 'none';
+    if (!el) return;
+    const closing = el.style.display !== 'none';
+    el.style.display = closing ? 'none' : 'block';
+    // Re-seed on open: the same form is reused across entries and across
+    // opens, and a stale picked target from the last entry would link the
+    // wrong fact.
+    if (!closing) dlinkReset(entryId);
+  }
+
+  // -------------------------------------------------------------------------
+  // Diary "Link to fact" target picker.
+  //
+  // This was <input list="fact-datalist-dropdown">, whose options carried the
+  // raw UUID as the value and the name as the label -- so it rendered as a
+  // 1000-row popup of names, submitted a UUID that was never displayed, and
+  // its only failure mode was a toast reading "Enter a fact ID". A datalist is
+  // a dropdown with a search box bolted on; on a vault this size that is worse
+  // than no control at all.
+  //
+  // It is deliberately the same picker as the fact pane's (paneLink* above),
+  // and for the same reasons: candidates are filtered client-side as you type,
+  // the expression matches renderMemories() so both lists agree on what a query
+  // means, and an already-mentioned fact is not offered -- a second MENTIONS
+  // edge to the same fact is a duplicate, not a new link.
+  // -------------------------------------------------------------------------
+  const _DLINK_LIMIT = 12;
+  let _dLink = {};
+
+  function _dlinkState(entryId) {
+    if (!_dLink[entryId]) _dLink[entryId] = { q: '', targetId: null, results: [], active: 0 };
+    return _dLink[entryId];
+  }
+
+  function dlinkCandidates(entryId, q) {
+    const needle = (q || '').trim().toLowerCase();
+    const entry = diaryEntries.find(e => e.id === entryId);
+    const linked = new Set((entry && entry.mentions || []).map(m => m.id));
+    const out = [];
+    for (const m of memories) {
+      if (linked.has(m.id)) continue;
+      const name = (m.name || '').toLowerCase();
+      if (needle && !m.text.toLowerCase().includes(needle) && !name.includes(needle)
+          && !String(m.category || '').toLowerCase().includes(needle)) continue;
+      out.push(m);
+      if (out.length >= 200) break;
+    }
+    out.sort((a, b) => ((a.name || a.text || '') + ' ' + (a.name || ''))
+                      .toLowerCase().localeCompare(((b.name || b.text || '') + ' ' + (b.name || '')).toLowerCase()));
+    return out.slice(0, _DLINK_LIMIT);
+  }
+
+  function dlinkSearch(entryId) {
+    const st = _dlinkState(entryId);
+    const input = document.getElementById('dlink-q-' + entryId);
+    st.q = input ? input.value : '';
+    st.results = dlinkCandidates(entryId, st.q);
+    st.active = 0;
+    dlinkRender(entryId);
+  }
+
+  function dlinkRender(entryId) {
+    const st = _dlinkState(entryId);
+    const box = document.getElementById('dlink-results-' + entryId);
+    const chosen = document.getElementById('dlink-chosen-' + entryId);
+    const chosenName = document.getElementById('dlink-chosen-name-' + entryId);
+    if (chosen) {
+      chosen.style.display = st.targetId ? 'flex' : 'none';
+      if (st.targetId && chosenName) {
+        const t = memories.find(x => x.id === st.targetId);
+        chosenName.textContent = t ? (t.name || (t.text || '').substring(0, 60)) : st.targetId;
+      }
+    }
+    if (!box) return;
+    if (st.targetId) { box.innerHTML = ''; return; }
+    if (!st.results.length) {
+      box.innerHTML = st.q.trim()
+        ? '<p class="empty" style="padding:.5rem .6rem; font-size:.8rem;">No matching memories.</p>'
+        : '';
+      return;
+    }
+    box.innerHTML = st.results.map((m, i) => {
+      const name = m.name || (m.text || '').substring(0, 60);
+      const snippet = m.name ? (m.text || '').replace(/\s+/g, ' ').trim().substring(0, 70) : '';
+      return `<div class="pane-link-result${i === st.active ? ' active' : ''}" onclick="dlinkPick('${entryId}', '${m.id}')">
+        <div>${escHtml(name)}</div>
+        ${snippet ? `<div class="result-snippet">${escHtml(snippet)}…</div>` : ''}
+      </div>`;
+    }).join('');
+  }
+
+  function dlinkPick(entryId, targetId) {
+    const st = _dlinkState(entryId);
+    st.targetId = targetId;
+    st.q = '';
+    st.results = [];
+    const input = document.getElementById('dlink-q-' + entryId);
+    if (input) input.value = '';
+    dlinkRender(entryId);
+  }
+
+  function dlinkClear(entryId) {
+    const st = _dlinkState(entryId);
+    st.targetId = null;
+    const input = document.getElementById('dlink-q-' + entryId);
+    if (input) { input.value = ''; input.focus(); }
+    dlinkSearch(entryId);
+  }
+
+  function dlinkKeys(entryId, ev) {
+    const st = _dlinkState(entryId);
+    if (st.targetId) return;
+    if (ev.key === 'ArrowDown' || ev.key === 'ArrowUp') {
+      ev.preventDefault();
+      if (!st.results.length) return;
+      const n = st.results.length;
+      st.active = (st.active + (ev.key === 'ArrowDown' ? 1 : n - 1)) % n;
+      dlinkRender(entryId);
+    } else if (ev.key === 'Enter') {
+      const pick = st.results[st.active];
+      if (pick) { ev.preventDefault(); dlinkPick(entryId, pick.id); }
+    } else if (ev.key === 'Escape') {
+      const input = document.getElementById('dlink-q-' + entryId);
+      if (input && input.value) { input.value = ''; dlinkSearch(entryId); }
+    }
+  }
+
+  function dlinkReset(entryId) {
+    _dLink[entryId] = { q: '', targetId: null, results: [], active: 0 };
+    const input = document.getElementById('dlink-q-' + entryId);
+    if (input) input.value = '';
+    dlinkRender(entryId);
   }
 
   async function saveDiaryLink(entryId) {
-    const targetVal = document.getElementById('dlink-target-' + entryId).value.trim();
-    if (!targetVal) { toast('⚠️ Enter a fact ID'); return; }
+    const targetVal = _dlinkState(entryId).targetId;
+    if (!targetVal) { toast('⚠️ Pick a memory to link'); return; }
     try {
       await api.post('diary/' + entryId + '/link', {factId: targetVal});
       toast('🔗 Linked');

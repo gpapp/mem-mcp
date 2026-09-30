@@ -597,5 +597,128 @@ class DiarySaveWiringTests(unittest.TestCase):
             self.assertIn(call, SOURCE, "%r does not pass the button" % call)
 
 
+def _diary_link_forms(source):
+    """The body of each `dlink-form-${entry.id}` block, as rendered."""
+    # Bounded by the form's own Cancel button, not by the next `</div>`: the
+    # form nests two divs, so a closing-tag scan truncates it mid-way and every
+    # assertion below silently reads a body that stops early.
+    out = []
+    marker = '<div id="dlink-form-${entry.id}"'
+    tail = 'toggleDiaryLinkForm(\'${entry.id}\')\">Cancel</button>\n'
+    idx = source.find(marker)
+    while idx != -1:
+        end = source.find(tail, idx)
+        end = end + len(tail) if end != -1 else -1
+        out.append(source[idx:end if end != -1 else len(source)])
+        idx = source.find(marker, end if end != -1 else len(source))
+    return out
+
+
+class DiaryLinkPickerTests(unittest.TestCase):
+    """The diary "Link to fact" target was a `<datalist>`.
+
+    A datalist whose options carry the raw UUID as `value` and the name as
+    `label` renders as a popup of every memory in the vault -- on this vault a
+    thousand rows -- and posts an id the user never saw. The only thing it could
+    report was a toast reading "Enter a fact ID", under a placeholder that said
+    "Search fact...". It is now the same client-side typeahead the fact pane
+    uses, so these assert the *shape* rather than the appearance: a search field
+    in both markup copies, a stored picked id, and no population of a datalist.
+
+    The `_fn` helper is local because `DiarySaveWiringTests._function` slices to
+    the next `"\n  function "`, which only finds non-async definitions -- and two
+    of the functions asserted here are plain ones.
+    """
+
+    def _fn(self, name):
+        start = -1
+        for prefix in ("async function %s(", "function %s("):
+            found = SOURCE.find(prefix % name)
+            if found != -1:
+                start = found
+                break
+        if start == -1:
+            return ""
+        end = SOURCE.find("\n  function ", start + 1)
+        if end == -1:
+            end = SOURCE.find("\n  async function ", start + 1)
+        return SOURCE[start:end if end != -1 else len(SOURCE)]
+
+    def test_no_datalist_of_facts_remains(self):
+        # Neither of these greps is for the bare id: the comment explaining what
+        # this replaced names it too, so a substring guard over the whole file
+        # reports green on a file containing the bug -- in its own words.
+        self.assertFalse('id="fact-datalist-dropdown"' in SOURCE,
+                         "the fact datalist element was left behind")
+        # The per-refresh population is the half that costs something: it built
+        # one <option> per memory on every loadMemories() call.
+        self.assertFalse('<option value="${m.id}">' in SOURCE,
+                         "loadMemories still fills a datalist of every fact")
+
+    def test_the_picker_is_a_search_field_in_both_markup_copies(self):
+        """The diary form is rendered twice -- view mode and edit mode.
+
+        A guard reading only one copy passes while the other still renders the
+        raw input, and which copy is live depends on whether the user is editing
+        the entry: not something a single-match source search can see.
+        """
+        self.assertEqual(SOURCE.count('class="pane-link-results"'), 3,
+                         "the fact pane plus both diary forms render a results box")
+
+        # Every one of these is checked *inside* each form, never over the whole
+        # file. A file-wide count pins every other contributor to the number --
+        # the JS definitions, the diary sidebar's own search input -- so it fails
+        # on correct code and would keep passing if one copy regressed.
+        forms = _diary_link_forms(SOURCE)
+        self.assertEqual(len(forms), 2, "the form is rendered twice: view and edit mode")
+        for form in forms:
+            for needle in ('<input type="search"', 'id="dlink-q-${entry.id}"',
+                           "dlinkSearch(", "dlinkKeys(", 'class="pane-link-results"',
+                           'id="dlink-chosen-${entry.id}"'):
+                self.assertTrue(needle in form,
+                                "a dlink-form copy is missing %r" % needle)
+            self.assertFalse("list=" in form,
+                             "a dlink-form copy still binds to a datalist")
+
+    def test_save_links_the_picked_id_not_a_typed_one(self):
+        """`saveDiaryLink` read the input's value, so it posted whatever was typed.
+
+        The only correct value is the id the picker stored, and an un-picked form
+        must refuse rather than post the query string as a fact id.
+        """
+        body = self._fn("saveDiaryLink")
+        self.assertTrue("_dlinkState(entryId).targetId" in body,
+                        "saveDiaryLink is not reading the picker's stored id")
+        self.assertFalse("dlink-target-" in body,
+                         "saveDiaryLink still reads a raw text input")
+        self.assertTrue("if (!targetVal)" in body,
+                        "an un-picked form must refuse, not post an empty id")
+
+    def test_candidates_exclude_what_is_already_linked(self):
+        """A second MENTIONS edge to the same fact is a duplicate, not a link."""
+        body = self._fn("dlinkCandidates")
+        self.assertTrue("entry.mentions" in body and "linked.has(m.id)" in body,
+                        "already-mentioned facts are still offered as targets")
+
+    def test_the_picker_filters_as_you_type(self):
+        """Find-as-you-type is the whole point of replacing the datalist."""
+        self.assertTrue('oninput="dlinkSearch(' in SOURCE,
+                        "the search field must filter on input, not on submit")
+        self.assertTrue("st.results = dlinkCandidates(entryId, st.q)" in self._fn("dlinkSearch"),
+                        "typing does not re-run the candidate filter")
+
+    def test_opening_the_form_drops_a_stale_pick(self):
+        """The same form element is reused across entries.
+
+        Without the reset, opening entry B's form shows entry A's picked target
+        and links the wrong fact -- silently, because the chip renders the
+        correct name for whatever was picked.
+        """
+        self.assertTrue("dlinkReset(entryId)" in self._fn("toggleDiaryLinkForm"),
+                        "the diary link form does not re-seed its picker on open")
+        self.assertTrue("targetId: null" in self._fn("dlinkReset"),
+                        "the reset does not clear the picked target")
+
+
 if __name__ == "__main__":
     unittest.main()
