@@ -488,6 +488,10 @@ Modify or delete links between memories directly from the UI.
 - Click ✏️ to change the relationship type inline
 - Click 🗑️ to delete the link (with confirmation)
 - The **Link to…** target is a search field, not a dropdown of every fact. Candidates exclude the source record and anything already linked, cap at `_PANE_LINK_LIMIT` (12), and match with the same expression `renderMemories()` uses, so the two lists agree on what a query means.
+- **Diary entries are candidates in the *fact* pane's picker, and that is not cosmetic.** `db_link_facts` has always had a `Fact`/`DiaryEntry` branch that MERGEs `MENTIONS` from the entry to the fact, `db_unlink_facts` matches it, `db_list_memories` returns it (`target_label`), and `renderLinkSection` draws it as a 📝 badge — so the edge was fully supported on every side *except* the one control that creates it, which searched `memories` only. Do not "simplify" `paneLinkCandidates` back to a fact-only loop. Three properties are load-bearing:
+  - Each candidate is `{kind, rec}`, and the kind survives into `st.targetKind`, because the relationship type is **meaningful only for a fact**. The server discards `relType` on a Fact→DiaryEntry link, so the field is hidden with an explanatory note (`#pane-link-relnote-<id>`) and `savePaneLink` sends `'MENTIONS'` itself — requiring a type there would block the link on an input that is thrown away.
+  - `loadDiary` is lazy (the diary tab fetches on first visit), so a picker opened on the Memories tab has an empty `diaryEntries`. `ensureDiaryEntries()` fetches the list *without* `loadDiary`'s side effects (it selects an entry and re-renders the sidebar, month pager and graph category sidebar) and de-duplicates concurrent calls.
+  - An entry already linked to the fact needs no separate exclusion: it arrives in `source.links` as an incoming `MENTIONS`, so the existing `linked` set already covers it. A second MENTIONS to the same fact is a duplicate, not a new link.
 
 ### Diary Search
 Search diary entries from the sidebar.

@@ -2251,8 +2251,8 @@ npm install @modelcontextprotocol/sdk</code></pre>
           ${renderLinkSection(m)}
         </div>
         <div id="pane-link-form-${m.id}" style="display:none; flex-direction:column; gap:.5rem; padding:.75rem; background:var(--bg); border-radius:6px; border:1px solid var(--border);">
-          <div style="font-size:.8rem; font-weight:600; color:var(--muted);">Link to another memory</div>
-          <input type="search" id="pane-link-q-${m.id}" placeholder="Search memories…" autocomplete="off"
+          <div style="font-size:.8rem; font-weight:600; color:var(--muted);">Link to a memory or diary entry</div>
+          <input type="search" id="pane-link-q-${m.id}" placeholder="Search memories &amp; diary…" autocomplete="off"
                  oninput="paneLinkSearch('${m.id}')" onkeydown="paneLinkKeys('${m.id}', event)">
           <div id="pane-link-results-${m.id}" class="pane-link-results"></div>
           <div id="pane-link-chosen-${m.id}" class="pane-link-chosen" style="display:none;">
@@ -2260,6 +2260,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
             <button class="btn btn-ghost btn-sm" onclick="paneLinkClear('${m.id}')">Change</button>
           </div>
           <input id="pane-link-rel-${m.id}" placeholder="Relationship type (e.g. KNOWS)">
+          <div id="pane-link-relnote-${m.id}" class="result-snippet" style="display:none;">📓 Diary entries are linked with <code>MENTIONS</code> — the entry points at this fact, so no relationship type is needed.</div>
           <div style="display:flex; gap:.5rem; justify-content:flex-end;">
             <button class="btn btn-ghost btn-sm" onclick="document.getElementById('pane-link-form-${m.id}').style.display='none'">Cancel</button>
             <button class="btn btn-primary btn-sm" onclick="savePaneLink('${m.id}')">Link</button>
@@ -2659,10 +2660,18 @@ npm install @modelcontextprotocol/sdk</code></pre>
     // never comes back holding a target picked in a previous visit -- and
     // re-seeding on *every* open would throw away a pick made a second ago.
     if (opening) {
-      _paneLink[id] = { q: '', targetId: null, results: [], active: 0 };
+      _paneLink[id] = { q: '', targetId: null, targetKind: null, results: [], active: 0 };
       const input = document.getElementById('pane-link-q-' + id);
       if (input) input.value = '';
       paneLinkRender(id);
+      // Diary entries are linkable targets (db_link_facts handles Fact ->
+      // DiaryEntry), and loadDiary is lazy -- the diary tab may never have been
+      // opened this session, so the picker would otherwise search an empty
+      // list. Fetch them here, once, and re-render when they land.
+      ensureDiaryEntries().then(() => {
+        const still = document.getElementById('pane-link-form-' + id);
+        if (still && still.style.display !== 'none' && !_paneLink[id].targetId) paneLinkSearch(id);
+      });
     }
   }
 
@@ -2678,12 +2687,41 @@ npm install @modelcontextprotocol/sdk</code></pre>
   //
   // Matching is deliberately the same expression renderMemories() uses, so the
   // same query finds the same thing in both places.
+  //
+  // Diary entries are candidates too. A fact -> diary link is a real edge (the
+  // backend writes MENTIONS from the entry to the fact, and the fact pane
+  // already renders it as a 📝 badge), so refusing to offer them here made the
+  // most common cross-record link unreachable from the only side that can
+  // express a *type* for it. Each candidate carries its kind so the render and
+  // the save can tell a Fact from a DiaryEntry: the relationship type is only
+  // meaningful for the former.
   const _PANE_LINK_LIMIT = 12;
   let _paneLink = {};
 
   function _paneLinkState(id) {
-    if (!_paneLink[id]) _paneLink[id] = { q: '', targetId: null, results: [], active: 0 };
+    if (!_paneLink[id]) _paneLink[id] = { q: '', targetId: null, targetKind: null, results: [], active: 0 };
     return _paneLink[id];
+  }
+
+  function _paneLinkTitle(c) {
+    if (c.kind === 'diary') return diaryEntryTitle(c.rec);
+    return c.rec.name || (c.rec.text || '').substring(0, 60);
+  }
+
+  function _paneLinkBody(c) {
+    return (c.kind === 'diary' ? (c.rec.content || '') : (c.rec.text || '')) || '';
+  }
+
+  // Same fields the diary sidebar shows, so a query that finds an entry there
+  // finds it here: title, body, date, client, project.
+  function _paneLinkDiaryHaystack(e) {
+    return [diaryEntryTitle(e), e.name || '', e.content || '',
+            e.date || '', e.timestamp || '',
+            e.clientName || '', e.contextName || ''].join(' ').toLowerCase();
+  }
+
+  function _paneLinkSortKey(c) {
+    return ((_paneLinkTitle(c) || '') + ' ' + _paneLinkBody(c)).toLowerCase();
   }
 
   function paneLinkCandidates(id, q) {
@@ -2691,6 +2729,8 @@ npm install @modelcontextprotocol/sdk</code></pre>
     const source = memories.find(x => x.id === id);
     // Anything already joined to this fact by any direction: a second edge of
     // the same type is a duplicate, and the old dropdown offered them freely.
+    // This also covers a diary entry already linked to this fact — db_list_
+    // memories returns it in source.links as an incoming MENTIONS.
     const linked = new Set((source && source.links || []).map(l => l.target_id));
     linked.add(id);
     const out = [];
@@ -2699,11 +2739,16 @@ npm install @modelcontextprotocol/sdk</code></pre>
       const name = (m.name || '').toLowerCase();
       if (needle && !m.text.toLowerCase().includes(needle) && !name.includes(needle)
           && !String(m.category || '').toLowerCase().includes(needle)) continue;
-      out.push(m);
+      out.push({ kind: 'fact', rec: m });
       if (out.length >= 200) break;
     }
-    out.sort((a, b) => ((a.name || a.text || '') + ' ' + (a.name || ''))
-                      .toLowerCase().localeCompare(((b.name || b.text || '') + ' ' + (b.name || '')).toLowerCase()));
+    for (const e of diaryEntries) {
+      if (linked.has(e.id)) continue;
+      if (needle && !_paneLinkDiaryHaystack(e).includes(needle)) continue;
+      out.push({ kind: 'diary', rec: e });
+      if (out.length >= 400) break;
+    }
+    out.sort((a, b) => _paneLinkSortKey(a).localeCompare(_paneLinkSortKey(b)));
     return out.slice(0, _PANE_LINK_LIMIT);
   }
 
@@ -2721,34 +2766,50 @@ npm install @modelcontextprotocol/sdk</code></pre>
     const box = document.getElementById('pane-link-results-' + id);
     const chosen = document.getElementById('pane-link-chosen-' + id);
     const chosenName = document.getElementById('pane-link-chosen-name-' + id);
+    const rel = document.getElementById('pane-link-rel-' + id);
+    const relNote = document.getElementById('pane-link-relnote-' + id);
+    // A diary target is linked with MENTIONS by the server, so asking for a
+    // relationship type would be a field the answer is silently discarded from.
+    const isDiary = !!(st.targetId && st.targetKind === 'diary');
+    if (rel) rel.style.display = isDiary ? 'none' : '';
+    if (relNote) relNote.style.display = isDiary ? 'block' : 'none';
     if (chosen) {
       chosen.style.display = st.targetId ? 'flex' : 'none';
       if (st.targetId && chosenName) {
-        const t = memories.find(x => x.id === st.targetId);
-        chosenName.textContent = t ? (t.name || (t.text || '').substring(0, 60)) : st.targetId;
+        const c = st.results.find(x => x.rec.id === st.targetId);
+        const t = c ? c.rec : (memories.find(x => x.id === st.targetId)
+                  || diaryEntries.find(x => x.id === st.targetId));
+        chosenName.textContent = t
+          ? ((c && _paneLinkTitle(c)) || (t.name || (t.text || t.content || '').substring(0, 60)))
+          : st.targetId;
       }
     }
     if (!box) return;
     if (st.targetId) { box.innerHTML = ''; return; }
     if (!st.results.length) {
       box.innerHTML = st.q.trim()
-        ? '<p class="empty" style="padding:.5rem .6rem; font-size:.8rem;">No matching memories.</p>'
+        ? '<p class="empty" style="padding:.5rem .6rem; font-size:.8rem;">No matching memories or diary entries.</p>'
         : '';
       return;
     }
-    box.innerHTML = st.results.map((m, i) => {
-      const name = m.name || (m.text || '').substring(0, 60);
-      const snippet = m.name ? (m.text || '').replace(/\s+/g, ' ').trim().substring(0, 70) : '';
-      return `<div class="pane-link-result${i === st.active ? ' active' : ''}" onclick="paneLinkPick('${id}', '${m.id}')">
-        <div>${escHtml(name)}</div>
-        ${snippet ? `<div class="result-snippet">${escHtml(snippet)}…</div>` : ''}
+    box.innerHTML = st.results.map((c, i) => {
+      const title = _paneLinkTitle(c) || c.rec.id;
+      const body = _paneLinkBody(c).replace(/\s+/g, ' ').trim();
+      const kindLine = c.kind === 'diary'
+        ? `📓 Diary${c.rec.date ? ' · ' + c.rec.date : (c.rec.timestamp ? ' · ' + String(c.rec.timestamp).slice(0, 10) : '')}`
+        : `🗂️ Memory${c.rec.category ? ' · ' + c.rec.category : ''}`;
+      return `<div class="pane-link-result${i === st.active ? ' active' : ''}" onclick="paneLinkPick('${id}', '${c.rec.id}', '${c.kind}')">
+        <div>${escHtml(title)}</div>
+        <div class="result-snippet">${escHtml(kindLine)}</div>
+        ${body ? `<div class="result-snippet">${escHtml(body.substring(0, 70))}…</div>` : ''}
       </div>`;
     }).join('');
   }
 
-  function paneLinkPick(id, targetId) {
+  function paneLinkPick(id, targetId, kind) {
     const st = _paneLinkState(id);
     st.targetId = targetId;
+    st.targetKind = kind || null;
     st.q = '';
     st.results = [];
     const input = document.getElementById('pane-link-q-' + id);
@@ -2759,6 +2820,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
   function paneLinkClear(id) {
     const st = _paneLinkState(id);
     st.targetId = null;
+    st.targetKind = null;
     const input = document.getElementById('pane-link-q-' + id);
     if (input) { input.value = ''; input.focus(); }
     paneLinkSearch(id);
@@ -2775,7 +2837,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
       paneLinkRender(id);
     } else if (ev.key === 'Enter') {
       const pick = st.results[st.active];
-      if (pick) { ev.preventDefault(); paneLinkPick(id, pick.id); }
+      if (pick) { ev.preventDefault(); paneLinkPick(id, pick.rec.id, pick.kind); }
     } else if (ev.key === 'Escape') {
       const input = document.getElementById('pane-link-q-' + id);
       if (input && input.value) { input.value = ''; paneLinkSearch(id); }
@@ -2841,13 +2903,18 @@ npm install @modelcontextprotocol/sdk</code></pre>
 
   async function savePaneLink(id) {
     const st = _paneLinkState(id);
-    const relType = document.getElementById('pane-link-rel-' + id).value.trim();
-    if (!st.targetId) { toastApiError({detail:'Pick a target memory from the search results first.'}, 'Relationship type required'); return; }
+    const isDiary = st.targetKind === 'diary';
+    const relInput = document.getElementById('pane-link-rel-' + id);
+    // db_link_facts ignores the relationship type on a Fact -> DiaryEntry link
+    // (it MERGEs MENTIONS from the entry to the fact), so requiring one here
+    // would block the link on a field the server does not use.
+    const relType = isDiary ? 'MENTIONS' : (relInput ? relInput.value.trim() : '');
+    if (!st.targetId) { toastApiError({detail:'Pick a memory or diary entry from the search results first.'}, 'Relationship type required'); return; }
     if (!relType) { toastApiError({detail:'Relationship type required.'}, 'Relationship type required'); return; }
     try {
       await api.post('memories/link', {sourceId: id, targetId: st.targetId, relType});
       toast('🔗 Linked');
-      _paneLink[id] = { q: '', targetId: null, results: [], active: 0 };
+      _paneLink[id] = { q: '', targetId: null, targetKind: null, results: [], active: 0 };
       await loadMemories();
       const m = memories.find(x => x.id === id);
       if (m) renderFactPane(m);
@@ -2995,6 +3062,24 @@ npm install @modelcontextprotocol/sdk</code></pre>
       renderCategorySidebar();
       toast('🗑️ Deleted');
     } catch(e) { toast('❌ Error'); }
+  }
+
+  // Facts can link to diary entries, so the fact pane's link picker needs the
+  // diary list even when the diary tab has never been opened (loadDiary is
+  // lazy). This fetches it WITHOUT loadDiary's side effects -- that one selects
+  // an entry and re-renders three diary panes, which is not the caller's
+  // business -- and it de-duplicates concurrent calls, since opening the picker
+  // on several facts in a row would otherwise re-fetch the same vault.
+  let _diaryEntriesPromise = null;
+  function ensureDiaryEntries() {
+    if (diaryEntries.length) return Promise.resolve(diaryEntries);
+    if (!_diaryEntriesPromise) {
+      _diaryEntriesPromise = api.get('diary')
+        .then(list => { diaryEntries = list || []; return diaryEntries; })
+        .catch(() => diaryEntries)
+        .finally(() => { _diaryEntriesPromise = null; });
+    }
+    return _diaryEntriesPromise;
   }
 
   async function loadDiary() {
