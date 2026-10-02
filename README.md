@@ -130,6 +130,37 @@ environment — so a Google client secret now lives in a file the app
 writes. The secret is never returned by any endpoint; the Setup page only tells
 you whether one is set.
 
+### Registration
+
+Self-service sign-up is **off unless you turn it on**: set
+`MEM_REGISTRATION_ENABLED=1` and restart. With it off there is no signup route at
+all, so nothing is exposed by upgrading. With it on, the login page grows a
+**✨ Create an account** card with two methods:
+
+- **Email and password** — an address and a password of at least 10 characters.
+- **A Google ID token** — the same `eyJ…` token as above, pasted in. This
+  additionally requires a client id saved under Setup → Google sign-in; without
+  one the Google method is not offered at all, because nothing could verify the
+  token.
+
+Your **email address becomes the account name**, and every account gets its own
+vault — accounts share only the server, nothing in the data.
+
+**The address is not verified and there is no password reset.** Anyone can
+register an address they do not own, and there is no mail sent, no confirmation
+link and no recovery path, so an address that gets reassigned later would reach
+the old account. Do not use an address you would mind losing.
+
+Registered passwords are stored as **scrypt hashes in the app's own SQLite
+database**, not in `htpasswd`, which stays read-only. Existing htpasswd accounts
+are therefore completely unaffected, and an account registered here cannot
+overwrite one that already exists — an address already known to either store is
+refused.
+
+`/mcp` is **unchanged** by this: it still accepts only an access key or a Google
+ID token, never a session cookie. Signing up gives you a dashboard, not an MCP
+credential.
+
 ### Proxy header trust
 
 **The GUI, the REST API and `/mcp` all require a verified credential.** A

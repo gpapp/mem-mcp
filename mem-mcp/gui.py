@@ -47,7 +47,10 @@ from sessions import (VaultSession, VaultSessionMiddleware, create_session,
                       save_oauth_client, get_oauth_client, oauth_client_public,
                       delete_oauth_client, link_google_identity,
                       unlink_google_identity, list_google_identities,
-                      resolve_google_identity, GOOGLE_PROVIDER)
+                      resolve_google_identity, GOOGLE_PROVIDER,
+                      verify_account_password, user_id_taken,
+                      create_credentials, validate_email,
+                      registration_enabled, allow_registration_attempt)
 import google_auth
 from matching_utils import (MergeDraftTooLarge, execute_merge,
                              format_people_merge_text, merge_draft_output_budget)
@@ -136,6 +139,93 @@ def _verify_htpasswd(username: str, password: str) -> bool:
         logging.warning(f"htpasswd verification failed: {e}")
         return False
 
+
+def _verify_account(user_id: str, password: str) -> str | None:
+    """The vault key this password opens, or None.
+
+    Returning the key rather than a bool is the point of this function. `user_id`
+    is the `userId` on every Fact, DiaryEntry and Client in the other two
+    stores, so a session holding `Alice@Example.com` when the vault key is
+    `alice@example.com` is a session that appears to be signed in and sees an
+    empty vault. Callers must store what this returns, not what they were given.
+
+    Two stores, checked in this order:
+
+    1. the `credentials` table, which self-service registration writes;
+    2. the operator's htpasswd file, which predates all of it.
+
+    The order matters and is not arbitrary. An address could in principle name an
+    account in both — an operator who also signs up with the same email — and
+    the row this app owns is the one whose password can be rotated by the app,
+    so it wins. Reversing the order would make the htpasswd copy authoritative
+    and a password change made in the UI a silent no-op.
+
+    The registered-account lookup is tried twice, exactly as typed and then
+    lowercased, because a registered account's key *is* its lowercased email
+    while an htpasswd username is case-sensitive (`Freddie` is a different user
+    from `freddie` there and must stay one). The htpasswd fallback therefore
+    gets the string exactly as it arrived, which is the only way its existing
+    accounts keep working.
+
+    This is the only place a password is checked. `api_login` and the `Basic`
+    branch of `_check_session_auth` both come through here rather than calling
+    `_verify_htpasswd` directly, because two call sites that each pick a store is
+    how they end up disagreeing about who can log in.
+    """
+    name = str(user_id or "").strip()
+    if not name or not password:
+        return None
+    for candidate in (name, name.lower()):
+        try:
+            if verify_account_password(candidate, password):
+                return candidate
+        except Exception as e:
+            # A broken credentials table must not become a broken login path:
+            # fall through to htpasswd so the operator can still get in to fix
+            # it.
+            logging.warning(f"credential store lookup failed for {candidate!r}: {e}")
+    if _verify_htpasswd(name, password):
+        return name
+    return None
+
+
+def _signup_client(request: Request) -> str:
+    """A best-effort identity for the signup rate limiter.
+
+    The rightmost X-Forwarded-For entry, not the leftmost. nginx is configured
+    with `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for`, which
+    *appends* the peer it saw, so the rightmost entry is the last hop that was
+    not chosen by the client — a request arriving with a forged
+    `X-Forwarded-For: 1.2.3.4` ends up as `1.2.3.4, <real peer>` and the real
+    peer is what gets read. The leftmost entry is whatever the client sent.
+
+    Falls back to the socket peer, which behind the proxy is nginx itself: that
+    means every signup shares one bucket rather than getting a free pass, which
+    is the right way for that fallback to fail.
+    """
+    forwarded = request.headers.get("x-forwarded-for") or ""
+    hops = [hop.strip() for hop in forwarded.split(",") if hop.strip()]
+    if hops:
+        return hops[-1]
+    client = getattr(request, "client", None)
+    return getattr(client, "host", "") or "unknown"
+
+
+def registration_config() -> dict:
+    """Which signup methods the landing page should offer, and why not.
+
+    Both answers are booleans the template branches on rather than a single
+    "registration is on", because the two halves fail independently: the env flag
+    turns the routes on, and a Google client id is what lets a Google token be
+    verified at all. Offering a Google form that returns 404 because no client id
+    is configured is worse than not offering it.
+    """
+    return {
+        "email": bool(registration_enabled("email")),
+        "google": bool(registration_enabled(GOOGLE_PROVIDER)),
+        "password_hint": vault_sessions.MIN_PASSWORD_CHARS,
+    }
+
 templates = Environment(
     loader=FileSystemLoader(os.path.join(os.path.dirname(__file__), "templates")),
     autoescape=select_autoescape(["html", "xml"])
@@ -188,8 +278,12 @@ def _check_session_auth(request: Request) -> str | None:
         name, sep, secret = decoded.partition(":")
         if not sep or not name:
             return None
-        if _verify_htpasswd(name, secret):
-            return name
+        # _verify_account, not _verify_htpasswd: Basic and the login form must
+        # accept exactly the same set of accounts, or a credential that works
+        # in the browser is refused to a script (or worse, the reverse).
+        account = _verify_account(name, secret)
+        if account:
+            return account
         # Logged, not raised: the 401 below is the answer the client needs, and
         # a failed login attempt is worth seeing without being an exception.
         logging.getLogger("memory-vault").warning(
@@ -1369,15 +1463,19 @@ class LoginRequest(BaseModel):
 
 @web_app.post("/api/auth/login", response_class=JSONResponse)
 async def api_login(request: Request, body: LoginRequest):
-    if _verify_htpasswd(body.username, body.password):
+    account = _verify_account(body.username, body.password)
+    if account:
         # clear() first, so the middleware deletes the old row and mints a new
         # session id rather than upgrading whatever id was already in the
         # browser. The password is verified here and then dropped on the floor:
         # it used to be written to the session so the Setup page could echo it,
         # and sessions are now persisted to disk.
         request.session.clear()
-        request.session["user"] = body.username
-        return {"status": "ok"}
+        # `account`, not body.username: for a registered account the vault
+        # key is the lowercased email, so storing what was typed would sign
+        # the user into a vault that does not exist. See _verify_account.
+        request.session["user"] = account
+        return {"status": "ok", "user": account}
     else:
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
@@ -1385,6 +1483,178 @@ async def api_login(request: Request, body: LoginRequest):
 async def api_logout(request: Request):
     request.session.clear()
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Self-service registration
+#
+# Two methods, both opt-in, both GUI-only. "GUI-only" is not a restriction
+# imposed here for tidiness -- it is what falls out of the design. A signup
+# produces a vault key, and a vault key is a credential, so exposing it on /mcp
+# would mean an unauthenticated endpoint on the path that holds every MCP tool.
+# The MCP side is unchanged and remains token-only: an account that exists gets
+# its access key from Setup -> Access Keys like any other.
+#
+# Both routes live under /api/auth/, which is the *only* prefix auth_guard lets
+# through unauthenticated, so they are open by construction. That is what a
+# signup endpoint has to be, and it is also why the flag defaults off.
+# ---------------------------------------------------------------------------
+
+class RegisterRequest(BaseModel):
+    email: str = ""
+    password: str = ""
+
+
+class GoogleRegisterRequest(BaseModel):
+    token: str = ""
+
+
+def _require_registration(method: str, request: Request) -> None:
+    """Refuse unless this signup method is switched on, counting the attempt.
+
+    The throttle is inside the guard on purpose: it has to run before the flag
+    check would otherwise return early, or an operator who turns registration
+    *off* has just removed the rate limit from a route that is still mounted.
+    Counting every attempt regardless of outcome is also the only version that
+    measures what an attacker is doing, which is the thing the limit exists for.
+    """
+    client = _signup_client(request)
+    if not allow_registration_attempt(client):
+        logging.getLogger("memory-vault").warning(
+            f"registration: rate limit hit for {client!r}"
+        )
+        raise HTTPException(
+            status_code=429,
+            detail="Too many sign-up attempts from this address. Try again in a few minutes.",
+        )
+    if not registration_enabled(method):
+        # 404, not 403. A 403 says "this exists and you may not"; a disabled
+        # signup route should be indistinguishable from one that was never
+        # mounted, so that turning the flag off does not advertise that
+        # registration is a thing this app has.
+        raise HTTPException(status_code=404, detail="Not found")
+
+
+@web_app.post("/api/auth/register", response_class=JSONResponse)
+async def api_register(request: Request, body: RegisterRequest):
+    """Create an email/password account and sign in as it.
+
+    The account's vault key is its lowercased email address, so no mapping layer
+    is introduced and every existing query that scopes by `userId` keeps working
+    unchanged. See sessions.py `credentials` for why there is no row created in
+    Neo4j: a `:User` node appears by itself the first time the new account writes
+    anything, and an empty account has nothing to write.
+    """
+    _require_registration("email", request)
+    try:
+        account = validate_email(body.email)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # user_id_taken is checked before hashing, not after. Hashing is the
+    # expensive half (~16 MiB and tens of ms) and an account that already exists
+    # cannot be created by hashing harder -- but the check has to happen before
+    # the INSERT as well, or two simultaneous signups for one address both pass
+    # it and the second overwrites the first's password. The PRIMARY KEY turns
+    # that race into an IntegrityError, which is handled below.
+    if user_id_taken(account):
+        raise HTTPException(
+            status_code=409,
+            detail="An account already exists for that address. Sign in instead.",
+        )
+    try:
+        create_credentials(account, body.password)
+    except ValueError as e:
+        # Password policy. The message is the policy, because it is the only
+        # place the policy is ever communicated.
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        if type(e).__name__ == "IntegrityError":
+            raise HTTPException(
+                status_code=409,
+                detail="An account already exists for that address. Sign in instead.",
+            )
+        raise _service_unavailable(e)
+
+    logging.getLogger("memory-vault").info(f"registration: created {account!r}")
+    request.session.clear()
+    request.session["user"] = account
+    return {"status": "ok", "user": account}
+
+
+@web_app.post("/api/auth/register/google", response_class=JSONResponse)
+async def api_register_google(request: Request, body: GoogleRegisterRequest):
+    """Create an account from a pasted Google ID token, and sign in as it.
+
+    The token is verified exactly as it is everywhere else -- same
+    `google_auth.google_identity`, same audience check against the configured
+    client id -- and then *linked* rather than resolved. That is the whole
+    difference from `POST /api/auth/google`: signing in needs an identity that
+    already points at a vault, and registering is the act of pointing it at one.
+
+    The vault key is the account's email, which is what makes an email signup and
+    a Google signup for the same address converge on one vault instead of two.
+    The cost is stated in AGENTS.md "Registration": an address is a vault key, so
+    a reassigned address would reach the old vault. Google signs with `sub` for
+    exactly this reason, and this app cannot have both when the email *is* the
+    identity.
+    """
+    _require_registration(GOOGLE_PROVIDER, request)
+
+    client_record = get_oauth_client(GOOGLE_PROVIDER)
+    if not client_record or not client_record.get("client_id"):
+        raise HTTPException(status_code=404, detail="Not found")
+    try:
+        identity = google_auth.google_identity(body.token, client_record["client_id"])
+    except google_auth.GoogleTokenError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    email = str(identity.get("email") or "").strip()
+    if not email:
+        # A token with no email claim cannot name a vault, because the email is
+        # the vault key. Refusing is the only honest answer -- inventing a key
+        # from the subject would produce a vault whose owner cannot type their
+        # own login.
+        raise HTTPException(
+            status_code=400,
+            detail="That Google token carries no email address, so it cannot name an account.",
+        )
+    try:
+        account = validate_email(email)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # Already linked is a refusal, not a shortcut into signing in: /api/auth/google
+    # is the route for that, and silently logging someone in on the register
+    # endpoint would make "register" and "sign in" the same request.
+    if resolve_google_identity(identity["subject"], GOOGLE_PROVIDER, touch=False):
+        raise HTTPException(
+            status_code=409,
+            detail="That Google account already has an account. Sign in instead.",
+        )
+    if user_id_taken(account):
+        # The same address already has a vault, by password or by another Google
+        # subject. Refusing rather than linking is deliberate: linking would give
+        # a second Google identity write access to someone else's vault on the
+        # strength of a matching email string.
+        raise HTTPException(
+            status_code=409,
+            detail="An account already exists for that address. Sign in instead.",
+        )
+
+    try:
+        vault_sessions.link_google_identity(
+            identity["subject"], account, email=email,
+            name=str(identity.get("name") or ""),
+        )
+    except Exception as e:
+        raise _service_unavailable(e)
+
+    logging.getLogger("memory-vault").info(f"registration: created {account!r} via Google")
+    request.session.clear()
+    request.session["user"] = account
+    return {"status": "ok", "user": account}
+
 
 
 @web_app.get("/api/whoami", response_class=JSONResponse)
@@ -1917,6 +2187,15 @@ async def get_landing(request: Request):
     base_url = mem.BASE_URL or "/"
     ctx["BASE_URL"] = base_url
     ctx["authenticated"] = bool(creds)
+    # Per-method, not one "registration is on". The two halves fail
+    # independently -- the env flag opens the routes, a Google client id is
+    # what makes a Google token verifiable at all -- so a single flag would
+    # have to render a Google form that 404s on a deployment with no
+    # client id configured. See registration_config().
+    signup = registration_config()
+    ctx["SIGNUP_EMAIL"] = signup["email"]
+    ctx["SIGNUP_GOOGLE"] = signup["google"]
+    ctx["SIGNUP_PASSWORD_MIN"] = signup["password_hint"]
     html = _render("landing", **ctx)
     return HTMLResponse(content=html)
 

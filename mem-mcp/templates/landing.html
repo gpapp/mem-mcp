@@ -29,6 +29,18 @@
     .btn { display: inline-block; background: var(--primary); color: #fff; padding: .8rem 2rem; border-radius: 8px; text-decoration: none; font-weight: 600; transition: transform .15s; cursor: pointer; border: none; }
     .btn:hover { transform: translateY(-2px); box-shadow: 0 4px 12px rgba(79,70,229,.3); }
     input { width: 100%; padding: .75rem; margin-bottom: 1rem; border: 1px solid var(--border); border-radius: 8px; font-size: 1rem; box-sizing: border-box; }
+    textarea { width: 100%; padding: .75rem; margin-bottom: 1rem; border: 1px solid var(--border); border-radius: 8px; font-size: .9rem; font-family: 'JetBrains Mono', 'Fira Code', monospace; box-sizing: border-box; resize: vertical; }
+    /* 16px on inputs is a functional fix, not a style choice: below it, iOS
+       zooms the viewport on focus and the zoom cannot be undone without a
+       reload, so the form never recovers its layout. */
+    input, textarea, select { font-size: 16px; }
+    @media (min-width: 640px) { textarea { font-size: .9rem; } }
+    .btn-secondary { background: var(--surface); color: var(--primary); border: 1px solid var(--primary); }
+    .btn-secondary:hover { box-shadow: none; background: #eef2ff; }
+    .note { font-size: .9rem; color: var(--muted); }
+    .form-error { color: #b91c1c; font-size: .9rem; margin-bottom: 1rem; }
+    .form-error:empty { display: none; }
+    details summary { cursor: pointer; color: var(--primary); font-weight: 600; }
     
     .step { margin-bottom: 1.5rem; }
     .step-num { display: inline-block; width: 24px; height: 24px; background: var(--primary); color: #fff; text-align: center; line-height: 24px; border-radius: 50%; font-size: .8rem; font-weight: 700; margin-right: .5rem; }
@@ -49,11 +61,48 @@
     <div class="card">
       <h2>🔐 Sign In</h2>
       <form id="loginForm">
-        <input type="text" name="username" placeholder="Username" required autocomplete="username">
+        <input type="text" name="username" placeholder="Email or username" required autocomplete="username">
         <input type="password" name="password" placeholder="Password" required autocomplete="current-password">
         <button type="submit" class="btn">Sign In</button>
       </form>
+      <p class="form-error" id="loginError"></p>
     </div>
+    {% if SIGNUP_EMAIL or SIGNUP_GOOGLE %}
+    <div class="card">
+      <h2>✨ Create an account</h2>
+      <p class="note" style="margin-top:0;">
+        Your email address becomes your account name, and each account gets its
+        own vault. Nothing is shared between accounts except this one server.
+      </p>
+      {% if SIGNUP_EMAIL %}
+      <form id="registerForm">
+        <input type="email" name="email" placeholder="Email address" required autocomplete="email">
+        <input type="password" name="password" placeholder="Password" required minlength="10" autocomplete="new-password">
+        <button type="submit" class="btn">Create account</button>
+      </form>
+      <p class="note">
+        At least {{SIGNUP_PASSWORD_MIN}} characters. The address is not verified —
+        anyone can register one, so do not use an address you would mind losing.
+      </p>
+      <p class="form-error" id="registerError"></p>
+      {% endif %}
+      {% if SIGNUP_GOOGLE %}
+      {% if SIGNUP_EMAIL %}<hr style="border:none;border-top:1px solid var(--border);margin:1.5rem 0;">{% endif %}
+      <h3 style="font-size:1rem;margin:0 0 .5rem;">🔵 Or with a Google ID token</h3>
+      <p class="note" style="margin-top:0;">
+        Paste a Google <strong>ID token</strong> (<code>eyJ…</code> — not an access
+        token, not a <code>ya29.…</code> one). It is checked against Google's
+        signature and this app's client id, and the account it names is created
+        from its email address. There is no redirect and no callback URL.
+      </p>
+      <form id="registerGoogleForm">
+        <textarea name="token" id="googleTokenInput" rows="3" placeholder="eyJhbGciOiJSUzI1NiIs…" required autocomplete="off" spellcheck="false"></textarea>
+        <button type="submit" class="btn btn-secondary">Create account with Google</button>
+      </form>
+      <p class="form-error" id="registerGoogleError"></p>
+      {% endif %}
+    </div>
+    {% endif %}
     {% else %}
     <div style="margin-top: 2rem;">
       <a href="{{BASE_URL}}/gui" class="btn">Enter Dashboard →</a>
@@ -90,21 +139,63 @@
 
   <script>
     const BASE_URL = "{{BASE_URL}}";
-    
-    const loginForm = document.getElementById('loginForm');
-    if (loginForm) {
-      loginForm.addEventListener('submit', async (e) => {
+
+    // The reason lives in the response body, and a bare Response throws it away.
+    // That was fine when the only failure was "Invalid credentials"; it is not
+    // fine now that a signup can say "that address is already registered" or
+    // "that Google token carries no email address", which are different problems
+    // with different fixes and both of which the user has to act on.
+    async function apiFail(res) {
+      let detail = '';
+      try {
+        const body = await res.clone().json();
+        if (body && body.detail) detail = String(body.detail);
+      } catch (_) { /* not JSON, or no body -- the status is all we have */ }
+      return detail || ('HTTP ' + res.status);
+    }
+
+    function showError(id, message) {
+      const el = document.getElementById(id);
+      if (el) el.textContent = message || '';
+    }
+
+    // Submit handler shared by all three forms: post JSON, send the user to the
+    // dashboard on success, and put the server's own reason in the form's error
+    // line on failure. Kept in one place so a new form cannot accidentally fall
+    // back to a blocking alert box and lose the detail.
+    function wireForm(formId, errorId, url, fields, buttonText) {
+      const form = document.getElementById(formId);
+      if (!form) return;
+      form.addEventListener('submit', async (e) => {
         e.preventDefault();
-        const form = new FormData(e.target);
-        const res = await fetch(BASE_URL + '/api/auth/login', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ username: form.get('username'), password: form.get('password') })
-        });
-        if (res.ok) window.location.href = BASE_URL + '/gui';
-        else alert('Invalid credentials');
+        const button = form.querySelector('button[type=submit]');
+        const label = button ? button.textContent : '';
+        showError(errorId, '');
+        if (button) { button.disabled = true; button.textContent = buttonText; }
+        try {
+          const data = {};
+          for (const [key, name] of Object.entries(fields)) data[key] = form.elements[name].value;
+          const res = await fetch(BASE_URL + url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(data)
+          });
+          if (res.ok) { window.location.href = BASE_URL + '/gui'; return; }
+          showError(errorId, await apiFail(res));
+        } catch (err) {
+          showError(errorId, 'Could not reach the server.');
+        } finally {
+          if (button) { button.disabled = false; button.textContent = label; }
+        }
       });
     }
+
+    wireForm('loginForm', 'loginError', '/api/auth/login',
+              { username: 'username', password: 'password' }, 'Signing in…');
+    wireForm('registerForm', 'registerError', '/api/auth/register',
+              { email: 'email', password: 'password' }, 'Creating account…');
+    wireForm('registerGoogleForm', 'registerGoogleError', '/api/auth/register/google',
+              { token: 'token' }, 'Checking token…');
   </script>
 </body>
 </html>

@@ -1088,8 +1088,20 @@ class ApiAuthTests(unittest.TestCase):
         cls.ladder_fn = staticmethod(
             _lift("gui.py", "resolve_bearer_token", namespace))
         cls.verifications = []
+        cls.registered_checks = []
         ns = dict(namespace)
         ns["_verify_htpasswd"] = lambda u, p: ApiAuthTests._verify(u, p)
+        # _check_session_auth now calls _verify_account (gui.py), the two-store
+        # check that consults the registered-account table before falling back to
+        # htpasswd. The stub has to mirror that order rather than just call
+        # htpasswd, or the suite keeps passing while the store this feature added
+        # is never reached. It also must NOT lowercase the name it hands to
+        # htpasswd: htpasswd usernames are case-sensitive, and a stub that folded
+        # case on both stores would hide the property the wrong-password and
+        # unknown-user tests exist to pin.
+        ns["_verify_account"] = lambda u, p: (
+            u if ApiAuthTests._registered(u, p) else
+            (u if ApiAuthTests._verify(u, p) else None))
         cls.check = staticmethod(_lift("gui.py", "_check_session_auth", ns))
         # staticmethod, or `self.user` binds it and every call arrives with
         # an extra self -- the same trap as HeaderPrecedenceTests.extract.
@@ -1098,6 +1110,14 @@ class ApiAuthTests(unittest.TestCase):
         ns2["_check_session_auth"] = cls.check
         cls.auth_guard = staticmethod(
             _lift_undecorated("gui.py", "auth_guard", ns2))
+
+    @classmethod
+    def _registered(cls, username, password):
+        """The `credentials` half of _verify_account. Empty here: these tests are
+        about the htpasswd path, and a populated one would let a registered
+        account short-circuit the verifier the tests are asserting was called."""
+        cls.registered_checks.append((username, password))
+        return False
 
     @classmethod
     def _verify(cls, username, password):

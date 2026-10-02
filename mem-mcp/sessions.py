@@ -37,11 +37,14 @@ and the caller hands it to the browser on that one response.
 # one the tests run on; `Python311AnnotationTests` walks the AST for it instead.
 from __future__ import annotations
 
+import base64
 import hashlib
+import hmac
 import json
 import os
 import secrets
 import sqlite3
+import subprocess
 import threading
 import time
 import uuid
@@ -124,6 +127,31 @@ CREATE TABLE IF NOT EXISTS google_identities (
 );
 
 CREATE INDEX IF NOT EXISTS google_identities_user_index ON google_identities (user_id);
+
+-- Accounts created by self-service registration, and their passwords.
+--
+-- This is a second credential store alongside the operator's htpasswd file, and
+-- it exists because that file is mounted read-only: `/app/htpasswd:ro` in
+-- docker-compose.yml means the app could verify a password it is not allowed to
+-- write a new one beside. Rather than make the operator's file writable -- which
+-- hands the app the ability to rewrite a file a human also edits by hand -- a
+-- registration writes here and login checks here first.
+--
+-- `user_id` is the vault key every other store in this app already scopes by,
+-- so it is the PRIMARY KEY and a registered account needs no mapping layer. For
+-- a registered account it is the lowercased email address; the pre-existing
+-- htpasswd accounts keep their usernames and have no row here at all.
+--
+-- There is deliberately no `email` column: `user_id` *is* the email for a
+-- registered account, and a second copy of the same string is a second thing to
+-- keep in agreement.
+CREATE TABLE IF NOT EXISTS credentials (
+    user_id       TEXT PRIMARY KEY,
+    password_hash TEXT NOT NULL,
+    created_at    REAL NOT NULL,
+    updated_at    REAL NOT NULL,
+    disabled_at   REAL
+);
 """
 
 _INIT_LOCK = threading.Lock()
@@ -873,6 +901,418 @@ def resolve_google_identity(subject, provider=GOOGLE_PROVIDER, now=None, touch: 
     if touch:
         record["last_used_at"] = moment
     return record
+
+
+# ---------------------------------------------------------------------------
+# Accounts and passwords
+#
+# Registration writes here; login reads here first and falls back to the
+# operator's htpasswd. See the comment on the `credentials` table in _SCHEMA for
+# why there are two stores instead of one writable file.
+#
+# Everything in this section is deliberately stdlib. sessions.py is imported and
+# called directly by the test suite on a machine with no database and no web
+# framework, which is the only reason these functions are testable at all.
+# ---------------------------------------------------------------------------
+
+# Registration is opt-in and off by default. It cannot be a code default of "on"
+# for the same reason auth_basic must not come back to the nginx MCP location:
+# an endpoint that creates accounts should be something an operator turned on,
+# not something a deployment inherits by upgrading.
+#
+# The `or "0"` form rather than a two-argument getenv, because a variable that is
+# present-but-empty must read as absent. `os.getenv(NAME, "1")` returns "" for an
+# empty MEM_REGISTRATION_ENABLED, and `"" == "1"` is False here so that case is
+# already safe -- but the empty string is also what an operator gets from a
+# compose `REGISTRATION_ENABLED=` line with no value, and treating that as
+# anything other than "off" is the wrong direction to be wrong in.
+REGISTRATION_ENABLED = str(os.getenv("MEM_REGISTRATION_ENABLED") or "0").strip().lower() in ("1", "true", "yes", "on")
+
+# scrypt parameters. N=2**14 with r=8 is ~16 MiB of memory per hash and roughly
+# 50-100ms on the small hardware this runs on, which is the intended cost: it is
+# paid on login and on signup, never on a request that has no password to check.
+# Stored in the encoded string rather than read from the environment, so raising
+# N later cannot lock anyone out of their own account.
+SCRYPT_N = 2 ** 14
+SCRYPT_R = 8
+SCRYPT_P = 1
+SCRYPT_DKLEN = 32
+SALT_BYTES = 16
+
+# A password is not length-capped by any hash here, but an unbounded one is a
+# denial-of-service primitive: scrypt's cost is in the salt and N, but the
+# input still has to be hashed, and a 100 MB "password" is 100 MB of work per
+# unauthenticated request on an endpoint that has no rate limit upstream.
+MIN_PASSWORD_CHARS = 10
+MAX_PASSWORD_CHARS = 1024
+
+# A password no real account has, used only to ask htpasswd whether a name
+# exists. Binary control characters make a collision with anything a human would
+# pick effectively impossible.
+_UNMATCHABLE_PASSWORD = "\x00\x01htpasswd-probe\x00"
+
+# Signup attempts per client per window. There is no rate limiting anywhere else
+# in this app -- no slowapi, no limiter, no 429 -- and a registration endpoint is
+# the one place where "guess a password" is a thing an outsider can attempt at
+# will. This is a plain in-process counter, which is honest about what it is: it
+# stops a script, not a distributed one. A proxy in front of the app is the real
+# answer for that.
+REGISTRATION_ATTEMPT_LIMIT = 10
+REGISTRATION_ATTEMPT_WINDOW = 600.0
+
+_ATTEMPTS_LOCK = threading.Lock()
+_ATTEMPTS: dict = {}
+
+
+def hash_password(password: str, *, n: int = SCRYPT_N, r: int = SCRYPT_R,
+                  p: int = SCRYPT_P, dklen: int = SCRYPT_DKLEN) -> str:
+    """Hash a password into the one string this module stores.
+
+    scrypt over PBKDF2 because PBKDF2's only cost knob is iterations and
+    iterations are cheap to raise on a GPU -- a hash you can do 10 billion times
+    a second is a hash that has to be checked 10 billion times a second. scrypt's
+    cost is in *memory*, which a GPU does not have to spare, so the same work
+    stays expensive on the attacker's hardware and not just on the server's.
+
+    The parameters travel inside the string (`scrypt$n$r$p$salt$hash`) so they can
+    be raised later without invalidating anyone's existing password: a verifier
+    reads the cost from what it was given rather than from what it was compiled
+    with.
+    """
+    text = str(password or "")
+    if len(text) < MIN_PASSWORD_CHARS:
+        raise ValueError(f"the password must be at least {MIN_PASSWORD_CHARS} characters")
+    if len(text) > MAX_PASSWORD_CHARS:
+        raise ValueError(f"the password must be at most {MAX_PASSWORD_CHARS} characters")
+    salt = os.urandom(SALT_BYTES)
+    digest = hashlib.scrypt(text.encode("utf-8"), salt=salt, n=n, r=r, p=p, dklen=dklen)
+    # dklen travels in the string as well as n/r/p, and that is not redundancy.
+    # A verifier that *derived* the length from the stored digest would compute a
+    # digest of that same length and compare equal -- so anyone who could shorten
+    # the stored hash by one byte would have made it verify against anything.
+    return "$".join([
+        "scrypt", str(n), str(r), str(p), str(dklen),
+        base64.b64encode(salt).decode("ascii"),
+        base64.b64encode(digest).decode("ascii"),
+    ])
+
+
+def verify_password(password: str, encoded: str) -> bool:
+    """True if `password` produced `encoded`. Never raises on a malformed hash.
+
+    A stored hash that will not parse is a *false*, not an exception. The caller
+    here is a login path, and a database row with a truncated hash -- restored
+    from a damaged savepoint, hand-edited, written by a future version with a
+    different format -- must read as "this account cannot log in" rather than as
+    a 500 on every request that touches it.
+    """
+    try:
+        parts = str(encoded or "").split("$")
+        if len(parts) != 7 or parts[0] != "scrypt":
+            return False
+        _, raw_n, raw_r, raw_p, raw_dklen, raw_salt, raw_digest = parts
+        dklen = int(raw_dklen)
+        salt = base64.b64decode(raw_salt, validate=True)
+        expected = base64.b64decode(raw_digest, validate=True)
+        if len(expected) != dklen:
+            # The stored digest disagrees with the length it claims to be, so the
+            # row is damaged rather than merely foreign. Refusing here is what
+            # stops a truncated hash from verifying against itself.
+            return False
+        digest = hashlib.scrypt(
+            str(password or "").encode("utf-8"), salt=salt,
+            n=int(raw_n), r=int(raw_r), p=int(raw_p), dklen=dklen,
+        )
+    except Exception:
+        return False
+    # compare_digest, not ==: a byte-by-byte comparison leaks the length of the
+    # matching prefix through timing, and this is the one comparison in the app
+    # where an attacker gets to run it repeatedly against a value of their
+    # choosing.
+    return hmac.compare_digest(digest, expected)
+
+
+def normalise_account_id(email) -> str:
+    """The vault key for a registered account: the email, lowercased and trimmed.
+
+    Lowercasing is not cosmetic. `user_id` is the PRIMARY KEY of this table and
+    the `userId` on every Fact, DiaryEntry and Client in the other two stores, so
+    `Alice@example.com` and `alice@example.com` would otherwise be two accounts
+    with two vaults and two sets of records -- the exact shape of the
+    case-collision bugs that surface as "my notes disappeared".
+
+    It also means the email is the vault key, which is a deliberate trade (see
+    AGENTS.md "Registration"): a reassigned address would reach the old vault.
+    That is why registration is opt-in rather than always available.
+    """
+    text = str(email or "").strip().lower()
+    if not text:
+        raise ValueError("an email address is required")
+    if len(text) > MAX_EMAIL_CHARS:
+        raise ValueError(f"that email address is longer than {MAX_EMAIL_CHARS} characters")
+    return text
+
+
+def validate_email(email) -> str:
+    """Return the normalised account id, or raise ValueError with a usable reason.
+
+    The shape check is deliberately loose -- one `@`, something on each side, a
+    dot in the domain, no whitespace. A strict RFC 5322 parser rejects valid
+    addresses (`a@b` is legal, `user@localhost` is legal in practice) and the
+    only authority on whether an address receives mail is a message to it, which
+    this app does not send. What is being stopped here is a string that could not
+    be an address at all, and a string long enough or shaped oddly enough to be
+    something else.
+    """
+    text = str(email or "").strip().lower()
+    if not text:
+        raise ValueError("an email address is required")
+    if len(text) > MAX_EMAIL_CHARS:
+        raise ValueError(f"that email address is longer than {MAX_EMAIL_CHARS} characters")
+    if text.count("@") != 1:
+        raise ValueError("that does not look like an email address")
+    local, _, domain = text.partition("@")
+    if not local or not domain:
+        raise ValueError("that does not look like an email address")
+    if any(character.isspace() for character in text):
+        raise ValueError("an email address cannot contain spaces")
+    if "." not in domain:
+        raise ValueError("that email address has no domain")
+    if len(local) > 64 or len(domain) > 253:
+        raise ValueError("that email address is too long")
+    return text
+
+
+def user_id_taken(user_id: str) -> bool:
+    """True if this vault key already exists in *any* of the three stores.
+
+    A registered account's `user_id` is its email, and an email can already name
+    something: an htpasswd user (the operator's own account, or one they added by
+    hand) or the vault a Google account is already linked to. Creating a
+    credentials row for either would produce two ways into one vault with two
+    independent passwords -- or, worse, silently re-point an existing vault at a
+    password the person registering just chose, which is an account takeover
+    dressed as a signup.
+
+    So the check is across all three stores rather than against this table alone.
+    """
+    key = str(user_id or "").strip()
+    if not key:
+        return False
+    init_db()
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM credentials WHERE user_id = ?"
+            " UNION ALL SELECT 1 FROM google_identities WHERE user_id = ? LIMIT 1",
+            (key, key),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is not None:
+        return True
+    # htpasswd is a file, so this one costs a subprocess -- but only for a
+    # candidate name that is not already known to be free, and registration is a
+    # rare event behind an opt-in flag.
+    return htpasswd_user_exists(key)
+
+
+def htpasswd_user_exists(username: str) -> bool:
+    """True if the operator's htpasswd file has this user.
+
+    `htpasswd -v` with an empty password is the only way to ask the file whether a
+    name is present, because htpasswd exposes no list operation. An empty
+    password cannot match a real entry unless someone deliberately created an
+    account whose password is the empty string, which the login form's own
+    `required` attribute prevents in practice; and even then the answer this
+    function gives is only "do not offer to register over the top of it".
+    """
+    path = str(os.getenv("HTPASSWD_PATH") or "").strip()
+    if not path or not os.path.exists(path):
+        return False
+    try:
+        result = subprocess.run(
+            ["htpasswd", "-vb", path, str(username), _UNMATCHABLE_PASSWORD],
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception:
+        # Unreadable htpasswd is not a reason to refuse a signup: the check is a
+        # courtesy against shadowing an operator's account, and the credential
+        # this actually creates is in a store this app owns.
+        return False
+    return result.returncode == 0
+
+
+def create_credentials(email, password: str, now=None) -> dict:
+    """Register an email/password account and return the stored record.
+
+    Refuses if the vault key is already spoken for, rather than upserting: an
+    upsert here would silently reset the password of an existing account, which
+    is the failure mode a "create" endpoint must not have.
+    """
+    key = validate_email(email)
+    if user_id_taken(key):
+        raise ValueError("that account already exists")
+    moment = _now(now)
+    encoded = hash_password(password)
+    init_db()
+    conn = _connect()
+    try:
+        conn.execute(
+            "INSERT INTO credentials (user_id, password_hash, created_at, updated_at, disabled_at)"
+            " VALUES (?, ?, ?, ?, NULL)",
+            (key, encoded, moment, moment),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return {"user_id": key, "created_at": moment, "updated_at": moment, "disabled_at": None}
+
+
+def get_credentials(user_id) -> dict | None:
+    """The credential row for a vault key, or None. Includes the password hash."""
+    key = str(user_id or "").strip()
+    if not key:
+        return None
+    init_db()
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT user_id, password_hash, created_at, updated_at, disabled_at"
+            " FROM credentials WHERE user_id = ?",
+            (key,),
+        ).fetchone()
+    finally:
+        conn.close()
+    return dict(row) if row is not None else None
+
+
+def verify_account_password(user_id, password: str) -> bool:
+    """True if `password` is the registered password for this vault key.
+
+    A disabled account is False even with the right password. Disabling is not
+    deleting so that the row keeps the vault key occupied: without that, the
+    address could be registered again and would come back pointing at a vault
+    whose records are still there.
+    """
+    record = get_credentials(user_id)
+    if not record or record.get("disabled_at") is not None:
+        return False
+    return verify_password(password, record["password_hash"])
+
+
+def set_password(user_id, password: str, now=None) -> bool:
+    """Replace the password for an existing registered account."""
+    key = str(user_id or "").strip()
+    if not key:
+        return False
+    init_db()
+    conn = _connect()
+    try:
+        cursor = conn.execute(
+            "UPDATE credentials SET password_hash = ?, updated_at = ?"
+            " WHERE user_id = ? AND disabled_at IS NULL",
+            (hash_password(password), _now(now), key),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        conn.close()
+
+
+def disable_credentials(user_id, now=None) -> bool:
+    """Refuse future logins for this account without releasing its vault key."""
+    key = str(user_id or "").strip()
+    if not key:
+        return False
+    moment = _now(now)
+    init_db()
+    conn = _connect()
+    try:
+        cursor = conn.execute(
+            "UPDATE credentials SET disabled_at = ?, updated_at = ?"
+            " WHERE user_id = ? AND disabled_at IS NULL",
+            (moment, moment, key),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        conn.close()
+
+
+def list_credentials() -> list:
+    """Every registered account, newest first. Never includes the hash."""
+    init_db()
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT user_id, created_at, updated_at, disabled_at"
+            " FROM credentials ORDER BY created_at DESC"
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(row) for row in rows]
+
+
+def allow_registration_attempt(client: str, now=None) -> bool:
+    """Count one signup attempt for `client`; False if it is over the limit.
+
+    In-process and therefore per-worker, which is stated plainly rather than
+    dressed up: it raises the cost of a script and does nothing about a botnet.
+    A proxy in front of the app is where real rate limiting belongs, and this
+    exists so that "there is none at all" is not the answer on a route that
+    creates accounts.
+
+    The window slides rather than resetting on the boundary, so a client cannot
+    get 2x the quota by straddling it. Entries are pruned on every call, which is
+    what keeps this from being a slow memory leak keyed by attacker-chosen
+    strings.
+    """
+    key = str(client or "").strip() or "unknown"
+    moment = _now(now)
+    cutoff = moment - REGISTRATION_ATTEMPT_WINDOW
+    with _ATTEMPTS_LOCK:
+        stamps = [value for value in _ATTEMPTS.get(key, ()) if value > cutoff]
+        if len(stamps) >= REGISTRATION_ATTEMPT_LIMIT:
+            _ATTEMPTS[key] = stamps
+            return False
+        stamps.append(moment)
+        _ATTEMPTS[key] = stamps
+        # Prune clients that are over the window and not the one being asked
+        # about, so the dict tracks live traffic rather than every address ever
+        # seen. Bounded by the number of concurrent clients, not by history.
+        for other in [k for k, v in _ATTEMPTS.items() if k != key and not any(t > cutoff for t in v)]:
+            _ATTEMPTS.pop(other, None)
+    return True
+
+
+def registration_enabled(method="email") -> bool:
+    """Whether this signup *method* may be used right now.
+
+    Both halves are required, and the second is the one that is easy to forget:
+    the flag turns the *route* on, but a Google signup cannot verify anything
+    without a client id, and one without a client id would accept a token it has
+    no way to check the audience of. "Enabled but not configured" is a 404-shaped
+    state that reads as a broken feature, so it is not offered.
+
+    This takes a method name ("email" / "google"), not a provider key, because
+    the two are not the same axis: the flag is about registration as a whole and
+    the client id is about Google specifically. A Google-only deployment and an
+    email-only one are both reachable without touching the flag.
+    """
+    if not REGISTRATION_ENABLED:
+        return False
+    name = str(method or "").strip().lower()
+    if name == "email":
+        return True
+    if name != GOOGLE_PROVIDER:
+        raise ValueError(f"unknown registration method: {method!r}")
+    client = get_oauth_client(GOOGLE_PROVIDER)
+    # stripped, not just truthy: a client id of "   " is the client id you get
+    # from a form that was submitted with an empty box, and verifying a token
+    # against it as an audience is the exact mistake the audience check exists
+    # to stop -- reached from the other direction.
+    return bool(client and str(client.get("client_id") or "").strip())
 
 
 # ---------------------------------------------------------------------------

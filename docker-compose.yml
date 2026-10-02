@@ -206,6 +206,14 @@ services:
       - MEM_SESSION_SECURE=${MEM_SESSION_SECURE:-0}
       - HTPASSWD_PATH=/app/htpasswd
 
+      # Self-service registration. Off by default: it opens two
+      # unauthenticated POST endpoints that each create a vault. The landing
+      # page offers email+password whenever this is on, and the Google method
+      # additionally once a client id is saved under Setup -> Google sign-in.
+      # Throttled per client address in-process; that stops a script, not a
+      # botnet, so a real deployment wants a rate limit in the proxy too.
+      - MEM_REGISTRATION_ENABLED=${MEM_REGISTRATION_ENABLED:-0}
+
         # Daily savepoints (Setup → Maintenance → Backup & Restore)
       - MEM_BACKUP_ENABLED=${MEM_BACKUP_ENABLED:-1}
       - MEM_BACKUP_HOUR=${MEM_BACKUP_HOUR:-3}
