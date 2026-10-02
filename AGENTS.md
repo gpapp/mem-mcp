@@ -36,7 +36,7 @@ The dependency-light regression suite covers matching, scope compatibility, scop
 
 `test_sessions.py` is the twelfth suite and it *imports and calls* `sessions.py`, which is stdlib-only by design for exactly this reason. It covers the session lifecycle (absolute-not-sliding expiry, the exact deadline boundary, expired rows deleted on read, logout-everywhere), the credential guard (`session["pass"]` raising at three layers), the middleware itself driven with real ASGI messages — including that the response body passes through untouched, which is the SSE property — and the PSK store (no plaintext on disk, a 10-char prefix that cannot authenticate, a session id refused as a PSK before the DB, ownership-scoped revocation). It also holds `Python311AnnotationTests`; see Gotchas for why that one is structural.
 
-`test_auth_guard.py` is the thirteenth, and it covers *which credential wins* rather than whether one is valid, so it is separate on purpose: `HeaderPrecedenceTests` pins the order, `McpAuthGuardTests` drives the real guard class with each credential carrying a **distinguishable owner** so a status-only assertion cannot hide having picked the wrong one, and `WiringTests` pins the things that would silently re-open the hole — no `auth_basic` in the nginx MCP location, `session.clear()` before login writes `user`, no template rendering `AUTH_PASS`, the bridge reading `MEM_VAULT_PSK`. That matters because every defect worth guarding there is a "this looks right and is wrong" — a cold model labelled `100% CPU`, a fingerprint that fires on every poll, a publish that blocks on a browser that stopped reading — and none is visible in the shape of the code. The same file also lifts `fetch_ollama_status` / `unload_ollama_model` out of `common.py` and `api_unload_model` / `_status_snapshot` out of `gui.py` with `ast.get_source_segment`, because those three cannot be imported here. `ImportDisciplineTests` imports the module in a **subprocess with httpx blocked at the import hook** rather than searching the source for the string: a docstring mentioning httpx is not an import of it, and that is the `assertIn`-over-a-whole-file lesson again. `test_mobile_layout.py::StatusWidgetLayoutTests` pins where the widget is allowed to sit — see "Server Status Widget" for why that is not a free choice.
+`test_auth_guard.py` is the thirteenth, and it covers *which credential wins* rather than whether one is valid, so it is separate on purpose: `HeaderPrecedenceTests` pins the order, `McpAuthGuardTests` drives the real guard class with each credential carrying a **distinguishable owner** so a status-only assertion cannot hide having picked the wrong one, and `WiringTests` pins the things that would silently re-open the hole — no `auth_basic` in the nginx MCP location, `session.clear()` before login writes `user`, no template rendering `AUTH_PASS`, the bridge reading `MEM_VAULT_PSK`. `ApiAuthTests` and `CorsAndDocsTests` cover the *other* half of the chain (the `/gui` + `/api/*` gate and the two unmatched surfaces), and every one of the six defects they guard was verified to bite by re-injection. That matters because every defect worth guarding there is a "this looks right and is wrong" — a cold model labelled `100% CPU`, a fingerprint that fires on every poll, a publish that blocks on a browser that stopped reading — and none is visible in the shape of the code. The same file also lifts `fetch_ollama_status` / `unload_ollama_model` out of `common.py` and `api_unload_model` / `_status_snapshot` out of `gui.py` with `ast.get_source_segment`, because those three cannot be imported here. `ImportDisciplineTests` imports the module in a **subprocess with httpx blocked at the import hook** rather than searching the source for the string: a docstring mentioning httpx is not an import of it, and that is the `assertIn`-over-a-whole-file lesson again. `test_mobile_layout.py::StatusWidgetLayoutTests` pins where the widget is allowed to sit — see "Server Status Widget" for why that is not a free choice.
 
 ```bash
 cd mem-mcp
@@ -84,36 +84,95 @@ none: `extract_user_from_headers` trusts it (see Authentication).
 
 ## Authentication
 
-Three credentials, checked in this order by `McpAuthGuard` (gui.py:1454):
+**There are two gates, and they check the same three credentials.**
 
-1. **live session cookie** — `request.session["user"]`
-2. **`Authorization: Basic`** — the password is *verified* against
-   `HTPASSWD_PATH`, not just decoded
-3. **`Authorization: Bearer mvk_…`** — resolved via `resolve_psk`
+| | gate | covers |
+|---|---|---|
+| `/mcp` | `McpAuthGuard` (gui.py:1531), wrapping the mount | every route fastmcp registers |
+| `/gui`, `/api/*` | `auth_guard` (gui.py:206) via `_check_session_auth` (gui.py:140) | ~60 handlers |
 
-Anything else is a 401. This matters: before, the app did not authenticate
-`/mcp` at all. `auth_guard` only matched `/gui` and `/api`, nginx's `auth_basic`
-was the sole gate, and a request that got past it ran as whichever user the
-`Basic` username claimed without the password ever being checked. The `Basic`
-branch is now verified precisely because the app inherited nginx's job.
+Order in both: **live session cookie** → **`Authorization: Basic`** (password
+*verified* against `HTPASSWD_PATH`) → **`Authorization: Bearer mvk_…`**
+(`resolve_psk`). Anything else is a 401. Only `/api/auth/*` is reachable without
+one, because that is where you exchange a credential for a session.
+
+**Both gates verify the `Basic` password, and that is the whole point.** The
+`/mcp` half had to start verifying when nginx's `auth_basic` came off. The
+`/gui` + `/api/*` half had **never** been verifying:
+
+```python
+decoded = base64.b64decode(auth_header.split(" ")[1]).decode("utf-8")
+if ":" in decoded:
+    return decoded.split(":", 1)[0]        # username trusted, password discarded
+```
+
+nginx has no `auth_basic` on the GUI location, so that decode was the entire
+gate for every route — `Authorization: Basic base64(alice:anything)` was alice's
+vault, including `POST /api/backup/restore/{id}` and `POST /api/psks`. A
+username is not a secret and the header is client-supplied, so returning one is
+not authentication. Verified with `_verify_htpasswd`, which costs a subprocess
+per request and is only reached when there is no session — a browser on the
+cookie path never pays it, and Basic is for scripted clients.
+
+**`auth_guard` must match `/gui` and `/api` only, and `/api/events` must not be
+on its allow-list.** The SSE stream used to be public. Its handler filtered
+events per user correctly, but the *user it filtered by* came from the
+unverified header sources below — so the filter selected an attacker-chosen
+vault's change feed. Filtering by a value the caller chose is not access
+control. The dead `/api/ping` entry went with it: an allow-list slot with no
+route behind it is an allow-list slot waiting for someone to implement a public
+health endpoint. `ApiAuthTests` pins the allow-list with an **AST walk, not a
+substring search** — the explanatory comment above it names `/api/events` on
+purpose, and a `#` comment is not in the tree.
+
+**`_user` must not parse headers.** It ended with `mem.extract_user_from_headers(...)`,
+which made `_require_user` in every handler a "did somebody hand us a username"
+check rather than an authentication check. The MCP path needs that function —
+it is how the guard's verified stamp reaches the tools — but `/gui` and
+`/api/*` must not, because nothing on those paths verified anything. It now
+reads `session["user"]` and `request.state.user`, both verified upstream, and
+nothing else. **Consequence: the proxy identity headers no longer authenticate
+anything**, on any path. If a deployment was relying on an authenticating proxy
+to supply identity, that has to change.
+
+**`extract_user_from_headers` returns `"anonymous"` rather than raising**, and
+that is load-bearing for the MCP tools, which call it with no guard beneath
+them. A bare `Bearer` with no token must return `"anonymous"` and must **not**
+fall through to `Remote-User` — a bad credential is not an absent one
+(`HeaderPrecedenceTests`).
 
 **The verified identity is stamped as header `x-vault-user`, and that header is
 stripped from every inbound request** by `VaultSessionMiddleware` before
-anything reads it. The two halves must stay together: `extract_user_from_headers`
-(common.py) gives `x-vault-user` top precedence over Basic, Bearer and the
-proxy headers *because* no client can supply it. Stripping is case-insensitive
-(`test_stripping_is_case_insensitive` in test_sessions.py exists for this — a
-lowercase-only filter is not a filter, since HTTP header names are).
+anything reads it. The two halves must stay together, and *both* must lowercase:
+`extract_user_from_headers` gives `x-vault-user` top precedence because no
+client can supply it. `VaultSessionMiddleware` used to compare against the
+lowercase constant directly, so `X-Vault-User` sailed past — uvicorn happens to
+lowercase header names in both its h11 and httptools implementations, which is
+why nothing broke. `test_stripping_is_case_insensitive` was asserting
+`b"x-vault-user" not in [b"X-Vault-User"]` and passed on the bug it was written
+to catch; it now lowercases the surviving keys.
 
-**`extract_user_from_headers` returns `"anonymous"` rather than raising**, and
-that is load-bearing for the unverified callers. It is the last resort of a
-function several layers below the guard, so rejecting there would turn a
-misconfigured proxy into a 500 rather than an empty vault. A bare `Bearer` with
-no token must return `"anonymous"` and must **not** fall through to
-`Remote-User` — a bad credential is not an absent one
-(`HeaderPrecedenceTests`).
+**CORS on `web_app` is derived from `BASE_URL`, not `["*"]`.** It was
+`allow_origins=["*"]` + `allow_credentials=True` + `allow_headers=["*"]`, and
+being registered last it is the **outermost** middleware — it answered before
+either gate ran. Any site could then read and mutate a named user's vault from
+the victim's browser with a `Basic` header. `SameSite=Lax` does not help,
+because no cookie was needed. `_cors_origins()` (server.py:33) returns the
+scheme+host of `BASE_URL`, and an unset or relative `BASE_URL` yields `[]` —
+no `Access-Control-Allow-Origin` at all, which is correct, since same-origin
+browser use never needed one. There is deliberately no knob: `BASE_URL` is
+already required and already the value an operator gets right. The MCP CORS
+(`mcp_cors`) keeps its wildcard on purpose — it sits *inside* `McpAuthGuard`, so
+it only runs on an already-authenticated request.
 
-`monitor_mcp_tool` still only logs; the guard is what authorizes. Do not add
+**`FastAPI(docs_url=None, redoc_url=None, openapi_url=None)`.** FastAPI
+registers `/docs`, `/redoc` and `/openapi.json` inside `__init__`, i.e. before
+every route and before the `/` mount, and `auth_guard` only matches `/gui*` and
+`/api*` — so all three were reachable with no credential and enumerated every
+route, parameter and schema. Nothing consumes the schema, so they are off
+rather than authenticated.
+
+`monitor_mcp_tool` still only logs; the gates are what authorize. Do not add
 per-tool checks to the decorator.
 
 ## Sessions & Access Keys
@@ -415,6 +474,32 @@ A status strip pinned to the bottom of the left rail of the **Memories** and **D
 - **A knob in `.env.example` that is not in the compose `environment:` block does not exist.** Docker Compose passes only the variables listed on a service, so a documented variable that is missing from that block is unreachable: it sits at its code default forever and editing `.env` does nothing. **24 documented variables were in exactly that state**, including `MEM_LLM_TIMEOUT` — shipped in `514e184` as the fix for the hardcoded 60s chat timeout, documented in `.env.example` and Critical Config, and genuinely untunable. Nothing errored: the app started normally, the default applied, and the only symptom was "I changed the env and nothing happened", which is indistinguishable from a caching problem. `test_env_wiring.py` derives the variable set from `.env.example` rather than hardcoding it, so a newly documented knob is covered the moment it is documented. Add a new knob in **both** files, with an inline `${VAR:-default}` so the effective value is visible in one place.
   - **Two `os.getenv` forms, only one of them dangerous.** `os.getenv(NAME, "fallback")` returns the empty string when the variable is present-but-empty, so a bare `${NAME}` in compose defeats the code's own default; `os.getenv(NAME) or "fallback"` treats empty as absent and is safe. The first version of that test asserted every bare interpolation was a crash, which was **false** — `LLM_QUERY_MODEL`, `MEM_SCOPE_MODEL` and `BASE_URL` are all the safe `or` form, and `BASE_URL`'s fallback is literally `""`. The assertion had to be narrowed to the two-argument form with a non-empty fallback before it said anything true.
   - **The two files also fail in opposite directions when a test is copied out of tree.** `test_env_wiring.py` and `test_mobile_layout.py` both resolve their inputs relative to their own location and walk up a directory, so a scratch copy needs the real layout (`mem-mcp/test_*.py` plus `.env.example` one level up). Running the copy in a flat directory produced 6 `FileNotFoundError`s that read exactly like a suite failing on the defect.
+- **A middleware that is registered last is the outermost, and the outermost is
+  the one that answers first.** `web_app.add_middleware(CORSMiddleware,
+  allow_origins=["*"], allow_credentials=True, allow_headers=["*"])` looked
+  like a permissive default and was a cross-origin hole: Starlette inserts at
+  position 0, so it wrapped `auth_guard` and `McpAuthGuard` both. Combined with
+  the unverified-Basic gate below, any page could read and mutate a named
+  user's vault from the victim's browser — and `SameSite=Lax` does not help,
+  because the attack used a header, not the cookie. The MCP copy of the same
+  middleware is *inside* `McpAuthGuard` and has always been fine, which is the
+  part that makes this easy to misread: two identically-configured middlewares,
+  one safe and one not, differing only in where they sit.
+- **A decoded credential is not a verified one, and the difference is invisible
+  in the code.** `if ":" in decoded: return decoded.split(":", 1)[0]` reads like
+  an auth check. It is a *parse*. The same function had been reviewed, shipped,
+  and exercised by a live GUI for a long time with the password discarded on
+  the next line, because the interesting line was the one returning a string
+  and the discarded one was the point. It is the same class of bug as the
+  `MATCH (n {id: $ids})` list-comparison one below: the code looks like it
+  asserts something and in fact only parses it. When a function *extracts* an
+  identity, ask what verified it, and if the answer is "the caller", check that
+  every caller has a guard above it — `/gui` had none.
+- **An allow-list entry with no route behind it is a trap, not dead code.**
+  `/api/ping` was allow-listed for unauthenticated access with no such handler
+  in the codebase. It is a loaded gun aimed at whoever eventually writes a
+  health endpoint, and the natural way to write one is to match the existing
+  list. Delete the entry rather than leaving it documented.
 - **A substring guard on source is not a guard, and it will pass on the bug.** `ScopeClassificationInputTests` forbids a text prefix slice like `item_text[:1500]`. Written as `assertNotIn("item_text[:", source)` it matched the *docstring I had just written*, which quotes the very slice it forbids — so the guard reported green on the file that contains the bug. It also failed to bite when the bug was genuinely re-injected, because I had checked `slice.lower` when `text[:N]` slices the **upper** bound. A blanket "no numeric prefix slice" rule then failed on the legitimate `kws[:10]`, a deliberate cap on a keyword list. What actually works is an `ast` walk for a `Slice` with `lower is None` and a numeric `upper`, applied only to names in a declared set of text carriers — docstrings are `ast.Constant` and cannot trip it. Related: `assertNotIn` over a whole 2500-line file makes unittest echo the entire file into the failure output; use `assertFalse(needle in src, msg)`. The same applies to `assertIn` over a single *function* — `ResolverInputTests` dumps kilobytes of source unless it uses `assertTrue(needle in segment, msg)`.
 - **`assertIn(needle, query)` asserts the needle is somewhere, not that it is where it must be.** This is the same lesson as the substring guard above, in a different place, and it hid a production bug for days: `ClearScopeQueryTests` asserted the batch clear contains `"$ids"`, which the broken query `MATCH (n {id: $ids, userId: $userId})` satisfies exactly. The parameter was present; it was in the wrong clause, on the wrong side of a property test, where a list is compared for equality and therefore matches nothing. Any guard that checks a token appears is checking the token, not the property. Derive the property: the fix was a lint (`ListParameterInPropertyMapTests`) that resolves each `s.run(...)` to the names bound to lists in its enclosing function and fails if one is used as a property-map value.
 - **A "guard verified to bite" claim is only true when the failure is the assertion.** My first reinjection of the keyword slice was written at 4-space indent into an 8-space block, so the file raised `IndentationError` and all 38 tests errored — which looks identical to "the guard caught it" in a summary, and proved nothing. Always `ast.parse` the injected file before running the suite, and check the failure names the assertion.

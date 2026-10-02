@@ -40,7 +40,7 @@ mem-mcp/
 - **Dedicated Merge Model** — Dashboard merge drafts use `MEM_MERGE_MODEL` (default `gemma4:e2b`), while search and scope classification run on `LLM_QUERY_MODEL` / `MEM_SCOPE_MODEL` (set both to the same model — the scope classifier is the slow path and defaults to the query model).
 - **Skills System** — Pluggable skill workflows (e.g., `process-transcription`, `memory-deduplication`) loaded from Markdown files.
 - **Unified Web UI** — A modern, proxy-aware dashboard to manage memories, view diary history, and explore insights.
-- **Multi-user Isolation** — Secure per-user vaults, resolved from a dashboard session, Basic auth, an access key, or proxy headers.
+- **Multi-user Isolation** — Secure per-user vaults, resolved from a verified dashboard session, a password-checked `Basic` credential, or an access key. Nothing else names a user.
 - **Client & Context Scoping** — Facts and diary entries can be scoped to a Client (e.g. "Deutsche Bank") and a Context within it (e.g. "SAP Implementation") via `FOR_CLIENT` / `IN_CONTEXT` graph links. Explicit `client`/`context` parameters hard-filter search; global search still finds everything.
 - **Scope Inference** — When no explicit client is passed, search infers the client from the query text (boost-only, never filters).
 - **Inactive Client Handling** — Clients untouched for 90 days are auto-deprioritized (−0.15 score, never hidden). Status can be manually pinned via `set_client_status`, `PUT /api/clients/{id}`, or the Setup-tab toggle; pinned clients are never auto-changed.
@@ -99,15 +99,30 @@ password — that is what the access key replaced.
 
 ### Proxy header trust
 
-With no credential at all, identity falls back to proxy headers
-(`Remote-User`, `X-Remote-User`, `X-User`, `X-Forwarded-User`) and finally to
-the literal user `"anonymous"`. Those headers are trusted because a reverse
-proxy is expected to set them, and they are the weakest link in the chain: a
-proxy that forwards a client-supplied `Remote-User` lets anyone name any user.
-Nginx overwrites it from `$remote_user`; if your proxy does not, strip it
-there. Note that `nginx_snippet.conf` no longer sets `Remote-User` on the MCP
-location at all — the app stamps the verified identity itself, as `X-Vault-User`,
-after stripping any inbound copy of that header.
+**The GUI, the REST API and `/mcp` all require a verified credential.** A
+dashboard session, a `Basic` password checked against the app's `htpasswd`, or
+an access key. Nothing else names a user.
+
+In particular, `Authorization: Basic` is *verified*. It used to be decoded and
+its username trusted without ever checking the password, which meant
+`base64(alice:anything)` authenticated as alice and reached every route,
+including the vault-wide restore endpoint. If you have a script that was relying
+on a wrong password working, it will now get a `401`.
+
+The proxy identity headers (`Remote-User`, `X-Remote-User`, `X-User`,
+`X-Forwarded-User`) are **no longer a way to authenticate**. They were the
+weakest link in the chain — a proxy that forwards a client-supplied `Remote-User`
+lets anyone name any user — and the app now strips the requirement instead of
+the risk: the header-reading resolver survives only on the `/mcp` path, where it
+reads the app's own verified `X-Vault-User` stamp and nothing else. If you were
+running an authenticating proxy in front of this app and relying on it to supply
+identity, that no longer works; put it in front of `/mcp` and have it inject
+`X-Vault-User` only if you have read the section above on why that header is
+stripped on ingress.
+
+`nginx_snippet.conf` sets none of these headers on either location — `$remote_user`
+is empty now that `auth_basic` is gone — and the app stamps the verified
+identity itself as `X-Vault-User` after stripping any inbound copy.
 
 ## MCP Tools (Advanced Suite)
 

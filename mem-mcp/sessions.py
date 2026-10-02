@@ -668,9 +668,15 @@ class VaultSessionMiddleware:
             await self.app(scope, receive, send)
             return
 
+        # lower(), not ==: HTTP header names are case-insensitive, so a
+        # comparison against the lowercase constant is not a filter — a client
+        # sending `X-Vault-User` would sail past it. uvicorn lowercases header
+        # names in both its h11 and httptools implementations, so this is not
+        # currently load-bearing; it is load-bearing for anything that drives
+        # this scope by hand (a test, an ASGI client, a different server).
         headers = [
             (key, value) for key, value in scope["headers"]
-            if key != VAULT_USER_HEADER
+            if key.lower() != VAULT_USER_HEADER
         ]
         session_id = _cookie_value(headers, self.cookie_name)
         record = load_session(session_id) if session_id else None

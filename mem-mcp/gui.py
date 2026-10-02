@@ -48,7 +48,18 @@ from matching_utils import (MergeDraftTooLarge, execute_merge,
                              format_people_merge_text, merge_draft_output_budget)
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from sse_starlette.sse import EventSourceResponse
-web_app = FastAPI(title="Memory Vault GUI")
+web_app = FastAPI(
+    title="Memory Vault GUI",
+    # FastAPI registers /docs, /redoc and /openapi.json inside __init__, i.e.
+    # before every route here and before the "/" MCP mount — so they are reached
+    # by an unauthenticated GET. auth_guard only matches /gui* and /api*, so it
+    # never sees them. They hand out the full route list, every parameter name
+    # and the whole schema. There is no consumer of the OpenAPI document in this
+    # app, so it is switched off rather than authenticated.
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
 # Persistent sessions, not cookie sessions. See sessions.py for why, and for the
 # one thing that changed as a result: `request.session["pass"]` no longer exists
 # and cannot be written, so the Setup page shows a PSK instead of the password.
@@ -127,26 +138,67 @@ templates = Environment(
 
 # Helper functions must be defined BEFORE middleware that uses them
 def _check_session_auth(request: Request) -> str | None:
-    """Returns username if authenticated, else None.
+    """Returns the username if a *verified* credential is present, else None.
 
-    A stored session is now evidence on its own. It used to require both `user`
-    and `pass` to be present, which existed only because the Setup page needed
-    a password to rebuild a Basic header from — a session whose value depends on
-    a credential nobody re-supplies is a session that can be invalidated by
+    This is the whole authentication decision for `/gui` and `/api/*`, so the
+    password is verified rather than merely decoded. It used to be:
+
+        decoded = base64.b64decode(auth_header.split(" ")[1]).decode("utf-8")
+        if ":" in decoded:
+            return decoded.split(":", 1)[0]
+
+    which returns the username and throws the password away — so
+    `Authorization: Basic base64(alice:anything)` authenticated as alice and
+    reached every route on this app, including `POST /api/backup/restore/{id}`
+    and `POST /api/psks`. Nothing verified it: `McpAuthGuard` verifies the same
+    header, but it only wraps the MCP mount, and nginx has no `auth_basic` on
+    the GUI location. The username is not a secret and the header is client
+    supplied, so returning one is not authentication at all.
+
+    Verifying costs a `htpasswd -vb` subprocess per request, which is why this
+    is only reached when there is no session — a browser using the dashboard is
+    on the cookie path and never pays it. Basic auth is for scripted clients.
+
+    A stored session is evidence on its own. It used to require both `user` and
+    `pass` to be present, which existed only because the Setup page needed a
+    password to rebuild a Basic header from — a session whose value depends on a
+    credential nobody re-supplies is a session that can be invalidated by
     anything that touches the password.
     """
     session_user = request.session.get("user")
     if session_user:
         return session_user
 
-    auth_header = request.headers.get("Authorization")
-    if auth_header and auth_header.startswith("Basic "):
+    auth_header = request.headers.get("Authorization") or ""
+    scheme, _, rest = auth_header.partition(" ")
+    scheme = scheme.lower()
+
+    if scheme == "basic":
         try:
-            encoded = auth_header.split(" ")[1]
-            decoded = base64.b64decode(encoded).decode("utf-8")
-            if ":" in decoded:
-                return decoded.split(":", 1)[0]
-        except Exception: pass
+            decoded = base64.b64decode(rest.strip()).decode("utf-8")
+        except Exception:
+            return None
+        # partition, not split(":", 1): a password may contain a colon, and a
+        # header with no colon at all is not a Basic credential.
+        name, sep, secret = decoded.partition(":")
+        if not sep or not name:
+            return None
+        if _verify_htpasswd(name, secret):
+            return name
+        # Logged, not raised: the 401 below is the answer the client needs, and
+        # a failed login attempt is worth seeing without being an exception.
+        logging.getLogger("memory-vault").warning(
+            f"gui: rejected Basic auth for {name!r} — password did not verify"
+        )
+        return None
+
+    if scheme == "bearer":
+        token = rest.strip()
+        if not token:
+            return None
+        record = resolve_psk(token)
+        return record["user_id"] if record else None
+
     return None
 
 # Auth guard middleware - protect /gui routes
@@ -156,14 +208,19 @@ async def auth_guard(request: Request, call_next):
         user = _check_session_auth(request)
         if user:
             request.state.user = user # Set user in request state
+        elif request.url.path.startswith("/api/auth"):
+            # Only the credential exchange itself is open. `/api/events` used to
+            # be on this list, which is how an SSE stream was readable without a
+            # session: the handler's own `_require_user` filtered events per
+            # user correctly, but the *user id it filtered by* came from the
+            # unverified header sources, so the filter selected an attacker-
+            # chosen vault's change feed. Filtering by a value the caller chose
+            # is not access control. `/api/ping` was here too and has no route.
+            pass
+        elif request.url.path.startswith("/api/"):
+            return JSONResponse({"detail": "Not authenticated"}, status_code=401)
         else:
-            # Allow specific unauthenticated paths
-            if request.url.path.startswith("/api/auth") or request.url.path in ["/api/ping", "/"] or request.url.path == "/api/events":
-                pass
-            elif request.url.path.startswith("/api/") and not request.url.path.startswith("/api/auth"):
-                return JSONResponse({"detail": "Not authenticated"}, status_code=401)
-            else:
-                return RedirectResponse(url=mem.BASE_URL or "/", status_code=302)
+            return RedirectResponse(url=mem.BASE_URL or "/", status_code=302)
     return await call_next(request)
 
 # Suppress noisy uvicorn access logs for the root path (MCP heartbeats)
@@ -243,13 +300,33 @@ class MemoryMergeDraft(BaseModel):
 # ---------------------------------------------------------------------------
 
 def _user(request: Request) -> str:
+    """The authenticated username for this request, or "anonymous".
+
+    Deliberately does **not** parse headers. It used to end with:
+
+        user = mem.extract_user_from_headers(dict(request.headers))
+        return user
+
+    which made every handler's `_require_user` a "did somebody hand us a
+    username" check rather than an authentication check: `extract_user_from_headers`
+    returns the username of an *unverified* Basic header and of four proxy
+    identity headers, so any handler relying on it would serve a vault named by
+    a client-supplied string. The MCP path needs that function — it is how
+    `McpAuthGuard`'s verified `x-vault-user` stamp reaches the tools — but
+    `/gui` and `/api/*` must not, because there is no guard on those paths that
+    could have verified anything first.
+
+    Both sources below are verified upstream: `session["user"]` by the login
+    handler, `request.state.user` by `auth_guard` calling `_check_session_auth`,
+    which verifies the Basic password against htpasswd and resolves a `mvk_`
+    access key through the store. Keeping the verification in the middleware and
+    the requirement in the handler is the point — a handler can no longer be
+    reached with an identity nobody checked.
+    """
     session_user = request.session.get("user")
     if session_user:
         return session_user
-    if hasattr(request.state, "user") and request.state.user:
-        return request.state.user
-    user = mem.extract_user_from_headers(dict(request.headers))
-    return user
+    return getattr(request.state, "user", "") or "anonymous"
 
 def _require_user(request: Request) -> str:
     user = _user(request)

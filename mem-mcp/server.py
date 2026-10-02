@@ -12,6 +12,7 @@ All services run on port 8080 by default.
 import os
 import asyncio
 from contextlib import suppress
+from urllib.parse import urlsplit
 import uvicorn
 import memory as mem
 import status_monitor
@@ -29,14 +30,50 @@ mcp_cors = StarletteMiddleware(
     allow_headers=["*"],
     allow_credentials=True
 )
+def _cors_origins() -> list:
+    """The browser origins allowed to call the GUI/API, derived from BASE_URL.
+
+    This was `allow_origins=["*"]` with `allow_credentials=True`, and that
+    combination is the whole cross-origin attack: `allow_headers=["*"]` grants
+    `Authorization` without an allowlist, and `allow_origins=["*"]` makes the
+    response readable by any page. Since this middleware is registered last it
+    is the *outermost* one — it answers a request before auth_guard or
+    McpAuthGuard run — so any site could read and mutate a named user's vault
+    from the victim's browser by sending `Authorization: Basic base64(alice:x)`.
+    `SameSite=Lax` does not help, because no cookie is needed.
+
+    There is no separate knob on purpose: BASE_URL is already the canonical
+    statement of where this app lives, is already required, and is already the
+    one value an operator gets right. An empty or relative BASE_URL yields an
+    empty list, which means no `Access-Control-Allow-Origin` is ever emitted —
+    same-origin browser use needs no CORS at all, so that is the honest answer
+    rather than a fallback to "*".
+    """
+    base = (mem.BASE_URL or "").strip()
+    if not base:
+        return []
+    parts = urlsplit(base)
+    if not parts.scheme or not parts.netloc:
+        return []
+    # BASE_URL carries the nginx mount point (/mem-mcp); an origin does not.
+    return [f"{parts.scheme}://{parts.netloc}"]
+
+
 # Enable CORS for the unified server
 web_app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# The MCP CORS above (`mcp_cors`) keeps its wildcard, and that is not an
+# oversight: it is handed to mcp.http_app() and therefore sits *inside*
+# McpAuthGuard, so it only ever runs on a request that has already presented a
+# verified session, Basic credential or access key. Narrowing it would only
+# restrict clients that are already authenticated, and MCP clients are not
+# browsers — the bridge talks to this over plain HTTP from node.
 
 # ---------------------------------------------------------------------------
 # Merge MCP into the Web GUI app

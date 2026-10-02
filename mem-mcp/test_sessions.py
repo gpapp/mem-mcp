@@ -752,8 +752,16 @@ class IdentityHeaderTests(AsgiCase):
         self.assertIn(b"authorization", keys, "Only the identity header may be removed")
 
     def test_stripping_is_case_insensitive(self):
-        # HTTP header names are case-insensitive, so a lowercase-only filter is
-        # not a filter.
+        # HTTP header names are case-insensitive, so a comparison against the
+        # lowercase constant is not a filter.
+        #
+        # This assertion used to read
+        #     assertNotIn(VAULT_USER_HEADER, [k for k, _ in seen["headers"]])
+        # which is `b"x-vault-user" not in [b"X-Vault-User"]` -- the capitalised
+        # header is still present, but the lowercase constant is not the thing
+        # being looked for, so it passed against the case-sensitive filter it
+        # was written to catch. It now lowercases the surviving keys, which is
+        # what "was it stripped" actually means.
         seen = {}
 
         async def handler(scope, receive, send):
@@ -761,7 +769,15 @@ class IdentityHeaderTests(AsgiCase):
             await send({"type": "http.response.start", "status": 200, "headers": []})
 
         asyncio.run(self._drive(handler, headers=[(b"X-Vault-User", b"victim")]))
-        self.assertNotIn(sessions.VAULT_USER_HEADER, [k for k, _ in seen["headers"]])
+        surviving = [key.lower() for key, _ in seen["headers"]]
+        self.assertTrue(
+            sessions.VAULT_USER_HEADER not in surviving,
+            msg=f"X-Vault-User survived the strip: {seen['headers']}")
+        # Belt and braces: the capitalised spelling must be gone too, so this
+        # cannot pass by a filter that merely lowercases its own output.
+        self.assertTrue(
+            all(key != b"X-Vault-User" for key, _ in seen["headers"]),
+            msg=f"X-Vault-User survived the strip: {seen['headers']}")
 
 
 if __name__ == "__main__":

@@ -21,7 +21,9 @@ import ast
 import asyncio
 import base64
 import os
+import types
 import unittest
+from urllib.parse import urlsplit
 
 import sessions
 
@@ -44,7 +46,10 @@ def _lift(relative_path, node_name, namespace):
     source = _read(*relative_path.split("/"))
     tree = ast.parse(source)
     for node in tree.body:
-        if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name == node_name:
+        # AsyncFunctionDef as well as FunctionDef: auth_guard is `async def`, and
+        # matching only the sync kind makes it look undefined.
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) \
+                and node.name == node_name:
             segment = ast.get_source_segment(source, node)
             exec(compile(segment, relative_path, "exec"), namespace)
             return namespace[node_name]
@@ -473,5 +478,402 @@ def _js_function_source(relative_path, name):
     raise AssertionError(f"unbalanced braces in {name}")
 
 
-if __name__ == "__main__":
-    unittest.main()
+def _module_node(relative_path, node_name):
+    """The AST node for a top-level def/class, for tests that must not match prose."""
+    tree = ast.parse(_read(*relative_path.split("/")))
+    for node in tree.body:
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) \
+                and node.name == node_name:
+            return node
+    raise AssertionError(f"{node_name} is not defined in {relative_path}")
+
+
+def _lift_undecorated(relative_path, node_name, namespace):
+    """As `_lift`, but drops decorators.
+
+    `@web_app.middleware("http")` is how these functions are registered, and
+    `ast.get_source_segment` includes it — so exec'ing the segment as written
+    would call `web_app.middleware` on a stub and register nothing, returning
+    the *undecorated* function. Which happens to be what a test wants, but only
+    by accident, and only for this decorator. Dropping it explicitly means the
+    test reads as "the function itself", and a future decorator on the function
+    under test does not silently change what is being exercised.
+    """
+    source = _read(*relative_path.split("/"))
+    tree = ast.parse(source)
+    for node in tree.body:
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) \
+                and node.name == node_name:
+            # Rebuild the node without its decorators, keeping its kind -- an
+            # AsyncFunctionDef reconstructed as a FunctionDef silently stops
+            # being awaitable and fails as "NoneType can't be awaited", which
+            # reads like a defect in the middleware rather than in the harness.
+            bare = type(node)(
+                name=node.name, args=node.args, body=node.body,
+                decorator_list=[], returns=node.returns, type_comment=None,
+                lineno=node.lineno, col_offset=node.col_offset,
+                # end_lineno/end_col_offset are not optional here: without them
+                # get_source_segment returns None and compile() rejects it. The
+                # span runs from `async def` (which is what node.lineno points
+                # at, not the decorator) to the end of the body, so the
+                # decorator is excluded by construction rather than by slicing.
+                end_lineno=node.end_lineno, end_col_offset=node.end_col_offset)
+            segment = ast.get_source_segment(source, bare)
+            exec(compile(segment, relative_path, "exec"), namespace)
+            return namespace[node_name]
+    raise AssertionError(f"{node_name} is not defined in {relative_path}")
+
+
+# ---------------------------------------------------------------------------
+# /gui and /api/* — the OTHER half of the trust chain
+# ---------------------------------------------------------------------------
+
+def _leaky_extract(headers):
+    """What extract_user_from_headers does: trust whatever names a user.
+
+    Prefixed to make its role obvious at the injection site, because a stub that
+    looks like a helper is a stub somebody will "clean up" later.
+    """
+    lowered = {k.lower(): v for k, v in headers.items()}
+    if lowered.get("x-vault-user"):
+        return lowered["x-vault-user"].strip()
+    auth = lowered.get("authorization", "")
+    if auth.lower().startswith("basic "):
+        parts = auth.split()
+        if len(parts) == 2:
+            decoded = base64.b64decode(parts[1]).decode("utf-8", "replace")
+            if ":" in decoded:
+                return decoded.split(":", 1)[0]
+    for name in ("remote-user", "x-remote-user", "x-user", "x-forwarded-user"):
+        if lowered.get(name):
+            return lowered[name]
+    return "anonymous"
+
+
+class _Request:
+    """The three attributes auth_guard and _user actually touch."""
+
+    def __init__(self, path, headers=None, session=None):
+        self.url = types.SimpleNamespace(path=path)
+        self.headers = headers or {}
+        self.session = {} if session is None else session
+        self.state = types.SimpleNamespace()
+
+
+class _Response:
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.status_code = kwargs.get("status_code")
+
+
+class ApiAuthTests(unittest.TestCase):
+    """The GUI/API gate, which is a *different* gate from McpAuthGuard.
+
+    Everything asserted here was reachable with
+    `Authorization: Basic base64(alice:anything)`. `_check_session_auth`
+    decoded the header, took the username and discarded the password, so
+    `_require_user` in all ~60 handlers was a "did somebody hand us a username"
+    check rather than an authentication check. McpAuthGuard verifies the same
+    header — but it wraps only the MCP mount, and nginx has no auth_basic on
+    the GUI location, so nothing verified it on this path.
+
+    These are lifted from gui.py rather than reimplemented, because a
+    hand-written copy of an auth check is worth exactly nothing.
+    """
+
+    PASSWORDS = {("alice", "correct-horse"), ("bob", "hunter2")}
+    KEYS = {"mvk_alice_key": "alice", "mvk_bob_key": "bob"}
+
+    @classmethod
+    def setUpClass(cls):
+        namespace = {
+            "base64": base64,
+            "logging": _NullLogger(),
+            "HTTPException": type("HTTPException", (Exception,), {}),
+            "Request": object,          # only ever an annotation
+            # `mem` carries a faithful extract_user_from_headers, not just
+            # BASE_URL. Without it, re-introducing the header fallback in `_user`
+            # fails as an AttributeError on the stub -- the suite goes red, but
+            # on a gap in the harness rather than on the property under test,
+            # and a defect that read the headers inline would slip past
+            # entirely. A stub must be complete enough that the *defect* is what
+            # the assertion sees.
+            "mem": types.SimpleNamespace(
+                BASE_URL="/mem-mcp",
+                extract_user_from_headers=_leaky_extract),
+            "JSONResponse": _Response,
+            "RedirectResponse": _Response,
+            "resolve_psk": lambda key, **kw: (
+                None if key not in cls.KEYS else {"user_id": cls.KEYS[key]}),
+            # Records every verification so a test can assert *that* it happened
+            # and not merely that the outcome was right.
+            "_verify_htpasswd": cls._verify,
+        }
+        cls.verifications = []
+        ns = dict(namespace)
+        ns["_verify_htpasswd"] = lambda u, p: ApiAuthTests._verify(u, p)
+        cls.check = staticmethod(_lift("gui.py", "_check_session_auth", ns))
+        # staticmethod, or `self.user` binds it and every call arrives with
+        # an extra self -- the same trap as HeaderPrecedenceTests.extract.
+        cls.user = staticmethod(_lift("gui.py", "_user", ns))
+        ns2 = dict(ns)
+        ns2["_check_session_auth"] = cls.check
+        cls.auth_guard = staticmethod(
+            _lift_undecorated("gui.py", "auth_guard", ns2))
+
+    @classmethod
+    def _verify(cls, username, password):
+        cls.verifications.append((username, password))
+        return (username, password) in cls.PASSWORDS
+
+    def setUp(self):
+        self.verifications.clear()
+
+    @staticmethod
+    def basic(user, password):
+        raw = base64.b64encode(f"{user}:{password}".encode()).decode()
+        return {"Authorization": f"Basic {raw}"}
+
+    def run_guard(self, path="/api/memories", headers=None, session=None):
+        """Run auth_guard over one request. Returns (verdict, request, reached).
+
+        `verdict` is whatever the middleware returned instead of calling on —
+        a _Response stub for a 401 or a redirect, None when it passed through.
+        """
+        request = _Request(path, headers, session)
+        reached = []
+
+        async def call_next(_request):
+            reached.append(_request)
+            return "passed through"
+
+        verdict = asyncio.run(self.auth_guard(request, call_next))
+        return verdict, request, bool(reached)
+
+    # -- the password is actually verified ---------------------------------
+
+    def test_a_correct_basic_password_is_accepted(self):
+        verdict, request, reached = self.run_guard(
+            headers=self.basic("alice", "correct-horse"))
+        self.assertTrue(reached)
+        self.assertEqual(request.state.user, "alice")
+
+    def test_a_wrong_basic_password_is_refused(self):
+        # The whole point. Before, this reached every route as alice.
+        verdict, _, reached = self.run_guard(headers=self.basic("alice", "wrong"))
+        self.assertFalse(reached)
+        self.assertEqual(verdict.status_code, 401)
+
+    def test_an_unknown_user_with_any_password_is_refused(self):
+        verdict, _, reached = self.run_guard(headers=self.basic("mallory", "x"))
+        self.assertFalse(reached)
+        self.assertEqual(verdict.status_code, 401)
+
+    def test_the_password_is_handed_to_the_verifier_whole(self):
+        # partition, not split(":", 1): a password containing a colon used to
+        # be truncated, so a correct password could not verify.
+        self.check(_Request("/api/x", self.basic("alice", "a:b:c")))
+        self.assertIn(("alice", "a:b:c"), self.verifications)
+
+    def test_a_basic_header_with_no_colon_is_refused(self):
+        raw = base64.b64encode(b"alice").decode()
+        verdict, _, reached = self.run_guard(headers={"Authorization": f"Basic {raw}"})
+        self.assertFalse(reached)
+        self.assertEqual(verdict.status_code, 401)
+
+    def test_the_basic_scheme_is_case_insensitive(self):
+        verdict, request, reached = self.run_guard(
+            headers={"Authorization": "basic " + self.basic("bob", "hunter2")["Authorization"].split()[1]})
+        self.assertTrue(reached)
+        self.assertEqual(request.state.user, "bob")
+
+    def test_a_malformed_basic_header_is_a_401_not_a_500(self):
+        verdict, _, reached = self.run_guard(
+            headers={"Authorization": "Basic not-base64!!"})
+        self.assertFalse(reached)
+        self.assertEqual(verdict.status_code, 401)
+
+    # -- the other two credentials still work here -------------------------
+
+    def test_a_session_cookie_is_accepted_without_spawning_htpasswd(self):
+        verdict, request, reached = self.run_guard(session={"user": "alice"})
+        self.assertTrue(reached)
+        self.assertEqual(request.state.user, "alice")
+        self.assertEqual(self.verifications, [],
+                         "the cookie path must not shell out to htpasswd")
+
+    def test_an_access_key_is_accepted(self):
+        verdict, request, reached = self.run_guard(
+            headers={"Authorization": "Bearer mvk_bob_key"})
+        self.assertTrue(reached)
+        self.assertEqual(request.state.user, "bob")
+
+    def test_an_unknown_access_key_is_refused(self):
+        verdict, _, reached = self.run_guard(
+            headers={"Authorization": "Bearer mvk_guessed"})
+        self.assertFalse(reached)
+        self.assertEqual(verdict.status_code, 401)
+
+    def test_a_bare_bearer_is_refused(self):
+        verdict, _, reached = self.run_guard(headers={"Authorization": "Bearer"})
+        self.assertFalse(reached)
+        self.assertEqual(verdict.status_code, 401)
+
+    # -- the allow-list ----------------------------------------------------
+
+    def test_the_event_stream_is_not_public(self):
+        # It was on the unauthenticated allow-list. The handler filtered events
+        # per user, but the user it filtered by came from the unverified header
+        # sources — so the filter selected an attacker-chosen vault's feed.
+        verdict, _, reached = self.run_guard(path="/api/events")
+        self.assertFalse(reached)
+        self.assertEqual(verdict.status_code, 401)
+
+    def test_the_login_endpoint_is_the_only_open_one(self):
+        for path in ("/api/auth/login", "/api/auth/logout"):
+            _, _, reached = self.run_guard(path=path, session={})
+            self.assertTrue(reached, msg=f"{path} must be reachable to log in")
+
+    def test_a_gui_path_without_a_credential_redirects_rather_than_401(self):
+        verdict, _, reached = self.run_guard(path="/gui")
+        self.assertFalse(reached)
+        self.assertEqual(verdict.status_code, 302)
+
+    def test_the_mcp_path_is_outside_this_guard(self):
+        # Documents *why* McpAuthGuard exists: this middleware only matches
+        # /gui* and /api*, so /mcp falls straight through to the mount.
+        _, _, reached = self.run_guard(path="/mcp")
+        self.assertTrue(reached)
+
+    def test_no_dead_ping_entry_is_left_on_the_allow_list(self):
+        # `/api/ping` was allow-listed with no route behind it — an allow-list
+        # slot waiting for someone to implement a public health endpoint.
+        #
+        # Scoped to auth_guard's own source, not to gui.py: the string also
+        # appears twice more in the log-suppression lists (EndpointFilter and
+        # log_gui_requests), which are harmless, so a whole-file assertion would
+        # pin contributors to the number rather than the property.
+        # An AST walk, not a substring search. A `#` comment is not in the tree
+        # at all, so the explanatory comment sitting directly above this
+        # allow-list -- which names both of these paths on purpose -- cannot
+        # satisfy or break the assertion. A substring search over the function
+        # source would match that comment and report green on the bug it was
+        # written to catch.
+        node = _module_node("gui.py", "auth_guard")
+        literals = {
+            child.value for child in ast.walk(node)
+            if isinstance(child, ast.Constant)
+            and isinstance(child.value, str)
+            and child.value.startswith("/api/")
+        }
+        # `literals` holds plain strings, not nodes.
+        self.assertNotIn("/api/events", literals,
+                         "/api/events is on the unauthenticated allow-list again")
+        self.assertNotIn("/api/ping", literals,
+                         "the dead /api/ping allow-list entry is back")
+        # Only /api/auth may be open, and it is a prefix test rather than a
+        # list entry -- so assert that is what is actually there.
+        self.assertIn("/api/auth", literals,
+                      "the /api/auth prefix exemption is missing")
+
+    # -- _user does not re-derive an identity from headers ------------------
+
+    def test_headers_alone_cannot_name_the_user(self):
+        # The proxy identity headers are the weakest link in
+        # extract_user_from_headers. The MCP path needs that function to read
+        # the guard's verified x-vault-user stamp, but a handler here must not
+        # consult it: there is no guard on this path that verified anything.
+        for headers in (
+            {"Remote-User": "alice"},
+            {"X-Remote-User": "alice"},
+            {"X-User": "alice"},
+            {"X-Forwarded-User": "alice"},
+            self.basic("alice", "whatever"),
+            {"x-vault-user": "alice"},
+        ):
+            request = _Request("/api/memories", headers)
+            self.assertEqual(self.user(request), "anonymous", msg=f"{headers}")
+
+    def test_the_session_and_the_guard_stamp_are_both_accepted(self):
+        self.assertEqual(self.user(_Request("/x", session={"user": "alice"})), "alice")
+        request = _Request("/x")
+        request.state.user = "bob"
+        self.assertEqual(self.user(request), "bob")
+
+
+# ---------------------------------------------------------------------------
+# CORS and the auto-registered documentation routes
+# ---------------------------------------------------------------------------
+
+class CorsAndDocsTests(unittest.TestCase):
+    """Two endpoints that needed no credential because nothing matched them."""
+
+    def _origins_for(self, base_url):
+        ns = {"mem": types.SimpleNamespace(BASE_URL=base_url), "urlsplit": urlsplit}
+        fn = _lift("server.py", "_cors_origins", ns)
+        return fn()
+
+    def test_cors_origins_come_from_base_url(self):
+        self.assertEqual(self._origins_for("https://host/mem-mcp"), ["https://host"])
+        self.assertEqual(
+            self._origins_for("https://host:8443/mem-mcp"), ["https://host:8443"])
+
+    def test_an_origin_is_scheme_and_host_with_no_mount_point(self):
+        # BASE_URL carries the nginx prefix; an Access-Control-Allow-Origin
+        # must not, or it matches nothing.
+        for base, expected in (
+            ("https://host/mem-mcp", "https://host"),
+            ("http://host:8086/mem-mcp", "http://host:8086"),
+        ):
+            self.assertEqual(self._origins_for(base), [expected], msg=base)
+
+    def test_an_unset_or_relative_base_url_yields_no_origin_at_all(self):
+        # Not a fallback to "*": no BASE_URL means no CORS headers, and
+        # same-origin browser use never needed any.
+        for base in ("", "   ", None, "/mem-mcp", "mem-mcp"):
+            self.assertEqual(self._origins_for(base), [], msg=repr(base))
+
+    def test_the_web_app_cors_is_not_a_wildcard_with_credentials(self):
+        # allow_origins=["*"] + allow_credentials=True + allow_headers=["*"]
+        # and registered last, so it is the OUTERMOST middleware: it answered
+        # before auth_guard or McpAuthGuard ran, and let any site read and
+        # mutate a named user's vault from the victim's browser.
+        tree = ast.parse(_read("server.py"))
+        calls = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "add_middleware"
+            and node.args
+            and getattr(node.args[0], "id", None) == "CORSMiddleware"
+        ]
+        self.assertTrue(calls, "no web_app.add_middleware(CORSMiddleware, ...) found")
+        for call in calls:
+            kwargs = {kw.arg: kw.value for kw in call.keywords}
+            origins = kwargs.get("allow_origins")
+            self.assertIsNotNone(origins, "allow_origins was dropped entirely")
+            # Assert on the *shape*: a call to _cors_origins(), not a literal.
+            self.assertIsInstance(origins, ast.Call, msg=(
+                "allow_origins must be derived from BASE_URL, not a literal: "
+                f"got {ast.dump(origins)}"))
+
+    def test_the_interactive_docs_and_schema_are_switched_off(self):
+        # FastAPI registers /docs, /redoc and /openapi.json inside __init__,
+        # before every route here and before the / mount, so auth_guard — which
+        # only matches /gui* and /api* — never saw them. They enumerate every
+        # route, parameter and schema.
+        tree = ast.parse(_read("gui.py"))
+        ctors = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "FastAPI"
+        ]
+        self.assertTrue(ctors, "web_app = FastAPI(...) not found")
+        for ctor in ctors:
+            kwargs = {kw.arg: kw.value for kw in ctor.keywords}
+            for name in ("docs_url", "redoc_url", "openapi_url"):
+                self.assertIn(name, kwargs, msg=f"{name} is not pinned")
+                self.assertIsInstance(
+                    kwargs[name], ast.Constant, msg=f"{name} must be a literal")
+                self.assertIsNone(kwargs[name].value, msg=f"{name} must be None")
