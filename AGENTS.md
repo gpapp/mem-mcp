@@ -582,6 +582,33 @@ Rules that matter when changing this code:
 ### Access Keys & Sessions
 Setup → **🔑 Access Keys** manages the credential an MCP client presents.
 
+- **The Setup page documents the authentication model, not just where the keys
+  live.** `/mcp` takes `Authorization: Bearer mvk_…` on every call; `/gui` and
+  `/api/*` take the session cookie, a verified `Basic` header, or a key. The
+  table under **Which credential goes where** is the only place a user learns
+  that before trying, and **🩺 When a client refuses to connect** maps each
+  client-side error to a cause. Both exist because the observed failure was
+  undiagnosable from the error alone: a client reported *"Incompatible auth
+  server: does not support dynamic client registration"*, which is what an MCP
+  client says when it receives a 401, assumes the server speaks OAuth, and
+  finds that it does not. The actual cause was nginx still answering
+  `auth_basic` itself, so the key never reached the app. Guidance text is worth
+  a guard for that reason — `SetupPageAuthGuidanceTests` pins the sections and
+  scopes each assertion to the block that owns the text, because `assertIn` over
+  a 5700-line template passes on any page containing the word.
+- **`-i` on the curl snippet is load-bearing.** The diagnostic tells the user to
+  read the `WWW-Authenticate` line; without `-i` curl prints no response
+  headers, so the section's stated purpose — distinguishing an app 401 from a
+  proxy 401 — silently stops working while the test stays green. Removing `-i`
+  did not fail the suite until that assertion existed.
+- **Both connection snippets are rewritten from the same key** at creation time
+  (`showNewPSK`), the config-file one via `textContent` because that is the one
+  place a secret is written into the page. Both are pinned on the exact
+  assignment, not the word `textContent`: an earlier version searched from the
+  `getElementById` call, a window covering three unrelated writes plus a
+  comment mentioning both words, so rewriting the secret-bearing write as
+  `innerHTML` passed green.
+
 - **Create a key** with an optional label and an optional expiry (never / 30 / 90 / 365 days).
 - **The plaintext is returned once**, by `POST /api/psks` and nothing else. Only a
   SHA-256 hash and a 10-character display prefix are stored, so the Setup page

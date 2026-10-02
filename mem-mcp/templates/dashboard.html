@@ -900,12 +900,58 @@
 <div id="page-setup" class="page">
   <div class="card">
     <h2 style="margin-top:0;">🔌 MCP Setup</h2>
-    <p>Connect your AI assistant to this Vault.</p>
+    <p>Connect your AI assistant to this Vault. Authentication is an <strong>access key</strong>
+       sent as a Bearer header on <strong>every</strong> request — there is no OAuth login to
+       click through, and nothing to log into in the client.</p>
+
     <div class="setup-grid">
         <div style="flex:1;">
-            <label>Standard Connection (HTTP):</label>
+            <label>Claude Code / Claude Desktop (command line):</label>
             <pre><code id="mcp-connect-cmd">claude mcp add --transport http memory-vault {{MCP_URL}} --header "Authorization: Bearer {{PSK_PREFIX}}&lt;your-access-key&gt;"</code></pre>
         </div>
+        <div style="flex:1;">
+            <label>Any other MCP client (config file):</label>
+            <pre><code id="mcp-connect-json">{
+  "mcpServers": {
+    "memory-vault": {
+      "type": "http",
+      "url": "{{MCP_URL}}",
+      "headers": {
+        "Authorization": "Bearer {{PSK_PREFIX}}&lt;your-access-key&gt;"
+      }
+    }
+  }
+}</code></pre>
+        </div>
+    </div>
+    <p style="font-size: 0.85rem; color: var(--muted); margin-top: 0.75rem;">
+       Both snippets fill themselves in the moment you create a key below, so copy them from
+       here rather than typing the placeholder by hand.
+    </p>
+
+    <div style="margin-top: 1.5rem;">
+      <label style="display:block; margin-bottom:0.4rem;">Which credential goes where</label>
+      <div style="font-size: 0.85rem; border: 1px solid var(--border); border-radius: 8px; overflow:hidden;">
+        <div style="display:flex; gap:0.75rem; padding:0.55rem 0.75rem; border-bottom: 1px solid var(--border);">
+          <code style="flex:0 0 130px;">/mcp</code>
+          <span style="flex:1;">An access key, <code>Authorization: Bearer {{PSK_PREFIX}}…</code>, on every call.
+            A session cookie and a username/password (Basic) header are both <strong>refused here</strong>
+            with a 401. This is what an MCP client uses.</span>
+        </div>
+        <div style="display:flex; gap:0.75rem; padding:0.55rem 0.75rem; border-bottom: 1px solid var(--border);">
+          <code style="flex:0 0 130px;">/gui, /api/*</code>
+          <span style="flex:1;">Your dashboard login (a session cookie), a <code>Basic</code>
+            username and password, or an access key. This is the browser and the setup
+            scripts — <strong>not</strong> the MCP endpoint.</span>
+        </div>
+        <div style="display:flex; gap:0.75rem; padding:0.55rem 0.75rem;">
+          <code style="flex:0 0 130px;">any other path</code>
+          <span style="flex:1;">Unreachable without a credential. A reverse proxy in front of
+            this app must not add its own HTTP Basic challenge on <code>/mcp</code> — nginx
+            answers such a challenge itself and never forwards the Bearer key, so the client
+            sees a login prompt where there is none.</span>
+        </div>
+      </div>
     </div>
 
     <div style="margin-top: 2.5rem; padding-top: 1.5rem; border-top: 1px solid var(--border);">
@@ -943,6 +989,54 @@
         <div style="font-size:.9rem; color:var(--muted);">Loading access keys…</div>
       </div>
       <div id="session-list" style="margin-top:1rem; font-size:.85rem; color:var(--muted);"></div>
+    </div>
+
+    <div style="margin-top: 2.5rem; padding-top: 1.5rem; border-top: 1px solid var(--border);">
+      <h3 style="margin-top:0;">🩺 When a client refuses to connect</h3>
+      <p style="font-size: 0.9rem; color: var(--muted); margin-bottom: 1rem;">
+        Every message below means the client reached the server and was turned away. None of
+        them is fixed by the dashboard login — <code>/mcp</code> only ever answers to an access key.
+      </p>
+
+      <div style="font-size: 0.85rem;">
+        <div style="padding:0.6rem 0; border-bottom: 1px solid var(--border);">
+          <div style="font-weight:600; margin-bottom:0.2rem;">"Incompatible auth server: does not support dynamic client registration"</div>
+          The client was answered with <code>401</code>, decided on its own that this server must
+          speak OAuth, and failed to find it. It is a <em>missing header</em>, not a broken
+          OAuth implementation: set <code>Authorization: Bearer</code> with a key in the client
+          config and it will never be challenged. If you have just done that and still see it,
+          a proxy in front of this app is still challenging with its own HTTP Basic — see the
+          last row of the table above.
+        </div>
+
+        <div style="padding:0.6rem 0; border-bottom: 1px solid var(--border);">
+          <div style="font-weight:600; margin-bottom:0.2rem;">"401 Unauthorized", or a browser window asking for a username</div>
+          Either the header is not reaching this app, or the key is wrong, expired, or revoked.
+          A browser <em>login prompt</em> rather than a JSON error means something other than
+          this app answered — this server never asks for a username on <code>/mcp</code>.
+        </div>
+
+        <div style="padding:0.6rem 0; border-bottom: 1px solid var(--border);">
+          <div style="font-weight:600; margin-bottom:0.2rem;">Connected, but every tool call fails</div>
+          The key resolved and then lost access — usually revoked in the list above, or
+          belonging to a different user than the vault it is pointed at.
+        </div>
+
+        <div style="padding:0.6rem 0;">
+          <div style="font-weight:600; margin-bottom:0.2rem;">Check it by hand</div>
+          <p style="margin:0 0 0.4rem;">This is what a correct key looks like, and it is the fastest way to tell a bad key from a blocked request — a working server answers <code>200</code>, a blocked one answers <code>401</code>:</p>
+          <pre><code style="display:block;">curl -i -X POST {{MCP_URL}} \
+  -H "Authorization: Bearer {{PSK_PREFIX}}&lt;your-access-key&gt;" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize"}'</code></pre>
+          <p style="margin:0.4rem 0 0;">Read the <code>WWW-Authenticate</code> line in the
+            response. It must say <code>Bearer</code>. If it says <code>Basic</code>, the answer
+            came from nginx, not from this app — the MCP location in the proxy config must not
+            carry <code>auth_basic</code>, because nginx answers that challenge itself and
+            never forwards the key.</p>
+        </div>
+      </div>
     </div>
 
     <div style="margin-top: 2.5rem; padding-top: 1.5rem; border-top: 1px solid var(--border);">
@@ -2195,17 +2289,32 @@ npm install @modelcontextprotocol/sdk</code></pre>
   }
 
   // The only moment the plaintext key exists outside the browser, so it gets a
-  // copy button, fills in the connection command, and stays up until the next
+  // copy button, fills in the connection snippets, and stays up until the next
   // create. There is deliberately no way to ask for it again.
   function showNewPSK(key) {
     const box = document.getElementById('psk-new');
     const value = document.getElementById('psk-new-value');
     const cmd = document.getElementById('mcp-connect-cmd');
+    const json = document.getElementById('mcp-connect-json');
     if (value) value.textContent = key;
     if (box) box.style.display = 'block';
     if (cmd) {
       cmd.textContent = 'claude mcp add --transport http memory-vault ' + MCP_URL +
         ' --header "Authorization: Bearer ' + key + '"';
+    }
+    if (json) {
+      // textContent, not innerHTML: the key is browser-generated so it cannot
+      // contain markup today, but this is the one place a secret is written
+      // into the page and there is no reason to give it a parser.
+      json.textContent = JSON.stringify({
+        mcpServers: {
+          'memory-vault': {
+            type: 'http',
+            url: MCP_URL,
+            headers: { Authorization: 'Bearer ' + key },
+          },
+        },
+      }, null, 2);
     }
     toast('\ud83d\udd11 Access key created \u2014 copy it now, it is not shown again', 8000);
   }

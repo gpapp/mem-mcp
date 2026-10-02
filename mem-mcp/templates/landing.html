@@ -64,17 +64,21 @@
       <p>Connect your AI assistant to your Vault using the command below.</p>
       
       <div class="step">
-        <p><span class="step-num">1</span> <strong>Claude Desktop / Claude Code:</strong></p>
-        <p>Run this in your terminal:</p>
-        <pre><code>claude mcp add --transport http memory-vault {{MCP_URL}} --header "Authorization: Bearer {{PSK_PREFIX}}&lt;your-access-key&gt;"</code></pre>
+        <p><span class="step-num">1</span> <strong>Create an access key:</strong></p>
+        <div style="background: var(--bg); padding: 1rem; border-radius: 8px; border: 1px dashed var(--primary);">
+          <p style="margin:0;">Signed in as <code>{{AUTH_USER}}</code>. Create a key under
+          <a href="{{BASE_URL}}/gui">Setup &rarr; Access Keys</a> — it is shown once, so copy it
+          then. The dashboard login itself is not a credential for an MCP client.</p>
+        </div>
       </div>
 
       <div class="step">
-        <p><span class="step-num">2</span> <strong>Create an access key:</strong></p>
-        <div style="background: var(--bg); padding: 1rem; border-radius: 8px; border: 1px dashed var(--primary);">
-          <p style="margin:0;">Signed in as <code>{{AUTH_USER}}</code>. Create a key under
-          <a href="{{BASE_URL}}/gui">Setup &rarr; Access Keys</a> — it is shown once.</p>
-        </div>
+        <p><span class="step-num">2</span> <strong>Paste the key into your client:</strong></p>
+        <p>Run this in your terminal, replacing the placeholder with the key you just created:</p>
+        <pre><code>claude mcp add --transport http memory-vault {{MCP_URL}} --header "Authorization: Bearer {{PSK_PREFIX}}&lt;your-access-key&gt;"</code></pre>
+        <p style="font-size:.9rem;">Other clients take the same key as a config-file header — see
+        <a href="{{BASE_URL}}/gui">Setup</a> for a ready-made snippet, per-client instructions and
+        troubleshooting.</p>
       </div>
     </div>
     {% endif %}

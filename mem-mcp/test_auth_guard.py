@@ -469,10 +469,177 @@ class WiringTests(unittest.TestCase):
 
     def test_the_psk_renderer_does_not_refetch_its_own_input(self):
         # A renderer that refetches loops: render -> fetch -> render. The
-        # backup panel measured 500+ requests for one finished job this way.
+        # backup panel measured 500+ requests for one finished backup this way.
         body = _js_function_source("templates/dashboard.html", "renderPSKs")
         self.assertNotIn("api.get", body)
         self.assertNotIn("loadPSKs", body)
+
+
+class SetupPageAuthGuidanceTests(unittest.TestCase):
+    """The Setup page must tell a user how to authenticate, not just where.
+
+    The one thing a user cannot infer from a 401 is which of three mechanisms
+    failed. Observed while writing this: a client reported "Incompatible auth
+    server: does not support dynamic client registration", which is what an
+    MCP client says when it gets a 401, assumes the server speaks OAuth, and
+    finds that it does not. The actual cause was a proxy answering with its own
+    Basic challenge before the key ever arrived. Nothing in the UI said either
+    of those things, so the only way to find it was to read the source.
+
+    These are guards on guidance text, which is unusual, and the reason is that
+    the text is the fix. Each assertion below names a failure a user cannot
+    self-diagnose from the error they are shown.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dashboard = _read("templates/dashboard.html")
+        cls.landing = _read("templates/landing.html")
+
+    def _between(self, start, end):
+        """The slice between two markers.
+
+        Asserting a word appears somewhere in a 5700-line template is the
+        `assertIn`-over-the-whole-file trap: it passes on any page that happens
+        to contain the word, which is not the same as the guidance existing.
+        Each assertion below is scoped to the block that owns the text.
+        """
+        i = self.dashboard.find(start)
+        self.assertTrue(i > 0, msg=f"missing marker: {start!r}")
+        j = self.dashboard.find(end, i)
+        self.assertTrue(j > i, msg=f"missing closing marker after {start!r}: {end!r}")
+        return self.dashboard[i:j]
+
+    def test_the_intro_says_the_key_is_sent_on_every_request(self):
+        # "every request" is the property that explains why a client that
+        # worked once can still fail later, and why this is not a login.
+        intro = self._between("<h2 style=\"margin-top:0;\">🔌 MCP Setup",
+                              "setup-grid")
+        self.assertIn("every", intro.lower())
+        self.assertIn("no OAuth login", intro,
+                      msg="the intro must say there is nothing to log into")
+
+    def test_the_oauth_misdiagnosis_is_named_on_the_page(self):
+        # The exact string the client prints. A user searching their error
+        # message must land on the paragraph that explains it, and it must say
+        # the cause is a missing header rather than blaming OAuth.
+        block = self._between("When a client refuses to connect",
+                              "</div>\n\n    <div style=\"margin-top: 2.5rem")
+        lower = block.lower()
+        self.assertIn("dynamic client registration", lower)
+        self.assertIn("missing header", lower)
+
+    def test_the_surface_table_names_all_three_paths(self):
+        # One credential per surface is the rule the guard enforces, and the
+        # table is the only place a user learns it before trying.
+        table = self._between("Which credential goes where",
+                              "any other path")
+        for path in ("/mcp", "/gui", "/api/*"):
+            self.assertIn(path, table,
+                          msg=f"the credential table does not cover {path}")
+
+    def test_the_mcp_row_says_a_cookie_and_basic_are_refused(self):
+        # Scoped to the /mcp row alone: "refused" appearing anywhere on the page
+        # says nothing about whether the row that matters says it.
+        table = self._between("Which credential goes where", "any other path")
+        mcp_row = table.split("/gui, /api/*")[0]
+        self.assertIn("refused", mcp_row.lower(),
+                      msg="the /mcp row must say the other credentials are refused")
+        self.assertIn("Bearer", mcp_row)
+
+    def test_the_page_warns_about_a_proxy_challenge(self):
+        # The failure this section was written for: nginx answers auth_basic
+        # itself and never forwards the key, so the app is never even asked.
+        block = self._between("When a client refuses to connect", "Local Proxy Bridge")
+        self.assertIn("auth_basic", block)
+        # And the tell the user can actually observe, not just the mechanism.
+        self.assertIn("Basic", block)
+
+    def test_a_key_can_be_tested_without_a_client(self):
+        # The curl snippet is the diagnostic, not decoration: it distinguishes a
+        # bad key (JSON 401 from this app) from a blocked request (HTML 401
+        # from the proxy) in one step, which no client-side message does.
+        # The paragraph explaining what to read in the response sits after the
+        # snippet, so the block runs to the end of the section rather than to
+        # the first </pre>.
+        block = self._between("Check it by hand", "Local Proxy Bridge")
+        self.assertIn("curl", block)
+        self.assertIn("-X POST", block)
+        # -i is not decoration. The block tells the user to read the
+        # WWW-Authenticate line, and without -i curl prints no response
+        # headers, so the diagnostic silently stops working while this test
+        # stays green. Removing -i re-injection did not fail until this
+        # assertion existed.
+        self.assertIn("curl -i ", block,
+                      msg="-i must be there or the WWW-Authenticate line is invisible")
+        self.assertIn("WWW-Authenticate", block)
+
+    def test_both_snippets_are_filled_when_a_key_is_created(self):
+        # A placeholder the user has to hand-edit is where a wrong header comes
+        # from. Both snippets are filled from the same key at creation time.
+        body = _js_function_source("templates/dashboard.html", "showNewPSK")
+        self.assertIn("mcp-connect-cmd", body)
+        self.assertIn("mcp-connect-json", body)
+        # Both must carry the same Bearer header, or the two paths disagree.
+        self.assertIn("Authorization: Bearer ' + key", body)
+        self.assertIn("headers: { Authorization: 'Bearer ' + key }", body)
+
+    def test_the_json_snippet_is_written_as_text_not_markup(self):
+        # showNewPSK is the one place a secret is written into the page. The
+        # key is browser-generated so it cannot contain markup today; this is
+        # not a reason to hand it a parser.
+        #
+        # This assertion pins the assignment, not the word "textContent".
+        # The first version searched from the getElementById call, whose window
+        # covers three unrelated textContent writes plus a comment mentioning
+        # both words -- so rewriting the secret-bearing write as innerHTML
+        # passed green. Re-injection is what caught it.
+        body = _js_function_source("templates/dashboard.html", "showNewPSK")
+        self.assertIn("json.textContent = JSON.stringify({", body,
+                      msg="the key must reach the snippet through textContent")
+        self.assertNotIn("json.innerHTML", body,
+                         msg="the key must never be written through a markup parser")
+
+    def test_the_config_snippet_is_valid_json_once_rendered(self):
+        # The snippet is emitted as literal markup for the placeholder state and
+        # rewritten by JS. Hand-editing the placeholder JSON is the failure the
+        # rewrite exists to prevent, so it has to parse as-is: a missing comma
+        # or a stray backslash in the template is invisible until a client
+        # silently refuses the config.
+        try:
+            import json
+        except ImportError:
+            self.skipTest("json is stdlib but unavailable here")
+        raw = self.dashboard.split('<code id="mcp-connect-json">')[1]
+        raw = raw.split("</code>")[0]
+        placeholder = "mvk_REPLACE_ME"
+        text = (raw.replace("&lt;", "<").replace("&gt;", ">")
+                   .replace("&amp;", "&").replace("&quot;", '"')
+                   .replace("{{MCP_URL}}", "/mem-mcp/mcp")
+                   .replace("{{PSK_PREFIX}}", placeholder)
+                   # The template shows a prefix plus a written-out placeholder,
+                   # which is not a key; substitute the whole thing so what is
+                   # parsed is the shape showNewPSK actually emits.
+                   .replace(placeholder + "<your-access-key>", placeholder))
+        try:
+            parsed = json.loads(text)
+        except ValueError as exc:
+            self.fail(f"the config-file snippet is not valid JSON: {exc}\n{text}")
+        server = parsed["mcpServers"]["memory-vault"]
+        self.assertEqual(server["url"], "/mem-mcp/mcp")
+        self.assertEqual(server["headers"]["Authorization"],
+                         f"Bearer {placeholder}")
+
+    def test_the_landing_page_creates_the_key_before_asking_for_the_command(self):
+        # Step order is the whole content of that page. Telling someone to run
+        # a command containing a key that step 2 then tells them to create is
+        # backwards, and the placeholder is what they would run.
+        create = self.landing.find("Create an access key")
+        run = self.landing.find("claude mcp add")
+        self.assertTrue(create > 0, msg="the landing page lost the create-a-key step")
+        self.assertTrue(run > 0, msg="the landing page lost the connect command")
+        self.assertLess(create, run,
+                        msg="the key must be created before the command that needs it")
 
 
 def _function_source(relative_path, name):
