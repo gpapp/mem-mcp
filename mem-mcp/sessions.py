@@ -91,6 +91,39 @@ CREATE TABLE IF NOT EXISTS psks (
 
 CREATE INDEX IF NOT EXISTS psks_user_id_index ON psks (user_id);
 CREATE INDEX IF NOT EXISTS sessions_expires_index ON sessions (expires_at);
+
+-- The OAuth client this app registered with an external provider, entered
+-- through the Setup page rather than the environment, so an operator can change
+-- it without a redeploy. Google is the only provider implemented; the column
+-- exists so adding one is a row rather than a second table.
+CREATE TABLE IF NOT EXISTS oauth_clients (
+    provider      TEXT PRIMARY KEY,
+    client_id     TEXT NOT NULL,
+    client_secret TEXT NOT NULL DEFAULT '',
+    created_at    REAL NOT NULL,
+    updated_at    REAL NOT NULL
+);
+
+-- Which external identity may open which vault. `user_id` is the same plain
+-- username string every other store in this app uses — there is no user table —
+-- so linking a Google account is the act of pointing a subject at a name.
+--
+-- The primary key is (provider, subject) and NOT (provider, subject, user_id):
+-- one subject resolves to exactly one vault, forever. That is what makes an
+-- unlinked account a refusal rather than a new empty vault, and it is why
+-- link_google_identity refuses to move an existing link instead of upserting.
+CREATE TABLE IF NOT EXISTS google_identities (
+    provider     TEXT NOT NULL DEFAULT 'google',
+    subject      TEXT NOT NULL,
+    user_id      TEXT NOT NULL,
+    email        TEXT NOT NULL DEFAULT '',
+    display_name TEXT NOT NULL DEFAULT '',
+    created_at   REAL NOT NULL,
+    last_used_at REAL,
+    PRIMARY KEY (provider, subject)
+);
+
+CREATE INDEX IF NOT EXISTS google_identities_user_index ON google_identities (user_id);
 """
 
 _INIT_LOCK = threading.Lock()
@@ -129,7 +162,12 @@ def _connect() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    """Create the schema. Idempotent, and called before every other function."""
+    """Create the schema. Idempotent, and called before every other function.
+
+    Every statement is CREATE ... IF NOT EXISTS, so a database written by an
+    older build gains the tables added since without a migration step: the only
+    thing a new column needs is a default, and only new tables have been added.
+    """
     global _initialised_path
     path = db_path()
     with _INIT_LOCK:
@@ -529,6 +567,312 @@ def revoke_psk(psk_id: str, user_id: str, now=None) -> bool:
         return cursor.rowcount > 0
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# External identities (Google)
+# ---------------------------------------------------------------------------
+
+GOOGLE_PROVIDER = "google"
+
+# Google's client ids are of the form "<number>-<slug>.apps.googleusercontent.com",
+# around 40-120 characters. A generous bound rejects a pasted paragraph without
+# needing the real shape, which is a documentation detail not a security control.
+MAX_CLIENT_ID_CHARS = 255
+MAX_CLIENT_SECRET_CHARS = 512
+
+# The display fields are bounded here as well as in google_auth, for the reason
+# PSK labels are: these store functions are public, so a caller that bypasses
+# google_auth entirely (a script, a future provider) still cannot write an
+# unbounded string into the database. sessions.py cannot import the constants
+# from google_auth because google_auth needs PyJWT and this module is
+# stdlib-only precisely so the test suite can import and call it with nothing
+# installed — the duplication is the price of that, and it is two integers.
+MAX_EMAIL_CHARS = 254   # RFC 5321's practical maximum
+MAX_NAME_CHARS = 120
+
+
+def _normalise_provider(provider) -> str:
+    """The provider key. Only one is implemented, so this is also the validator."""
+    name = str(provider or "").strip().lower()
+    if name != GOOGLE_PROVIDER:
+        raise ValueError(f"provider must be {GOOGLE_PROVIDER!r}")
+    return name
+
+
+def save_oauth_client(provider, client_id, client_secret=None, now=None) -> dict:
+    """Store (or replace) the OAuth client for a provider. Returns the record.
+
+    `client_secret=None` keeps whatever secret is already stored; `""` clears it.
+    That distinction is the whole reason it is not a plain string: the Setup page
+    never receives the secret back, so a save that only meant to correct a client
+    id cannot send the stored value, and "absent means keep" is what stops it
+    wiping the secret instead.
+
+    The secret is stored as typed. That is a deliberate consequence of letting an
+    operator configure this from the Setup page rather than the environment: the
+    value has to be written somewhere the app owns, and this database is already
+    the place sessions and key hashes live, on the operator's bind mount. It is
+    not encrypted at rest, and pretending otherwise in a comment would be worse
+    than saying it. What keeps it from mattering is that verifying a Google ID
+    token needs no secret at all — the signature is checked against Google's
+    public keys — so the stored secret is only read if a code-exchange flow is
+    added later.
+    """
+    init_db()
+    name = _normalise_provider(provider)
+    client_id = str(client_id or "").strip()
+    if not client_id:
+        raise ValueError("A client id is required")
+    # Refused, not truncated. A display field that loses its tail is still
+    # readable, but a credential that loses its tail is simply a wrong
+    # credential: it would be stored, shown as saved, and fail later at the point
+    # of use with a Google-side error that says nothing about a length limit
+    # here. The bound is generous relative to what Google issues, so exceeding it
+    # means a paste went wrong and should be refused at the point of entry.
+    if len(client_id) > MAX_CLIENT_ID_CHARS:
+        raise ValueError("That client id is too long to be a Google client id")
+    if client_secret is not None and len(str(client_secret).strip()) > MAX_CLIENT_SECRET_CHARS:
+        raise ValueError("That client secret is too long to be a Google client secret")
+    moment = _now(now)
+    conn = _connect()
+    try:
+        existing = conn.execute(
+            "SELECT * FROM oauth_clients WHERE provider = ?", (name,)
+        ).fetchone()
+        if client_secret is None:
+            # Absent: keep the stored secret, or "" when there was never one.
+            secret = (existing["client_secret"] if existing is not None else "") or ""
+        else:
+            secret = str(client_secret).strip()
+        created_at = existing["created_at"] if existing is not None else moment
+        conn.execute(
+            "INSERT INTO oauth_clients (provider, client_id, client_secret, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?)"
+            " ON CONFLICT(provider) DO UPDATE SET"
+            " client_id = excluded.client_id,"
+            " client_secret = excluded.client_secret,"
+            " updated_at = excluded.updated_at",
+            (name, client_id, secret, created_at, moment),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM oauth_clients WHERE provider = ?", (name,)
+        ).fetchone()
+    finally:
+        conn.close()
+    return dict(row)
+
+
+def get_oauth_client(provider=GOOGLE_PROVIDER) -> dict | None:
+    """The stored client, secret included, or None. Internal: see the public_* pair.
+
+    Returning the secret here and stripping it one layer out is deliberate, and
+    it is only safe because oauth_client_public is the single place that builds a
+    client record for a response. A caller that wants to show the configuration
+    must go through that.
+    """
+    init_db()
+    name = _normalise_provider(provider)
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM oauth_clients WHERE provider = ?", (name,)
+        ).fetchone()
+    finally:
+        conn.close()
+    return dict(row) if row is not None else None
+
+
+def oauth_client_public(record) -> dict:
+    """A client record safe to send to a browser: the secret becomes a flag.
+
+    The Setup page needs to show whether a secret is configured so an operator
+    can tell "never set one" from "set one and forgot it", and it must not be
+    able to read the secret back — this app has exactly one place a Google secret
+    is ever needed (a future code exchange), and that is not the UI.
+    """
+    record = dict(record or {})
+    secret = record.get("client_secret") or ""
+    return {
+        "provider": record.get("provider") or GOOGLE_PROVIDER,
+        "client_id": record.get("client_id") or "",
+        "secret_set": bool(secret),
+        "created_at": record.get("created_at"),
+        "updated_at": record.get("updated_at"),
+    }
+
+
+def delete_oauth_client(provider=GOOGLE_PROVIDER) -> bool:
+    """Forget the OAuth client. Identity links are deliberately left alone.
+
+    Removing the client id makes every token unverifiable, because the audience
+    check has nothing to compare against — so the links stop granting access at
+    that moment without the links themselves being rewritten. Deleting them too
+    would mean that restoring a client id did not restore access, which is the
+    opposite of what an operator who fat-fingered the field wants.
+    """
+    init_db()
+    name = _normalise_provider(provider)
+    conn = _connect()
+    try:
+        cursor = conn.execute("DELETE FROM oauth_clients WHERE provider = ?", (name,))
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        conn.close()
+
+
+def link_google_identity(subject, user_id, email="", name="", provider=GOOGLE_PROVIDER, now=None) -> dict:
+    """Point an external subject at a vault, and return the record.
+
+    Raises ValueError if the subject is already linked to a *different* vault. A
+    subject is one account at one provider, so a second link is a contradiction
+    rather than a second grant — and silently reassigning would let anyone who can
+    log in as any vault claim another vault's account by pasting its token,
+    which is a privilege escalation dressed up as a convenience.
+
+    Re-linking the same subject to the same vault is an update of the display
+    fields, so an operator can correct a mistyped email without a delete.
+    """
+    init_db()
+    subject = str(subject or "").strip()
+    user_id = str(user_id or "").strip()
+    if not subject:
+        raise ValueError("A subject is required")
+    if not user_id:
+        raise ValueError("A linked identity needs a vault")
+    provider = _normalise_provider(provider)
+    email = str(email or "").strip()[:MAX_EMAIL_CHARS]
+    display_name = " ".join(str(name or "").split())[:MAX_NAME_CHARS]
+    moment = _now(now)
+
+    conn = _connect()
+    try:
+        existing = conn.execute(
+            "SELECT user_id FROM google_identities WHERE provider = ? AND subject = ?",
+            (provider, subject),
+        ).fetchone()
+        if existing is not None and existing["user_id"] != user_id:
+            raise ValueError(
+                "that Google account is already linked to a different vault"
+            )
+        if existing is None:
+            conn.execute(
+                "INSERT INTO google_identities"
+                " (provider, subject, user_id, email, display_name, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (provider, subject, user_id, email, display_name, moment),
+            )
+        else:
+            conn.execute(
+                "UPDATE google_identities SET email = ?, display_name = ?"
+                " WHERE provider = ? AND subject = ?",
+                (email, display_name, provider, subject),
+            )
+        conn.commit()
+        # Re-read rather than assembling the return from what was written: the
+        # UPDATE path does not touch created_at, so a hand-built dict would claim
+        # a fresh creation time for a link that has existed for months, and
+        # last_used_at could not be filled in at all. One extra SELECT on a
+        # write a human performs once is cheaper than a return value that lies.
+        row = conn.execute(
+            "SELECT * FROM google_identities WHERE provider = ? AND subject = ?",
+            (provider, subject),
+        ).fetchone()
+    finally:
+        conn.close()
+    return dict(row)
+
+
+def unlink_google_identity(subject, user_id, provider=GOOGLE_PROVIDER) -> bool:
+    """Unlink, if the link belongs to `user_id`. False otherwise.
+
+    Ownership is a WHERE clause for the reason revoke_psk gives: reading the row
+    first and comparing in Python leaves a window in which the link could change
+    hands, and it would let the caller see a subject that is not theirs.
+    """
+    if not subject or not user_id:
+        return False
+    init_db()
+    provider = _normalise_provider(provider)
+    conn = _connect()
+    try:
+        cursor = conn.execute(
+            "DELETE FROM google_identities WHERE provider = ? AND subject = ? AND user_id = ?",
+            (provider, str(subject).strip(), str(user_id)),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        conn.close()
+
+
+def list_google_identities(user_id) -> list:
+    """Every external identity linked to one vault, oldest first.
+
+    Only the requesting vault's own rows are read. Unlike the PSK list there is
+    no revoked/expired status to show: a link is either there or it was deleted,
+    and a deleted link leaving a tombstone would only invite the question of
+    whether a tombstone still grants anything.
+    """
+    user_id = str(user_id or "").strip()
+    if not user_id:
+        return []
+    init_db()
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT provider, subject, user_id, email, display_name, created_at, last_used_at"
+            " FROM google_identities WHERE user_id = ? ORDER BY created_at, subject",
+            (user_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(row) for row in rows]
+
+
+def resolve_google_identity(subject, provider=GOOGLE_PROVIDER, now=None, touch: bool = True) -> dict | None:
+    """The vault a verified subject is linked to, or None.
+
+    last_used_at is bumped only on the success path, exactly as resolve_psk
+    does: a subject that is not linked must not be able to keep a row alive by
+    being replayed, and there is no way to warm a row that does not exist.
+
+    `touch=False` is for the Setup page's "check this token" button. Looking at
+    a token to find out who it belongs to is not authenticating with it, and a
+    last_used_at that moved while somebody was reading the Setup page would
+    describe something that never happened.
+
+    This is only ever called after google_auth has verified the signature, the
+    issuer, the audience and the expiry. It is a lookup, not a check, and its
+    name says so deliberately.
+    """
+    if not subject:
+        return None
+    init_db()
+    provider = _normalise_provider(provider)
+    moment = _now(now)
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM google_identities WHERE provider = ? AND subject = ?",
+            (provider, str(subject).strip()),
+        ).fetchone()
+        if row is None:
+            return None
+        if touch:
+            conn.execute(
+                "UPDATE google_identities SET last_used_at = ? WHERE provider = ? AND subject = ?",
+                (moment, provider, row["subject"]),
+            )
+            conn.commit()
+    finally:
+        conn.close()
+    record = dict(row)
+    if touch:
+        record["last_used_at"] = moment
+    return record
 
 
 # ---------------------------------------------------------------------------

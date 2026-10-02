@@ -43,7 +43,12 @@ from memory import SESSION_MAX_AGE # Import from memory.py
 import sessions as vault_sessions
 from sessions import (VaultSession, VaultSessionMiddleware, create_session,
                       delete_session, load_session, create_psk, list_psks,
-                      revoke_psk, resolve_psk, normalise_label, MAX_EXPIRY_DAYS)
+                      revoke_psk, resolve_psk, normalise_label, MAX_EXPIRY_DAYS,
+                      save_oauth_client, get_oauth_client, oauth_client_public,
+                      delete_oauth_client, link_google_identity,
+                      unlink_google_identity, list_google_identities,
+                      resolve_google_identity, GOOGLE_PROVIDER)
+import google_auth
 from matching_utils import (MergeDraftTooLarge, execute_merge,
                              format_people_merge_text, merge_draft_output_budget)
 from jinja2 import Environment, FileSystemLoader, select_autoescape
@@ -193,13 +198,76 @@ def _check_session_auth(request: Request) -> str | None:
         return None
 
     if scheme == "bearer":
-        token = rest.strip()
-        if not token:
-            return None
-        record = resolve_psk(token)
-        return record["user_id"] if record else None
+        # resolve_bearer_token is the whole ladder, shared with McpAuthGuard, so
+        # the two gates cannot drift into accepting different credentials.
+        user, reason = resolve_bearer_token(rest.strip())
+        if not user:
+            # Logged rather than returned: this gate's 401 is a fixed JSON body
+            # read by the dashboard, and the reason belongs in the log where an
+            # operator looks. The MCP guard, whose 401 is read by a client with
+            # no log, puts the same reason in the response instead.
+            logging.getLogger("memory-vault").info(
+                f"gui: rejected a bearer credential — {reason}"
+            )
+        return user
 
     return None
+
+def resolve_bearer_token(token: str) -> tuple:
+    """Resolve a presented bearer token to (user_id | None, reason).
+
+    One ladder, used by both gates. It was tempting to leave the two
+    independently — `/mcp` and `/gui`+`/api/*` each grew their own bearer branch,
+    and an access-key check appearing in both is exactly how the two start to
+    disagree about which credentials they accept. A gate that accepts something
+    the other does not is not a feature, it is a drift that has not happened yet.
+
+    Two credential types, in a deliberate order:
+
+      1. `mvk_…`, an access key. Checked first because it is a lookup against a
+         row that already exists, and because it is what a vault's own operator
+         minted for a specific device.
+      2. A Google ID token. Only if it looks like a JWT at all, so that a failed
+         access-key lookup does not put a network fetch in front of every bad key.
+
+    A Google token that verifies but is not linked to any vault returns None with
+    a reason that says so, because that is an *actionable* outcome rather than a
+    failure: the person holding a valid token is a legitimate Google user who
+    simply has not been given a vault yet, and the remedy is one click in Setup.
+    Collapsing it into a generic 401 is the kind of thing that costs an evening.
+
+    Returns the username, never a role: `userId` in this app *is* the username,
+    so resolving a credential and choosing a vault are the same statement.
+    """
+    token = (token or "").strip()
+    if not token:
+        return None, "no token was presented"
+
+    record = resolve_psk(token)
+    if record:
+        return record["user_id"], ""
+
+    if not google_auth.looks_like_a_google_token(token):
+        return None, "that is not a known credential"
+
+    client = get_oauth_client(GOOGLE_PROVIDER)
+    if not client or not client.get("client_id"):
+        return None, ("Google sign-in is not configured for this vault — set a "
+                      "client id in Setup → Google sign-in")
+
+    try:
+        identity = google_auth.google_identity(token, client["client_id"])
+    except google_auth.GoogleTokenError as exc:
+        # The exception's own text is already free of token material, and this
+        # is the line an operator reads to tell "expired" from "not for us".
+        return None, f"that Google token is not usable ({exc})"
+
+    link = resolve_google_identity(identity["subject"], GOOGLE_PROVIDER)
+    if not link:
+        who = identity["email"] or identity["subject"]
+        return None, (f"the Google account {who} is not linked to a vault yet — "
+                      "link it in Setup → Google sign-in")
+    return link["user_id"], ""
 
 # Auth guard middleware - protect /gui routes
 @web_app.middleware("http")
@@ -1389,6 +1457,182 @@ async def api_revoke_psk(psk_id: str, request: Request):
     return {"ok": True, "id": psk_id}
 
 
+# ---------------------------------------------------------------------------
+# Google sign-in
+#
+# There is no redirect flow here and no callback URL: a Google ID token is
+# pasted in, verified, and exchanged for a session — or used directly as a bearer
+# token by an MCP client. Verification is google_auth's job; these routes only
+# decide which vault a verified subject may open, which is a link table.
+#
+# A verified token is NOT on its own a credential. Anyone can obtain a valid
+# Google token for this client id by being a Google user, including someone who
+# has never heard of this vault, so a subject has to be linked to a vault by an
+# operator before it grants anything. That is the difference between "Google is
+# an identity provider here" and "anyone with a Google account gets in", and it
+# is why /api/google/verify does not link anything by itself.
+# ---------------------------------------------------------------------------
+
+class GoogleConfigRequest(BaseModel):
+    clientId: str = ""
+    # None means "keep the stored secret"; "" would clear it. The page sends the
+    # field only when it is non-empty, because it never holds the secret to send
+    # back — see save_oauth_client for why that distinction matters.
+    clientSecret: Optional[str] = None
+
+
+class GoogleTokenRequest(BaseModel):
+    token: str = ""
+
+
+class GoogleLinkRequest(BaseModel):
+    subject: str = ""
+    email: str = ""
+    name: str = ""
+
+
+@web_app.get("/api/google", response_class=JSONResponse)
+async def api_google_state(request: Request):
+    """The caller's Google configuration and their linked identities.
+
+    One call, because the section has to show a client id, whether a secret is
+    set, and the list of linked accounts, and a Setup section that needs three
+    round trips to render is a section that renders wrong.
+    """
+    user_id = _require_user(request)
+    client = get_oauth_client(GOOGLE_PROVIDER)
+    return {
+        "configured": bool(client and client.get("client_id")),
+        "client": oauth_client_public(client) if client else None,
+        "identities": list_google_identities(user_id),
+    }
+
+
+@web_app.post("/api/google/config", response_class=JSONResponse)
+async def api_save_google_config(request: Request, body: GoogleConfigRequest):
+    """Store the OAuth client id (and secret) for this vault."""
+    user_id = _require_user(request)
+    try:
+        record = save_oauth_client(GOOGLE_PROVIDER, body.clientId, body.clientSecret)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    logging.getLogger("memory-vault").info(
+        f"google client saved: user={user_id} "
+        f"client_id={record['client_id'][:24]}… secret_set={bool(record['client_secret'])}"
+    )
+    # oauth_client_public, not the record: the secret must not leave this
+    # function, and returning the record here would put it in a response body
+    # and in the browser's network log forever after.
+    return {"ok": True, "client": oauth_client_public(record)}
+
+
+@web_app.delete("/api/google/config", response_class=JSONResponse)
+async def api_delete_google_config(request: Request):
+    """Forget the client. Linked identities stay; they stop working."""
+    _require_user(request)
+    return {"ok": delete_oauth_client(GOOGLE_PROVIDER)}
+
+
+@web_app.post("/api/google/verify", response_class=JSONResponse)
+async def api_verify_google_token(request: Request, body: GoogleTokenRequest):
+    """Check a pasted token and report who it belongs to. Links nothing.
+
+    Deliberately a separate step from linking: this returns an identity for a
+    human to look at, and only a second, explicit action grants it a vault. A
+    single "paste and it works" button means whatever token happened to be in the
+    clipboard gets the vault of whoever was signed in when they pressed it.
+
+    `alreadyLinked` says whether that subject is already pointed at this vault, so
+    the UI can skip the link button for an account that is already granted.
+    """
+    user_id = _require_user(request)
+    client = get_oauth_client(GOOGLE_PROVIDER)
+    if not client or not client.get("client_id"):
+        raise HTTPException(status_code=400, detail="Set a Google client id first")
+    try:
+        identity = google_auth.google_identity(body.token, client["client_id"])
+    except google_auth.GoogleTokenError as e:
+        # 400, not 401: nothing is wrong with *this caller's* credential, the
+        # thing they pasted is not a usable token. 401 would tell a browser that
+        # it needs to log in, which is not the problem.
+        raise HTTPException(status_code=400, detail=str(e))
+    link = resolve_google_identity(identity["subject"], GOOGLE_PROVIDER, touch=False)
+    return {
+        "identity": identity,
+        "alreadyLinked": bool(link and link["user_id"] == user_id),
+    }
+
+
+@web_app.post("/api/google/link", response_class=JSONResponse)
+async def api_link_google_identity(request: Request, body: GoogleLinkRequest):
+    """Point the caller's vault at a Google subject the caller has already seen.
+
+    The subject arrives from /api/google/verify and is not re-verified here,
+    which is a real limitation worth stating: a signed-in caller can therefore
+    name *any* subject string and get it linked to their own vault. That is
+    self-harm rather than an attack — it grants the caller access to a vault they
+    already have, using an identity they do not control — and the alternative
+    (re-verifying the token here) would mean the token had to stay in the browser
+    between two clicks, which is a worse trade. What genuinely must not happen is
+    a *second* vault claiming an existing link, and link_google_identity refuses
+    that with a 409.
+    """
+    user_id = _require_user(request)
+    try:
+        record = link_google_identity(body.subject, user_id,
+                                     email=body.email, name=body.name,
+                                     provider=GOOGLE_PROVIDER)
+    except ValueError as e:
+        # The "already linked to a different vault" case lands here, and 409 is
+        # the honest status: the request is fine, the current state conflicts.
+        # _conflict, not a bare raise: the reason is data-dependent and the
+        # access log records the status only, so without this line the one
+        # thing that says *why* is never written anywhere.
+        raise _conflict(e)
+    logging.getLogger("memory-vault").info(
+        f"google identity linked: subject={record['subject'][:12]}… user={user_id}"
+    )
+    return {"ok": True, "identity": record}
+
+
+@web_app.delete("/api/google/link/{subject}", response_class=JSONResponse)
+async def api_unlink_google_identity(subject: str, request: Request):
+    """Unlink. 404 for unknown, not yours, or already unlinked — one answer."""
+    user_id = _require_user(request)
+    if not unlink_google_identity(subject, user_id, GOOGLE_PROVIDER):
+        raise HTTPException(status_code=404, detail="No such linked account")
+    logging.getLogger("memory-vault").info(
+        f"google identity unlinked: subject={subject[:12]}… user={user_id}"
+    )
+    return {"ok": True, "subject": subject}
+
+
+@web_app.post("/api/auth/google", response_class=JSONResponse)
+async def api_login_google(request: Request, body: GoogleTokenRequest):
+    """Exchange a Google ID token for a session cookie.
+
+    This is what makes a Google identity usable from a browser without any
+    redirect flow: the token is the credential, and it is spent once for a
+    30-day session rather than being pasted on every request.
+
+    `session.clear()` before writing the user, for the reason it is there on the
+    password path too: the middleware reads a cleared session as "delete the old
+    row and mint a new id", which is what defeats session fixation. An id planted
+    in the browser before this call must not still be the logged-in id after it.
+    """
+    user_id, reason = resolve_bearer_token(body.token)
+    if not user_id:
+        # No _require_user here — this is the credential exchange, so the token
+        # in the body is the thing being evaluated, exactly as the password is
+        # on /api/auth/login. 401 because from the browser's point of view this
+        # is a failed sign-in.
+        raise HTTPException(status_code=401, detail=reason)
+    request.session.clear()
+    request.session["user"] = user_id
+    logging.getLogger("memory-vault").info(f"google sign-in: user={user_id}")
+    return {"status": "ok", "user": user_id}
+
+
 @web_app.get("/api/events")
 async def sse_events(request: Request):
     user_id = _require_user(request) # Ensure user is authenticated for SSE stream
@@ -1583,23 +1827,25 @@ class McpAuthGuard:
         # Bearer only. split, not [1] on a fixed index: a bare
         # "Authorization: Bearer" with no token raised IndexError and turned a
         # bad request into a 500, which tells the client nothing and reads as a
-        # server fault.
+        # server fault. resolve_bearer_token owns the whole ladder and is shared
+        # with the /gui gate.
+        reason = "no credential was presented"
         if authorization.lower().startswith("bearer "):
             parts = authorization.split(None, 1)
             if len(parts) == 2:
-                record = resolve_psk(parts[1].strip())
-                if record:
-                    user = record["user_id"]
+                user, reason = resolve_bearer_token(parts[1])
 
         if user is None:
             logging.getLogger("memory-vault").warning(
-                "mcp: unauthenticated request to %s (authorization=%s)",
-                scope.get("path"), "yes" if authorization else "no",
+                "mcp: unauthenticated request to %s — %s",
+                scope.get("path"), reason,
             )
             body = self._unauthenticated(
-                "MCP accepts an access key only: send "
-                "'Authorization: Bearer mvk_…'. Create one in Setup → Access "
-                "Keys. A session cookie and Basic auth are not accepted here."
+                "MCP accepts an access key or a Google ID token. Send "
+                "'Authorization: Bearer mvk_…' (create one in Setup → Access "
+                "Keys) or a Google token for an account linked in Setup → "
+                f"Google sign-in. {reason}. A session cookie and Basic auth are "
+                "not accepted here."
             )
             await send({"type": "http.response.start", "status": 401, "headers": [
                 (b"content-type", b"application/json"),

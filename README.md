@@ -68,19 +68,21 @@ Two gates check credentials, and they do not accept the same ones:
 |---|---|---|
 | Dashboard session cookie | Issued by `POST /api/auth/login` against `htpasswd` | Browsing the dashboard and `/api/*` from a browser |
 | `Authorization: Basic <base64 user:pass>` | `auth_guard`, against the app's own `htpasswd` | Scripted calls to `/api/*` |
-| `Authorization: Bearer mvk_…` | `McpAuthGuard`, against the access-key store | **All MCP clients** — the only credential `/mcp` accepts |
+| `Authorization: Bearer mvk_…` | `McpAuthGuard`, against the access-key store | **All MCP clients** |
+| `Authorization: Bearer eyJ…` (a Google **ID token**) | `McpAuthGuard`, against Google | Signing in as an account linked under Setup → Google sign-in |
 
 MCP requests are authenticated **by the application**, not by nginx. This is a
 change from earlier versions, where nginx's `auth_basic` on the `/mem-mcp/mcp`
 location was the only check and the app trusted whatever it was handed.
 
-The MCP endpoint takes an **access key and nothing else** — no session cookie,
-no Basic header. That is deliberate: a cookie is a credential the browser
-replays on its own and cannot be scoped to one device, and Basic is the account
-password, which also unlocks `/api/*` and cannot be revoked for one lost laptop
-without changing it for everyone. So an MCP client that used to send a username
-and password needs a key instead. Your dashboard login is unaffected; it
-authenticates `/gui` and `/api/*` exactly as before.
+The MCP endpoint takes only a **per-call token**: an access key or a Google ID
+token. It refuses a session cookie and a `Basic` header, and that is deliberate:
+a cookie is a credential the browser replays on its own and cannot be scoped to
+one device, and Basic is the account password, which also unlocks `/api/*` and
+cannot be revoked for one lost laptop without changing it for everyone. So an MCP
+client that used to send a username and password needs a key or a Google token
+instead. Your dashboard login is unaffected; it authenticates `/gui` and `/api/*`
+exactly as before.
 
 **Access keys** are created in **Setup → Access Keys**. A key is shown exactly
 once, at creation: only a SHA-256 hash is stored, so it cannot be displayed
@@ -101,11 +103,39 @@ and the record lives in `MEM_SESSION_DIR`, which compose bind-mounts to
 sliding) and can be ended by logging out. The session no longer stores your
 password — that is what the access key replaced.
 
+### Google sign-in
+
+Setup → **Google sign-in** lets you authenticate with a Google **ID
+token** instead of an access key. It is deliberately *not* an OAuth redirect: the
+app never redeems a code, so there is no callback URL to register and **no client
+secret is needed** — just the client id, which you paste into the Setup
+page.
+
+1. Paste your **client id** (and, optionally, a client secret) under
+   **🔁 Google sign-in** and save. Only a hash-free client id is
+   required; the secret is stored in the app's SQLite file and is never shown
+   back.
+2. Paste a Google **ID token** (it starts `eyJ…`, not `ya29.…`) into the
+   box and press **Verify**. The app checks the signature, the audience (your
+   client id) and the expiry against Google.
+3. Press **Link to my vault**. Nothing is granted until you do that: a Google
+   account that is not linked is refused, never given a new empty vault. One
+   Google account maps to exactly one vault, forever.
+
+The linked accounts are listed underneath, with an **Unlink** button. Unlinking
+takes effect on the next request.
+
+Note that the client id and secret are saved **into SQLite**, not read from the
+environment — so a Google client secret now lives in a file the app
+writes. The secret is never returned by any endpoint; the Setup page only tells
+you whether one is set.
+
 ### Proxy header trust
 
 **The GUI, the REST API and `/mcp` all require a verified credential.** A
-dashboard session, a `Basic` password checked against the app's `htpasswd`, or
-an access key. Nothing else names a user.
+dashboard session, a `Basic` password checked against the app's `htpasswd`, an
+access key, or a Google ID token whose subject is linked to a vault. Nothing
+else names a user.
 
 In particular, `Authorization: Basic` is *verified*. It used to be decoded and
 its username trusted without ever checking the password, which meant

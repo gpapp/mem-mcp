@@ -38,9 +38,11 @@ The dependency-light regression suite covers matching, scope compatibility, scop
 
 `test_auth_guard.py` is the thirteenth, and it covers *which credential wins* rather than whether one is valid, so it is separate on purpose: `HeaderPrecedenceTests` pins the order, `McpAuthGuardTests` drives the real guard class with each credential carrying a **distinguishable owner** so a status-only assertion cannot hide having picked the wrong one, and `WiringTests` pins the things that would silently re-open the hole — no `auth_basic` in the nginx MCP location, `session.clear()` before login writes `user`, no template rendering `AUTH_PASS`, the bridge reading `MEM_VAULT_PSK`. `ApiAuthTests` and `CorsAndDocsTests` cover the *other* half of the chain (the `/gui` + `/api/*` gate and the two unmatched surfaces), and every one of the six defects they guard was verified to bite by re-injection. That matters because every defect worth guarding there is a "this looks right and is wrong" — a cold model labelled `100% CPU`, a fingerprint that fires on every poll, a publish that blocks on a browser that stopped reading — and none is visible in the shape of the code. The same file also lifts `fetch_ollama_status` / `unload_ollama_model` out of `common.py` and `api_unload_model` / `_status_snapshot` out of `gui.py` with `ast.get_source_segment`, because those three cannot be imported here. `ImportDisciplineTests` imports the module in a **subprocess with httpx blocked at the import hook** rather than searching the source for the string: a docstring mentioning httpx is not an import of it, and that is the `assertIn`-over-a-whole-file lesson again. `test_mobile_layout.py::StatusWidgetLayoutTests` pins where the widget is allowed to sit — see "Server Status Widget" for why that is not a free choice.
 
+`test_google_auth.py` is the fourteenth, and it is the second suite that **imports its subject directly** — `PyJWT` and `cryptography` are real dependencies, which is the trade this feature deliberately made: hand-rolling RSA verification would have kept the module stdlib-only, but signature verification *is* the attack surface, and twenty lines of `pow()` is exactly where an `alg: none` bug goes to hide. It generates a real 2048-bit key with `cryptography` and signs real tokens, replacing only the **HTTP fetch of the key set** — a stubbed `get_signing_key_from_jwt` returning a truthy object would let every test pass against a verifier that checked no signature at all. `GoogleTokenTests` therefore covers the audience check (the headline property), both sides of the clock-skew boundary, tampering, `alg: none`, an unknown `kid`, and the fact that neither an exception message nor a log line may contain any part of the token. `PrefilterTests` pins the cheap shape test `resolve_bearer_token` uses to decide whether a JWKS lookup is worth attempting, and `KeySourceTests` pins the cache settings *by value* rather than by trusting the comment beside them. One of its findings was a real defect — the dead `except jwt.DecodeError` branch, described under "Authentication".
+
 ```bash
 cd mem-mcp
-python3 -m unittest -v test_matching_regressions.py test_embedding_reliability.py test_chunking.py test_cypher_safety.py test_backup_compression.py test_people_extraction.py test_graph_scope.py test_mobile_layout.py test_llm_reliability.py test_env_wiring.py test_status_monitor.py test_sessions.py test_auth_guard.py
+python3 -m unittest -v test_matching_regressions.py test_embedding_reliability.py test_chunking.py test_cypher_safety.py test_backup_compression.py test_people_extraction.py test_graph_scope.py test_mobile_layout.py test_llm_reliability.py test_env_wiring.py test_status_monitor.py test_sessions.py test_auth_guard.py test_google_auth.py
 ```
 
 This was a Windows path (`C:/tools/miniconda3/python.exe`) with PowerShell `Push-Location`/`Pop-Location`, and it does not exist on the Linux host these files are edited from — every suite "failed" on an interpreter that is not there. Any `python`/`python3` on `PATH` runs all ten; none of them import a DB driver.
@@ -88,16 +90,56 @@ none: `extract_user_from_headers` trusts it (see Authentication).
 
 | | gate | accepts | covers |
 |---|---|---|---|
-| `/mcp` | `McpAuthGuard` (gui.py:1531), wrapping the mount | **`Authorization: Bearer mvk_…` only** | every route fastmcp registers |
-| `/gui`, `/api/*` | `auth_guard` (gui.py:206) via `_check_session_auth` (gui.py:140) | session cookie → `Basic` (verified) → `Bearer mvk_…` | ~60 handlers |
+| `/mcp` | `McpAuthGuard` (gui.py:1531), wrapping the mount | **`Authorization: Bearer mvk_…` or a Google ID token** | every route fastmcp registers |
+| `/gui`, `/api/*` | `auth_guard` (gui.py:206) via `_check_session_auth` (gui.py:140) | session cookie → `Basic` (verified) → `Bearer mvk_…` or Google ID token | ~60 handlers |
 
-`/mcp` takes exactly one credential: a per-call access key. Anything else — no
-header, a session cookie, or a Basic header — is a 401 whose body names the one
-way in and whose `WWW-Authenticate` header says `Bearer` (it used to say
+`/mcp` takes only a per-call token: an access key or a Google ID token. Anything
+else — no header, a session cookie, or a Basic header — is a 401 whose body names
+the ways in and whose `WWW-Authenticate` header says `Bearer` (it used to say
 `Basic`, which pointed at a credential this endpoint no longer accepts). On
 `/gui` and `/api/*` the order is session → `Basic` → `Bearer`, and only
 `/api/auth/*` is reachable without one, because that is where you exchange a
 credential for a session.
+
+**Both gates resolve a `Bearer` token through one function,
+`resolve_bearer_token` (gui.py), and that is the point.** It ran its own ladder
+when there was only one kind of token; there are now two, and a second copy of
+the ladder would drift from the first — one gate accepting a revoked key the
+other rejects is exactly the bug that shape invites. The ladder is `resolve_psk`
+first, then Google (and only if `google_auth.looks_like_a_google_token`, so an
+access key never costs a JWKS lookup), then `resolve_google_identity`.
+`BearerLadderTests` drives every rung; **`BearerCallSiteTests` pins that both
+gates actually call it**, because a test of a helper is not a test of its call
+site — and it asserts neither gate contains `resolve_psk(` or
+`google_auth.google_identity(`, which is how a second ladder announces itself.
+
+**Every failure returns an actionable reason, not a bare 401**, because the
+reason reaches the client body and a generic one is indistinguishable between
+the four ways a token can be wrong. "Google sign-in is not configured", "that
+Google token is not usable (ExpiredSignatureError)", "not linked to a vault —
+sign in and link it under Setup → Google sign-in" name three different remedies.
+The last one is deliberately **not** a silent new vault: see "Google sign-in"
+under Features.
+
+**A Google token's *audience* is the client id, and verifying one needs no
+client secret.** The secret is only used to redeem a code for a token, which
+this app never does — the operator pastes an ID token they already hold. That is
+why `oauth_clients.client_secret` is optional and why `POST /api/google/verify`
+works with nothing but a client id saved.
+
+**`PyJWKClientError` is not a `DecodeError`, and that collapsed two true reasons
+into one false one.** The malformed-token branch was written as
+`except jwt.DecodeError`, which the real client never raises — it raises
+`PyJWKClientError` (MRO: `PyJWKClientError → PyJWTError → Exception`). So every
+garbage paste reported *"could not resolve Google's signing keys"*, sending an
+operator to look at a key cache instead of at their own clipboard, and an
+`alg: none` token was rejected by the key lookup for want of a `kid` — meaning
+the `algorithms=["RS256"]` pin was never actually exercised. `verify_google_token`
+now calls `jwt.get_unverified_header` first: not-a-JWT raises `DecodeError` →
+"that is not a JSON Web Token", and `header["alg"] != "RS256"` raises "the token
+declares <alg> signature algorithm, and only RS256 is accepted" **before** any
+network round trip. `GoogleTokenTests` asserts `source.calls == 0` for both, so
+the proof is that *this* check caught it rather than the key lookup.
 
 **`/mcp` is token-only on purpose; the other two credentials are the point, not
 an oversight.** A session cookie is a *bearer* credential the browser replays by
@@ -627,6 +669,45 @@ Setup → **🔑 Access Keys** manages the credential an MCP client presents.
 called twice mints two keys, not one; the UI treats the response as single-use.
 A `GET /api/psks` that leaked a plaintext would defeat the whole design, so
 `test_auth_guard.WiringTests` pins that no route other than the POST reaches it.
+
+### Google sign-in
+Setup → **🔵 Google sign-in** lets an operator paste an existing Google **ID
+token** (`eyJ…`, not an access token, not `ya29.…`) and exchange it for a session.
+There is **no redirect flow and no callback URL** — the app never redeems a code,
+so it needs no client secret to verify anything, only a client id.
+
+- **The client id and secret are saved from the UI into SQLite**, not read from
+  the environment (`oauth_clients`, one row per provider). This is a deliberate
+  consequence of that choice: a Google client secret now lives in a file the app
+  writes. It is never shown back — `oauth_client_public` is the single redaction
+  point and returns `secret_set: bool`, and the UI puts a *placeholder* in the
+  password field rather than the value. An absent secret means **keep the stored
+  one**; `""` means **clear it**, which is why the parameter is
+  `Optional[str] = None` and not a string.
+- **A Google identity grants nothing until a human links it.** The primary key is
+  `(provider, subject)` and *not* `(provider, subject, user_id)`, precisely so a
+  second link cannot be created even by accident: one Google subject maps to
+  exactly one vault, forever, chosen by a human under Setup. An unlinked subject
+  is **refused with a reason**, not auto-provisioned — `userId` is the htpasswd
+  username and there is no user table, so an automatic mapping would have to come
+  from an email, and emails get reassigned. `link_google_identity` raises
+  `ValueError` (a 409) if the subject already belongs to another vault.
+- **The identity is `sub`, never `email`.** `google_identity` returns both, and
+  the vault is resolved from `sub` only; the email is display.
+- **`POST /api/auth/google`** turns a pasted token into a dashboard session, and
+  it calls `request.session.clear()` **before** writing `user` — the same
+  session-fixation defence as the password path.
+- **`POST /api/google/link` trusts the subject string from the caller**, which is
+  a real limitation and is documented as one: a signed-in user can name any
+  subject and attach it to their own vault. That is self-harm, not an attack —
+  it grants nothing they did not already have, and it cannot take a subject away
+  from another vault (the store refuses that).
+- `sessions.py` **must not import `google_auth`** — it is stdlib-only so
+  `test_sessions.py` can import it on a box with no web framework, and
+  `google_auth` needs PyJWT. That is why `MAX_EMAIL_CHARS`/`MAX_NAME_CHARS` are
+  duplicated as locals in `sessions.py`, and why the *display* fields truncate
+  while the *credential* fields are refused when oversized: a truncated name is
+  still the right name, a truncated client id is a wrong credential.
 
 ### Build Graph Mode
 Build your own focused subgraph starting from any memory.
