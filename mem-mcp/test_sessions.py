@@ -17,6 +17,8 @@ Run:  python3 -m unittest -v test_sessions.py
 """
 
 import asyncio
+import ast
+import builtins
 import os
 import shutil
 import sqlite3
@@ -24,6 +26,170 @@ import tempfile
 import unittest
 
 import sessions
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+class Python311AnnotationTests(unittest.TestCase):
+    """Annotations must not reference a name that is not bound yet.
+
+    The container runs `python:3.11-slim` (mem-mcp/Dockerfile). This suite runs
+    on whatever interpreter the developer has, and on 3.14 that is 3.14 — where
+    PEP 649 makes annotations *lazy*, so a forward reference to a class defined
+    further down the file imports perfectly. On 3.11 annotations are evaluated
+    when the `def` runs, the class body raises `NameError`, and the app does not
+    start at all.
+
+    That failure is invisible from here by construction, so it cannot be caught
+    by importing the module — the interpreter that would expose it is not the
+    one running the tests. Stripping `from __future__ import annotations` does not
+    help either: PEP 649 is the 3.14 *default*, not something the future import
+    turns on. So this walks the AST and checks the property directly: every name
+    used in an annotation is already bound at that point in module order.
+
+    `from __future__ import annotations` makes this pass by making annotations
+    strings. That is guaranteed by the language spec on every version ≥ 3.7, so
+    it is not a 3.11 guess — but it is also why the check is worth keeping: it
+    catches the day someone removes that line, which would look fine here.
+    """
+
+    # Scanned as text, never imported: gui.py and common.py cannot be imported
+    # on a box without fastapi/httpx, which is precisely why the defect needs a
+    # static check rather than a test that imports its subject.
+    MODULES = ("sessions.py", "gui.py", "common.py", "server.py")
+
+    @staticmethod
+    def _module_bindings(tree):
+        """Names bound at module level, with the line each becomes available.
+
+        Only whole-module bindings are recorded, which is what PEP 649-era
+        ordering actually turns on: a name used inside a class body must be
+        bound at module scope by the time that class body runs. Functions and
+        classes are recorded by name because a `def` binds its name the moment
+        its body finishes, which is close enough — a self-referential type is
+        the one case this admits, and quoting it is correct anyway.
+        """
+        bindings = []
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef):
+                bindings.append((node.lineno, node.name))
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                bindings.append((node.lineno, node.name))
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    for sub in ast.walk(target):
+                        if isinstance(sub, ast.Name):
+                            bindings.append((sub.lineno, sub.id))
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                bindings.append((node.lineno, node.target.id))
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    bindings.append((node.lineno, (alias.asname or alias.name).split(".")[0]))
+            elif isinstance(node, (ast.For, ast.AsyncFor)):
+                for sub in ast.walk(node.target):
+                    if isinstance(sub, ast.Name):
+                        bindings.append((sub.lineno, sub.id))
+            elif isinstance(node, (ast.With, ast.AsyncWith)):
+                for item in node.items:
+                    if item.optional_vars is not None:
+                        for sub in ast.walk(item.optional_vars):
+                            if isinstance(sub, ast.Name):
+                                bindings.append((sub.lineno, sub.id))
+        return sorted(bindings)
+
+    @staticmethod
+    def _annotation_names(node):
+        """Every bare Name appearing anywhere inside an annotation."""
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Name):
+                yield sub
+
+    @staticmethod
+    def _annotations(tree):
+        """(lineno, annotation) for every annotation in the module, nested included."""
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                args = node.args
+                collected = list(args.posonlyargs) + list(args.args) + list(args.kwonlyargs)
+                for extra in (args.vararg, args.kwarg):
+                    if extra is not None and extra.annotation is not None:
+                        yield extra.annotation
+                for arg in collected:
+                    if arg.annotation is not None:
+                        yield arg.annotation
+                if node.returns is not None:
+                    yield node.returns
+            elif isinstance(node, ast.AnnAssign):
+                yield node.annotation
+
+    def test_no_annotation_uses_a_name_bound_later_in_the_file(self):
+        """Safe if annotations are deferred, or if there is nothing to defer.
+
+        The two are alternatives, not requirements together: a forward
+        reference is only fatal when the annotation is actually evaluated, which
+        is what `from __future__ import annotations` prevents. Asserting on the
+        forward reference alone would fail on the fixed file forever; asserting
+        on the future import alone would miss a *second* module that introduces
+        one without the guard. What must never happen is the combination.
+        """
+        problems = []
+        for name in self.MODULES:
+            path = os.path.join(HERE, name)
+            with open(path, encoding="utf-8") as handle:
+                source = handle.read()
+            tree = ast.parse(source, name)
+            if "from __future__ import annotations" in source:
+                continue          # annotations are strings; nothing is evaluated
+            bindings = self._module_bindings(tree)
+            for annotation in self._annotations(tree):
+                for name_node in self._annotation_names(annotation):
+                    if name_node.id in dir(builtins):
+                        continue
+                    available = [b for b in bindings if b[0] <= name_node.lineno]
+                    if not any(b[1] == name_node.id for b in available):
+                        problems.append(
+                            f"{name}:{name_node.lineno} annotates with '{name_node.id}', "
+                            f"which is not bound until after this line, and the "
+                            f"module does not defer annotations")
+        self.assertFalse(
+            problems,
+            "forward reference in an eagerly-evaluated annotation; the 3.11 "
+            "container evaluates annotations at def time and will refuse to "
+            "start:\n  " + "\n  ".join(problems))
+
+    def test_sessions_defers_annotations_so_the_container_can_import_it(self):
+        """The half of the disjunction above that sessions.py relies on.
+
+        It is a real forward reference — `VaultSessionMiddleware` is defined
+        above `VaultSession` and annotates a parameter as `vault: VaultSession`
+        — so the future import is what makes this file importable at all on the
+        3.11 container. Pinning it directly means removing that one line is
+        caught here by name, not merely implied by the check above.
+        """
+        source = open(os.path.join(HERE, "sessions.py"), encoding="utf-8").read()
+        self.assertIn("from __future__ import annotations", source,
+                      "sessions.py must defer annotations: the container is 3.11 "
+                      "and the class order below requires it")
+
+    def test_the_forward_reference_this_file_relies_on_still_exists(self):
+        """Guards the fix from the other side.
+
+        If someone reorders the two classes so `VaultSession` comes first, the
+        future import becomes unnecessary — and then a test that only asserted
+        the import is present would keep passing while describing nothing. This
+        pins the reason the import is there, so removing either the class order
+        or the import is a deliberate, visible choice.
+        """
+        with open(os.path.join(HERE, "sessions.py"), encoding="utf-8") as handle:
+            tree = ast.parse(handle.read(), "sessions.py")
+        order = [n.name for n in tree.body if isinstance(n, ast.ClassDef)]
+        self.assertLess(
+            order.index("VaultSessionMiddleware"), order.index("VaultSession"),
+            "the forward reference is gone -- if VaultSession now precedes the "
+            "middleware, the future import can go too, and this test should be "
+            "deleted rather than left explaining a hazard that no longer exists")
+
+
 
 
 class StoreCase(unittest.TestCase):

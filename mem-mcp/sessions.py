@@ -26,6 +26,17 @@ list. The plaintext exists exactly once, in the return value of create_psk(),
 and the caller hands it to the browser on that one response.
 """
 
+# Annotations are strings, not evaluated objects. This is not a style choice:
+# `VaultSessionMiddleware` is defined above `VaultSession` and annotates a
+# parameter as `vault: VaultSession`. On Python 3.14 (PEP 649) that annotation is
+# never evaluated, so the forward reference is invisible — and the module
+# imports cleanly. The container runs 3.11, where annotations *are* evaluated at
+# `def` time, so the class body raised `NameError: name 'VaultSession' is not
+# defined` and the app would not start at all. A guard test cannot catch this by
+# importing the module here, because the interpreter that hides the bug is the
+# one the tests run on; `Python311AnnotationTests` walks the AST for it instead.
+from __future__ import annotations
+
 import hashlib
 import json
 import os
