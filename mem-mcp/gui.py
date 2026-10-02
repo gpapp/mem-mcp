@@ -1531,30 +1531,35 @@ async def api_unload_model(request: Request, body: ModelUnload):
 class McpAuthGuard:
     """Authenticates a request to the MCP app and records who it belongs to.
 
-    Three credentials are accepted, in this order:
+    Exactly one credential is accepted: `Authorization: Bearer mvk_…`, a
+    pre-shared key from Setup → Access Keys. Nothing else.
 
-      1. a live session cookie   the dashboard and the downloaded bridge script
-      2. `Authorization: Basic`  verified against the app's htpasswd, which is
-                                 what existing MCP clients already send
-      3. `Authorization: Bearer mvk_…`  a pre-shared key from Access Keys
+    Two credentials that used to be accepted here are deliberately not, and
+    both removals are the point rather than a simplification:
 
-    Basic is verified here rather than trusted as a username because nginx no
-    longer authenticates /mcp: dropping `auth_basic` there is what lets a PSK
-    reach the app at all, and the cost of that is that the app must now do the
-    check nginx used to do. Existing clients are unaffected — they send the
-    same header and it verifies against the same htpasswd.
+      * a **session cookie**. A cookie is a *bearer* credential that the
+        browser sends on its own. Handing the same credential to an MCP client
+        means anything that can reach the MCP endpoint can replay it, and it
+        cannot be scoped to one device — the opposite of what an access key is
+        for. The dashboard keeps its sessions; `/gui` and `/api/*` are gated by
+        `auth_guard` instead, which is where a cookie belongs.
+      * **`Authorization: Basic`**, previously verified against the app's
+        htpasswd. It is per-call and stateless, so the objection to it is not
+        the mechanism but the credential: it is the account password, so every
+        client holds a credential that unlocks `/api/*` as well, that rotates
+        only when a human changes it, and that cannot be revoked for one lost
+        laptop without changing it for everyone.
 
     On success the verified user is stamped into the scope as X-Vault-User,
     which VaultSessionMiddleware has already stripped from the request, so
     downstream code reads an identity nobody could have sent itself. Anything
-    else is a 401: no PSK, no cookie and no valid Basic previously meant the
-    tools ran as the user "anonymous" and returned somebody else's (empty)
-    vault rather than an error, which reads like a successful empty search.
+    else is a 401: with no credential the tools used to run as the user
+    "anonymous" and return somebody else's (empty) vault rather than an
+    error, which reads like a successful empty search.
     """
 
-    def __init__(self, app, verify_basic=None):
+    def __init__(self, app):
         self.app = app
-        self.verify_basic = verify_basic or _verify_htpasswd
 
     @staticmethod
     def _unauthenticated(reason: str) -> bytes:
@@ -1569,30 +1574,17 @@ class McpAuthGuard:
         headers = [(k.lower(), v) for k, v in scope["headers"]]
         user = None
 
-        # 1. Session cookie — already resolved by VaultSessionMiddleware.
-        session = scope.get("session")
-        if session is not None and session.get("user"):
-            user = session["user"]
-
         authorization = ""
         for key, value in headers:
             if key == b"authorization":
                 authorization = value.decode("latin-1", "replace")
                 break
 
-        if user is None and authorization.lower().startswith("basic "):
-            try:
-                decoded = base64.b64decode(authorization.split(None, 1)[1]).decode("utf-8")
-                name, _, secret = decoded.partition(":")
-                if name and self.verify_basic(name, secret):
-                    user = name
-            except Exception:
-                user = None
-
-        if user is None and authorization.lower().startswith("bearer "):
-            # split, not [1] on a fixed index: a bare "Authorization: Bearer"
-            # with no token raised IndexError and turned a bad request into a
-            # 500, which tells the client nothing and reads as a server fault.
+        # Bearer only. split, not [1] on a fixed index: a bare
+        # "Authorization: Bearer" with no token raised IndexError and turned a
+        # bad request into a 500, which tells the client nothing and reads as a
+        # server fault.
+        if authorization.lower().startswith("bearer "):
             parts = authorization.split(None, 1)
             if len(parts) == 2:
                 record = resolve_psk(parts[1].strip())
@@ -1605,13 +1597,14 @@ class McpAuthGuard:
                 scope.get("path"), "yes" if authorization else "no",
             )
             body = self._unauthenticated(
-                "MCP needs a session cookie, Basic auth, or an access key "
-                "(Authorization: Bearer mvk_…). Create one in Setup → Access Keys."
+                "MCP accepts an access key only: send "
+                "'Authorization: Bearer mvk_…'. Create one in Setup → Access "
+                "Keys. A session cookie and Basic auth are not accepted here."
             )
             await send({"type": "http.response.start", "status": 401, "headers": [
                 (b"content-type", b"application/json"),
                 (b"content-length", str(len(body)).encode()),
-                (b"www-authenticate", b'Basic realm="Architectural Tool Vault"'),
+                (b"www-authenticate", b'Bearer realm="Architectural Tool Vault"'),
             ]})
             await send({"type": "http.response.body", "body": body})
             return
@@ -1636,7 +1629,6 @@ def _get_auth_context(request: Request):
     nothing here can retrieve it afterwards, by design.
     """
     auth_user = request.session.get("user")
-    auth_b64 = ""
     auth_header = request.headers.get("Authorization")
     if not auth_user and auth_header and auth_header.startswith("Basic "):
         # Keep working for a browser that arrived with a Basic header instead of
@@ -1656,7 +1648,6 @@ def _get_auth_context(request: Request):
 
     return {
         "AUTH_USER": auth_user,
-        "AUTH_B64": auth_b64,
         "PSK_PREFIX": vault_sessions.PSK_PREFIX,
         "MCP_URL": mcp_url,
     }

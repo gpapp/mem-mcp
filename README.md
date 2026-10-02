@@ -62,21 +62,25 @@ The server is **unified** on port **8080** (mapped to **8086** in Docker).
 
 ## Authentication
 
-Three credentials are accepted, and which one you use decides where it is
-checked:
+Two gates check credentials, and they do not accept the same ones:
 
 | Credential | Where it is verified | Use it for |
 |---|---|---|
-| Dashboard session cookie | Issued by `POST /api/auth/login` against `htpasswd` | Browsing the dashboard |
-| `Authorization: Basic <base64 user:pass>` | `McpAuthGuard`, against the app's own `htpasswd` | Existing MCP clients |
-| `Authorization: Bearer mvk_…` | `McpAuthGuard`, against the access-key store | New MCP clients, one key per device |
+| Dashboard session cookie | Issued by `POST /api/auth/login` against `htpasswd` | Browsing the dashboard and `/api/*` from a browser |
+| `Authorization: Basic <base64 user:pass>` | `auth_guard`, against the app's own `htpasswd` | Scripted calls to `/api/*` |
+| `Authorization: Bearer mvk_…` | `McpAuthGuard`, against the access-key store | **All MCP clients** — the only credential `/mcp` accepts |
 
 MCP requests are authenticated **by the application**, not by nginx. This is a
 change from earlier versions, where nginx's `auth_basic` on the `/mem-mcp/mcp`
-location was the only check and the app trusted whatever it was handed. Basic
-auth still works and still uses the same `htpasswd` file — existing clients need
-no change — but the app now does the check itself, which is what makes the
-access key possible and what makes a key revocable from the UI.
+location was the only check and the app trusted whatever it was handed.
+
+The MCP endpoint takes an **access key and nothing else** — no session cookie,
+no Basic header. That is deliberate: a cookie is a credential the browser
+replays on its own and cannot be scoped to one device, and Basic is the account
+password, which also unlocks `/api/*` and cannot be revoked for one lost laptop
+without changing it for everyone. So an MCP client that used to send a username
+and password needs a key instead. Your dashboard login is unaffected; it
+authenticates `/gui` and `/api/*` exactly as before.
 
 **Access keys** are created in **Setup → Access Keys**. A key is shown exactly
 once, at creation: only a SHA-256 hash is stored, so it cannot be displayed
@@ -298,9 +302,9 @@ Run this command to add the vault to your Claude configuration:
 claude mcp add --transport http memory-vault https://<your-host>/mem-mcp/mcp --header "Authorization: Bearer <key>"
 ```
 *(The Setup page fills this command in with your real key when you create one, and
-the landing page links straight to it. A `Basic` header also still works if you
-already have one configured — it is verified against the same `htpasswd` the login
-form uses.)*
+the landing page links straight to it. `/mcp` accepts this header and nothing
+else — a client still configured with a username and password will get a 401
+naming the access-key header it needs.)*
 
 ## Tech Stack
 

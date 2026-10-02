@@ -911,8 +911,11 @@
     <div style="margin-top: 2.5rem; padding-top: 1.5rem; border-top: 1px solid var(--border);">
       <h3 style="margin-top:0;">🔑 Access Keys</h3>
       <p style="font-size: 0.9rem; color: var(--muted); margin-bottom: 1rem;">
-        An access key is what an MCP client sends as <code>Authorization: Bearer {{PSK_PREFIX}}…</code>
-        instead of a username and password. Signed in as <code>{{AUTH_USER}}</code>.
+        An access key is the <strong>only</strong> credential the <code>/mcp</code> endpoint accepts —
+        <code>Authorization: Bearer {{PSK_PREFIX}}…</code>, on every call. A session cookie and a
+        username/password (Basic) header are both refused there with a 401. Your dashboard login still
+        works everywhere else; it just does not authenticate an MCP client. Signed in as
+        <code>{{AUTH_USER}}</code>.
         <strong>A key is shown once, when it is created</strong> — only a hash is stored, so it cannot be
         displayed again. Create one per device, so a lost laptop is one revoked key rather than a lost vault.
       </p>

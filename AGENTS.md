@@ -74,9 +74,9 @@ All three backing services are pinned to an exact tag — `qdrant/qdrant:v1.19.1
 removing it is what lets `Authorization: Bearer mvk_…` reach the app at all:
 nginx can only check a username and password against a file on the host, so it
 rejects a PSK before the request is ever forwarded. The app took that job over
-in `McpAuthGuard` (gui.py) and accepts three things — session cookie, Basic
-against the app's own `htpasswd`, or an access key. Re-adding `auth_basic`
-silently breaks PSK support with nothing in the logs to say so.
+in `McpAuthGuard` (gui.py), which accepts an **access key and nothing else** —
+not a session cookie, not `Basic`. Re-adding `auth_basic` silently breaks PSK
+support with nothing in the logs to say so.
 
 The MCP location also no longer sets `Remote-User`, because nothing sets
 `$remote_user` once `auth_basic` is gone, and a stale header is worse than
@@ -84,21 +84,37 @@ none: `extract_user_from_headers` trusts it (see Authentication).
 
 ## Authentication
 
-**There are two gates, and they check the same three credentials.**
+**There are two gates, and they no longer check the same credentials.**
 
-| | gate | covers |
-|---|---|---|
-| `/mcp` | `McpAuthGuard` (gui.py:1531), wrapping the mount | every route fastmcp registers |
-| `/gui`, `/api/*` | `auth_guard` (gui.py:206) via `_check_session_auth` (gui.py:140) | ~60 handlers |
+| | gate | accepts | covers |
+|---|---|---|---|
+| `/mcp` | `McpAuthGuard` (gui.py:1531), wrapping the mount | **`Authorization: Bearer mvk_…` only** | every route fastmcp registers |
+| `/gui`, `/api/*` | `auth_guard` (gui.py:206) via `_check_session_auth` (gui.py:140) | session cookie → `Basic` (verified) → `Bearer mvk_…` | ~60 handlers |
 
-Order in both: **live session cookie** → **`Authorization: Basic`** (password
-*verified* against `HTPASSWD_PATH`) → **`Authorization: Bearer mvk_…`**
-(`resolve_psk`). Anything else is a 401. Only `/api/auth/*` is reachable without
-one, because that is where you exchange a credential for a session.
+`/mcp` takes exactly one credential: a per-call access key. Anything else — no
+header, a session cookie, or a Basic header — is a 401 whose body names the one
+way in and whose `WWW-Authenticate` header says `Bearer` (it used to say
+`Basic`, which pointed at a credential this endpoint no longer accepts). On
+`/gui` and `/api/*` the order is session → `Basic` → `Bearer`, and only
+`/api/auth/*` is reachable without one, because that is where you exchange a
+credential for a session.
 
-**Both gates verify the `Basic` password, and that is the whole point.** The
-`/mcp` half had to start verifying when nginx's `auth_basic` came off. The
-`/gui` + `/api/*` half had **never** been verifying:
+**`/mcp` is token-only on purpose; the other two credentials are the point, not
+an oversight.** A session cookie is a *bearer* credential the browser replays by
+itself, so accepting one on the MCP path hands every client something that cannot
+be scoped to a device and cannot be revoked without ending the user's own
+dashboard session — the opposite of what an access key is for. `Basic` is not
+refused for its mechanism, which is fine (per-call and stateless, same as a
+key), but for its *credential*: it is the account password, so it also unlocks
+`/api/*`, it rotates only when a human changes it, and one lost laptop cannot
+have it revoked without changing it for everyone. Keeping it would have made
+every access key revocable in name only. The dashboard keeps its sessions —
+`auth_guard` is untouched, and `ApiAuthTests` pins that a cookie still opens
+`/api/*`.
+
+**`auth_guard` verifies the `Basic` password, and that is the whole point.** It
+is now the only gate that accepts `Basic` at all, and it had **never** been
+verifying it:
 
 ```python
 decoded = base64.b64decode(auth_header.split(" ")[1]).decode("utf-8")

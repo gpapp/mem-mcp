@@ -153,18 +153,18 @@ class _StubStore:
 class GuardCase(unittest.TestCase):
     """Drives the real guard class with real ASGI messages.
 
-    The three credentials are checked by giving each one a *distinguishable
-    owner*, so a test asserting the resolved user also proves which credential
-    was honoured. An assertion on the status code alone would pass if the guard
-    picked the wrong credential and then 200'd anyway.
+    One credential is accepted on /mcp — a Bearer access key — so the owner a
+    test resolves also proves which credential was honoured. An assertion on
+    the status code alone would pass if the guard picked the wrong credential
+    and then 200'd anyway, and the two credentials that are *refused* are the
+    reason that matters: a test has to be able to say "a correct password is
+    still refused", which is indistinguishable from "refused" without also
+    checking that the refusal is for the right reason.
     """
-
-    GOOD_PASSWORD = "correct-horse"
 
     @classmethod
     def setUpClass(cls):
         cls.known_keys = {"mvk_alice_key": "alice", "mvk_bob_key": "bob"}
-        cls.pw = {("alice", "correct-horse"): True, ("bob", "hunter2"): True}
         namespace = {
             "base64": base64,
             "logging": _NullLogger(),
@@ -175,9 +175,10 @@ class GuardCase(unittest.TestCase):
             "resolve_psk": lambda key, **kw: (
                 None if key not in cls.known_keys
                 else {"user_id": cls.known_keys[key], "id": "k"}),
-            "_verify_htpasswd": lambda user, pw: cls.pw.get((user, pw), False),
         }
         cls.Guard = _lift("gui.py", "McpAuthGuard", namespace)
+        # Still needed, to build the header a refusal test has to send. Nothing
+        # in the guard verifies it any more, and that is the point.
         cls.basic = staticmethod(lambda user, pw: base64.b64encode(
             f"{user}:{pw}".encode()).decode())
 
@@ -255,20 +256,29 @@ class McpAuthGuardTests(GuardCase):
             self.assertEqual(status, 401, msg=f"{value!r} was not refused")
             self.assertFalse(reached)
 
-    def test_a_session_cookie_is_accepted(self):
-        status, reached, scope = self.call(session_user="alice")
-        self.assertEqual(status, 200)
-        self.assertEqual(self.vault_user(scope), "alice")
+    def test_a_session_cookie_is_refused(self):
+        # The dashboard keeps its sessions; /mcp does not use them. A cookie is
+        # a bearer credential the browser replays on its own, so accepting one
+        # here hands every MCP client something that cannot be scoped to a
+        # device — and cannot be revoked without ending the user's own session.
+        status, reached, _ = self.call(session_user="alice")
+        self.assertEqual(status, 401)
+        self.assertFalse(reached, "A session cookie must not authenticate /mcp")
 
-    def test_valid_basic_auth_is_accepted_and_verified(self):
-        status, _, scope = self.call(
+    def test_basic_auth_is_refused_even_with_the_correct_password(self):
+        # Not the mechanism that is refused — Basic is per-call and stateless,
+        # which is the same property a key has. It is the credential: the
+        # account password, so it also unlocks /api/*, it rotates only when a
+        # human changes it, and it cannot be revoked for one lost laptop
+        # without changing it for everyone. Keeping it here would have made
+        # every access key revocable in name only.
+        status, reached, _ = self.call(
             [("Authorization", f"Basic {self.basic('bob', 'hunter2')}")])
-        self.assertEqual(status, 200)
-        self.assertEqual(self.vault_user(scope), "bob")
+        self.assertEqual(status, 401)
+        self.assertFalse(reached,
+                         "A correct account password must not authenticate /mcp")
 
     def test_basic_auth_with_the_wrong_password_is_refused(self):
-        # This is the check nginx used to do. Nothing verified the password
-        # before, so removing auth_basic had to mean the app took it over.
         status, reached, _ = self.call(
             [("Authorization", f"Basic {self.basic('bob', 'wrong')}")])
         self.assertEqual(status, 401)
@@ -279,23 +289,36 @@ class McpAuthGuardTests(GuardCase):
             [("Authorization", f"Basic {self.basic('mallory', 'x')}")])
         self.assertEqual(status, 401)
 
-    def test_a_session_takes_precedence_over_a_bearer_key(self):
-        # Both are valid and they name different people. Whichever wins, the
-        # answer must be one of them and the other must not be consulted --
-        # pinning "session first" makes that a decision rather than an accident.
+    def test_any_other_authorization_scheme_is_refused(self):
+        # The guard used to dispatch on the scheme, so "bearer " was the only
+        # string it looked at. Anything else simply fell through to the
+        # session, which is gone — so these must be refused rather than
+        # reaching the app unidentified.
+        for value in ("Digest response=abc", "Token mvk_alice_key",
+                      "Negotiate dG9rZW4=", "mvk_alice_key"):
+            status, reached, _ = self.call([("Authorization", value)])
+            self.assertEqual(status, 401, msg=f"{value!r} was not refused")
+            self.assertFalse(reached)
+
+    def test_a_session_cookie_does_not_override_a_valid_access_key(self):
+        # Both are present and they name different people. The cookie is never
+        # read, so the key decides — pinning that makes "the cookie is ignored"
+        # a statement rather than an accident of which check ran first.
         status, _, scope = self.call(
             [("Authorization", "Bearer mvk_bob_key")], session_user="alice")
         self.assertEqual(status, 200)
-        self.assertEqual(self.vault_user(scope), "alice")
+        self.assertEqual(self.vault_user(scope), "bob")
 
-    def test_an_invalid_bearer_does_not_fall_back_to_a_valid_session(self):
-        # A bad key on a request that also has a cookie should still succeed on
-        # the cookie; the point is that the *key* is not silently ignored as if
-        # it had been the identity. Proven by asserting the key's user is not it.
-        status, _, scope = self.call(
+    def test_an_invalid_key_does_not_fall_back_to_a_session_cookie(self):
+        # The old ladder fell through, so a revoked or guessed key on a request
+        # that also carried a cookie still authenticated as the cookie's owner.
+        # There is nothing to fall through to now, and that has to be pinned:
+        # "it still works because of the cookie" is indistinguishable from
+        # "the key was accepted" unless the cookie names someone else.
+        status, reached, _ = self.call(
             [("Authorization", "Bearer mvk_guessed")], session_user="alice")
-        self.assertEqual(status, 200)
-        self.assertEqual(self.vault_user(scope), "alice")
+        self.assertEqual(status, 401)
+        self.assertFalse(reached)
 
     def test_a_spoofed_identity_header_is_replaced_not_trusted(self):
         status, _, scope = self.call(
@@ -308,10 +331,12 @@ class McpAuthGuardTests(GuardCase):
             "There must be exactly one identity header, and it must be the verified one",
         )
 
-    def test_the_401_explains_the_three_ways_in(self):
+    def test_the_401_names_the_only_way_in_and_advertises_it(self):
         # A bare 401 on /mcp is indistinguishable from a wrong URL, a proxy
-        # misconfiguration, or a revoked key. The body is the only place the
-        # remedy can live.
+        # misconfiguration, or a revoked key. The body and the
+        # WWW-Authenticate header are the only places the remedy can live — and
+        # the header used to say Basic, which is a credential this endpoint no
+        # longer accepts at all, so it actively pointed at the wrong answer.
         guard = self.Guard(self._echo_app)
         scope = {"type": "http", "path": "/mcp", "method": "POST", "headers": [],
                  "query_string": b""}
@@ -324,11 +349,19 @@ class McpAuthGuardTests(GuardCase):
             captured.append(message)
 
         asyncio.run(guard(scope, receive, send))
+        start = next(m for m in captured if m["type"] == "http.response.start")
+        headers = {k.decode().lower(): v.decode() for k, v in start["headers"]}
         body = b"".join(m.get("body", b"") for m in captured
                         if m["type"] == "http.response.body")
         text = body.decode()
         self.assertIn("Access Keys", text)
         self.assertIn("Bearer mvk_", text)
+        # Say what is refused too, or the operator re-adds Basic and gets a 401
+        # again with nothing in the logs to say why it worked yesterday.
+        self.assertIn("session cookie", text)
+        self.assertIn("Basic", text)
+        self.assertTrue(headers["www-authenticate"].startswith("Bearer"),
+                        f"WWW-Authenticate must offer Bearer, got {headers['www-authenticate']!r}")
 
     def test_a_websocket_upgrade_is_not_gated_on_http_logic(self):
         # Passing through unchecked is deliberate: the MCP app here is
