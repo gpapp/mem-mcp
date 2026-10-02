@@ -32,9 +32,11 @@ The dependency-light regression suite covers matching, scope compatibility, scop
 
 **A test of a helper is not a test of its call site.** `OllamaModelMatchTests` covers `_ollama_model_matches` directly, and re-injecting the old `if model in installed` into `ensure_ollama_models` left all of them green — the download bug lived in the caller. There is now a tenth test that asserts the call site, for the same reason `WriteOrderingGuardTests` exists. Whenever a bug is a wrong call rather than a wrong function, pin the call.
 
+`test_status_monitor.py` is the eleventh suite and the only one that imports its subject directly: `status_monitor.py` is standard-library-only (no `httpx`, nothing from `common`), so its snapshot builder, change fingerprint and subscriber plumbing are **called** rather than lifted out of the source. That matters because every defect worth guarding there is a "this looks right and is wrong" — a cold model labelled `100% CPU`, a fingerprint that fires on every poll, a publish that blocks on a browser that stopped reading — and none is visible in the shape of the code. The same file also lifts `fetch_ollama_status` / `unload_ollama_model` out of `common.py` and `api_unload_model` / `_status_snapshot` out of `gui.py` with `ast.get_source_segment`, because those three cannot be imported here. `ImportDisciplineTests` imports the module in a **subprocess with httpx blocked at the import hook** rather than searching the source for the string: a docstring mentioning httpx is not an import of it, and that is the `assertIn`-over-a-whole-file lesson again. `test_mobile_layout.py::StatusWidgetLayoutTests` pins where the widget is allowed to sit — see "Server Status Widget" for why that is not a free choice.
+
 ```bash
 cd mem-mcp
-python3 -m unittest -v test_matching_regressions.py test_embedding_reliability.py test_chunking.py test_cypher_safety.py test_backup_compression.py test_people_extraction.py test_graph_scope.py test_mobile_layout.py test_llm_reliability.py test_env_wiring.py
+python3 -m unittest -v test_matching_regressions.py test_embedding_reliability.py test_chunking.py test_cypher_safety.py test_backup_compression.py test_people_extraction.py test_graph_scope.py test_mobile_layout.py test_llm_reliability.py test_env_wiring.py test_status_monitor.py
 ```
 
 This was a Windows path (`C:/tools/miniconda3/python.exe`) with PowerShell `Push-Location`/`Pop-Location`, and it does not exist on the Linux host these files are edited from — every suite "failed" on an interpreter that is not there. Any `python`/`python3` on `PATH` runs all ten; none of them import a DB driver.
@@ -61,8 +63,108 @@ All three backing services are pinned to an exact tag — `qdrant/qdrant:v1.19.1
 
 **IMPORTANT**: Update `nginx_snippet.conf` before deploying. Two locations:
 
-- `/mem-mcp/mcp/` → MCP (Basic Auth via nginx)
+- `/mem-mcp/mcp/` → MCP (**authenticated by the app**, see Authentication below)
 - `/mem-mcp/` → GUI/API (session auth via app, cookie passthrough)
+
+**Do not re-add `auth_basic` to the MCP location.** It used to be there, and
+removing it is what lets `Authorization: Bearer mvk_…` reach the app at all:
+nginx can only check a username and password against a file on the host, so it
+rejects a PSK before the request is ever forwarded. The app took that job over
+in `McpAuthGuard` (gui.py) and accepts three things — session cookie, Basic
+against the app's own `htpasswd`, or an access key. Re-adding `auth_basic`
+silently breaks PSK support with nothing in the logs to say so.
+
+The MCP location also no longer sets `Remote-User`, because nothing sets
+`$remote_user` once `auth_basic` is gone, and a stale header is worse than
+none: `extract_user_from_headers` trusts it (see Authentication).
+
+## Authentication
+
+Three credentials, checked in this order by `McpAuthGuard` (gui.py:1454):
+
+1. **live session cookie** — `request.session["user"]`
+2. **`Authorization: Basic`** — the password is *verified* against
+   `HTPASSWD_PATH`, not just decoded
+3. **`Authorization: Bearer mvk_…`** — resolved via `resolve_psk`
+
+Anything else is a 401. This matters: before, the app did not authenticate
+`/mcp` at all. `auth_guard` only matched `/gui` and `/api`, nginx's `auth_basic`
+was the sole gate, and a request that got past it ran as whichever user the
+`Basic` username claimed without the password ever being checked. The `Basic`
+branch is now verified precisely because the app inherited nginx's job.
+
+**The verified identity is stamped as header `x-vault-user`, and that header is
+stripped from every inbound request** by `VaultSessionMiddleware` before
+anything reads it. The two halves must stay together: `extract_user_from_headers`
+(common.py) gives `x-vault-user` top precedence over Basic, Bearer and the
+proxy headers *because* no client can supply it. Stripping is case-insensitive
+(`test_stripping_is_case_insensitive` in test_sessions.py exists for this — a
+lowercase-only filter is not a filter, since HTTP header names are).
+
+**`extract_user_from_headers` returns `"anonymous"` rather than raising**, and
+that is load-bearing for the unverified callers. It is the last resort of a
+function several layers below the guard, so rejecting there would turn a
+misconfigured proxy into a 500 rather than an empty vault. A bare `Bearer` with
+no token must return `"anonymous"` and must **not** fall through to
+`Remote-User` — a bad credential is not an absent one
+(`HeaderPrecedenceTests`).
+
+`monitor_mcp_tool` still only logs; the guard is what authorizes. Do not add
+per-tool checks to the decorator.
+
+## Sessions & Access Keys
+
+`sessions.py` is **stdlib-only by design** — no fastapi, no httpx, nothing from
+`common` — so both stores can be imported and *called* by the test suites on a
+machine with no web framework and no database. That is why it is importable
+where `common.py` and `gui.py` are not, and why `test_sessions.py` asserts on
+behaviour (expiry, revocation, ownership) instead of lifting source segments
+with `ast.get_source_segment` the way most of the other suites must.
+
+**`VaultSessionMiddleware` is raw ASGI, not `BaseHTTPMiddleware`, and that is
+not a style choice.** `/api/events` and `/api/status/stream` are SSE; a
+`BaseHTTPMiddleware` in that path buffers the stream it exists to pass through.
+Wrapping `send` is what lets a `Set-Cookie` be appended to the response start
+message without touching the body. It reads and writes `scope["headers"]`
+directly, which is also what keeps the starlette import out of the file.
+
+- **Sessions are server-side; the cookie is only an opaque id.** That is what
+  makes login survive a container rebuild — but only because `MEM_SESSION_DIR`
+  points at the bind mount. The dir defaults to `<dirname LOG_DIR>/sessions`,
+  which is *inside the container* and therefore lost on rebuild. If you change
+  the compose volume, change the default too.
+- **`expires_at` is absolute, `last_seen_at` slides.** 30 days from creation.
+  A sliding session means an attacker who steals a cookie keeps it alive by
+  using it — which is indistinguishable, from the server, from the owner.
+- **Login clears the session first** (`api_login` calls `request.session.clear()`
+  before writing `user`). The middleware reads that as "delete the old row and
+  mint a new id" — which is what defeats session fixation. An id planted in the
+  browser before login must not still be the logged-in id afterwards.
+- **`session["pass"]` raises.** `VaultSession.__setitem__` rejects
+  `pass`/`password`/`passwd` at the point of writing, and `create_session` /
+  `update_session_data` reject them too, because a dict-level guard alone would
+  leave a direct `create_session(data={"pass": ...})` writing one layer down.
+  The Setup page used to rebuild a Basic header out of the session password
+  purely to display it; it now shows an access key instead, and there is no
+  reason to restore the old behaviour.
+- **Expiry is enforced on read.** A row past its deadline is deleted by the read
+  that found it, so a dead cookie cannot be probed for existence by timing. The
+  boot purge in `server.py` and `_session_gc_loop` are the belt to that braces;
+  a failed write is logged and swallowed, never a 500.
+
+**A PSK is stored as a SHA-256 hash and its plaintext is returned exactly once.**
+Only a 10-char display prefix is persisted, and `resolve_psk` refuses a key that
+does not carry the `mvk_` prefix *before* touching the database — a session id
+is a bearer credential too, and without that check it would be hashed and
+looked up, which is a cross-mechanism path from "stolen cookie" to "full MCP
+access" waiting to be closed by accident.
+
+`list_psks` keeps revoked rows visible (`status: revoked`) because a key that
+vanishes from the list is indistinguishable from one that was never revoked.
+`revoke_psk` returns one answer for "no such id", "not yours" and "already
+revoked" so the endpoint cannot be walked to enumerate real key ids, and it
+scopes by `user_id` in the UPDATE rather than reading a row and comparing in
+Python.
 
 ## Critical Config
 
@@ -107,7 +209,9 @@ All three backing services are pinned to an exact tag — `qdrant/qdrant:v1.19.1
 - Chat logging: `MEM_LLM_LOG_CHARS` (default 1000, `0` = sizes only) — how much of each prompt and answer reaches `memory-vault.log`
 - Query rewrite cache: `MEM_QUERY_CACHE_TTL` (default 900s) and `MEM_QUERY_CACHE_MAX` (default 256 entries); either `0` disables the cache — see "Query Rewrite Cache"
 - Embedding retries: `MEM_EMBED_RETRIES` (default 2) and `MEM_EMBED_RETRY_BACKOFF` (default 1.5, in seconds), `MEM_EMBED_MAX_CHARS` (default 8000) — see "Embedding Reliability"
-- User vault resolved from `Authorization: Basic` header or session cookie
+- Server status widget: `MEM_STATUS_POLL_SECONDS` (default 10) and `MEM_STATUS_HTTP_TIMEOUT` (default 8) — see "Server Status Widget"
+- User vault resolved from a session cookie, `Authorization: Basic`, an access key, or proxy headers — see Authentication
+- Sessions and access keys: `MEM_SESSION_DIR` (must be the bind mount, or a container rebuild logs everyone out) and `MEM_SESSION_SECURE` (adds `Secure` to the session cookie; only enable when the app is reached over HTTPS, since the process cannot detect the proxy's scheme and a `Secure` cookie on a plain-HTTP visit is silently dropped). `MEM_SESSION_SECRET` is no longer used to sign anything.
 - `BASE_URL` must include `/mcp` prefix when behind nginx
 
 ## Diary Consistency & Auto-Fix
@@ -285,6 +389,20 @@ A reclassify returned `503 Service Unavailable` and was read as "out of memory l
 
 Tests live in `mem-mcp/test_llm_reliability.py`, using the same `ast.get_source_segment` lift as the embedding suite. They are behavioural rather than source-shape checks **on purpose**: the defect was the *absence* of a log line, and only a fake client that actually raises can assert that. Reinjecting the old body makes 17 of the 23 fail and drops the recorded ERROR lines from 1 to 0.
 
+## Server Status Widget
+
+A status strip pinned to the bottom of the left rail of the **Memories** and **Diary** tabs, and a full model panel on **Setup**, both fed by one snapshot pushed over SSE from one poller. It answers the question the "must say `100% GPU`" rule in Critical Config keeps needing answered, and it puts an unload button where the model it evicts is named.
+
+- **One poller for the process, not one per browser tab.** `status_monitor.broadcast_loop(mem.fetch_ollama_status, mem.STATUS_POLL_SECONDS)` is started in the `server.py` lifespan and cancelled with the other tasks. `GET /api/status/stream` subscribes; `GET /api/status` returns the stored snapshot (and probes once on the cold path). N tabs must not mean N polls of a GPU that is already contended.
+- **The change fingerprint excludes the wall clock, and that is the whole design.** `status_monitor.signature()` covers `ok`, `version`, `error`, `warnings`, `maintenance` and the per-model state — and deliberately *not* `checked` or `expiresAt`, both listed in `VOLATILE_SNAPSHOT_KEYS`. Fingerprint the snapshot wholesale and every poll looks like a change, so the widget is rewritten six times a minute to say nothing; fingerprint too narrowly and a model that loaded never appears. The keep-alive countdown is therefore a **client-side timer over an absolute timestamp** (`fmtEta` + `updateEtas`), not part of the pushed state. Do not move a timestamp into the signature.
+- **`/api/ps` has no processor field, so the label is recomputed.** `processor_label(size, size_vram)` applies the rule `ollama ps` prints (no VRAM → `100% CPU`, VRAM covers the model → `100% GPU`, otherwise a split, **CPU share first**). This is the widget's real payload: AGENTS.md's only reliable GPU check, made visible without `docker exec`.
+- **Only a resident model gets a label.** Deriving it from an installed model's byte count paints every cold model `100% CPU`, which reads as a model running on the processor — and hides the one thing the widget exists to show. `resident` and `installed` are separate fields and both matter: a configured model Ollama has never heard of is the state an operator most needs to see.
+- **A failed route degrades the widget; a failed service kills it.** `fetch_ollama_status` records a non-200 or an unparseable body as a `warnings` entry and keeps `ok=True`, and sets `error` only when a transport failure means nothing answered. The alternative is a moved route painting the whole service down, or a broken route hiding behind a green light.
+- **Unloading is `keep_alive: 0` and nothing else.** There is no DELETE in Ollama's API. A model that is not resident answers 200 and does nothing, so `api_unload_model` **validates the name against the live snapshot first** and 400s with the real names — otherwise a typo is an operation that reports success and changes nothing. It then re-probes and broadcasts rather than patching the snapshot locally: what actually left VRAM is Ollama's answer, not our assumption about it.
+- **`publish()` answers whether it changed, not what the snapshot is.** `_status_snapshot` in `gui.py` therefore calls it and *then* reads `last_snapshot()` back; assigning the return value hands the caller a `True`, which surfaces two lines later as an `AttributeError` in a different endpoint. `StatusEndpointTests` runs it, because the line reads correctly on its own.
+- **Subscriber queues are bounded to one and evict the oldest.** A widget one tick stale is much cheaper than a poller wedged on a browser that stopped reading. The SSE generator also sends a `ping` every 15s, because an idle stream is the normal case and a proxy in front of the app closes it without one. The browser keeps a 30s `GET /api/status` poll running *only* while `readyState !== OPEN`, so a proxy that keeps dropping the stream cannot leave a frozen widget that still looks live.
+- **The widget is pinned inside the rail, not below the layout.** Both rails are flex columns with `overflow: hidden` and the widget is `flex: 0 0 auto; margin-top: auto`. A strip *under* `.memories-layout` pushes the page past `height: calc(100vh - 140px)` and makes a three-pane reading screen scroll — which is the one thing that layout avoids. `.memories-sidebar` consequently became `overflow: hidden` and its scroller moved to `#categories-sidebar` (with `flex: 1 1 auto`, not a zero basis — same trap as the mobile panes, in miniature). `StatusWidgetLayoutTests` pins the placement, the rail structure and the absence of a sibling strip.
+
 ## Gotchas
 
 - Qdrant not accessible from host—interact via app only
@@ -301,6 +419,7 @@ Tests live in `mem-mcp/test_llm_reliability.py`, using the same `ast.get_source_
 - **Three request fields decide whether a live retest measures anything at all.** Scoring the classifier by hand-crafting an Ollama request gave four empty answers in a row, which reads as "the prompt broke the model". It had not: `get_llm_response` sends `"think": False`, and without it `nemotron-3-nano:4b` spends the entire `num_predict` budget on a `thinking` block and returns `content: ""` with `done_reason: "length"`. It also pins `temperature: 0.0`. A harness that omits any of the three is not testing the prompt, and its failure mode is indistinguishable from a model regression. Check `done_reason` before believing an empty answer.
 - **A model can be *argued* into a client it was never offered, and the retry is not obvious.** The old prompt called an explicit `**Client:**` header "authoritative". On an MBAG RFI whose header reads `## Client: Daimler AG (MBAG)`, the model returned that name verbatim — which is the end customer, not one of the stored clients — so `resolve_scope_name` matched nothing and the item was stamped unscoped. The severity is what makes it worth fixing: the header rule looked protective and instead deleted the scope for every customer-named document, and the loss is silent because a null is a normal outcome the UI renders the same as any other.
 - **Cypher cannot be parsed locally** — there is no Neo4j and no driver in this environment, so a syntax error ships to production and surfaces as `neo4j.exceptions.CypherSyntaxError` on first execution. `test_cypher_safety.py` exists because of this: it extracts every Cypher string constant and f-string fragment and lints `FOREACH (v IN <list> | ...)` for a variable referenced inside its own list. A `FOREACH (x IN ... ELSE [x] END | DELETE x)` is a parse error, not a runtime one, and it was the reason every full reclassify aborted on its first call. The suite also pins the scope-clear query's shape. Add to it when you add a query. It skips **docstrings**: a docstring is prose that happens to quote a query, and linting it is a false positive that only ever gets "fixed" by rewording a comment, when the check is about Cypher and not English.
+- **Chained `OPTIONAL MATCH`es return a cross product, and `collect(DISTINCT ...)` does not undo it.** A pattern on a relationship multiplies the rows it produces, so two of them in the same clause chain return their *product* — and a `collect(DISTINCT x)` in the `RETURN` deduplicates values *within* a row, it never merges rows. `db_list_diary` chained four patterns (`FOR_CLIENT`, `IN_CONTEXT`, `MENTIONS`, `RELEVANT_TO`) with a `WITH d, cl, ctx` in between, so every entry with five auto-linked participants and one cross-reference came back **five times with the same `d.id`**. The client assigns that list straight into `diaryEntries`, so the UI rendered one card per combination — and only for entries written since auto-linking existed, which is why it was reported as "the new ones are duplicated" rather than as a data problem. `db_list_memories` had the same defect through `RELEVANT_TO` alone, which is many-valued by design. The fix is one aggregating `WITH` after each pattern, **including the last one**: an entry with two `RELEVANT_TO` links is two rows just as surely as one with two `MENTIONS`, so an earlier version of this fix that collapsed every pattern *except* the trailing one only turned a mentions×relevant product into a single relevant multiplier. `OneRowPerRecordTests` derives the property from the clause structure, and is deliberately **scoped to those two functions** — they are the only two whose rows are pushed one-per into a client array and rendered. Roughly thirty other chained-pattern queries exist; none is reachable as a rendered list, and no Cypher can be executed here to check a rewrite, so they are left alone on purpose. When one of those becomes a record list, the analyzer is already written — that is what it is for.
   - **Every desktop scroll pane here is a flex item with a zero flex basis**, and the mobile block has to release *all* of them, not the one you happen to be looking at. `flex: 1` (and `flex: 1 1 0` with an explicit `min-height: 0` on `#diary-dates-list`) is basis 0. Stacked, the parent column is `height: auto`, a scroll container is sized from that basis, the parent resolves against zero, and the content renders into a box with no height — no error, nothing to scroll, the tab just looks empty. The fix needs **both** halves, `flex: 0 0 auto` *and* `overflow-y: visible`; either alone reproduces it. This bit twice, one level apart: the memories pane was released and `.diary-main` was not, then `.diary-main` was released and `#diary-dates-list` — the date/search-results list, not a detail pane — was not, so searching returned nothing visible while the entries pane looked fine. The sidebars then become the bounded scroll region (`max-height` + `overflow-y: auto`), giving one scroll area per sidebar rather than a nested one. `test_mobile_layout.py::StackedPaneVisibilityTests` derives the whole class from the stylesheet — any full-width selector that declares vertical scrolling *and* a zero flex basis — so a new tab cannot silently repeat this. The same test class is the worked example of **assert presence before asserting a negative**: an earlier version only checked that `overflow-y: auto` was *absent*, and `_decls` returns `""` for a missing selector, so deleting the rule outright made it pass. Two diary columns are bounded now, not one — see "Diary Screen Layout".
   - **CSS is not validated by anything here, and an inline style beats a media query.** Three page layouts are fixed-width columns — memories `180px + 280px + flex`, diary `flex + 340px + 250px`, graph `200px + flex` — and each pane sits inside `height: calc(100vh - Npx)` with its own `overflow-y: auto`, so on touch the *page* cannot scroll: you drag inside a pane that may be one line tall. `test_mobile_layout.py` pins the `@media (max-width: 900px)` / `640px` rules that fix both. Four things it is protecting, each of which fails silently:
   - **An inline `style` on `.graph-layout` disables the entire mobile block.** Inline styles win at every specificity, so one re-added attribute reverts the graph to two 200px columns with no error anywhere. The `display: flex` lives in the stylesheet for exactly this reason.
@@ -351,6 +470,28 @@ Rules that matter when changing this code:
 - **`db_search_diary` keeps its own inconsistency** — `top_p` on the blended `score`, not on `confidence`. Scope ranking is applied to it identically; do not "fix" the threshold while you are in there.
 
 ## Features
+
+### Access Keys & Sessions
+Setup → **🔑 Access Keys** manages the credential an MCP client presents.
+
+- **Create a key** with an optional label and an optional expiry (never / 30 / 90 / 365 days).
+- **The plaintext is returned once**, by `POST /api/psks` and nothing else. Only a
+  SHA-256 hash and a 10-character display prefix are stored, so the Setup page
+  cannot show it again — the client snippet is filled in with the real key at
+  creation time and never re-fetchable. Do not add an endpoint that returns it.
+- **Revoke** takes effect on the next request, with no file edit and no restart:
+  `DELETE /api/psks/{id}`. Revoked rows stay in the list with
+  `status: revoked` and render without an action button.
+- The **live browser sessions** for the signed-in user are listed underneath, so
+  "log out everywhere" is something an operator can see before they do it.
+- Each key belongs to the `userId` it was minted for, and `userId` *is* the
+  username — there is no user table. A key therefore grants exactly the vault
+  its owner has, which is the entire point of it being revocable per device.
+
+**Creating a key must not be repeatable into the same key.** `POST /api/psks`
+called twice mints two keys, not one; the UI treats the response as single-use.
+A `GET /api/psks` that leaked a plaintext would defeat the whole design, so
+`test_auth_guard.WiringTests` pins that no route other than the POST reaches it.
 
 ### Build Graph Mode
 Build your own focused subgraph starting from any memory.

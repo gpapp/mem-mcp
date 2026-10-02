@@ -221,6 +221,160 @@ class StackedPaneVisibilityTests(unittest.TestCase):
                 )
 
 
+class StatusWidgetLayoutTests(unittest.TestCase):
+    """The status widget sits on the bottom edge of the left rail of two pages.
+
+    There is no browser here, so what is pinned is the set of ways it can go
+    wrong silently: pinned to nothing (a rail that is not a flex column, or a
+    widget with no `margin-top: auto`), pinned to a rail that is not the left
+    one, or — the one that costs the whole tab — a strip added *below* the
+    layout, which pushes the page past `height: calc(100vh - 140px)` and makes
+    a three-pane reading screen scroll.
+
+    The mobile half is the same zero-basis trap as every other pane, so it is
+    checked through the same derived rule rather than by listing the widget.
+    """
+
+    # The left rail of each page: the categories column and the calendar rail.
+    _RAILS = (".memories-sidebar", ".diary-sidebar")
+    # Markup and stylesheet spell this differently; both are pinned.
+    _WIDGET = ".srv-status"
+    _WIDGET_CLASS = 'class="srv-status"'
+
+    def setUp(self):
+        self.base = _declarations(CSS)
+        self.tablet = _declarations(_media_block(900))
+
+    def test_the_widget_is_a_child_of_both_left_rails(self):
+        """Not a sibling strip, and not a child of the scroller.
+
+        A widget inside the scrolled element scrolls out of sight on a long
+        list, which for the memories rail is the moment it is least wanted.
+        """
+        for rail in self._RAILS:
+            with self.subTest(rail=rail):
+                body = self._rail_markup(rail)
+                self.assertTrue(body, msg=f"{rail} not found in the template")
+                self.assertIn(self._WIDGET_CLASS, body,
+                              msg=f"the status widget is not inside {rail}")
+
+    def _rail_markup(self, rail):
+        cls = rail[1:]
+        m = re.search(
+            r'<div class="%s"[^>]*>(.*?)\n    </div>' % re.escape(cls), SOURCE, re.S
+        )
+        return m.group(1) if m else ""
+
+    def test_each_rail_is_a_flex_column_so_the_widget_can_pin(self):
+        """Without `display: flex; flex-direction: column` there is no free
+        space for `margin-top: auto` to push against, and the widget renders
+        directly under the content instead of on the bottom edge."""
+        for rail in self._RAILS:
+            with self.subTest(rail=rail):
+                decls = _decls(self.base, rail)
+                self.assertTrue(decls.strip(), msg=f"{rail} has no desktop rule")
+                self.assertIn("display: flex", decls)
+                self.assertIn("flex-direction: column", decls)
+                self.assertIn("overflow: hidden", decls,
+                              msg=f"{rail} is not hidden, so a pinned widget "
+                                  f"cannot be relied on and the rail may grow")
+
+    def test_the_widget_takes_no_flex_space_of_its_own(self):
+        decls = _decls(self.base, self._WIDGET)
+        self.assertTrue(decls.strip(), msg="the widget has no desktop rule")
+        self.assertIn("flex: 0 0 auto", decls,
+                      msg="a growing widget steals the rail from the list above it")
+        self.assertIn("margin-top: auto", decls,
+                      msg="without this the widget is not on the bottom edge")
+
+    def test_no_strip_is_added_below_either_layout(self):
+        """`calc(100vh - 140px)` leaves no room for a footer under the panes."""
+        for layout in (".memories-layout", ".diary-layout"):
+            with self.subTest(layout=layout):
+                m = re.search(
+                    r'<div class="%s">(.*?)\n  </div>' % re.escape(layout[1:]), SOURCE, re.S
+                )
+                self.assertTrue(m, msg=f"{layout} markup not found")
+                after = SOURCE.split(m.group(0), 1)[1]
+                # The next thing in the page must be another page, not a strip
+                # belonging to this layout.
+                following = after.lstrip().split("\n", 1)[0]
+                self.assertTrue(
+                    following.strip().startswith("</div>") or "page-" in following,
+                    msg=f"{layout} is followed by {following[:60]!r}, which "
+                        f"looks like a sibling strip below the panes",
+                )
+
+    def test_the_widget_is_not_a_zero_basis_scroll_container(self):
+        """The same trap as the panes, in miniature: it must not scroll."""
+        decls = _decls(self.base, self._WIDGET)
+        for basis in ("flex: 1;", "flex: 1 1 0;", "flex: 1 1 0%"):
+            self.assertNotIn(basis, decls)
+        self.assertNotIn("overflow-y: auto", decls,
+                         msg="the widget scrolls instead of the rail it is pinned to")
+
+    def test_the_memories_rail_scrolls_on_its_list_not_itself(self):
+        """The rail became `overflow: hidden` so the widget can pin.
+
+        The scroller moved to `#categories-sidebar`, and it has to move with a
+        non-zero basis: a zero basis inside the stacked auto-height column
+        resolves against nothing, which is the empty-tab bug in miniature.
+        """
+        rail = _decls(self.base, ".memories-sidebar")
+        self.assertNotIn("overflow-y: auto", rail,
+                         msg="the rail is the scroller again, so the widget scrolls away")
+        chips = _decls(self.base, "#categories-sidebar")
+        self.assertTrue(chips.strip(), msg="#categories-sidebar has no rule at all")
+        self.assertIn("overflow-y: auto", chips)
+        for basis in ("flex: 1 1 0;", "flex: 1 1 0%", "flex: 1;"):
+            self.assertNotIn(basis, chips,
+                             msg="#categories-sidebar is a zero-basis scroller")
+        self.assertIn("min-height: 0", chips)
+
+    def test_the_category_chips_do_not_stretch_to_fill_the_rail(self):
+        """The one assertion missing when this broke, and the reason it passed.
+
+        The rail became a flex column so the status widget could pin to its
+        bottom edge, and the chip list was made the scroller with
+        `flex: 1 1 auto`. A *growing* chip list is handed the leftover column
+        height — and `.chips-container` is a wrapping **row** flex container
+        whose default `align-items: stretch` matches every chip to its line's
+        cross size, so the chips themselves became full-height blocks filling
+        the rail. The category count is small and constant; a rail that tall is
+        the chip list, not the data.
+
+        The previous test checked the basis was not zero and said nothing about
+        growth, so `1 1 auto` passed a test written for `0 1 auto`. Both halves
+        are asserted now: shrinkable, and not growable.
+        """
+        chips = _decls(self.base, "#categories-sidebar")
+        self.assertTrue(chips.strip(), msg="#categories-sidebar has no rule at all")
+        grow = re.search(r"flex:\s*(\d+)", chips)
+        self.assertIsNotNone(grow, msg="#categories-sidebar has no flex shorthand")
+        self.assertEqual(
+            grow.group(1), "0",
+            msg="the chip list may shrink and scroll but must not claim the "
+                "rail's free space -- the widget's margin-top:auto is the only "
+                f"thing that wants it; got flex: {grow.group(0)}",
+        )
+        # Belt and braces: if the list is ever shorter than the space it was
+        # given, the lines must pack at the top rather than stretch to fill.
+        self.assertIn("align-content: flex-start", chips,
+                      msg="without this the wrapped chip lines stretch to the "
+                          "container height even when the container is taller")
+        # And the chips themselves must not be stretched by the default
+        # `align-items: stretch` on their wrapping row container.
+        self.assertNotIn("align-items: stretch", chips)
+
+    def test_stacked_the_widget_still_renders(self):
+        """Below the breakpoint the rail is a bounded scroller, so the widget
+        is at the end of its content rather than pinned. That is acceptable;
+        being *inside* a `height: 0` box is not, and `flex: 0 0 auto` is what
+        rules that out in a column."""
+        self.assertNotIn("display: none", _decls(self.tablet, self._WIDGET))
+        self.assertIn("flex: 0 0 auto", _decls(self.base, self._WIDGET))
+
+
 class LayoutInlineStyleTests(unittest.TestCase):
     """An inline style beats a stylesheet rule of any specificity."""
 
@@ -381,13 +535,18 @@ class GraphTouchTests(unittest.TestCase):
 
     def test_the_observer_is_detached_before_the_network_is_destroyed(self):
         # rebuildNetwork() replaces the canvas; a live observer would keep
-        # fitting a destroyed one.
-        idx = SOURCE.index("function rebuildNetwork()")
+        # fitting a destroyed one. The teardown moved into destroyNetwork() so
+        # that loadGraph() could use it too, and this follows the property to
+        # wherever it lives rather than pinning a function body -- the order is
+        # what matters, not which function holds it.
+        idx = SOURCE.index("function destroyNetwork()")
         body = SOURCE[idx:idx + 600]
         self.assertIn("graphResizeObserver.disconnect()", body)
         self.assertLess(
             body.index("graphResizeObserver.disconnect()"),
             body.index("network.destroy()"),
+            "disconnecting first means no callback can fire against a network "
+            "that is being torn down",
         )
 
 
@@ -694,6 +853,121 @@ class DiaryFillsThePageTests(unittest.TestCase):
             "the two full-bleed pages must pad alike, or the shared 100vh "
             "budget above is comparing two different chromes",
         )
+
+
+class GraphRenderLoopTests(unittest.TestCase):
+    """A resize handler that resizes what it observes is a loop, not a handler.
+
+    "Load graph grows the canvas infinitely" was three defects stacked, none of
+    which raises and each of which makes the next one worse. There is no browser
+    here, so what is pinned is the shape that turns each pass into another pass.
+
+    - **`#graph-container` derives its height from its own content.**
+      `.graph-main` is `flex: 1` inside `.graph-layout`, which is a flex *row*
+      with no height of its own — so the container's height comes from the vis
+      canvas inside it. A `ResizeObserver` on that container which calls
+      `fit()` resizes the canvas, the container, and therefore itself. Every
+      pass was slightly larger than the last.
+    - **The observer responded to height as well as width.** The reason it
+      exists is the mobile block stacking the layout, which changes the *width*
+      of a canvas vis sized once at construction. Gating on width keeps that
+      case and removes the feedback edge.
+    - **Each load left its observer and its network behind.** Six call sites
+      reach `loadGraph()`, it never destroyed what was there, and the observer
+      reads the *global* `network` — so an observer from load 1 was refitting
+      the network from load 6, six observers deep. Teardown happens before the
+      load, not only in `rebuildNetwork()`.
+    """
+
+    def _function(self, name):
+        start = SOURCE.index("function %s(" % name)
+        end = SOURCE.index("\n  function ", start)
+        return SOURCE[start:end]
+
+    def _observer_body(self):
+        """Just the ResizeObserver callback, not the whole of initNetwork.
+
+        initNetwork has *two* resize paths — the observer and the `resize`
+        fallback for browsers without ResizeObserver — and they are the same
+        shape. Asserting on the whole function let a fix in the fallback branch
+        satisfy a check on the observer: the first version of this test passed
+        on an observer that had been stripped of its width gate, because
+        `lastWidth` and `clientWidth` were still present a few lines below.
+        """
+        start = SOURCE.index("graphResizeObserver = new ResizeObserver(")
+        end = SOURCE.index("graphResizeObserver.observe(container)", start)
+        return SOURCE[start:end]
+
+    def setUp(self):
+        self.init = self._function("initNetwork")
+        self.observer = self._observer_body()
+        self.load = self._function("loadGraph")
+        self.rebuild = self._function("rebuildNetwork")
+        self.destroy = self._function("destroyNetwork")
+
+    def test_the_resize_handler_ignores_height_changes(self):
+        self.assertIn("clientWidth", self.observer,
+                      msg="the handler must gate on width, the only thing the "
+                          "mobile stacking actually changes")
+        for height in ("offsetHeight", "contentRect", "clientHeight"):
+            self.assertNotIn(height, self.observer,
+                             msg=f"reacting to {height} feeds the loop: the "
+                                 f"canvas grows the container, which fires this again")
+
+    def test_the_resize_handler_is_deduped_on_the_last_width(self):
+        """Without this the handler runs on every notification, not every change.
+
+        `ResizeObserver` delivers an entry on *any* box change, including the
+        one it caused, so an ungated `fit()` is a loop even on a container whose
+        height is not content-derived.
+        """
+        self.assertIn("lastWidth", self.observer,
+                      msg="no dedupe: the observer fires on its own resize too")
+        self.assertIn("width === lastWidth", self.observer,
+                      msg="the handler must return early for a width it already fitted")
+        self.assertLess(self.observer.index("lastWidth = width"),
+                        self.observer.index("network.fit("),
+                        msg="the dedupe has to happen before the refit, not after")
+
+    def test_the_fallback_resize_path_is_gated_too(self):
+        """Same handler, other branch — it has the same loop in it."""
+        start = SOURCE.index("window.addEventListener('resize'")
+        body = SOURCE[start:SOURCE.index("\n  function ", start)]
+        self.assertIn("width === lastWidth", body,
+                      msg="the no-ResizeObserver fallback refits on every event "
+                          "with no dedupe, which is the same loop")
+
+    def test_every_load_tears_down_the_previous_graph_first(self):
+        """`loadGraph` is not the only entry point that builds a network."""
+        self.assertIn("destroyNetwork()", self.load,
+                      msg="loadGraph builds a network without releasing the "
+                          "previous one, so its observer and physics loop leak "
+                          "per reload")
+        self.assertLess(self.load.index("destroyNetwork()"),
+                        self.load.index("api.get('graph'"),
+                        msg="teardown after the await lets two in-flight loads "
+                            "both reach initNetwork")
+
+    def test_both_rebuild_paths_use_the_same_teardown(self):
+        for name, body in (("rebuildNetwork", self.rebuild),
+                           ("loadGraph", self.load)):
+            with self.subTest(function=name):
+                self.assertIn("destroyNetwork()", body)
+        self.assertIn("disconnect()", self.destroy)
+        self.assertIn("network.destroy()", self.destroy)
+        self.assertIn("graphResizeObserver = null", self.destroy,
+                      msg="a stale handle is how a second teardown silently "
+                          "skips the observer that is still attached")
+        self.assertIn("network = null", self.destroy)
+
+    def test_a_stale_response_cannot_render_over_a_newer_one(self):
+        """Two loads in flight both cleared the container, then both drew."""
+        self.assertIn("graphLoadToken", SOURCE,
+                      msg="no load token: two concurrent /api/graph responses "
+                          "both build a network into the same container")
+        self.assertIn("++graphLoadToken", self.load)
+        self.assertIn("token !== graphLoadToken", self.load,
+                      msg="the token is incremented but never checked")
 
 
 class DiarySaveWiringTests(unittest.TestCase):

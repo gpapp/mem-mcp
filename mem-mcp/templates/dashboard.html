@@ -197,7 +197,19 @@
 
     /* ── Memories Page Layout ── */
     .memories-layout { display: flex; gap: 1rem; height: calc(100vh - 140px); min-height: 500px; }
-    .memories-sidebar { width: 180px; flex-shrink: 0; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow-y: auto; }
+    .memories-sidebar { width: 180px; flex-shrink: 0; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; display: flex; flex-direction: column; }
+    /* The categories list is what scrolls, so the status widget can sit on the
+       bottom edge instead of scrolling away with the chips. `0 1 auto` and not
+       `1 1 auto`: it must be allowed to *shrink* and scroll, but not to grow.
+       Given the leftover column height it stretched to fill the rail, and since
+       `.chips-container` is a wrapping row flex container whose default
+       `align-items: stretch` matches every chip to its line's cross size, the
+       chips themselves grew into full-height blocks. The free space belongs to
+       the widget's `margin-top: auto`, which is the only thing that wanted it.
+       A non-zero basis still matters below the breakpoint, for the same reason
+       as the panes: a zero basis inside the stacked auto-height column
+       resolves against nothing. */
+    #categories-sidebar { flex: 0 1 auto; overflow-y: auto; min-height: 0; align-content: flex-start; }
     .memories-list-col { width: 280px; flex-shrink: 0; display: flex; flex-direction: column; gap: .5rem; min-width: 0; }
     .memories-list-scroll { flex: 1; overflow-y: auto; }
     .memories-main { flex: 1; min-width: 0; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 1.25rem; overflow-y: auto; }
@@ -377,6 +389,50 @@
        instead of hugging the left edge of a very wide card. */
     .diary-view-content { }
 
+    /* ── Server status: bottom-left of Memories and Diary ── */
+    /* Pinned to the bottom of the *left* rail of each page -- the Memories
+       categories column and the Diary calendar rail. Both rails are already
+       flex columns with `overflow: hidden`, so a `flex: 0 0 auto` child with
+       `margin-top: auto` lands on the bottom edge without introducing a
+       second scroll region inside a rail that already has one. Sizing the
+       widget any other way (a full-width strip under the layout) would push
+       the page past `height: calc(100vh - 140px)` and make the whole tab
+       scroll, which is the one thing the three-pane layout avoids. */
+    .srv-status {
+      flex: 0 0 auto; margin-top: auto; padding: .5rem .6rem;
+      border-top: 1px solid var(--border); font-size: .7rem;
+      color: var(--muted); line-height: 1.35; overflow-wrap: anywhere;
+    }
+    .srv-head { display: flex; align-items: center; gap: .35rem; font-weight: 600; color: var(--text); }
+    .srv-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex: 0 0 auto; }
+    .srv-dot.ok { background: #16a34a; }
+    .srv-dot.warn { background: #d97706; }
+    .srv-dot.down { background: #dc2626; }
+    .srv-model { display: flex; gap: .35rem; align-items: baseline; margin-top: .3rem; }
+    .srv-model .name { font-weight: 600; color: var(--text); }
+    .srv-model .proc { margin-left: auto; font-size: .62rem; white-space: nowrap; }
+    .srv-gpu { color: #16a34a; }
+    .srv-cpu { color: #d97706; }
+    .srv-sub { font-size: .62rem; }
+    .srv-empty { margin-top: .3rem; font-style: italic; }
+    .srv-maint { margin-top: .4rem; padding-top: .35rem; border-top: 1px dashed var(--border); }
+    /* The keep-alive countdown is a client-side timer over an absolute
+       timestamp, not part of the pushed state: the server deliberately keeps
+       it out of the change fingerprint so a quiet vault pushes nothing. */
+    .srv-eta { font-variant-numeric: tabular-nums; }
+    .srv-warn { color: #d97706; }
+
+    /* Setup page: one row per model, resident first (the server sorts it that
+       way, so the order is not restated here and cannot drift). */
+    .model-row { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap;
+                 padding: .45rem .6rem; border: 1px solid var(--border);
+                 border-radius: 6px; margin-bottom: .35rem; font-size: .85rem; }
+    .model-row .mname { font-weight: 600; }
+    .model-row .mtag { font-size: .7rem; color: var(--muted); }
+    .model-row .msize { margin-left: auto; color: var(--muted); font-size: .75rem; }
+    .model-row.resident { border-color: var(--primary); }
+    .model-row .btn { min-height: 0; }
+
     pre { background: #1f2937; color: #f3f4f6; padding: 1rem; border-radius: 8px; overflow-x: auto; font-size: .85rem; }
 
     /* ── Build Graph Mode ── */
@@ -521,8 +577,7 @@
          Left as it is on a phone it is the last thing in a horizontal
          scroller -- present in the DOM, off the right edge of the screen,
          with no scrollbar to advertise that it is there. So the bar wraps
-         and the filter takes a full-width row of its own below the tabs.
-         `order` does the work: it is the last flex child, and the tab
+         and the filter takes a full-width row of its own below the tabs.         `order` does the work: it is the last flex child, and the tab
          buttons are all order 0 by default. */
       .tabs { flex-wrap: wrap; overflow-x: visible; row-gap: .3rem; }
       .cf-bar { order: 99; width: 100%; margin-left: 0; padding-bottom: .1rem; }
@@ -578,6 +633,8 @@
          pane looks fine. The list now lives in its own .diary-list-col
          rather than inside .diary-sidebar, which does not change the trap --
          #diary-dates-list is still the zero-basis scroller inside it. */
+
+
       .diary-main, .memories-main,
       .memories-list-scroll, #diary-dates-list {
         flex: 0 0 auto; overflow-y: visible; min-height: auto;
@@ -655,6 +712,8 @@
     <div class="memories-sidebar" style="padding: .75rem .5rem;">
       <div style="font-size:.7rem; font-weight:700; text-transform:uppercase; letter-spacing:.5px; color:var(--muted); padding:.25rem .5rem .6rem;">Categories</div>
       <div id="categories-sidebar" class="chips-container"></div>
+      <!-- Server status: rendered from the SSE snapshot, never polled. -->
+      <div class="srv-status" data-srv></div>
     </div>
 
     <!-- Col 2: Fact list -->
@@ -742,6 +801,10 @@
         <button class="btn-month" onclick="goToToday()" title="Jump to today">📅</button>
       </div>
       <div class="diary-month-dates" id="diary-month-dates"></div>
+      <!-- Server status, on the same bottom edge as the Memories tab. The
+           calendar grid above it is not a scroller, so this is the only
+           element in the rail that can take the free space. -->
+      <div class="srv-status" data-srv></div>
     </div>
     <div class="diary-list-col">
       <div class="diary-list-head">
@@ -841,13 +904,42 @@
     <div class="setup-grid">
         <div style="flex:1;">
             <label>Standard Connection (HTTP):</label>
-            <pre><code>claude mcp add --transport http memory-vault {{MCP_URL}} --header "Authorization: Basic {{AUTH_BASE64}}"</code></pre>
+            <pre><code id="mcp-connect-cmd">claude mcp add --transport http memory-vault {{MCP_URL}} --header "Authorization: Bearer {{PSK_PREFIX}}&lt;your-access-key&gt;"</code></pre>
         </div>
     </div>
 
-    <div style="margin-top:1.5rem; background: var(--bg); padding: 1rem; border-radius: 8px; border: 1px dashed var(--primary); display: flex; gap: 2rem;">
-        <div><strong>User:</strong> <code>{{AUTH_USER}}</code></div>
-        <div><strong>Pass:</strong> <code>{{AUTH_PASS}}</code></div>
+    <div style="margin-top: 2.5rem; padding-top: 1.5rem; border-top: 1px solid var(--border);">
+      <h3 style="margin-top:0;">🔑 Access Keys</h3>
+      <p style="font-size: 0.9rem; color: var(--muted); margin-bottom: 1rem;">
+        An access key is what an MCP client sends as <code>Authorization: Bearer {{PSK_PREFIX}}…</code>
+        instead of a username and password. Signed in as <code>{{AUTH_USER}}</code>.
+        <strong>A key is shown once, when it is created</strong> — only a hash is stored, so it cannot be
+        displayed again. Create one per device, so a lost laptop is one revoked key rather than a lost vault.
+      </p>
+      <div style="display:flex; gap:.5rem; flex-wrap:wrap; align-items:center;">
+        <input id="psk-label" type="text" placeholder="Label (e.g. laptop, CI)" style="flex:1; min-width:180px;">
+        <select id="psk-expiry">
+          <option value="">Never expires</option>
+          <option value="30">30 days</option>
+          <option value="90">90 days</option>
+          <option value="365">1 year</option>
+        </select>
+        <button id="psk-create-btn" class="btn btn-primary btn-sm" onclick="createPSK()">＋ Create key</button>
+      </div>
+      <div id="psk-status" style="margin-top:.75rem; font-size:.9rem; color:var(--muted);"></div>
+      <div id="psk-new" style="display:none; margin-top:1rem; background: var(--bg); padding: 1rem; border-radius: 8px; border: 1px solid var(--primary);">
+        <div style="font-size:.85rem; color:var(--muted); margin-bottom:.4rem;">
+          Copy this now — it is not shown again. If you lose it, revoke the key and create another.
+        </div>
+        <div style="display:flex; gap:.5rem; align-items:center;">
+          <code id="psk-new-value" style="flex:1; word-break:break-all; user-select:all;"></code>
+          <button class="btn btn-sm" onclick="copyNewPSK()">📋 Copy</button>
+        </div>
+      </div>
+      <div id="psk-list" style="margin-top:1rem; max-height:260px; overflow-y:auto;">
+        <div style="font-size:.9rem; color:var(--muted);">Loading access keys…</div>
+      </div>
+      <div id="session-list" style="margin-top:1rem; font-size:.85rem; color:var(--muted);"></div>
     </div>
 
     <div style="margin-top: 2.5rem; padding-top: 1.5rem; border-top: 1px solid var(--border);">
@@ -858,21 +950,46 @@
 
       <ol style="font-size: 0.9rem; padding-left: 1.5rem; margin-bottom: 1.5rem;">
         <li style="margin-bottom: 0.75rem;">
-          <a href="{{BASE_URL}}/api/download/mcp-bridge.mjs" class="btn btn-primary btn-sm" style="display: inline-block; text-decoration: none; margin-bottom: 0.5rem;">
+          <a href="{{BASE_URL}}/api/download/mcp-bridge.mjs" class="btn btn-primary btn-sm" style="display:inline-block; text-decoration:none; margin-bottom:.5rem;">
             ⬇️ Download mcp-bridge.mjs
           </a><br>
-          <em>The downloaded file is already pre-configured with your secure credentials and server URL.</em>
+          <em>The server URL is already filled in. It reads your access key from the
+          <code>MEM_VAULT_PSK</code> environment variable rather than baking a credential into the
+          file — a downloaded script that carries a live key ends up in backups and
+          screen shares.</em>
         </li>
         <li style="margin-bottom: 0.75rem;">
           <strong>Install dependencies</strong> in the folder where you saved the script:<br>
           <pre style="margin-top: 0.5rem;"><code>npm init -y
 npm install @modelcontextprotocol/sdk</code></pre>
         </li>
+        <li style="margin-bottom: 0.75rem;">
+          <strong>Give the bridge a key</strong> (create one above first):<br>
+          <pre style="margin-top: 0.5rem;"><code>export MEM_VAULT_PSK='{{PSK_PREFIX}}&lt;paste-your-key&gt;'
+# or put it in ~/.claude/mcp-bridge.env and source it from here</code></pre>
+        </li>
         <li>
           <strong>Connect Claude Code</strong> to your local bridge:<br>
           <pre style="margin-top: 0.5rem;"><code>claude mcp add memory-vault-local node mcp-bridge.mjs</code></pre>
         </li>
       </ol>
+    </div>
+
+    <div style="margin-top: 2.5rem; padding-top: 1.5rem; border-top: 1px solid var(--border);">
+      <h3 style="margin-top:0;">🧠 Loaded models</h3>
+      <p style="font-size: 0.9rem; color: var(--muted); margin-bottom: 1rem;">
+        What Ollama currently holds in memory, updated live. On a shared GPU card
+        two resident chat models evict each other, so unloading the one you are not
+        using is the cheapest way to stop paying the cold-load cost.
+        <strong>Unloading is safe</strong> — the next request that needs a model
+        reloads it, which costs 9-20s.
+      </p>
+      <div id="models-meta" style="font-size:.85rem; color:var(--muted); margin-bottom:.5rem;">Waiting for the first status update…</div>
+      <div id="models-table"></div>
+      <div style="display:flex; gap:.5rem; flex-wrap:wrap; align-items:center; margin-top:.75rem;">
+        <button id="models-unload-all-btn" class="btn btn-sm" onclick="unloadAllModels()">♻️ Unload all resident models</button>
+        <span id="models-note" style="font-size:.85rem; color:var(--muted);"></span>
+      </div>
     </div>
 
     <div style="margin-top: 2.5rem; padding-top: 1.5rem; border-top: 1px solid var(--border);">
@@ -1049,6 +1166,10 @@ npm install @modelcontextprotocol/sdk</code></pre>
   let selectedFactId = null;
   let network = null;
   let graphResizeObserver = null;
+  // Monotonic token so a stale /api/graph response cannot render over a newer
+  // one. Two loads in flight (clicking two category chips) both cleared the
+  // container, then both built a network into it.
+  let graphLoadToken = 0;
   /* ── Lazy loading (infinite scroll): render in batches, append on scroll ── */
   const LAZY_BATCH = 50;
   let memVisible = [], memRendered = 0, memObserver = null;
@@ -1126,7 +1247,9 @@ npm install @modelcontextprotocol/sdk</code></pre>
     loadWhoami();
     loadClients();   // populate clientListCache + clientActiveMap for the filter dropdown
     loadSavepoints();  // once on initial load; deduped against switchTab('setup')
+    loadPSKs();  // same deal as loadSavepoints
     initSSE();
+    initStatusStream();
     switchTab(activeTab);
   }
 
@@ -1134,6 +1257,225 @@ npm install @modelcontextprotocol/sdk</code></pre>
     const el = document.getElementById('toast');
     el.textContent = msg; el.classList.add('show');
     setTimeout(() => el.classList.remove('show'), ms);
+  }
+
+  /* ── Server status ──────────────────────────────────────────────────────
+     One snapshot per change, pushed over SSE from a single poller in the
+     server. There is deliberately no refresh interval here: the poller owns
+     the cadence, and it pushes only when the fingerprint in
+     status_monitor.signature() changes. The keep-alive countdown is the one
+     thing the browser ticks itself, because the server keeps that timestamp
+     out of the fingerprint precisely so a quiet vault pushes nothing. */
+  let serverStatus = null;
+  let statusSource = null;
+  let statusFallback = null;
+
+  function fmtBytes(n) {
+    n = Number(n) || 0;
+    if (n <= 0) return '';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let i = 0;
+    while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+    return (i === 0 ? n : n.toFixed(n < 10 ? 1 : 0)) + ' ' + units[i];
+  }
+
+  function fmtEta(expiresAt) {
+    if (!expiresAt) return '';
+    const ms = new Date(expiresAt).getTime() - Date.now();
+    if (!isFinite(ms)) return '';
+    if (ms <= 0) return 'unloads now';
+    const secs = Math.round(ms / 1000);
+    if (secs < 60) return secs + 's';
+    const mins = Math.round(secs / 60);
+    if (mins < 60) return mins + 'm';
+    const hrs = Math.floor(mins / 60);
+    return hrs + 'h ' + (mins % 60) + 'm';
+  }
+
+  function modelTitle(m) {
+    const parts = [m.name];
+    if ((m.roles || []).length) parts.push('roles: ' + m.roles.join(', '));
+    if (m.family) parts.push(m.family);
+    if (m.quantization) parts.push(m.quantization);
+    if (m.resident) {
+      parts.push('resident' + (m.processor ? ' on ' + m.processor : ''));
+      parts.push(m.sizeVram ? fmtBytes(m.sizeVram) + ' of ' + fmtBytes(m.size) + ' in VRAM'
+                             : fmtBytes(m.size) + ' in RAM');
+      if (m.expiresAt) parts.push('unloads ' + fmtEta(m.expiresAt) + ' from now');
+    } else {
+      parts.push(m.installed ? 'installed, not loaded' : 'not installed');
+    }
+    return parts.join(' · ');
+  }
+
+  function statusDotClass(snap) {
+    if (!snap) return '';
+    if (!snap.ok) return 'down';
+    return (snap.warnings && snap.warnings.length) ? 'warn' : 'ok';
+  }
+
+  function statusWidgetHtml(snap) {
+    const dot = statusDotClass(snap);
+    let head;
+    if (!snap) {
+      head = '<div class="srv-head"><span class="srv-dot"></span><span>status…</span></div>';
+    } else if (snap.ok) {
+      const label = (snap.version ? 'Ollama ' + escHtml(snap.version) : 'Ollama')
+        + ' · ' + (snap.residentCount || 0) + ' loaded';
+      head = `<div class="srv-head" title="${escHtml(snap.url || '')}"><span class="srv-dot ${dot}"></span><span>${label}</span></div>`;
+    } else {
+      head = `<div class="srv-head" title="${escHtml(snap.error || '')}"><span class="srv-dot down"></span><span>Ollama down</span></div>`;
+    }
+
+    let body;
+    if (!snap) {
+      body = '';
+    } else if (!snap.ok) {
+      body = `<div class="srv-empty">${escHtml(snap.error || 'no answer')}</div>`;
+    } else if ((snap.warnings || []).length) {
+      body = `<div class="srv-empty srv-warn">${escHtml(snap.warnings[0])}</div>`;
+    } else {
+      const resident = (snap.models || []).filter(m => m.resident);
+      body = resident.length
+        ? resident.map(m => {
+            const gpu = /GPU/.test(m.processor || '');
+            return `<div class="srv-model" title="${escHtml(modelTitle(m))}">` +
+              `<span class="name">${escHtml(m.name)}</span>` +
+              `<span class="proc ${gpu ? 'srv-gpu' : 'srv-cpu'}">${escHtml(m.processor || 'loaded')}</span></div>` +
+              `<div class="srv-sub">${escHtml((m.roles || []).join(' · ') || 'unconfigured')} · ` +
+              `<span class="srv-eta" data-eta="${escHtml(m.expiresAt || '')}">${escHtml(fmtEta(m.expiresAt))}</span></div>`;
+          }).join('')
+        : '<div class="srv-empty">no models loaded</div>';
+    }
+
+    // The maintenance lock is per user and a reclassify holds it for the whole
+    // run, so it is the one thing here that explains a vault that is up but
+    // not answering.
+    const jobs = Object.entries((snap && snap.maintenance) || {});
+    const maint = jobs.length
+      ? `<div class="srv-maint">🔒 ${jobs.map(([u, op]) => `${escHtml(op)} <span class="srv-sub">(${escHtml(u)})</span>`).join(', ')}</div>`
+      : '';
+    return head + body + maint;
+  }
+
+  function renderModelsPanel(snap) {
+    const table = document.getElementById('models-table');
+    const meta = document.getElementById('models-meta');
+    const note = document.getElementById('models-note');
+    if (!table || !meta) return;
+    if (!snap) return;
+
+    if (!snap.ok) {
+      meta.innerHTML = `<span class="srv-warn">Ollama is not answering: ${escHtml(snap.error || 'no answer')}</span>`;
+      table.innerHTML = '';
+      if (note) note.textContent = '';
+      return;
+    }
+    const age = snap.checked ? Math.max(0, Math.round((Date.now() - new Date(snap.checked).getTime()) / 1000)) : null;
+    meta.innerHTML = `Ollama ${escHtml(snap.version || '(version unknown)')} at <code>${escHtml(snap.url || '')}</code> · ` +
+      `${snap.installedCount || 0} installed · ${snap.residentCount || 0} in memory` +
+      (age !== null ? ` · checked ${age}s ago` : '') +
+      ((snap.warnings || []).length ? `<br><span class="srv-warn">${escHtml(snap.warnings.join('; '))}</span>` : '');
+
+    const models = snap.models || [];
+    if (!models.length) {
+      table.innerHTML = '<div class="srv-empty">No models reported by Ollama.</div>';
+    } else {
+      table.innerHTML = models.map(m => {
+        const state = m.resident
+          ? `<span class="mtag srv-gpu">resident${m.processor ? ' · ' + escHtml(m.processor) : ''}</span>` +
+            (m.expiresAt ? ` <span class="mtag">unloads in <span class="srv-eta" data-eta="${escHtml(m.expiresAt)}">${escHtml(fmtEta(m.expiresAt))}</span></span>` : '')
+          : `<span class="mtag">${m.installed ? 'installed, not loaded' : 'not installed'}</span>`;
+        const action = m.resident
+          ? `<button class="btn btn-sm" data-model="${escHtml(m.name)}" onclick="unloadModel(this.dataset.model)">♻️ Unload</button>`
+          : '';
+        return `<div class="model-row ${m.resident ? 'resident' : ''}" title="${escHtml(modelTitle(m))}">` +
+          `<span class="mname">${escHtml(m.name)}</span>` +
+          `<span class="mtag">${escHtml((m.roles || []).join(' · ') || 'unconfigured')}</span>` +
+          state +
+          `<span class="msize">${escHtml(fmtBytes(m.size) || '')}${m.resident && m.sizeVram ? ' · ' + escHtml(fmtBytes(m.sizeVram)) + ' VRAM' : ''}</span>` +
+          action +
+          '</div>';
+      }).join('');
+    }
+    if (note) {
+      const jobs = Object.entries(snap.maintenance || {});
+      note.textContent = jobs.length
+        ? `Maintenance running: ${jobs.map(([u, op]) => op + ' (' + u + ')').join(', ')}`
+        : '';
+    }
+  }
+
+  function renderServerStatus(snap) {
+    serverStatus = snap;
+    // Two widgets, one per page, both filled from the same snapshot. Query by
+    // class rather than by id: a duplicated id would be silently dropped from
+    // the second, and only one of the two pages would ever show a status.
+    document.querySelectorAll('.srv-status').forEach(el => { el.innerHTML = statusWidgetHtml(snap); });
+    renderModelsPanel(snap);
+  }
+
+  // Ticks only the countdowns. Everything else arrives as an event.
+  function updateEtas() {
+    document.querySelectorAll('.srv-eta[data-eta]').forEach(el => {
+      const next = fmtEta(el.getAttribute('data-eta'));
+      if (el.textContent !== next) el.textContent = next;
+    });
+  }
+
+  function initStatusStream() {
+    if (statusSource) return;
+    try {
+      statusSource = new EventSource(`${apiBase}/status/stream`);
+    } catch (e) {
+      console.warn('[status] SSE unavailable, falling back to polling', e);
+      statusSource = null;
+    }
+    if (statusSource) {
+      statusSource.addEventListener('server_status', (e) => {
+        try { renderServerStatus(JSON.parse(e.data)); }
+        catch (err) { console.warn('[status] bad payload', err); }
+      });
+      statusSource.onerror = () => {
+        // EventSource reconnects on its own. Nothing to do but not pretend the
+        // widget is live -- the fallback poll below covers the gap.
+        console.warn('[status] stream interrupted, reconnecting');
+      };
+    }
+    // A plain poll, running only while the stream is not open. EventSource
+    // retries silently, so without this a proxy that keeps dropping the stream
+    // leaves a frozen widget that still looks live.
+    statusFallback = setInterval(() => {
+      if (statusSource && statusSource.readyState === 1) return;
+      api.get('status').then(renderServerStatus).catch(() => {});
+    }, 30000);
+    setInterval(updateEtas, 1000);
+  }
+
+  async function unloadModel(name) {
+    if (!confirm(`Unload ${name} from memory?\n\nThe next request that needs it pays a cold load (9-20s).`)) return;
+    try {
+      const res = await api.post('status/models/unload', { model: name });
+      renderServerStatus(res.status);
+      toast(`♻️ ${name} unloaded`, 3000);
+    } catch (e) { toastApiError(e, `Could not unload ${name}`); }
+  }
+
+  async function unloadAllModels() {
+    const resident = ((serverStatus && serverStatus.models) || []).filter(m => m.resident);
+    if (!resident.length) { toast('Nothing is loaded'); return; }
+    if (!confirm(`Unload ${resident.map(m => m.name).join(', ')}?`)) return;
+    let failed = 0;
+    // Sequential on purpose: each unload is a 200 that the next status push
+    // reflects, and firing them together would race the broadcasts and leave
+    // the widget showing whichever answer landed last.
+    for (const m of resident) {
+      try {
+        const res = await api.post('status/models/unload', { model: m.name });
+        renderServerStatus(res.status);
+      } catch (e) { failed++; console.error('[status] unload failed', m.name, e); }
+    }
+    toast(failed ? `⚠️ ${failed} model(s) could not be unloaded` : '♻️ All models unloaded', failed ? 6000 : 3000);
   }
 
   function initSSE() {
@@ -1291,6 +1633,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     if (tab === 'setup') {
       loadReclassifyStatus();
       loadSavepoints();
+      loadPSKs();
       if (!duplicateClusters.length) renderDuplicateEmptyState();
     }
     saveSessionState();
@@ -1741,6 +2084,161 @@ npm install @modelcontextprotocol/sdk</code></pre>
   //   - polled only while a backup/restore is actually in flight
   // A job that is already running when the page opens is adopted, so its
   // result is still picked up, but an idle vault makes no requests.
+  // ---------------------------------------------------------------------
+  // Access keys (Setup page)
+  //
+  // Loaded the same way as savepoints: once per visit, deduped, forced on
+  // refresh or after a mutation. renderPSKs() is a pure renderer for the same
+  // reason renderBackupStatus() is — a render that refetches its own input is
+  // a request loop.
+  // ---------------------------------------------------------------------
+  const PSK_PREFIX = "{{PSK_PREFIX}}";
+  const MCP_URL = "{{MCP_URL}}";
+  const SESSION_MAX_AGE_DAYS = Math.round(Number("{{SESSION_MAX_AGE_DAYS}}"));
+  let psksLoaded = false;
+  let psksInFlight = null;
+  let psksCache = [];
+
+  function loadPSKs(opts) {
+    const force = !!(opts && opts.force);
+    if (psksInFlight) return psksInFlight;
+    if (psksLoaded && !force) return Promise.resolve();
+    psksInFlight = fetchPSKs().finally(() => { psksInFlight = null; });
+    return psksInFlight;
+  }
+
+  async function fetchPSKs() {
+    const list = document.getElementById('psk-list');
+    try {
+      const data = await api.get('psks');
+      psksLoaded = true;
+      renderPSKs(data.psks || []);
+      renderSessions(data.sessions || []);
+    } catch (e) {
+      psksLoaded = false;
+      if (list) list.innerHTML = `<div style="font-size:.9rem; color:var(--danger);">\u26a0\ufe0f Could not load access keys${e && e.status ? ' (' + e.status + ')' : ''}</div>`;
+    }
+  }
+
+  function fmtWhen(ts) {
+    if (!ts) return 'never';
+    const then = new Date(ts * 1000);
+    if (Number.isNaN(then.getTime())) return 'never';
+    const secs = Math.max(0, Math.floor(Date.now() / 1000 - ts));
+    if (secs < 90) return 'just now';
+    if (secs < 5400) return Math.floor(secs / 60) + ' min ago';
+    if (secs < 172800) return Math.floor(secs / 3600) + ' h ago';
+    return then.toLocaleDateString();
+  }
+
+  function fmtDay(ts) {
+    if (!ts) return '';
+    const then = new Date(ts * 1000);
+    return Number.isNaN(then.getTime()) ? '' : then.toLocaleDateString();
+  }
+
+  function renderPSKs(rows) {
+    const el = document.getElementById('psk-list');
+    if (!el) return;
+    psksCache = rows;
+    if (!rows.length) {
+      el.innerHTML = '<div style="font-size:.9rem; color:var(--muted);">No access keys yet. Create one above, then paste it into the connection command.</div>';
+      return;
+    }
+    el.innerHTML = rows.map(row => {
+      const dead = row.status !== 'active';
+      const label = row.label ? escHtml(row.label) : '<em style="color:var(--muted)">unlabelled</em>';
+      const badge = dead
+        ? '<span style="color:var(--muted)">' + escHtml(row.status) + '</span>'
+        : '<span style="color:var(--success)">active</span>';
+      const expiry = row.expires_at ? ' \u00b7 expires ' + fmtDay(row.expires_at) : '';
+      const action = dead ? '' :
+        '<button class="btn btn-sm" onclick="revokePSK(\'' + escHtml(row.id) + '\')">\ud83d\uddd1\ufe0f Revoke</button>';
+      return '<div style="display:flex; gap:.75rem; align-items:center; padding:.5rem 0; border-bottom:1px solid var(--border);">' +
+          '<div style="flex:1; min-width:0;">' +
+            '<div><strong>' + label + '</strong> <code>' + escHtml(row.prefix) + '\u2026</code> ' + badge + '</div>' +
+            '<div style="font-size:.8rem; color:var(--muted);">created ' + fmtWhen(row.created_at) +
+              ' \u00b7 last used ' + fmtWhen(row.last_used_at) + expiry + '</div>' +
+          '</div>' + action +
+        '</div>';
+    }).join('');
+  }
+
+  function renderSessions(rows) {
+    const el = document.getElementById('session-list');
+    if (!el) return;
+    if (!rows.length) { el.textContent = 'No active browser sessions.'; return; }
+    el.textContent = rows.length + ' active browser session' + (rows.length === 1 ? '' : 's') +
+      '. They survive a server restart and a container rebuild, and end at logout or after ' +
+      SESSION_MAX_AGE_DAYS + ' days.';
+  }
+
+  async function createPSK() {
+    const label = document.getElementById('psk-label');
+    const expiry = document.getElementById('psk-expiry');
+    const btn = document.getElementById('psk-create-btn');
+    const raw = expiry && expiry.value ? Number(expiry.value) : null;
+    try {
+      if (btn) btn.disabled = true;
+      const created = await api.post('psks', { label: label ? label.value : '', expiresInDays: raw });
+      if (label) label.value = '';
+      showNewPSK(created.key);
+      await loadPSKs({ force: true });
+    } catch (e) {
+      toastApiError(e, 'Could not create an access key');
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  // The only moment the plaintext key exists outside the browser, so it gets a
+  // copy button, fills in the connection command, and stays up until the next
+  // create. There is deliberately no way to ask for it again.
+  function showNewPSK(key) {
+    const box = document.getElementById('psk-new');
+    const value = document.getElementById('psk-new-value');
+    const cmd = document.getElementById('mcp-connect-cmd');
+    if (value) value.textContent = key;
+    if (box) box.style.display = 'block';
+    if (cmd) {
+      cmd.textContent = 'claude mcp add --transport http memory-vault ' + MCP_URL +
+        ' --header "Authorization: Bearer ' + key + '"';
+    }
+    toast('\ud83d\udd11 Access key created \u2014 copy it now, it is not shown again', 8000);
+  }
+
+  async function copyNewPSK() {
+    const value = document.getElementById('psk-new-value');
+    if (!value || !value.textContent) return;
+    try {
+      await navigator.clipboard.writeText(value.textContent);
+      toast('\ud83d\udccb Copied');
+    } catch (_) {
+      // The clipboard API needs a secure context, which a plain-HTTP visit to
+      // the vault does not have. Selecting the text works everywhere.
+      const range = document.createRange();
+      range.selectNodeContents(value);
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+      toast('\ud83d\udccb Selected \u2014 press Ctrl+C', 4000);
+    }
+  }
+
+  async function revokePSK(id) {
+    const row = psksCache.find(r => r.id === id);
+    const what = row && row.label ? ' ("' + row.label + '")' : '';
+    if (!confirm('Revoke this access key' + what + '?\n\nAny client using it stops working immediately.')) return;
+    try {
+      await api.delete('psks/' + encodeURIComponent(id));
+      await loadPSKs({ force: true });
+      toast('\ud83d\uddd1\ufe0f Access key revoked');
+    } catch (e) {
+      if (e && e.status === 404) { await loadPSKs({ force: true }); toast('\u26a0\ufe0f That key is already gone'); }
+      else toastApiError(e, 'Could not revoke the access key');
+    }
+  }
+
   let savepointsLoaded = false;
   let savepointsInFlight = null;
   let backupTimer = null;
@@ -3978,8 +4476,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     const tr = document.createElement('tr');
     tr.innerHTML = `<td style="padding:2px 4px;"><input class="de-meta-key" placeholder="new key" style="width:100%; border:1px solid var(--border); border-radius:3px; padding:2px 4px;"></td>
       <td style="padding:2px 4px;"><input class="de-meta-val" placeholder="value" style="width:100%; border:1px solid var(--border); border-radius:3px; padding:2px 4px;"></td>
-      <td style="padding:2px 4px;"><button class="btn btn-danger btn-sm" onclick="removeDiaryMetaRow(this)" name="Delete">🗑️</button></td>`;
-    tbody.appendChild(tr);
+      <td style="padding:2px 4px;"><button class="btn btn-danger btn-sm" onclick="removeDiaryMetaRow(this)" name="Delete">🗑️</button></td>`;    tbody.appendChild(tr);
     tr.querySelector('.de-meta-key').focus();
   }
 
@@ -4471,12 +4968,25 @@ function nodeInCategory(n) {
   return activeGraphCategories.has(n.group);
 }
 
-async function loadGraph() {
-  const container = document.getElementById('graph-container');
-  container.innerHTML = '<p class="empty">Loading graph...</p>';
-  try {
-    const data = await api.get('graph', graphScopeParams());
-    graphLoaded = true;
+  async function loadGraph() {
+    const container = document.getElementById('graph-container');
+    // Tear the previous graph down first, every time. A vis.Network owns its
+    // canvas, its physics loop and its ResizeObserver until destroy() is called,
+    // and the observer reads the *global* `network` — so an observer left behind
+    // by the last load starts refitting this one. Six call sites reach
+    // loadGraph, so a handful of reloads left a handful of observers, each of
+    // which resized the canvas on every resize event; see initNetwork for how
+    // that fed itself.
+    destroyNetwork();
+    const token = ++graphLoadToken;
+    container.innerHTML = '<p class="empty">Loading graph...</p>';
+    try {
+      const data = await api.get('graph', graphScopeParams());
+      // A newer load started while this one was waiting: it owns the container.
+      if (token !== graphLoadToken) return;
+      graphLoaded = true;
+
+
       container.innerHTML = '';
 
       let nodesToKeep = new Set();
@@ -4686,16 +5196,32 @@ async function loadGraph() {
     // vis.js sizes its canvas once, at construction. Below 900px the layout
     // stacks, so the canvas keeps the width it was built at and gets clipped
     // instead of reflowing -- the graph is present but half off-screen.
+    //
+    // Width only, and at most once per distinct width. Reacting to height here
+    // is what grew the canvas without bound: `.graph-main` is a flex item in a
+    // row whose height is `auto`, so `#graph-container`'s height is derived from
+    // the canvas inside it. redraw()/fit() resize that canvas, the container
+    // changes, this observer fires again, and each pass was a little larger than
+    // the last. The stacking case that motivates the observer changes the
+    // *width* as well, so gating on width keeps the fix and drops the loop.
     if (typeof ResizeObserver !== 'undefined') {
+      let lastWidth = container.clientWidth;
       graphResizeObserver = new ResizeObserver(function () {
-        if (!network) return;
+        if (!network || !container.isConnected) return;
+        const width = container.clientWidth;
+        if (width === lastWidth) return;
+        lastWidth = width;
         network.redraw();
         network.fit({ animation: false });
       });
       graphResizeObserver.observe(container);
     } else {
+      let lastWidth = container.clientWidth;
       window.addEventListener('resize', function () {
         if (!network || !container.offsetParent) return;
+        const width = container.clientWidth;
+        if (width === lastWidth) return;
+        lastWidth = width;
         network.redraw();
         network.fit({ animation: false });
       });
@@ -4718,14 +5244,18 @@ async function loadGraph() {
     saveSessionState();
   }
 
+  function destroyNetwork() {
+    // The observer closes over the *global* `network`, not over the instance it
+    // was created for, so a stale observer would happily refit the newest one.
+    // Both halves are load-bearing: an observer alone keeps a detached canvas
+    // being redrawn, and a network alone keeps its physics loop and canvas
+    // listeners alive.
+    if (graphResizeObserver) { graphResizeObserver.disconnect(); graphResizeObserver = null; }
+    if (network) { network.destroy(); network = null; }
+  }
+
   function rebuildNetwork() {
-    if (network) {
-      // The observer captures `network` by closure through the shared global,
-      // but it must be detached or a destroyed canvas keeps being refit.
-      if (graphResizeObserver) { graphResizeObserver.disconnect(); graphResizeObserver = null; }
-      network.destroy();
-      network = null;
-    }
+    destroyNetwork();
 
     if (isBuildMode && buildGraphNodes.size === 0) {
       const container = document.getElementById('graph-container');

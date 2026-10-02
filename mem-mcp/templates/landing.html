@@ -66,14 +66,14 @@
       <div class="step">
         <p><span class="step-num">1</span> <strong>Claude Desktop / Claude Code:</strong></p>
         <p>Run this in your terminal:</p>
-        <pre><code>claude mcp add --transport http memory-vault {{MCP_URL}} --header "Authorization: Basic {{AUTH_BASE64}}"</code></pre>
+        <pre><code>claude mcp add --transport http memory-vault {{MCP_URL}} --header "Authorization: Bearer {{PSK_PREFIX}}&lt;your-access-key&gt;"</code></pre>
       </div>
 
       <div class="step">
-        <p><span class="step-num">2</span> <strong>Active Credentials:</strong></p>
+        <p><span class="step-num">2</span> <strong>Create an access key:</strong></p>
         <div style="background: var(--bg); padding: 1rem; border-radius: 8px; border: 1px dashed var(--primary);">
-          <p style="margin:0;"><strong>User:</strong> <code>{{AUTH_USER}}</code></p>
-          <p style="margin:.5rem 0 0 0;"><strong>Pass:</strong> <code>{{AUTH_PASS}}</code></p>
+          <p style="margin:0;">Signed in as <code>{{AUTH_USER}}</code>. Create a key under
+          <a href="{{BASE_URL}}/gui">Setup &rarr; Access Keys</a> — it is shown once.</p>
         </div>
       </div>
     </div>

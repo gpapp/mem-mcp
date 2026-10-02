@@ -20,6 +20,8 @@ from datetime import datetime
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
 
+import status_monitor
+
 
 def _load_env_file() -> None:
     """Load the repository .env for direct local server launches.
@@ -108,6 +110,8 @@ class _StripAnsiFilter(logging.Filter):
         return True
 
 # Session secret – must be set via environment (e.g., Docker). No fallback.
+import sessions
+
 SESSION_SECRET = os.getenv("MEM_SESSION_SECRET")
 # SESSION_SECRET defined earlier with strict environment check
 if not SESSION_SECRET:
@@ -427,6 +431,103 @@ async def ensure_ollama_models() -> None:
                         raise RuntimeError(f"Ollama failed to pull {model}: {update['error']}")
 
             logger.warning(f"Ollama result: model download complete: {model}")
+
+
+# ---------------------------------------------------------------------------
+# Server status
+#
+# A snapshot of Ollama's residency, for the status widget in the corner of the
+# Memories/Diary pages and the model panel on the Setup page. It is polled on a
+# slow interval and pushed over SSE only when the fingerprint changes, so this
+# is deliberately not on the request path and carries its own short timeout: a
+# status probe must never be the reason a search is slow. The pure half of the
+# snapshot lives in status_monitor.py so it can be tested without httpx.
+# ---------------------------------------------------------------------------
+STATUS_POLL_SECONDS = max(2.0, float(os.getenv("MEM_STATUS_POLL_SECONDS", "10")))
+# Long enough for Ollama to answer on a loaded GPU, short enough that a wedged
+# service shows up as "down" rather than as a widget frozen on the last answer.
+STATUS_HTTP_TIMEOUT = max(1.0, float(os.getenv("MEM_STATUS_HTTP_TIMEOUT", "8")))
+
+
+def configured_model_roles() -> list:
+    """The role -> model map the status widget labels models with."""
+    return status_monitor.model_roles(
+        embedder=EMBED_MODEL,
+        query=LLM_QUERY_MODEL,
+        extract=EXTRACT_MODEL,
+        scope=SCOPE_MODEL,
+        merge=MERGE_MODEL,
+    )
+
+
+async def fetch_ollama_status() -> dict:
+    """One status snapshot. Never raises: a dead service is a snapshot, not an exception.
+
+    A failed endpoint is a *warning*, not an error, so the widget can show the
+    service alive but degraded. Only a total failure sets ``error``, which is
+    the only thing that turns the indicator red — the alternative is a moved
+    route painting the whole service as down.
+    """
+    roles = configured_model_roles()
+    warnings: list = []
+    version = tags = ps = None
+
+    try:
+        async with httpx.AsyncClient(timeout=STATUS_HTTP_TIMEOUT) as client:
+            bodies = {}
+            for label, endpoint in (("version", "/api/version"),
+                                    ("ps", "/api/ps"),
+                                    ("tags", "/api/tags")):
+                response = await client.get(f"{OLLAMA_URL}{endpoint}")
+                if response.status_code != 200:
+                    warnings.append(f"{endpoint} returned HTTP {response.status_code}: "
+                                    f"{_ollama_detail(response)}")
+                    continue
+                try:
+                    bodies[label] = response.json()
+                except Exception:
+                    warnings.append(f"{endpoint} returned a body that is not JSON")
+            version, ps, tags = bodies.get("version"), bodies.get("ps"), bodies.get("tags")
+    except Exception as exc:
+        return status_monitor.build_status(
+            roles=roles, url=OLLAMA_URL, maintenance=active_maintenance(),
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
+    return status_monitor.build_status(
+        roles=roles, url=OLLAMA_URL, version=version, tags=tags, ps=ps,
+        warnings=warnings, maintenance=active_maintenance(),
+    )
+
+
+async def unload_ollama_model(model: str) -> None:
+    """Evict a resident model from VRAM/RAM.
+
+    ``keep_alive: 0`` is Ollama's documented unload, and it is the only
+    supported way to do this: there is no DELETE. A model that is not resident
+    answers 200 and does nothing, which is why the caller validates the name
+    against the live snapshot first — a typo here would otherwise be a silent
+    no-op behind a 200.
+    """
+    body = {"model": model, "keep_alive": 0}
+    logger.warning(f"Ollama request: POST {OLLAMA_URL}/api/generate body={body}")
+    async with httpx.AsyncClient(timeout=STATUS_HTTP_TIMEOUT) as client:
+        try:
+            response = await client.post(f"{OLLAMA_URL}/api/generate", json=body)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not reach Ollama at {OLLAMA_URL} to unload {model}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        if response.status_code != 200:
+            detail = _ollama_detail(response)
+            logger.warning(
+                f"Ollama response: POST /api/generate unload status={response.status_code} body={response.text}"
+            )
+            raise RuntimeError(
+                f"Ollama refused to unload {model} (HTTP {response.status_code}): {detail}"
+            )
+    logger.warning(f"Ollama result: model unloaded: {model}")
 
 
 def clean_extracted_people_names(names: list) -> list[str]:
@@ -802,9 +903,49 @@ async def get_llm_response(prompt: str, system: str = "", model: str = "",
 # User extraction
 # ---------------------------------------------------------------------------
 def extract_user_from_headers(headers: dict) -> str:
+    """Work out which vault a request is for.
+
+    Precedence is the trust order, highest first:
+
+      x-vault-user   stamped by McpAuthGuard *after* it authenticated the
+                     request. VaultSessionMiddleware strips this header from
+                     every inbound request, so a client cannot send its own
+                     value — which is why it is allowed to win outright rather
+                     than being treated as just another hint.
+      Authorization: Bearer   a pre-shared key, resolved against the store.
+      Authorization: Basic    the username only; the password is *not* verified
+                     here. Anything needing proof verifies it first (McpAuthGuard
+                     does, against htpasswd) and stamps x-vault-user.
+      proxy identity headers    Remote-User and friends. These are trusted
+                     because a reverse proxy is expected to set them, and they
+                     are the weakest link in this function: a proxy that
+                     forwards a client-supplied Remote-User hands anyone the
+                     ability to name any user. Nginx overwrites it from
+                     $remote_user; if yours does not, strip it there.
+      "anonymous"   the no-evidence answer.
+
+    Returning "anonymous" rather than rejecting is deliberate for the unverified
+    callers, which is exactly why McpAuthGuard exists: on the MCP path a
+    request that got this far has already been authenticated.
+    """
     h = {k.lower(): v for k, v in headers.items()}
 
+    verified = h.get("x-vault-user", "")
+    if verified:
+        return verified.strip()
+
     auth = h.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        try:
+            token = auth.split(None, 1)[1].strip()
+        except IndexError:
+            token = ""
+        if token:
+            record = sessions.resolve_psk(token)
+            if record:
+                return record["user_id"]
+        return "anonymous"
+
     if auth.lower().startswith("basic "):
         try:
             parts = auth.split()

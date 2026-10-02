@@ -30,6 +30,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 import memory as mem
+import status_monitor
 from backup import list_savepoints, start_backup, start_restore, get_backup_status
 from migrate_client_context import (
     start_reclassify_scope, get_reclassify_status,
@@ -38,14 +39,21 @@ from migrate_client_context import (
 from fastapi import Request, HTTPException, FastAPI
 from fastapi.responses import Response, JSONResponse, HTMLResponse, RedirectResponse
 from pydantic import BaseModel
-from starlette.middleware.sessions import SessionMiddleware
-from memory import SESSION_SECRET, SESSION_MAX_AGE # Import from memory.py
+from memory import SESSION_MAX_AGE # Import from memory.py
+import sessions as vault_sessions
+from sessions import (VaultSession, VaultSessionMiddleware, create_session,
+                      delete_session, load_session, create_psk, list_psks,
+                      revoke_psk, resolve_psk, normalise_label, MAX_EXPIRY_DAYS)
 from matching_utils import (MergeDraftTooLarge, execute_merge,
                              format_people_merge_text, merge_draft_output_budget)
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from sse_starlette.sse import EventSourceResponse
 web_app = FastAPI(title="Memory Vault GUI")
-web_app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET, session_cookie="mem_session", max_age=SESSION_MAX_AGE, same_site="lax", https_only=False)
+# Persistent sessions, not cookie sessions. See sessions.py for why, and for the
+# one thing that changed as a result: `request.session["pass"]` no longer exists
+# and cannot be written, so the Setup page shows a PSK instead of the password.
+web_app.add_middleware(VaultSessionMiddleware, max_age=SESSION_MAX_AGE,
+                       cookie_name=vault_sessions.SESSION_COOKIE)
 
 HTPASSWD_PATH = os.getenv("HTPASSWD_PATH", os.path.join(os.path.dirname(__file__), "htpasswd"))
 
@@ -119,10 +127,16 @@ templates = Environment(
 
 # Helper functions must be defined BEFORE middleware that uses them
 def _check_session_auth(request: Request) -> str | None:
-    """Returns username if authenticated, else None."""
+    """Returns username if authenticated, else None.
+
+    A stored session is now evidence on its own. It used to require both `user`
+    and `pass` to be present, which existed only because the Setup page needed
+    a password to rebuild a Basic header from — a session whose value depends on
+    a credential nobody re-supplies is a session that can be invalidated by
+    anything that touches the password.
+    """
     session_user = request.session.get("user")
-    session_pass = request.session.get("pass")
-    if session_user and session_pass:
+    if session_user:
         return session_user
 
     auth_header = request.headers.get("Authorization")
@@ -1211,8 +1225,13 @@ class LoginRequest(BaseModel):
 @web_app.post("/api/auth/login", response_class=JSONResponse)
 async def api_login(request: Request, body: LoginRequest):
     if _verify_htpasswd(body.username, body.password):
+        # clear() first, so the middleware deletes the old row and mints a new
+        # session id rather than upgrading whatever id was already in the
+        # browser. The password is verified here and then dropped on the floor:
+        # it used to be written to the session so the Setup page could echo it,
+        # and sessions are now persisted to disk.
+        request.session.clear()
         request.session["user"] = body.username
-        request.session["pass"] = body.password
         return {"status": "ok"}
     else:
         raise HTTPException(status_code=401, detail="Invalid credentials")
@@ -1226,6 +1245,71 @@ async def api_logout(request: Request):
 @web_app.get("/api/whoami", response_class=JSONResponse)
 async def api_whoami(request: Request):
     return {"user": _require_user(request)}
+
+
+# ---------------------------------------------------------------------------
+# Access keys (MCP pre-shared keys)
+#
+# A PSK is the credential an MCP client presents as `Authorization: Bearer
+# mvk_…`. It is minted here, shown exactly once, and revocable here — which is
+# the whole reason the app validates it rather than nginx: a key an operator
+# can take away without editing a file on the host is a key that gets taken
+# away when a laptop goes missing.
+#
+# Every handler is scoped to the caller's own userId, in the query itself
+# (revoke_psk) rather than by reading a row and comparing in Python. Do not
+# "simplify" that into a fetch-then-check: it is a fetch-then-check that made
+# ownership a TOCTOU window.
+# ---------------------------------------------------------------------------
+
+class PskCreateRequest(BaseModel):
+    label: str = ""
+    expiresInDays: Optional[int] = None
+
+
+@web_app.get("/api/psks", response_class=JSONResponse)
+async def api_list_psks(request: Request):
+    """The caller's own keys, and how many browsers hold a live session."""
+    user_id = _require_user(request)
+    return {
+        "psks": list_psks(user_id),
+        "sessions": vault_sessions.active_sessions_for_user(user_id),
+    }
+
+
+@web_app.post("/api/psks", response_class=JSONResponse)
+async def api_create_psk(request: Request, body: PskCreateRequest):
+    """Mint a key. The plaintext is in this response and nowhere else, ever.
+
+    A 201 because a key was created and this cannot be repeated: calling this
+    twice does not return the first key, it mints a second one. The UI treats
+    the response as single-use and says so.
+    """
+    user_id = _require_user(request)
+    try:
+        created = create_psk(user_id, label=body.label, expires_in_days=body.expiresInDays)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    # The id, the owner and the key; never the digest, and never the plaintext
+    # again. An admin action is worth an INFO line — it is not a failure.
+    logging.getLogger("memory-vault").info(
+        f"psk created: id={created['id'][:8]} user={user_id} label={created['label']!r}"
+    )
+    return created
+
+
+@web_app.delete("/api/psks/{psk_id}", response_class=JSONResponse)
+async def api_revoke_psk(psk_id: str, request: Request):
+    """Revoke a key immediately. 404 for unknown, not yours, or already revoked."""
+    user_id = _require_user(request)
+    if not revoke_psk(psk_id, user_id):
+        # One answer for all three, so the endpoint cannot be walked to discover
+        # which key ids exist.
+        raise HTTPException(status_code=404, detail="No such access key")
+    logging.getLogger("memory-vault").info(
+        f"psk revoked: id={psk_id[:8]} user={user_id}"
+    )
+    return {"ok": True, "id": psk_id}
 
 
 @web_app.get("/api/events")
@@ -1261,29 +1345,233 @@ async def sse_events(request: Request):
 
     return EventSourceResponse(event_generator())
 
+
+# ---------------------------------------------------------------------------
+# Server status (Ollama residency)
+#
+# The status widget in the corner of the Memories and Diary pages, and the
+# model panel on the Setup page, read from one snapshot taken by one poller for
+# the whole process. A browser tab does not poll Ollama; it subscribes to
+# `/api/status/stream` and the process pushes a snapshot when the fingerprint
+# in status_monitor.signature() changes. That is why there is no refresh
+# interval in the browser: the countdown on a keep-alive is the client's own
+# timer, and everything else arrives as an event.
+# ---------------------------------------------------------------------------
+
+class ModelUnload(BaseModel):
+    model: str
+
+
+async def _status_snapshot() -> dict:
+    """The current snapshot, fetching once if the poller has not run yet.
+
+    The poller normally has one before the first request arrives, so this is
+    the startup-race path rather than the steady state — an MCP-only process
+    with the GUI mounted still gets a real answer instead of None.
+
+    Note the two steps: ``publish()`` answers *whether it changed*, not what
+    the snapshot is, so assigning its return value here would hand every
+    caller a bool. Read the stored snapshot back instead.
+    """
+    snapshot = status_monitor.last_snapshot()
+    if snapshot is None:
+        await status_monitor.publish(await mem.fetch_ollama_status())
+        snapshot = status_monitor.last_snapshot()
+    return snapshot
+
+
+@web_app.get("/api/status", response_class=JSONResponse)
+async def api_status(request: Request):
+    _require_user(request)
+    return await _status_snapshot()
+
+
+@web_app.get("/api/status/stream")
+async def api_status_stream(request: Request):
+    _require_user(request)
+    queue = status_monitor.subscribe()
+
+    async def event_generator():
+        try:
+            # Send the current state immediately, so the widget is populated on
+            # first paint rather than after the next poll. If the poller has
+            # not run yet this also seeds the store.
+            yield {"event": "server_status", "data": json.dumps(await _status_snapshot())}
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    snapshot = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    yield {"event": "server_status", "data": json.dumps(snapshot)}
+                except asyncio.TimeoutError:
+                    # Comment frame, not an event: a proxy in front of this
+                    # closes an idle stream, and an idle stream is the normal
+                    # case for a status widget that has nothing to report.
+                    yield {"event": "ping", "data": "{}"}
+                except Exception as e:
+                    logging.getLogger("memory-vault").error(f"Error in status SSE generator: {e}")
+                    await asyncio.sleep(1)
+        finally:
+            status_monitor.unsubscribe(queue)
+
+    return EventSourceResponse(event_generator())
+
+
+@web_app.post("/api/status/models/unload", response_class=JSONResponse)
+async def api_unload_model(request: Request, body: ModelUnload):
+    _require_user(request)
+    model = (body.model or "").strip()
+    if not model:
+        raise HTTPException(status_code=400, detail="A model name is required.")
+
+    # Validate against the live snapshot instead of trusting the request. An
+    # unload of a model Ollama has not loaded answers 200 and does nothing, so
+    # a typo would otherwise be an operation that reports success and changes
+    # nothing — the same class of silent no-op the client-list format bug was.
+    snapshot = await _status_snapshot()
+    known = [m["name"] for m in snapshot.get("models", [])]
+    if model not in known:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown model '{model}'. Loaded models: {', '.join(known) or 'none'}",
+        )
+
+    try:
+        await mem.unload_ollama_model(model)
+    except RuntimeError as exc:
+        raise _service_unavailable(exc)
+
+    # Re-probe and broadcast rather than patching the snapshot in place: what
+    # actually left VRAM is Ollama's answer, not our assumption about it.
+    refreshed = await status_monitor.publish(await mem.fetch_ollama_status())
+    return {"ok": True, "changed": refreshed, "status": status_monitor.last_snapshot()}
+
+
+# ---------------------------------------------------------------------------
+# MCP authentication
+# ---------------------------------------------------------------------------
+
+class McpAuthGuard:
+    """Authenticates a request to the MCP app and records who it belongs to.
+
+    Three credentials are accepted, in this order:
+
+      1. a live session cookie   the dashboard and the downloaded bridge script
+      2. `Authorization: Basic`  verified against the app's htpasswd, which is
+                                 what existing MCP clients already send
+      3. `Authorization: Bearer mvk_…`  a pre-shared key from Access Keys
+
+    Basic is verified here rather than trusted as a username because nginx no
+    longer authenticates /mcp: dropping `auth_basic` there is what lets a PSK
+    reach the app at all, and the cost of that is that the app must now do the
+    check nginx used to do. Existing clients are unaffected — they send the
+    same header and it verifies against the same htpasswd.
+
+    On success the verified user is stamped into the scope as X-Vault-User,
+    which VaultSessionMiddleware has already stripped from the request, so
+    downstream code reads an identity nobody could have sent itself. Anything
+    else is a 401: no PSK, no cookie and no valid Basic previously meant the
+    tools ran as the user "anonymous" and returned somebody else's (empty)
+    vault rather than an error, which reads like a successful empty search.
+    """
+
+    def __init__(self, app, verify_basic=None):
+        self.app = app
+        self.verify_basic = verify_basic or _verify_htpasswd
+
+    @staticmethod
+    def _unauthenticated(reason: str) -> bytes:
+        import json as _json
+        return _json.dumps({"error": "unauthorized", "detail": reason}).encode()
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        headers = [(k.lower(), v) for k, v in scope["headers"]]
+        user = None
+
+        # 1. Session cookie — already resolved by VaultSessionMiddleware.
+        session = scope.get("session")
+        if session is not None and session.get("user"):
+            user = session["user"]
+
+        authorization = ""
+        for key, value in headers:
+            if key == b"authorization":
+                authorization = value.decode("latin-1", "replace")
+                break
+
+        if user is None and authorization.lower().startswith("basic "):
+            try:
+                decoded = base64.b64decode(authorization.split(None, 1)[1]).decode("utf-8")
+                name, _, secret = decoded.partition(":")
+                if name and self.verify_basic(name, secret):
+                    user = name
+            except Exception:
+                user = None
+
+        if user is None and authorization.lower().startswith("bearer "):
+            # split, not [1] on a fixed index: a bare "Authorization: Bearer"
+            # with no token raised IndexError and turned a bad request into a
+            # 500, which tells the client nothing and reads as a server fault.
+            parts = authorization.split(None, 1)
+            if len(parts) == 2:
+                record = resolve_psk(parts[1].strip())
+                if record:
+                    user = record["user_id"]
+
+        if user is None:
+            logging.getLogger("memory-vault").warning(
+                "mcp: unauthenticated request to %s (authorization=%s)",
+                scope.get("path"), "yes" if authorization else "no",
+            )
+            body = self._unauthenticated(
+                "MCP needs a session cookie, Basic auth, or an access key "
+                "(Authorization: Bearer mvk_…). Create one in Setup → Access Keys."
+            )
+            await send({"type": "http.response.start", "status": 401, "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode()),
+                (b"www-authenticate", b'Basic realm="Architectural Tool Vault"'),
+            ]})
+            await send({"type": "http.response.body", "body": body})
+            return
+
+        scope["headers"] = [(k, v) for k, v in scope["headers"]
+                            if k.lower() != vault_sessions.VAULT_USER_HEADER]
+        scope["headers"].append((vault_sessions.VAULT_USER_HEADER, user.encode("utf-8")))
+        await self.app(scope, receive, send)
+
 # ---------------------------------------------------------------------------
 # HTML Routes
 # ---------------------------------------------------------------------------
 
 def _get_auth_context(request: Request):
-    # Try session auth first, then Basic Auth header
-    auth_user, auth_pass, auth_b64 = "unknown", "********", ""
+    """What the landing page, the Setup page and the bridge script need to render.
 
-    session_user = request.session.get("user")
-    session_pass = request.session.get("pass")
-    if session_user and session_pass:
-        auth_user, auth_pass = session_user, session_pass
-        auth_b64 = base64.b64encode(f"{auth_user}:{auth_pass}".encode()).decode()
-    else:
-        auth_header = request.headers.get("Authorization")
-        if auth_header and auth_header.startswith("Basic "):
-            try:
-                encoded = auth_header.split(" ")[1]
-                auth_b64 = encoded
-                decoded = base64.b64decode(encoded).decode("utf-8")
-                if ":" in decoded:
-                    auth_user, auth_pass = decoded.split(":", 1)
-            except Exception: pass
+    There is no password in here any more. It used to be reconstructed from the
+    session purely so the pages could print it and rebuild a Basic header from
+    it — which put a live credential into the HTML of every page load, into
+    localStorage-friendly copy-paste, and (before this change) into a cookie
+    and then onto disk. A PSK is created once in Access Keys and is shown once;
+    nothing here can retrieve it afterwards, by design.
+    """
+    auth_user = request.session.get("user")
+    auth_b64 = ""
+    auth_header = request.headers.get("Authorization")
+    if not auth_user and auth_header and auth_header.startswith("Basic "):
+        # Keep working for a browser that arrived with a Basic header instead of
+        # the login form; the header itself is passed through, not decoded.
+        try:
+            decoded = base64.b64decode(auth_header.split(" ")[1]).decode("utf-8")
+            if ":" in decoded:
+                auth_user = decoded.split(":", 1)[0]
+        except Exception:
+            pass
+    if not auth_user:
+        auth_user = "unknown"
 
     # Intelligently calculate MCP_URL
     # If BASE_URL is https://hass.securemail.hu/mcp, we want the mcp_url to be https://hass.securemail.hu/mcp/mcp
@@ -1291,9 +1579,9 @@ def _get_auth_context(request: Request):
 
     return {
         "AUTH_USER": auth_user,
-        "AUTH_PASS": auth_pass,
-        "AUTH_BASE64": auth_b64,
-        "MCP_URL": mcp_url
+        "AUTH_B64": auth_b64,
+        "PSK_PREFIX": vault_sessions.PSK_PREFIX,
+        "MCP_URL": mcp_url,
     }
 
 
@@ -1340,5 +1628,8 @@ async def get_gui(request: Request):
     # One source of truth for the cluster cap: the input's max attribute, the
     # client-side validation and the server-side 400 must not disagree.
     ctx["MERGE_MAX_CLUSTER"] = MERGE_MAX_CLUSTER
+    # Shown next to the session count so the number the UI promises and the one
+    # the store enforces come from the same place.
+    ctx["SESSION_MAX_AGE_DAYS"] = SESSION_MAX_AGE // 86400
     html = _render("dashboard", **ctx)
     return HTMLResponse(content=html)

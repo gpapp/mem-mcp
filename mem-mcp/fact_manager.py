@@ -1516,7 +1516,19 @@ def db_find_patterns(user_id: str) -> list:
 
 
 def db_list_memories(user_id: str) -> list:
-    """Return all facts for a user from Neo4j with metadata and links."""
+    """Return all facts for a user from Neo4j with metadata and links.
+
+    **One row per fact.** The client assigns this list straight into
+    `memories`, so a repeated row is a repeated card. `RELEVANT_TO` is
+    many-valued by design (it is how a record is cross-referenced to a second
+    client), so an uncollected fan-out there returned the fact once per
+    cross-reference -- `collect(DISTINCT ...)` in the RETURN does not merge
+    rows, it only deduplicates within one. Each pattern therefore gets its own
+    aggregating `WITH` before the next, and the trailing one too: a fact with
+    two cross-references is two rows just as surely as one with two links of
+    any other type. Same defect and same fix as `db_list_diary`; see
+    `test_cypher_safety.OneRowPerRecordTests`.
+    """
     neo4j_driver = get_neo4j()
     if not neo4j_driver:
         raise RuntimeError("Neo4j not connected.")
@@ -1525,13 +1537,19 @@ def db_list_memories(user_id: str) -> list:
         result = s.run(
             """
             MATCH (c:Category)<-[:IN_CATEGORY]-(f:Fact {userId: $userId})
+            WITH f, head(collect(c.name)) as category
             OPTIONAL MATCH (f)-[:FOR_CLIENT]->(cl:Client)
+            WITH f, category,
+                 head(collect(cl.id)) as clientId, head(collect(cl.name)) as clientName
             OPTIONAL MATCH (f)-[:IN_CONTEXT]->(ctx:Context)
+            WITH f, category, clientId, clientName,
+                 head(collect(ctx.id)) as contextId, head(collect(ctx.name)) as contextName
             OPTIONAL MATCH (f)-[:RELEVANT_TO]->(rc)
-            RETURN f, c.name as category, cl.name as clientName, cl.id as clientId,
-                   ctx.name as contextName, ctx.id as contextId,
-                   collect(DISTINCT {id: rc.id, name: rc.name,
-                                     kind: CASE WHEN rc:Context THEN 'context' ELSE 'client' END}) as relevantClients,
+            WITH f, category, clientName, clientId, contextName, contextId,
+                 collect(DISTINCT {id: rc.id, name: rc.name,
+                                   kind: CASE WHEN rc:Context THEN 'context' ELSE 'client' END}) as relevantClients
+            RETURN f, category, clientName, clientId, contextName, contextId,
+                   relevantClients,
                    [(f)-[r]-(other {userId: $userId})
                     WHERE (other:Fact OR other:DiaryEntry)
                       AND type(r) <> 'IN_CATEGORY' AND type(r) <> 'KNOWS'

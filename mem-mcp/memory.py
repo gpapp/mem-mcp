@@ -11,8 +11,11 @@ from common import (
     HTTP_TIMEOUT, BASE_URL, COLLECTION_NAME, DIARY_COLLECTION,
     SESSION_SECRET, SESSION_MAX_AGE, db_subscribers,
     publish_db_event, get_qdrant, get_neo4j, wait_for_service, ensure_ollama_models,
-    get_embedding, get_llm_response, extract_user_from_headers, logger
+    get_embedding, get_llm_response, extract_user_from_headers, logger,
+    STATUS_POLL_SECONDS, configured_model_roles, fetch_ollama_status, unload_ollama_model
 )
+
+import status_monitor
 
 from fact_manager import (
     extract_people_metadata, db_add_memory, db_update_memory, db_delete_memory,

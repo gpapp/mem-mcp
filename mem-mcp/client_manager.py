@@ -118,7 +118,17 @@ async def db_create_context(name: str, client_id: str, user_id: str) -> str:
 
 
 def db_list_clients(user_id: str) -> list:
-    """Return all Client nodes with their Contexts for a user."""
+    """Return all Client nodes with their Contexts for a user.
+
+    **One row per client.** `HAS_CONTEXT` is many-valued by definition — a
+    client has several projects — so collecting the contexts in the `RETURN`
+    deduplicated them *within* each row without merging the rows, and a client
+    with two projects came back twice with the same complete list attached.
+    The client list is pushed one-per into `clientListCache`, so it drew two
+    identical cards and the client filter offered the name twice. The collect
+    belongs in a `WITH` before the `RETURN`; see
+    `test_cypher_safety.OneRowPerRecordTests`.
+    """
     neo4j_driver = get_neo4j()
     if not neo4j_driver:
         raise RuntimeError("Neo4j not connected.")
@@ -128,10 +138,11 @@ def db_list_clients(user_id: str) -> list:
             """
             MATCH (c:Client {userId: $userId})
             OPTIONAL MATCH (c)-[:HAS_CONTEXT]->(ctx:Context)
-            RETURN c, collect(ctx) as contexts
+            WITH c, collect(ctx) as contexts
+            RETURN c, contexts
             ORDER BY c.name ASC
             """,
-            userId=user_id
+            userId=user_id,
         )
         clients = []
         for r in result:

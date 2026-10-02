@@ -1019,6 +1019,417 @@ class DedupUnderSetupTests(unittest.TestCase):
         )
 
 
+# The queries whose rows are pushed one-per into a client array and rendered.
+# Derived from the blast radius, not from taste: a repeated row in any of these
+# is a repeated card. `db_list_clients` is here because a report of "the client
+# is showing up twice" was answered by the same fan-out as the diary list, which
+# is the cost of scoping this to two functions on the first attempt -- the
+# analyzer had already flagged the query and the scope was narrowed anyway.
+_RENDERED_LIST_QUERIES = (
+    ("diary_manager.py", "db_list_diary"),
+    ("fact_manager.py", "db_list_memories"),
+    ("client_manager.py", "db_list_clients"),
+)
+
+
+def _function_queries(path, function_name):
+    """Every Cypher string literal inside one function, docstrings excluded.
+
+    A docstring is prose that quotes the query's own vocabulary, so including it
+    would make the structural checks read the explanation of the fix as another
+    copy of the thing being fixed — which is the `assertIn`-over-a-whole-file
+    lesson in a new place.
+    """
+    with open(path, "r", encoding="utf-8") as handle:
+        source = handle.read()
+    tree = ast.parse(source)
+    docstrings = _docstring_nodes(tree)
+    func = next(n for n in ast.walk(tree)
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and n.name == function_name)
+    for node in ast.walk(func):
+        if (isinstance(node, ast.Constant) and isinstance(node.value, str)
+                and id(node) not in docstrings and _CYPHER_RE.search(node.value)):
+            yield node.value
+
+
+def _row_reads(func):
+    """The string keys read off a *result row*, not off a node.
+
+    Two distinctions matter and an earlier version of this got both wrong:
+
+    * it collected every `x["key"]` in the function, which included
+      `f_node["timestamp"]` — a property of the `Fact` node the row carries, not
+      a column of the row. Requiring `timestamp` to appear in the query then
+      failed a correct query, which is the failure mode that makes a lint get
+      switched off.
+    * the loop variable is identified by iterating **the driver result**, so
+      only a `for`/comprehension over a plain Name counts. `db_list_clients`
+      walks `r["contexts"]` in an inner comprehension, and treating `ctx` as a
+      row made `id`, `name` and `active` look like dropped columns of the query.
+    """
+    targets = set()
+    for node in ast.walk(func):
+        if isinstance(node, ast.For) and isinstance(node.target, ast.Name):
+            if isinstance(node.iter, ast.Name):
+                targets.add(node.target.id)
+        elif isinstance(node, ast.comprehension) and isinstance(node.target, ast.Name):
+            if isinstance(node.iter, ast.Name):
+                targets.add(node.target.id)
+
+    reads = set()
+    for node in ast.walk(func):
+        base = None
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
+            base = node.value.id
+            key = node.slice
+        elif (isinstance(node, ast.Call) and node.args
+              and isinstance(node.func, ast.Attribute)
+              and node.func.attr in ("get", "getOrDefault")
+              and isinstance(node.func.value, ast.Name)):
+            base = node.func.value.id
+            key = node.args[0]
+        if base in targets and isinstance(key, ast.Constant) and isinstance(key.value, str):
+            reads.add(key.value)
+    return reads
+
+
+class OneRowPerRecordTests(unittest.TestCase):
+    """Chained `OPTIONAL MATCH`es return a cross product, not a record list.
+
+    A `MATCH`/`OPTIONAL MATCH` on a *relationship* pattern multiplies the rows
+    it produces. Two such patterns in the same clause chain therefore return
+    their product, so a record with five MENTIONS and one RELEVANT_TO comes
+    back five times, each row carrying the same `d.id` and the same date.
+    `collect(DISTINCT ...)` in the RETURN does not repair it: it deduplicates
+    *within* a row, it does not merge rows.
+
+    This shipped. `db_list_diary` chained four of them, so the diary list the
+    client renders held the same entry once per combination — and only for
+    entries written since auto-linking existed, which is why it read as "the
+    new ones are duplicated" rather than as a data problem.
+
+    The fix is structural: every expanding pattern is followed by its own
+    aggregating `WITH` before the next one, so the query is back to one row per
+    record. The check below derives that property from the clause structure
+    rather than searching for a needle, so a query written later is covered by
+    the same rule and a fix cannot be faked by rewording a comment.
+
+    Single-valued patterns are exempt (`(d)-[:IN_CONTEXT]->(ctx:Context)` where
+    an entry is linked to at most one project) but are *also* folded with
+    `head(collect(...))` in the fixed query, because "at most one" is a
+    property of the writers, not of the schema: a second edge would double the
+    rows again. An `OPTIONAL MATCH` that matches nothing still yields one row
+    with a null, so `head` is safe and never drops the record.
+
+    **A lint that demands a rewrite of correct code is worse than no lint**, so
+    this models all three ways a fan-out is legitimately collapsed, not just
+    the one the fix happened to use:
+
+    * an aggregating `WITH` between the patterns;
+    * `RETURN DISTINCT`, which collapses whole rows;
+    * a final `RETURN` that collects **every** variable the expanding patterns
+      introduced. `fact_manager`'s merge query chains two expansions and then
+      collects both, which is correct — collecting the full out/in sets with
+      DISTINCT and returning them together is the right way to write it, and
+      rewriting it "to satisfy" this lint would be damage.
+
+    It also skips queries whose caller is not asking for a record list, which
+    is the third thing that made a blanket rule unusable: the graph query that
+    returns `(ctx, n, c)` triples is a join, and its rows are meant to repeat.
+    Those are covered by a separate, narrower assertion rather than by
+    pretending the fan-out does not exist.
+    """
+
+    # A clause that can multiply rows: a relationship pattern, or a bare node
+    # pattern (kept, because a second node pattern is equally a second row).
+    # OPTIONAL is part of the keyword so the two are not split apart.
+    _CLAUSE = re.compile(
+        r"\b(OPTIONAL\s+MATCH|MATCH|WITH|RETURN|UNWIND|MERGE|CREATE)\b", re.I)
+    _AGGREGATE = re.compile(
+        r"\b(collect|head|size|count|sum|avg|min|max|stdev|percentileCont|"
+        r"percentileDisc|collectDistinct)\s*\(", re.I)
+    # One relationship edge per node, per the writers' discipline: a record has
+    # one category, one client and one project, and every setter replaces the
+    # edge rather than adding to it. These cannot fan out a row, so a query that
+    # only chains them is safe *and does not need rewriting* — flagging those
+    # would be demanding churn on correct code, which is how a lint starts being
+    # ignored.
+    _SINGLE_VALUED_TYPES = frozenset({
+        "IN_CATEGORY", "FOR_CLIENT", "IN_CONTEXT", "HAS_CONTEXT", "PART_OF",
+    })
+    # The node a relationship pattern binds, e.g. `-[:MENTIONS]->(f:Fact)`.
+    _BINDS = re.compile(r"(<-\[[^\]]*\]-|\)-\[[^\]]*\]->|->\[[^\]]*\]-)\s*\(\s*(\w+)\s*[:)]")
+
+    def _clauses(self, query):
+        """The read half of a query, as a list of (keyword, body) clauses.
+
+        Split on clause keywords so each MATCH's *pattern* can be judged on its
+        own: a WHERE or a RETURN that follows belongs to the next clause, and
+        treating them as part of the pattern is how a lint starts reading
+        English as Cypher.
+        """
+        head = re.split(r"\b(?:MERGE|CREATE)\b", query, maxsplit=1, flags=re.I)[0]
+        if not re.search(r"\bRETURN\b", head, re.I):
+            return []
+        parts = self._CLAUSE.split(head)
+        out = []
+        for i in range(1, len(parts) - 1, 2):
+            out.append((parts[i].upper(), parts[i + 1]))
+        return out
+
+    def _expands(self, body):
+        """Does this pattern bind a *many-valued* thing?
+
+        Four things count, and the distinctions matter:
+
+        * a relationship whose type is not in `_SINGLE_VALUED_TYPES` —
+          MENTIONS, RELEVANT_TO, and anything added later;
+        * an **anonymous** relationship (`-[r]->`, `-[]->`), because an unknown
+          type is not evidence of a single edge;
+        * a bare node pattern with **no** property map (`MATCH (c:Category)`),
+          which is a join by definition.
+
+        Two things that look like the above are not, and each one produced a
+        green test that was green for the wrong reason:
+
+        * the **tail node of a relationship pattern**. `(d)-[:FOR_CLIENT]->(cl)`
+          matches "a node with a label and no property map", so counting it made
+          every scoped query look like a fan-out — and then `withs == patterns`
+          happened to hold anyway, because the extra counts cancelled out.
+          Relationship patterns are stripped before the node check.
+        * a node pattern **with** a property map is a lookup, not a join:
+          `MATCH (d:DiaryEntry {id: $did, userId: $userId})` addresses one node
+          and cannot fan out, and treating it as expandable flags every query
+          that starts with the record it is about.
+        """
+        arrows = r"<-\[[^\]]*\]-|\)-\[[^\]]*\]->|->\[[^\]]*\]-|--|<-"
+        for types in re.findall(arrows, body):
+            spec = types
+            named = re.findall(r":\s*(\w+)", spec)
+            if not named or not set(named) <= self._SINGLE_VALUED_TYPES:
+                return True
+        # A relationship is a relationship even when it is written without a
+        # type (`-[]->`), so strip the whole construct before hunting for a
+        # standalone node pattern.
+        rest = re.sub(arrows, " ", body)
+        for node in re.findall(r"\(\s*\w+\s*:[^()]*\)", rest):
+            if "{" not in node:
+                return True
+        return False
+
+    @staticmethod
+    def _bound_variables(body):
+        """Variables introduced by a fan-out: the *other* end of the edge.
+
+        The record itself is not one of them — it is what the query is
+        projecting, and it is the thing being repeated.
+        """
+        found = set()
+        for types, name in OneRowPerRecordTests._BINDS.findall(body):
+            spec = types
+            named = re.findall(r":\s*(\w+)", spec)
+            if not named or not set(named) <= OneRowPerRecordTests._SINGLE_VALUED_TYPES:
+                found.add(name)
+        return found
+
+    @staticmethod
+    def _record_projection(return_body, record_vars):
+        """Does the RETURN hand back the record itself, rather than only aggregates?
+
+        This is the distinction that separates a real defect from a correct
+        query that happens to chain two patterns. The merge query collects the
+        full out/in relationship sets and projects no node, so every one of its
+        repeated rows carries the *complete* answer and reading one is correct.
+        `db_list_memories` collects the same way but also returns `f`, so each
+        repeated row is another copy of the fact and the caller pushes all of
+        them. A collect in the RETURN collapses values *within* a row; it never
+        merges rows, and it only makes the repetition harmless when there is no
+        record identity left to repeat.
+
+        Function calls are blanked first, so `rc.id` inside `collect(...)` is
+        not mistaken for a projected variable.
+        """
+        body = return_body
+        # Strip innermost calls repeatedly: collect(...), head(collect(...)),
+        # coalesce(other.text, other.content) -- all aggregates, not projections.
+        previous = None
+        while previous != body:
+            previous = body
+            body = re.sub(r"\w+\s*\([^()]*\)", " ", body)
+        return sorted(v for v in record_vars if re.search(rf"\b{re.escape(v)}\b", body))
+
+    def _unaggregated_expansions(self, query):
+        """Fan-outs that are never collapsed, in a query that returns records.
+
+        Returns a list of human-readable offenders, empty when the query is
+        sound. A fan-out is collapsed by an aggregating `WITH` after it, or by
+        `RETURN DISTINCT` (which deduplicates whole rows). Either way the
+        repetition is only *harmless* when the query projects no record
+        identity, because a collect collapses values within a row and never
+        merges rows — see `_record_projection`.
+
+        Note that a **single** uncollapsed fan-out is already a defect, not
+        only a chain of two. An entry with two `RELEVANT_TO` links and one
+        `OPTIONAL MATCH` for them is returned twice. Chaining is the worse case
+        because the multiplier is the product, but the rule is the same and
+        the first fix for `db_list_diary` got this wrong: it added an
+        aggregating `WITH` after each pattern *except the last*, which turned a
+        mentions×relevant product into a single relevant multiplier and still
+        duplicated every cross-referenced entry.
+        """
+        clauses = self._clauses(query)
+        if not clauses:
+            return []
+        record_vars = set()
+        uncleared = []
+        returns = []
+        for keyword, body in clauses:
+            if not record_vars and keyword in ("MATCH", "OPTIONAL MATCH"):
+                # The first clause says what the query is *about*; everything
+                # after it is enrichment. These are the variables a caller
+                # would receive one-per, so a repeat is a repeat of the record.
+                record_vars = set(re.findall(r"\(\s*(\w+)\s*[:)]", body))
+                record_vars |= self._bound_variables(body)
+            if keyword == "WITH":
+                if self._AGGREGATE.search(body):
+                    uncleared = []
+                continue
+            if keyword in ("MATCH", "OPTIONAL MATCH"):
+                if self._expands(body):
+                    uncleared.append(" ".join(body.split())[:60])
+                continue
+            if keyword == "RETURN":
+                returns.append(body)
+                if re.match(r"\s*DISTINCT\b", body, re.I):
+                    return []          # whole rows are deduplicated
+        if not uncleared:
+            return []
+        projected = sorted({v for body in returns
+                            for v in self._record_projection(body, record_vars)})
+        if not projected:
+            return []                  # aggregates only: the repeats are harmless
+        return [f"{o}  (projecting {', '.join(projected)})" for o in uncleared]
+
+    def test_the_list_queries_are_one_row_per_record(self):
+        """Scoped to the queries whose rows become a rendered list.
+
+        `_RENDERED_LIST_QUERIES` is the whole blast radius of this defect, and
+        it is what made the defect visible at all: a repeated row in any of them
+        is a repeated card. An earlier version of this test scoped it to two
+        functions and left `db_list_clients` out on the grounds that only the
+        diary and fact lists were reachable — and then a report of "the Deutsche
+        Bank client is showing up twice" turned out to be this same fan-out, on
+        `HAS_CONTEXT`. The analyzer had already flagged that query and the scope
+        was narrowed anyway.
+
+        It is *not* applied to the other ~30 chained-pattern queries, and the
+        reason is worth stating rather than leaving as an omission: none of them
+        is reachable as a rendered list, and no Cypher can be executed here to
+        check a rewrite. Rewriting thirty unrunnable queries to satisfy a lint is
+        how the `FOREACH` bug in this file's docstring happened in the first
+        place. When one of those does become a record list, add it here.
+        """
+        for module, function in _RENDERED_LIST_QUERIES:
+            with self.subTest(function=function):
+                for query in _function_queries(os.path.join(HERE, module), function):
+                    with self.subTest(query=" ".join(query.split())[:40]):
+                        self.assertEqual(
+                            self._unaggregated_expansions(query), [],
+                            f"{module}:{function} returns one row per "
+                            f"relationship combination, and the client renders "
+                            f"every row as a separate card",
+                        )
+
+    def test_no_with_between_two_patterns_fails_to_aggregate(self):
+        """`WITH d, cl, ctx` is the shape the bug had, verbatim.
+
+        A WITH that only projects looks like it tidies the query and collapses
+        nothing, so it reads as a style choice. It is the difference between one
+        row per entry and one row per combination.
+        """
+        for module, function in _RENDERED_LIST_QUERIES:
+            with self.subTest(function=function):
+                for query in _function_queries(os.path.join(HERE, module), function):
+                    for keyword, body in self._clauses(query):
+                        if keyword != "WITH":
+                            continue
+                        with self.subTest(with_body=" ".join(body.split())[:60]):
+                            self.assertRegex(
+                                body, self._AGGREGATE,
+                                "a WITH here projects without aggregating, so "
+                                "the rows the previous pattern fanned out are "
+                                "still fanned out",
+                            )
+
+    def test_no_aggregation_happens_in_the_return(self):
+        """The trailing `OPTIONAL MATCH` needs a `WITH` too.
+
+        This is the shape of the first, wrong fix: aggregate between each pair
+        of patterns, and let the last one collect in the RETURN. That turns a
+        mentions×relevant product into a single relevant multiplier — better,
+        and still wrong, because an entry with two cross-references comes back
+        twice. A `collect` in the RETURN deduplicates values *within* a row; it
+        can never merge rows, so it is the wrong place for the last collapse.
+        """
+        for module, function in _RENDERED_LIST_QUERIES:
+            with self.subTest(function=function):
+                for query in _function_queries(os.path.join(HERE, module), function):
+                    for keyword, body in self._clauses(query):
+                        if keyword != "RETURN":
+                            continue
+                        with self.subTest(return_body=" ".join(body.split())[:60]):
+                            self.assertNotRegex(
+                                body, r"\bcollect\s*\(",
+                                "aggregating in the RETURN cannot collapse the "
+                                "rows; the last pattern needs its own WITH",
+                            )
+
+    def test_every_field_the_python_reads_is_still_returned(self):
+        """A `WITH` chain renames things on the way to the RETURN.
+
+        Moving the collects into `WITH` clauses means the RETURN no longer
+        derives them inline, so an alias can be dropped on the way through — and
+        the failure is a `KeyError` on the first list load after the deploy, in
+        a query nobody can run locally.
+
+        The direction is **read ⊆ returned**, not the reverse. A Python read that
+        the query no longer projects is silent (a `KeyError`, or a field quietly
+        absent from every card). The opposite — a returned alias nobody reads —
+        is harmless, and checking for it was what made an earlier version of
+        this test pass on a query whose WITH alias no longer matched its RETURN:
+        the renamed `ctxId` was not on the list of names being looked for, so
+        the test had nothing to say. An unbound variable in the RETURN is loud
+        and needs no guard.
+
+        Scoped to the **RETURN** clause, not the whole query: a `WITH` that
+        introduces `relevantClients` leaves the name lying around even after it
+        has been dropped from the projection, so searching the whole string
+        passed on a query that no longer returns the field at all.
+        """
+        for module, function in _RENDERED_LIST_QUERIES:
+            with self.subTest(function=function):
+                with open(os.path.join(HERE, module), encoding="utf-8") as handle:
+                    tree = ast.parse(handle.read())
+                func = next(n for n in ast.walk(tree)
+                            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                            and n.name == function)
+                reads = _row_reads(func)
+                query = "\n".join(_function_queries(os.path.join(HERE, module), function))
+                analyzer = OneRowPerRecordTests()
+                returned = " ".join(body for keyword, body in analyzer._clauses(query)
+                                    if keyword == "RETURN")
+                self.assertTrue(returned, f"{function}: no RETURN clause found")
+                for field in sorted(reads):
+                    with self.subTest(field=field):
+                        self.assertRegex(
+                            returned, rf"\b{re.escape(field)}\b",
+                            f"{function} reads `{field}` off every row but the "
+                            f"RETURN no longer projects it, so the list raises a "
+                            f"KeyError on the first load after deploy",
+                        )
+
+
 class ScopeIsRankedNotFilteredTests(unittest.TestCase):
     """`client`/`context` must rank search results, never delete them.
 

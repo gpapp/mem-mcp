@@ -15,6 +15,14 @@ neo4j_logs/
 ollama_data/
 mem-mcp-data/
 
+# Sessions. The bind mount is mem-mcp-data/sessions (see MEM_SESSION_DIR), but
+# the default location is next to the logs dir, so a local run can leave a real
+# session database — with live session ids in it — inside the source tree.
+mem-mcp/sessions/
+*.db
+*.db-wal
+*.db-shm
+
 # IDEs
 .vscode/
 .idea/

@@ -82,7 +82,7 @@ services:
       # after any idle gap. 30m keeps it warm for a working session and still
       # releases it overnight -- the card is 4 GB shared with ASR (1.25 GB), so
       # holding a 3.3 GB model resident indefinitely starves the transcriber.
-      - OLLAMA_KEEP_ALIVE=30m
+      - OLLAMA_KEEP_ALIVE=5m
 
   mem-mcp:
     build: ./mem-mcp
@@ -127,6 +127,14 @@ services:
       # disables it, which restores the pre-cache behaviour.
       - MEM_QUERY_CACHE_TTL=${MEM_QUERY_CACHE_TTL:-900}
       - MEM_QUERY_CACHE_MAX=${MEM_QUERY_CACHE_MAX:-256}
+
+      # Server status widget. One poller in the lifespan feeds every browser
+      # over SSE; it pushes only when the status fingerprint changes, so the
+      # interval is how fast a freshly loaded model appears, not a refresh
+      # rate. HTTP_TIMEOUT is separate from the chat budgets on purpose -- a
+      # status probe must never be what makes anything else slow.
+      - MEM_STATUS_POLL_SECONDS=${MEM_STATUS_POLL_SECONDS:-10}
+      - MEM_STATUS_HTTP_TIMEOUT=${MEM_STATUS_HTTP_TIMEOUT:-8}
 
       # Merge-draft budget. The only LLM call whose prompt is uncapped: it
       # json.dumps the full text of every selected record, so it is sized
@@ -189,6 +197,13 @@ services:
       - MEM_NEO4J_PASSWORD=${NEO_PASS}
       - MEM_SESSION_SECRET=${MEM_SESSION_SECRET}
       - BASE_URL=${BASE_URL}
+
+        # Sessions and MCP access keys. MEM_SESSION_DIR must point at the
+        # bind mount below, not at the container filesystem: a rebuild replaces
+        # the container, and a session that lived inside it would log everyone
+        # out on every deploy.
+      - MEM_SESSION_DIR=/app/sessions
+      - MEM_SESSION_SECURE=${MEM_SESSION_SECURE:-0}
       - HTPASSWD_PATH=/app/htpasswd
 
         # Daily savepoints (Setup → Maintenance → Backup & Restore)
@@ -202,6 +217,7 @@ services:
       - ./mem-mcp-data/logs:/app/logs
       - ./mem-mcp-data/backup:/app/backup
       - ./mem-mcp-data/htpasswd:/app/htpasswd:ro
+      - ./mem-mcp-data/sessions:/app/sessions
 
 volumes:
   MEM_model_cache:

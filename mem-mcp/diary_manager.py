@@ -1041,7 +1041,30 @@ def db_list_diary_entries(user_id: str, from_ts: Optional[str] = None, to_ts: Op
 
 
 def db_list_diary(user_id: str) -> list:
-    """Return all diary entries for a user from Neo4j with mention links, grouped by date."""
+    """Return all diary entries for a user from Neo4j with mention links, grouped by date.
+
+    **One row per entry, and that has to be earned.** Four relationship
+    patterns hang off a DiaryEntry (FOR_CLIENT, IN_CONTEXT, MENTIONS,
+    RELEVANT_TO) and two of them are genuinely many-valued, so chaining the
+    `OPTIONAL MATCH`es returns their *cross product*: an entry with five
+    mentions and one relevant client came back five times, all carrying the
+    same `d.id`. `collect(DISTINCT ...)` in the RETURN does not undo that — it
+    collapses the duplicates *within* each row, it does not merge the rows.
+    The client assigns this list straight into `diaryEntries`, so the UI
+    rendered the same entry once per combination, and only for entries that had
+    been auto-linked since they were written, which is why it looked like "the
+    new ones are duplicated" rather than like a data problem.
+
+    So each expanding pattern is followed by its own aggregating `WITH`,
+    including the **last** one before the RETURN — an entry with two
+    RELEVANT_TO links is two rows just as surely as one with two MENTIONS, so
+    collapsing all but the trailing pattern only turns a mentions×relevant
+    product into a single relevant multiplier. `head(collect(...))` for the
+    single-valued scope edges: an OPTIONAL MATCH that finds nothing still
+    produces one row with a null, so `head` yields null rather than dropping
+    the entry. `test_cypher_safety.OneRowPerRecordTests` derives the property
+    from the clause structure, so a query added later is covered too.
+    """
     neo4j_driver = get_neo4j()
     if not neo4j_driver:
         raise RuntimeError("Neo4j not connected.")
@@ -1059,18 +1082,22 @@ def db_list_diary(user_id: str) -> list:
             """
             MATCH (d:DiaryEntry {userId: $userId})
             OPTIONAL MATCH (d)-[:FOR_CLIENT]->(cl:Client)
+            WITH d, head(collect(cl.id)) as clientId, head(collect(cl.name)) as clientName
             OPTIONAL MATCH (d)-[:IN_CONTEXT]->(ctx:Context)
-            WITH d, cl, ctx
+            WITH d, clientId, clientName,
+                 head(collect(ctx.id)) as contextId, head(collect(ctx.name)) as contextName
             OPTIONAL MATCH (d)-[:MENTIONS]->(f:Fact)
+            WITH d, clientId, clientName, contextId, contextName,
+                 collect(DISTINCT {id: f.id, text: f.text, name: f.name}) as mentions
             OPTIONAL MATCH (d)-[:RELEVANT_TO]->(rc)
             WHERE rc IS NULL OR rc:Client OR rc:Context
+            WITH d, clientId, clientName, contextId, contextName, mentions,
+                 collect(DISTINCT {id: rc.id, name: rc.name,
+                                   kind: CASE WHEN rc:Context THEN 'context' ELSE 'client' END}) as relevantClients
             RETURN d.id as id, d.date as date, d.content as content, d.timestamp as timestamp, d.name as name,
                    d.metadata as metadata, d.keywords as keywords,
-                   cl.name as clientName, cl.id as clientId,
-                   ctx.name as contextName, ctx.id as contextId,
-                   collect(DISTINCT {id: f.id, text: f.text, name: f.name}) as mentions,
-                   collect(DISTINCT {id: rc.id, name: rc.name,
-                                     kind: CASE WHEN rc:Context THEN 'context' ELSE 'client' END}) as relevantClients,
+                   clientName, clientId, contextName, contextId,
+                   mentions, relevantClients,
                    [x IN [(d)-[:RELATED_TO]-(e:DiaryEntry) | {id: e.id, name: e.name, date: e.date,
                                                                 timestamp: e.timestamp}] WHERE x.id <> d.id] as entryLinks
             ORDER BY d.date DESC, d.timestamp DESC

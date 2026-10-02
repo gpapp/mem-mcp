@@ -40,11 +40,12 @@ mem-mcp/
 - **Dedicated Merge Model** — Dashboard merge drafts use `MEM_MERGE_MODEL` (default `gemma4:e2b`), while search and scope classification run on `LLM_QUERY_MODEL` / `MEM_SCOPE_MODEL` (set both to the same model — the scope classifier is the slow path and defaults to the query model).
 - **Skills System** — Pluggable skill workflows (e.g., `process-transcription`, `memory-deduplication`) loaded from Markdown files.
 - **Unified Web UI** — A modern, proxy-aware dashboard to manage memories, view diary history, and explore insights.
-- **Multi-user Isolation** — Secure per-user vaults based on Basic-Auth or proxy headers.
+- **Multi-user Isolation** — Secure per-user vaults, resolved from a dashboard session, Basic auth, an access key, or proxy headers.
 - **Client & Context Scoping** — Facts and diary entries can be scoped to a Client (e.g. "Deutsche Bank") and a Context within it (e.g. "SAP Implementation") via `FOR_CLIENT` / `IN_CONTEXT` graph links. Explicit `client`/`context` parameters hard-filter search; global search still finds everything.
 - **Scope Inference** — When no explicit client is passed, search infers the client from the query text (boost-only, never filters).
 - **Inactive Client Handling** — Clients untouched for 90 days are auto-deprioritized (−0.15 score, never hidden). Status can be manually pinned via `set_client_status`, `PUT /api/clients/{id}`, or the Setup-tab toggle; pinned clients are never auto-changed.
-- **Setup Tab** — Client list with active/inactive toggles, plus MCP connection details.
+- **Setup Tab** — Client list with active/inactive toggles, MCP connection details, and **Access Keys** (revocable `Bearer mvk_…` credentials for MCP clients).
+- **Persistent Sessions** — Login survives a server restart and a container rebuild; sessions live in SQLite on a bind-mounted volume rather than in the cookie, and the plaintext password is no longer stored.
 - **Daily Backups & Restore** — An in-process scheduler writes a vault-wide savepoint (graph + both vector collections) each night, keeps the last `MEM_BACKUP_KEEP`, and Setup → Maintenance → Backup & Restore can take one immediately or restore any of them.
 - **Long-Record Chunking** — A fact or diary entry that runs past the embedding budget is indexed as several vectors, so a query about a detail in the middle of a 40k-char transcription can still find the record. Search collapses a chunk family back to one result and returns the full text.
 - **Lazy-Loaded Lists** — Memories and diary sidebar render in batches of 50 with infinite scroll; calendar has a 📅 jump-to-today button.
@@ -61,9 +62,52 @@ The server is **unified** on port **8080** (mapped to **8086** in Docker).
 
 ## Authentication
 
-User identity is resolved automatically from:
-1. `Authorization: Basic <base64 user:pass>`
-2. Proxy headers: `Remote-User`, `X-Remote-User`, `X-User`, `X-Forwarded-User`
+Three credentials are accepted, and which one you use decides where it is
+checked:
+
+| Credential | Where it is verified | Use it for |
+|---|---|---|
+| Dashboard session cookie | Issued by `POST /api/auth/login` against `htpasswd` | Browsing the dashboard |
+| `Authorization: Basic <base64 user:pass>` | `McpAuthGuard`, against the app's own `htpasswd` | Existing MCP clients |
+| `Authorization: Bearer mvk_…` | `McpAuthGuard`, against the access-key store | New MCP clients, one key per device |
+
+MCP requests are authenticated **by the application**, not by nginx. This is a
+change from earlier versions, where nginx's `auth_basic` on the `/mem-mcp/mcp`
+location was the only check and the app trusted whatever it was handed. Basic
+auth still works and still uses the same `htpasswd` file — existing clients need
+no change — but the app now does the check itself, which is what makes the
+access key possible and what makes a key revocable from the UI.
+
+**Access keys** are created in **Setup → Access Keys**. A key is shown exactly
+once, at creation: only a SHA-256 hash is stored, so it cannot be displayed
+again or recovered. Revoking one takes effect immediately, with no file to edit
+and no restart. Give each device its own key so a lost laptop is one revoked key
+rather than a changed password.
+
+```bash
+# Setup → Access Keys → create one, then:
+claude mcp add --transport http memory-vault https://<your-host>/mem-mcp/mcp \
+  --header "Authorization: Bearer mvk_..."
+```
+
+**Sessions** are stored server-side (SQLite) rather than inside the cookie, so
+they survive a container rebuild: the cookie carries only an opaque random id
+and the record lives in `MEM_SESSION_DIR`, which compose bind-mounts to
+`./mem-mcp-data/sessions`. A session is valid for 30 days from creation (not
+sliding) and can be ended by logging out. The session no longer stores your
+password — that is what the access key replaced.
+
+### Proxy header trust
+
+With no credential at all, identity falls back to proxy headers
+(`Remote-User`, `X-Remote-User`, `X-User`, `X-Forwarded-User`) and finally to
+the literal user `"anonymous"`. Those headers are trusted because a reverse
+proxy is expected to set them, and they are the weakest link in the chain: a
+proxy that forwards a client-supplied `Remote-User` lets anyone name any user.
+Nginx overwrites it from `$remote_user`; if your proxy does not, strip it
+there. Note that `nginx_snippet.conf` no longer sets `Remote-User` on the MCP
+location at all — the app stamps the verified identity itself, as `X-Vault-User`,
+after stripping any inbound copy of that header.
 
 ## MCP Tools (Advanced Suite)
 
@@ -235,9 +279,13 @@ converts — the rest carry over to the following one.
 
 Run this command to add the vault to your Claude configuration:
 ```bash
-claude mcp add --transport http memory-vault http://<your-host>:8086/mcp --header "Authorization: Basic <base64-creds>"
+# Create a key first in Setup → Access Keys, then paste it in place of <key>:
+claude mcp add --transport http memory-vault https://<your-host>/mem-mcp/mcp --header "Authorization: Bearer <key>"
 ```
-*(Copy your pre-filled command directly from the landing page!)*
+*(The Setup page fills this command in with your real key when you create one, and
+the landing page links straight to it. A `Basic` header also still works if you
+already have one configured — it is verified against the same `htpasswd` the login
+form uses.)*
 
 ## Tech Stack
 
