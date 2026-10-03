@@ -60,6 +60,13 @@ SESSION_COOKIE = "mem_session"
 # using it is a session whose only remedy is rotating every PSK.
 SESSION_MAX_AGE = 30 * 24 * 60 * 60  # 30 days in seconds
 
+# How long a session that names nobody may live. A pre-authentication session
+# carries an OAuth `state` across one redirect, which takes seconds; a 30-day
+# window buys nothing and leaves a row behind for every abandoned sign-in
+# attempt. It is also the window a stolen state would have to be replayed in,
+# so shorter is better on both counts.
+PRE_AUTH_MAX_AGE = 10 * 60  # 10 minutes
+
 # A visible scheme prefix, so a key found in a log, a shell history or a
 # screenshot is identifiable as a vault credential rather than a random string.
 PSK_PREFIX = "mvk_"
@@ -279,16 +286,29 @@ def create_session(username: str, max_age: int = SESSION_MAX_AGE, now=None, data
     `max_age` is clamped to a positive value so a misconfigured knob produces
     a short session rather than one that never expires or one that never
     starts.
+
+    **An empty username is allowed only when the payload carries no `user`
+    key**, and that case is a pre-authentication session: the OAuth `state`
+    lives here between the consent redirect and the callback, and there is no
+    user yet. `payload.setdefault("user", ...)` below is skipped for it, and
+    that skip is the whole point — writing a placeholder name here would be an
+    authentication bypass, because `_check_session_auth` trusts `session["user"]`
+    without asking how it got there. So the invariant is not "every row names
+    somebody" but "a row that names somebody is only ever created from a real
+    `user` value". Such a row is unreachable through `active_sessions_for_user`
+    and `delete_sessions_for_user`, both of which refuse an empty name.
     """
     init_db()
     username = (username or "").strip()
+    payload = dict(data) if data else {}
     if not username:
-        raise ValueError("A session needs a username")
+        if not payload or "user" in payload:
+            raise ValueError("A session needs a username")
     age = SESSION_MAX_AGE if max_age is None else int(max_age)
     if age <= 0:
         raise ValueError("max_age must be positive")
-    payload = dict(data) if data else {}
-    payload.setdefault("user", username)
+    if username:
+        payload.setdefault("user", username)
     _reject_credentials(payload)
     moment = _now(now)
     session_id = new_session_id()
@@ -1636,14 +1656,28 @@ class VaultSessionMiddleware:
             return None
 
     def _write_session(self, vault: VaultSession) -> str:
-        username = (vault.data.get("user") or "").strip()
-        if not username:
-            # A session with no identity is not a session. Refusing to persist
-            # it keeps "is there a row" and "is there a user" the same question.
+        # The test is `if not vault.data`, not "is there a user". An *empty*
+        # session is what a logout looks like and must not become a row, but a
+        # session holding only a pre-authentication key is not empty: the OAuth
+        # flow stores `state` there between the consent redirect and the
+        # callback, and a person who is mid-sign-in is not logged out. Refusing
+        # to persist a session without a `user` meant every `/api/auth/google/
+        # start` handed the browser an *expired* cookie, so the callback always
+        # arrived with no state and reported "the sign-in did not come back from
+        # the browser that started it" — deterministically, on every attempt.
+        # The routes around it were fully tested and could not catch it: they
+        # drive a dict, so nothing ever ran the code that persists the state.
+        if not vault.data:
             if vault.session_id:
                 delete_session(vault.session_id)
             return self._expired_cookie()
-        record = create_session(username, max_age=self.max_age, data=vault.data)
+        record = create_session(vault.data.get("user") or "",
+                                # A row that names nobody gets the short
+                                # lifetime: it exists to carry one `state`
+                                # across one redirect.
+                                max_age=(self.max_age if vault.data.get("user")
+                                         else PRE_AUTH_MAX_AGE),
+                                data=vault.data)
         vault.set_record(record)
         return self._cookie(record["session_id"])
 

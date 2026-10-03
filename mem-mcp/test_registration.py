@@ -1397,6 +1397,56 @@ class CallSiteTests(unittest.TestCase):
         self.assertLess(source.index("allow_registration_attempt("),
                         source.index("registration_enabled("))
 
+    def test_the_oauth_state_lives_in_the_session_and_nowhere_else(self):
+        # The single seam between the two routes. `state` has to survive the
+        # round trip to Google, and the server-side session is the only thing
+        # here that survives it -- so it goes in the session, and the value that
+        # comes back is compared against what is in there.
+        #
+        # This is pinned rather than exercised because every test of these two
+        # routes drives `_Request(session={...})`, a plain dict. Nothing in this
+        # file runs VaultSessionMiddleware, so the state "surviving" in a test
+        # says nothing at all about it surviving in production. It did not: a
+        # session with no `user` was refused by the middleware, so every start
+        # handed the browser an expired cookie and every callback reported that
+        # the sign-in had not come back. Both halves were green.
+        start = _function_source("mem-mcp/gui.py", "api_google_start")
+        self.assertIn('request.session["oauth_state"] = state', start, msg=(
+            "the state must be written to the session -- that is the only thing "
+            "the callback can read it back from"))
+        self.assertIn("google_auth.authorization_url(state,", start, msg=(
+            "the same value has to go to Google, or there is nothing to compare "
+            "the callback's echo against"))
+
+        callback = _function_source("mem-mcp/gui.py", "api_google_callback")
+        self.assertIn('request.session.get("oauth_state")', callback, msg=(
+            "the comparison has to read the session, not a parameter"))
+        self.assertIn("hmac.compare_digest", callback)
+
+        # And nowhere else: a state in a query string survives in browser
+        # history, in a Referer and in any proxy log on the way back from Google.
+        for name in ("api_google_start", "api_google_callback"):
+            source = _function_source("mem-mcp/gui.py", name)
+            self.assertNotIn('["state"]', source.replace('session["oauth_state"]', ""),
+                             msg=f"{name} must not build a URL carrying the state")
+            self.assertNotIn("state=", source, msg=(
+                f"{name} must not put the state in a URL"))
+
+    def test_the_pre_auth_session_is_persisted_by_the_middleware(self):
+        # The other half of that seam, asserted from the suite that owns the flow
+        # so that a change to either module fails here. test_sessions pins the
+        # middleware's behaviour in detail; what matters for this flow is only
+        # that the store accepts a row with no user in it.
+        directory = tempfile.mkdtemp(prefix="reg-oauth-")
+        self.addCleanup(shutil.rmtree, directory, True)
+        previous = os.environ.get("MEM_SESSION_DIR")
+        os.environ["MEM_SESSION_DIR"] = directory
+        self.addCleanup(lambda: os.environ.__setitem__("MEM_SESSION_DIR", previous)
+                        if previous is not None else None)
+        record = sessions.create_session("", data={"oauth_state": "opaque"})
+        self.assertNotIn("user", record["data"],
+                         "a pre-auth session must carry no identity to read")
+
     def test_google_start_is_not_gated_on_the_registration_flag(self):
         source = _function_source("mem-mcp/gui.py", "api_google_start")
         self.assertIn("google_auth.configured()", source)

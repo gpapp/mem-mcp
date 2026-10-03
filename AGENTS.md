@@ -283,9 +283,50 @@ directly, which is also what keeps the starlette import out of the file.
   purely to display it; it now shows an access key instead, and there is no
   reason to restore the old behaviour.
 - **Expiry is enforced on read.** A row past its deadline is deleted by the read
-  that found it, so a dead cookie cannot be probed for existence by timing. The
-  boot purge in `server.py` and `_session_gc_loop` are the belt to that braces;
-  a failed write is logged and swallowed, never a 500.
+   that found it, so a dead cookie cannot be probed for existence by timing. The
+   boot purge in `server.py` and `_session_gc_loop` are the belt to that braces;
+   a failed write is logged and swallowed, never a 500. **That log line is
+   load-bearing for diagnosis, not decoration:** a swallowed failure here emits
+   no `Set-Cookie` at all, so the request succeeds and the flow only breaks one
+   request later. A `NameError` in `_write_session` reproduces the exact
+   user-visible symptom of the bug below while naming a different cause, so read
+   the `session:` lines before believing the message on the landing page.
+ - **A session is persisted when it has *data*, not when it has a *user*.** This
+   is not a distinction anyone would invent, so here is why it exists. The OAuth
+   flow stores `state` in the session between the consent redirect and the
+   callback, and at that moment there is no user — the person is mid-sign-in.
+   `_write_session` used to refuse to persist a session without a `user`, on the
+   reasonable-sounding grounds that "a session with no identity is not a
+   session". The consequence was that **every Google sign-in failed, always**:
+   `/api/auth/google/start` set `oauth_state` and nothing else, so the middleware
+   answered with `Max-Age=0`, and the callback arrived with a dead cookie, found
+   no state, and reported *"the sign-in did not come back from the browser that
+   started it"*. The empty session is what a logout looks like, and that is the
+   only shape that must not become a row. `create_session` therefore accepts an
+   empty username **only** when the payload carries no `user`, and skips
+   `payload.setdefault("user", …)` for it — that skip is the security property,
+   not a convenience, because `_check_session_auth` trusts `session["user"]`
+   without asking how it got there, so a placeholder name would be a way in. The
+   invariant is therefore **"a row that names somebody is only ever created from
+   a real `user` value"**, and such a row stays unreachable through
+   `active_sessions_for_user` / `delete_sessions_for_user`, which both refuse an
+   empty name. A row that names nobody also gets `PRE_AUTH_MAX_AGE` (10 minutes)
+   rather than the 30-day session lifetime: it exists to carry one `state` across
+   one redirect, so the long window buys nothing, leaves a row behind for every
+   abandoned sign-in attempt, and widens the replay window for a stolen state.
+ - **A route test with a dict `session` stub cannot see any of this.** Every test
+   of `api_google_start` / `api_google_callback` passes `_Request(session={...})`,
+   a plain dict, so nothing in `test_registration.py` ever runs
+   `VaultSessionMiddleware`. The state "survived" in every one of those tests
+   while never surviving in production, and the suite was green. The fix was
+   pinned from both ends: `test_sessions` asserts the middleware persists a
+   pre-auth key, reaches the next request and carries no `user`, and
+   `CallSiteTests.test_the_oauth_state_lives_in_the_session_and_nowhere_else`
+   asserts the route writes the state *into the session* rather than a query
+   string — because a state in a URL survives in browser history, in a `Referer`
+   and in every proxy log on the way back from Google. **When two modules meet
+   at a boundary, test each one's half and pin the seam; do not assume a test
+   that drives one of them covers the other.**
 
 **A PSK is stored as a SHA-256 hash and its plaintext is returned exactly once.**
 Only a 10-char display prefix is persisted, and `resolve_psk` refuses a key that

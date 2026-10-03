@@ -684,13 +684,124 @@ class SessionMiddlewareTests(AsgiCase):
         self.assertIsNone(sessions.load_session(session_id),
                           "An empty session row must not outlive the request")
 
-    def test_a_session_with_no_identity_is_not_persisted(self):
+    def test_an_empty_session_is_not_persisted(self):
+        # "Empty" is the shape that must not become a row: clearing the session
+        # and writing nothing back is a logout. The test is that the session has
+        # no *data*, not that it has no user -- see the next three tests for why
+        # that distinction is the whole bug.
         async def handler(scope, receive, send):
-            scope["session"]["csrf"] = "opaque"
+            scope["session"].clear()
             await send({"type": "http.response.start", "status": 200, "headers": []})
 
         messages = asyncio.run(self._drive(handler))
         self.assertIn("Max-Age=0", self.set_cookie(messages))
+
+    def test_a_session_holding_only_a_pre_auth_key_is_persisted(self):
+        # The OAuth flow stores `state` here between the consent redirect and the
+        # callback. Refusing to persist a session without a `user` made every
+        # sign-in fail: start handed the browser an expired cookie, so the
+        # callback arrived with no state and reported that the sign-in "did not
+        # come back from the browser that started it".
+        async def handler(scope, receive, send):
+            scope["session"]["oauth_state"] = "opaque-state"
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+
+        messages = asyncio.run(self._drive(handler))
+        set_cookie = self.set_cookie(messages)
+        self.assertNotIn("Max-Age=0", set_cookie or "")
+        record = sessions.load_session(self.session_id_of(set_cookie))
+        self.assertIsNotNone(record, "the pre-auth session must exist as a row")
+        self.assertEqual(record["data"].get("oauth_state"), "opaque-state")
+
+    def test_a_pre_auth_session_authenticates_nobody(self):
+        # The row is persisted without a `user`, and that absence is load-bearing:
+        # `_check_session_auth` trusts `session["user"]` without asking where it
+        # came from, so writing a placeholder name here would be a way in.
+        async def handler(scope, receive, send):
+            scope["session"]["oauth_state"] = "opaque-state"
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+
+        messages = asyncio.run(self._drive(handler))
+        record = sessions.load_session(self.session_id_of(self.set_cookie(messages)))
+        self.assertNotIn("user", record["data"],
+                         "a pre-auth session must carry no identity to read")
+        self.assertEqual(record["username"], "")
+
+    def test_a_pre_auth_key_survives_to_the_next_request(self):
+        # The property the OAuth flow actually depends on, and the one nothing
+        # tested: the routes were driven with a plain dict, so the code that
+        # carries `state` between the two requests never ran in a test at all.
+        async def start(scope, receive, send):
+            scope["session"]["oauth_state"] = "opaque-state"
+            await send({"type": "http.response.start", "status": 302, "headers": []})
+
+        seen = {}
+
+        async def callback(scope, receive, send):
+            seen["state"] = scope["session"].get("oauth_state")
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+
+        first = self.set_cookie(asyncio.run(self._drive(start)))
+        self.assertIn("Max-Age=600", first)
+        asyncio.run(self._drive(callback, cookie=first.split(";")[0]))
+        self.assertEqual(seen["state"], "opaque-state",
+                         "the callback must see the state the start wrote")
+
+    def test_a_signed_in_session_still_names_its_user(self):
+        # The other half of the relaxation: a real login is unchanged, and the
+        # username column is what the session list on the Setup page reads.
+        messages = asyncio.run(self._drive(self.login("alice")))
+        record = sessions.load_session(self.session_id_of(self.set_cookie(messages)))
+        self.assertEqual(record["username"], "alice")
+        self.assertEqual(record["data"]["user"], "alice")
+        self.assertEqual([r["username"] for r in sessions.active_sessions_for_user("alice")],
+                         ["alice"])
+
+    def test_a_pre_auth_session_is_never_listed_as_anybody_sessions(self):
+        # Both helpers refuse an empty name, so a pending row cannot surface in
+        # the Setup page's live-session list and cannot be revoked by name.
+        async def handler(scope, receive, send):
+            scope["session"]["oauth_state"] = "opaque-state"
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+
+        messages = asyncio.run(self._drive(handler))
+        self.session_id_of(self.set_cookie(messages))
+        self.assertEqual(sessions.active_sessions_for_user(""), [])
+        self.assertEqual(sessions.active_sessions_for_user("alice"), [])
+        self.assertEqual(sessions.delete_sessions_for_user(""), 0)
+
+    def test_a_pre_auth_session_expires_in_minutes_and_a_login_in_days(self):
+        # Both go through `_write_session`, so "a short session" has to be a
+        # decision about the *row*, not a consequence of one. Driven through a
+        # middleware configured with a long max_age, otherwise the two lifetimes
+        # are equal in the harness and the assertion below would be vacuous.
+        middleware = sessions.VaultSessionMiddleware(self._wrap, max_age=30 * 86400)
+        self.middleware, original = middleware, self.middleware
+
+        async def pending(scope, receive, send):
+            scope["session"]["oauth_state"] = "opaque-state"
+            await send({"type": "http.response.start", "status": 302, "headers": []})
+
+        record = sessions.load_session(
+            self.session_id_of(self.set_cookie(asyncio.run(self._drive(pending)))))
+        self.assertEqual(record["expires_at"] - record["created_at"],
+                         sessions.PRE_AUTH_MAX_AGE)
+
+        login = sessions.load_session(
+            self.session_id_of(self.set_cookie(asyncio.run(self._drive(self.login("alice"))))))
+        self.assertEqual(login["expires_at"] - login["created_at"], 30 * 86400)
+        self.middleware = original
+
+    def test_a_nameless_row_cannot_be_minted_with_a_user_in_the_payload(self):
+        # `create_session` only tolerates an empty username when the payload
+        # carries no `user`, so the relaxation cannot be used to write a row that
+        # claims an identity while naming nobody.
+        with self.assertRaises(ValueError):
+            sessions.create_session("", data={"user": "alice"})
+        with self.assertRaises(ValueError):
+            sessions.create_session("", data={})
+        with self.assertRaises(ValueError):
+            sessions.create_session("", data=None)
 
     def test_writing_a_password_through_the_middleware_is_refused(self):
         async def handler(scope, receive, send):
