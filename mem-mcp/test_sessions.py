@@ -398,21 +398,26 @@ class PskTests(StoreCase):
         created = sessions.create_session("alice")
         self.assertIsNone(sessions.resolve_psk(created["session_id"]))
 
-    def test_revocation_takes_effect_immediately(self):
+    # One test covers the group: a revoked key not resolving is one property,
+    # and the two cases are the two moments at which it has to hold.
+    def test_a_revoked_key_never_resolves_again(self):
         created = sessions.create_psk("alice", label="old laptop")
         self.assertTrue(sessions.revoke_psk(created["id"], "alice"))
-        self.assertIsNone(sessions.resolve_psk(created["key"]))
+        with self.subTest(case="immediately after the revoke"):
+            self.assertIsNone(sessions.resolve_psk(created["key"]))
+
+        # Minted with an expiry, so the later read is one that expiry alone could
+        # also produce -- which is what makes the second case worth having.
+        expiring = sessions.create_psk("alice", expires_in_days=1)
+        sessions.revoke_psk(expiring["id"], "alice")
+        long_after = expiring["created_at"] + 10 * 24 * 3600
+        with self.subTest(case="past its own expiry, so revocation has to be why"):
+            self.assertIsNone(sessions.resolve_psk(expiring["key"], now=long_after))
 
     def test_revoking_twice_reports_that_nothing_happened(self):
         created = sessions.create_psk("alice")
         self.assertTrue(sessions.revoke_psk(created["id"], "alice"))
         self.assertFalse(sessions.revoke_psk(created["id"], "alice"))
-
-    def test_a_revoked_key_stays_revoked_after_its_expiry_is_reached(self):
-        created = sessions.create_psk("alice", expires_in_days=1)
-        sessions.revoke_psk(created["id"], "alice")
-        long_after = created["created_at"] + 10 * 24 * 3600
-        self.assertIsNone(sessions.resolve_psk(created["key"], now=long_after))
 
     def test_replaying_a_dead_key_does_not_warm_its_row(self):
         created = sessions.create_psk("alice")
@@ -501,16 +506,19 @@ class PskTransferTests(StoreCase):
         self.assertIsNotNone(resolved)
         self.assertEqual(resolved["user_id"], "carol")
 
-    def test_a_moved_key_leaves_the_old_vaults_list(self):
+    # One test covers the group: the transfer's write is scoped to alice's rows,
+    # and the three cases are the three listings that show it.
+    def test_the_transfer_moves_alice_rows_and_nothing_else(self):
         before = self._alice_ids()
         sessions.transfer_psks("alice", "carol")
-        self.assertEqual(sessions.list_psks("alice"), [])
-        self.assertEqual({row["id"] for row in sessions.list_psks("carol")}, before)
 
-    def test_another_users_keys_are_untouched(self):
-        sessions.transfer_psks("alice", "carol")
-        self.assertEqual([row["id"] for row in sessions.list_psks("bob")],
-                         [self.staying["id"]])
+        with self.subTest(case="the old vault's list is emptied"):
+            self.assertEqual(sessions.list_psks("alice"), [])
+        with self.subTest(case="the new vault holds exactly alice's rows"):
+            self.assertEqual({row["id"] for row in sessions.list_psks("carol")}, before)
+        with self.subTest(case="another user's list is untouched"):
+            self.assertEqual([row["id"] for row in sessions.list_psks("bob")],
+                             [self.staying["id"]])
 
     def test_the_returned_count_is_the_number_moved(self):
         self.assertEqual(len(self._alice_ids()), 2)
@@ -524,18 +532,22 @@ class PskTransferTests(StoreCase):
         moved = {row["id"]: row["status"] for row in sessions.list_psks("carol")}
         self.assertEqual(moved[revoked["id"]], "revoked")
 
-    def test_a_transfer_to_the_same_user_is_refused(self):
+    # One test covers the group: a transfer whose arguments name no move is refused
+    # and writes nothing, and the cases are the degenerate arguments.
+    def test_a_degenerate_transfer_is_refused_and_moves_nothing(self):
         # "Moved 0 keys" and "there were no keys" are the same number, and a
         # migration that prints one of them has told the operator nothing.
-        with self.assertRaises(ValueError):
-            sessions.transfer_psks("alice", "alice")
-        self.assertEqual(len(sessions.list_psks("alice")), 2)
-
-    def test_an_empty_name_is_refused_rather_than_matching_nothing(self):
-        for old, new in (("", "carol"), ("alice", ""), ("  ", "carol")):
-            with self.assertRaises(ValueError):
-                sessions.transfer_psks(old, new)
-        self.assertEqual(len(sessions.list_psks("alice")), 2)
+        cases = {
+            "source and destination are the same user": ("alice", "alice"),
+            "source name is empty": ("", "carol"),
+            "destination name is empty": ("alice", ""),
+            "source name is only whitespace": ("  ", "carol"),
+        }
+        for label, (old, new) in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaises(ValueError):
+                    sessions.transfer_psks(old, new)
+                self.assertEqual(len(sessions.list_psks("alice")), 2)
 
     def test_a_transfer_never_writes_the_plaintext(self):
         sessions.transfer_psks("alice", "carol")
@@ -653,11 +665,25 @@ class AsgiCase(StoreCase):
 
 class SessionMiddlewareTests(AsgiCase):
 
-    def test_an_anonymous_request_gets_no_cookie(self):
-        messages = asyncio.run(self._drive(lambda s, r, send: send(
-            {"type": "http.response.start", "status": 200, "headers": []})))
-        self.assertIsNone(self.set_cookie(messages),
-                          "An anonymous request must not be issued a session")
+    # One test covers the group: both cases assert the same property -- no
+    # Set-Cookie is emitted unless the request persisted something -- over the
+    # two inputs that can leave nothing to persist.
+    def test_no_cookie_is_issued_when_there_is_nothing_to_persist(self):
+        async def inert(scope, receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+
+        set_cookie, session_id = self.login_then("alice")
+        cases = {
+            "anonymous request, no inbound cookie": {},
+            "live inbound cookie the handler leaves untouched": {
+                "cookie": f"{sessions.SESSION_COOKIE}=" + session_id},
+        }
+        for label, kwargs in cases.items():
+            with self.subTest(case=label):
+                messages = asyncio.run(self._drive(inert, **kwargs))
+                self.assertIsNone(self.set_cookie(messages),
+                                  "A request that persists nothing must not be "
+                                  "issued a session")
 
     def test_logging_in_issues_a_cookie_and_stores_the_user(self):
         set_cookie, session_id = self.login_then("alice")
@@ -676,16 +702,24 @@ class SessionMiddlewareTests(AsgiCase):
         self.assertIn("Path=/", set_cookie)
         self.assertNotIn("Secure", set_cookie)  # opt-in via MEM_SESSION_SECURE
 
-    def test_secure_can_be_turned_on(self):
-        middleware = sessions.VaultSessionMiddleware(self._wrap, secure=True)
-        self.assertIn("Secure", middleware._cookie("abc"))
-
-    def test_secure_follows_the_env_var_when_not_passed(self):
+    # One test covers the group: `secure` is one property reached from two input
+    # sources, and every case asserts the same thing about it.
+    def test_secure_is_opt_in_by_argument_or_by_env_var(self):
         os.environ["MEM_SESSION_SECURE"] = "1"
         try:
-            self.assertTrue(sessions.VaultSessionMiddleware(self._wrap).secure)
+            from_env = sessions.VaultSessionMiddleware(self._wrap)
         finally:
             del os.environ["MEM_SESSION_SECURE"]
+        explicit = sessions.VaultSessionMiddleware(self._wrap, secure=True)
+        default = sessions.VaultSessionMiddleware(self._wrap)
+
+        with self.subTest(case="MEM_SESSION_SECURE=1, argument left at its default"):
+            self.assertTrue(from_env.secure)
+        with self.subTest(case="secure=True passed to the constructor"):
+            self.assertTrue(explicit.secure)
+            self.assertIn("Secure", explicit._cookie("abc"))
+        with self.subTest(case="neither source set, so the flag stays off"):
+            self.assertFalse(default.secure)
 
     def test_the_session_is_restored_on_the_next_request(self):
         set_cookie, _ = self.login_then("alice")
@@ -699,24 +733,24 @@ class SessionMiddlewareTests(AsgiCase):
                                      + self.session_id_of(set_cookie)))
         self.assertEqual(seen["user"], "alice")
 
-    def test_an_untouched_request_rewrites_no_cookie(self):
-        set_cookie, _ = self.login_then("alice")
-        messages = asyncio.run(self._drive(
-            lambda s, r, send: send({"type": "http.response.start", "status": 200, "headers": []}),
-            cookie=f"{sessions.SESSION_COOKIE}=" + self.session_id_of(set_cookie)))
-        self.assertIsNone(self.set_cookie(messages))
-
-    def test_logging_out_drops_the_row_and_expires_the_cookie(self):
-        set_cookie, session_id = self.login_then("alice")
-
-        async def handler(scope, receive, send):
+    # One test covers the group: both cases assert the same property -- clearing
+    # the session makes the cookie an expiring one and leaves no row -- over the
+    # two inputs a clear can arrive on, a request with no session and a logout.
+    def test_clearing_the_session_expires_the_cookie_and_leaves_no_row(self):
+        async def clearing(scope, receive, send):
             scope["session"].clear()
             await send({"type": "http.response.start", "status": 200, "headers": []})
 
-        messages = asyncio.run(self._drive(
-            handler, cookie=f"{sessions.SESSION_COOKIE}=" + session_id))
-        self.assertIn("Max-Age=0", self.set_cookie(messages))
-        self.assertIsNone(sessions.load_session(session_id))
+        with self.subTest(case="clear on a request that held no session"):
+            messages = asyncio.run(self._drive(clearing))
+            self.assertIn("Max-Age=0", self.set_cookie(messages))
+
+        set_cookie, session_id = self.login_then("alice")
+        with self.subTest(case="logout of a live session also drops its row"):
+            messages = asyncio.run(self._drive(
+                clearing, cookie=f"{sessions.SESSION_COOKIE}=" + session_id))
+            self.assertIn("Max-Age=0", self.set_cookie(messages))
+            self.assertIsNone(sessions.load_session(session_id))
 
     def test_logging_in_over_an_existing_session_issues_a_different_id(self):
         # Session fixation: an id planted before login must not still be the
@@ -753,18 +787,11 @@ class SessionMiddlewareTests(AsgiCase):
         self.assertIsNone(sessions.load_session(session_id),
                           "An empty session row must not outlive the request")
 
-    def test_an_empty_session_is_not_persisted(self):
-        # "Empty" is the shape that must not become a row: clearing the session
-        # and writing nothing back is a logout. The test is that the session has
-        # no *data*, not that it has no user -- see the next three tests for why
-        # that distinction is the whole bug.
-        async def handler(scope, receive, send):
-            scope["session"].clear()
-            await send({"type": "http.response.start", "status": 200, "headers": []})
-
-        messages = asyncio.run(self._drive(handler))
-        self.assertIn("Max-Age=0", self.set_cookie(messages))
-
+    # "Empty" is the shape that must not become a row: clearing the session
+    # and writing nothing back is a logout (asserted in
+    # test_clearing_the_session_expires_the_cookie_and_leaves_no_row). The test
+    # is that the session has no *data*, not that it has no user -- see the next
+    # three tests for why that distinction is the whole bug.
     def test_a_session_holding_only_a_pre_auth_key_is_persisted(self):
         # The OAuth flow stores `state` here between the consent redirect and the
         # callback. Refusing to persist a session without a `user` made every
@@ -1111,12 +1138,21 @@ class GoogleIdentityStoreTests(StoreCase):
         row = sessions.link_google_identity(self.SUBJECT, "bob")
         self.assertEqual(row["user_id"], "bob")
 
-    def test_an_empty_subject_is_refused(self):
-        # Keying a vault on "" would make every unlinked token resolve at once.
-        for value in ("", "   ", None):
-            with self.subTest(value=repr(value)):
-                with self.assertRaises(ValueError):
-                    sessions.link_google_identity(value, "alice")
+    # One test covers the group: a blank field that keys a row is refused, and the
+    # two cases are the two fields `link_google_identity` requires.
+    def test_a_blank_key_field_is_refused(self):
+        # An empty subject would make every unlinked token resolve at once; an
+        # empty user_id is a link that grants nothing and would resolve to "" for
+        # anybody holding the token.
+        cases = {
+            "empty subject": lambda value: sessions.link_google_identity(value, "alice"),
+            "empty vault": lambda value: sessions.link_google_identity(self.SUBJECT, value),
+        }
+        for label, call in cases.items():
+            for value in ("", "   ", None):
+                with self.subTest(field=label, value=repr(value)):
+                    with self.assertRaises(ValueError):
+                        call(value)
 
     def test_oversized_display_fields_are_truncated_not_refused(self):
         # The opposite policy from the credentials above, and deliberately: these
@@ -1126,15 +1162,6 @@ class GoogleIdentityStoreTests(StoreCase):
                                             email="e" * 500, name="n" * 500)
         self.assertEqual(len(row["email"]), sessions.MAX_EMAIL_CHARS)
         self.assertEqual(len(row["display_name"]), sessions.MAX_NAME_CHARS)
-
-    def test_a_link_with_no_vault_is_refused(self):
-        # user_id IS the vault, so an empty one is a link that grants nothing and
-        # would resolve to "" for anybody holding the token.
-        for value in ("", "   ", None):
-            with self.subTest(value=repr(value)):
-                with self.assertRaises(ValueError):
-                    sessions.link_google_identity(self.SUBJECT, value)
-
 
 
 if __name__ == "__main__":

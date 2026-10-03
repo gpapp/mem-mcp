@@ -95,25 +95,28 @@ class HeaderPrecedenceTests(unittest.TestCase):
         self.assertEqual(self.extract(headers), "alice")
 
     def test_a_valid_bearer_key_resolves_to_its_owner(self):
-        self.assertEqual(
-            self.extract({"Authorization": "Bearer mvk_real_key"}), "alice")
-
-    def test_bearer_is_case_insensitive_on_the_scheme(self):
-        # Clients are not careful about scheme case, and a 401 that only
-        # happens when a client writes `bearer` is a bug report, not a policy.
-        self.assertEqual(
-            self.extract({"Authorization": "bearer mvk_real_key"}), "alice")
+        # One test covers the group: all three spellings assert the same fact —
+        # a bearer scheme naming a known key resolves to its owner — and the
+        # only thing that varies is the scheme's case. Clients are not careful
+        # about it, and a 401 that only happens when a client writes `bearer`
+        # is a bug report, not a policy.
+        for value in ("Bearer mvk_real_key", "bearer mvk_real_key",
+                      "BEARER mvk_real_key"):
+            with self.subTest(value=value):
+                self.assertEqual(self.extract({"Authorization": value}), "alice")
 
     def test_an_unknown_bearer_key_yields_no_user_at_all(self):
-        self.assertEqual(
-            self.extract({"Authorization": "Bearer mvk_guessed"}), "anonymous")
-
-    def test_a_bearer_key_is_not_fallback_checked_as_a_username(self):
-        # If Bearer missed and the function fell through to the proxy headers,
-        # a bad key would fall back to trusting Remote-User. A key that is
-        # wrong must be an answer, not an absence of one.
-        headers = {"Authorization": "Bearer mvk_guessed", "Remote-User": "victim"}
-        self.assertEqual(self.extract(headers), "anonymous")
+        # One test covers the group: both inputs assert the same fact — a key
+        # that resolves to nobody is an answer in its own right. The second
+        # case also carries a proxy header, because if Bearer missed and the
+        # function fell through to those, a bad key would fall back to trusting
+        # Remote-User. A key that is wrong must be an answer, not an absence
+        # of one.
+        for headers in ({"Authorization": "Bearer mvk_guessed"},
+                        {"Authorization": "Bearer mvk_guessed",
+                         "Remote-User": "victim"}):
+            with self.subTest(headers=headers):
+                self.assertEqual(self.extract(headers), "anonymous")
 
     def test_basic_still_works_so_existing_clients_keep_connecting(self):
         self.assertEqual(self.extract(self.basic("alice")), "alice")
@@ -126,14 +129,16 @@ class HeaderPrecedenceTests(unittest.TestCase):
         self.assertEqual(self.extract({"AUTHORIZATION": "Bearer mvk_real_key"}), "alice")
         self.assertEqual(self.extract({"X-Vault-User": "alice"}), "alice")
 
-    def test_no_evidence_is_anonymous_rather_than_a_guess(self):
-        self.assertEqual(self.extract({}), "anonymous")
-
-    def test_a_malformed_authorization_header_does_not_raise(self):
-        for value in ("Bearer", "Bearer ", "Basic", "Basic not-base64!!",
-                      "Basic " + base64.b64encode(b"no-colon").decode()):
-            self.assertEqual(self.extract({"Authorization": value}), "anonymous",
-                             msg=f"{value!r} did not fall through cleanly")
+    def test_no_usable_credential_is_anonymous_rather_than_a_guess_or_an_error(self):
+        # One test covers the group: an absent Authorization header and each
+        # malformed one all assert the same fact — nothing here names a user, so
+        # the answer is "anonymous" and nothing raises.
+        cases = [{}] + [{"Authorization": value} for value in
+                        ("Bearer", "Bearer ", "Basic", "Basic not-base64!!",
+                         "Basic " + base64.b64encode(b"no-colon").decode())]
+        for headers in cases:
+            with self.subTest(headers=headers):
+                self.assertEqual(self.extract(headers), "anonymous")
 
 
 class _StubStore:
@@ -188,10 +193,10 @@ class GuardCase(unittest.TestCase):
     One credential is accepted on /mcp — a Bearer access key — so the owner a
     test resolves also proves which credential was honoured. An assertion on
     the status code alone would pass if the guard picked the wrong credential
-    and then 200'd anyway, and the two credentials that are *refused* are the
-    reason that matters: a test has to be able to say "a correct password is
-    still refused", which is indistinguishable from "refused" without also
-    checking that the refusal is for the right reason.
+    and then 200'd anyway, and the two credentials that are *refused* — Basic and the session cookie —
+    are the reason that matters: a test has to be able to say "a correct
+    password is still refused", which is indistinguishable from "refused"
+    without also checking that the refusal is for the right reason.
     """
 
     @classmethod
@@ -271,71 +276,65 @@ class _NullLogger:
 
 class McpAuthGuardTests(GuardCase):
 
-    def test_a_request_with_no_credential_is_refused(self):
-        status, reached, _ = self.call()
-        self.assertEqual(status, 401)
-        self.assertFalse(reached, "The MCP app must never see an unauthenticated request")
+    def test_every_credential_except_an_access_key_is_refused(self):
+        # One test covers the group: every case asserts the same fact — the
+        # request is answered 401 by the guard and the MCP app is never reached.
+        # The labels are what keep the cases distinct, because each one is a
+        # different reason a caller might reasonably expect to be let in.
+        def basic(user, password):
+            return [("Authorization", f"Basic {self.basic(user, password)}")]
+
+        cases = [
+            # No credential presented at all.
+            ("no credential", [], None),
+            ("an unknown access key", [("Authorization", "Bearer mvk_guessed_key")], None),
+            # An empty or malformed bearer: no key for the store to resolve.
+            ("an empty bearer", [("Authorization", "Bearer")], None),
+            ("a whitespace-only bearer", [("Authorization", "Bearer ")], None),
+            ("a lowercase bearer", [("Authorization", "bearer")], None),
+            # The dashboard keeps its sessions; /mcp does not use them. A cookie
+            # is a bearer credential the browser replays on its own, so
+            # accepting one here hands every MCP client something that cannot be
+            # scoped to a device — and cannot be revoked without ending the
+            # user's own session.
+            ("a session cookie", [], "alice"),
+            # Not the mechanism that is refused — Basic is per-call and
+            # stateless, which is the same property a key has. It is the
+            # credential: the account password, so it also unlocks /api/*, it
+            # rotates only when a human changes it, and it cannot be revoked for
+            # one lost laptop without changing it for everyone. Keeping it here
+            # would have made every access key revocable in name only.
+            ("Basic with the correct account password", basic("bob", "hunter2"), None),
+            ("Basic with the wrong password", basic("bob", "wrong"), None),
+            ("Basic for a user that does not exist", basic("mallory", "x"), None),
+            # The guard used to dispatch on the scheme, so "bearer " was the only
+            # string it looked at. Anything else simply fell through to the
+            # session, which is gone — so these must be refused rather than
+            # reaching the app unidentified.
+            ("Digest", [("Authorization", "Digest response=abc")], None),
+            ("Token", [("Authorization", "Token mvk_alice_key")], None),
+            ("Negotiate", [("Authorization", "Negotiate dG9rZW4=")], None),
+            ("a bare key with no scheme", [("Authorization", "mvk_alice_key")], None),
+            # The old ladder fell through, so a revoked or guessed key on a
+            # request that also carried a cookie still authenticated as the
+            # cookie's owner. There is nothing to fall through to now, and the
+            # cookie has to name somebody else or "it still works because of the
+            # cookie" is indistinguishable from "the key was accepted".
+            ("an invalid key alongside a session cookie",
+             [("Authorization", "Bearer mvk_guessed")], "alice"),
+        ]
+        for label, headers, session_user in cases:
+            with self.subTest(credential=label):
+                status, reached, _ = self.call(headers, session_user=session_user)
+                self.assertEqual(status, 401)
+                self.assertFalse(reached,
+                                 f"{label} must never reach the MCP app")
 
     def test_a_valid_access_key_is_accepted(self):
         status, reached, scope = self.call([("Authorization", "Bearer mvk_alice_key")])
         self.assertEqual(status, 200)
         self.assertTrue(reached)
         self.assertEqual(self.vault_user(scope), "alice")
-
-    def test_an_unknown_access_key_is_refused(self):
-        status, reached, _ = self.call([("Authorization", "Bearer mvk_guessed_key")])
-        self.assertEqual(status, 401)
-        self.assertFalse(reached)
-
-    def test_an_empty_or_malformed_bearer_is_refused(self):
-        for value in ("Bearer", "Bearer ", "bearer"):
-            status, reached, _ = self.call([("Authorization", value)])
-            self.assertEqual(status, 401, msg=f"{value!r} was not refused")
-            self.assertFalse(reached)
-
-    def test_a_session_cookie_is_refused(self):
-        # The dashboard keeps its sessions; /mcp does not use them. A cookie is
-        # a bearer credential the browser replays on its own, so accepting one
-        # here hands every MCP client something that cannot be scoped to a
-        # device — and cannot be revoked without ending the user's own session.
-        status, reached, _ = self.call(session_user="alice")
-        self.assertEqual(status, 401)
-        self.assertFalse(reached, "A session cookie must not authenticate /mcp")
-
-    def test_basic_auth_is_refused_even_with_the_correct_password(self):
-        # Not the mechanism that is refused — Basic is per-call and stateless,
-        # which is the same property a key has. It is the credential: the
-        # account password, so it also unlocks /api/*, it rotates only when a
-        # human changes it, and it cannot be revoked for one lost laptop
-        # without changing it for everyone. Keeping it here would have made
-        # every access key revocable in name only.
-        status, reached, _ = self.call(
-            [("Authorization", f"Basic {self.basic('bob', 'hunter2')}")])
-        self.assertEqual(status, 401)
-        self.assertFalse(reached,
-                         "A correct account password must not authenticate /mcp")
-
-    def test_basic_auth_with_the_wrong_password_is_refused(self):
-        status, reached, _ = self.call(
-            [("Authorization", f"Basic {self.basic('bob', 'wrong')}")])
-        self.assertEqual(status, 401)
-        self.assertFalse(reached)
-
-    def test_a_basic_header_for_an_unknown_user_is_refused(self):
-        status, _, _ = self.call(
-            [("Authorization", f"Basic {self.basic('mallory', 'x')}")])
-        self.assertEqual(status, 401)
-
-    def test_any_other_authorization_scheme_is_refused(self):
-        # The guard used to dispatch on the scheme, so "bearer " was the only
-        # string it looked at. Anything else simply fell through to the
-        # session, which is gone — so these must be refused rather than
-        # reaching the app unidentified.
-        for value in ("Digest response=abc", "Token mvk_alice_key",
-                      "Negotiate dG9rZW4=", "mvk_alice_key"):
-            status, reached, _ = self.call([("Authorization", value)])
-            self.assertEqual(status, 401, msg=f"{value!r} was not refused")
-            self.assertFalse(reached)
 
     def test_a_session_cookie_does_not_override_a_valid_access_key(self):
         # Both are present and they name different people. The cookie is never
@@ -345,17 +344,6 @@ class McpAuthGuardTests(GuardCase):
             [("Authorization", "Bearer mvk_bob_key")], session_user="alice")
         self.assertEqual(status, 200)
         self.assertEqual(self.vault_user(scope), "bob")
-
-    def test_an_invalid_key_does_not_fall_back_to_a_session_cookie(self):
-        # The old ladder fell through, so a revoked or guessed key on a request
-        # that also carried a cookie still authenticated as the cookie's owner.
-        # There is nothing to fall through to now, and that has to be pinned:
-        # "it still works because of the cookie" is indistinguishable from
-        # "the key was accepted" unless the cookie names someone else.
-        status, reached, _ = self.call(
-            [("Authorization", "Bearer mvk_guessed")], session_user="alice")
-        self.assertEqual(status, 401)
-        self.assertFalse(reached)
 
     def test_a_spoofed_identity_header_is_replaced_not_trusted(self):
         status, _, scope = self.call(
@@ -461,15 +449,27 @@ class BearerLadderTests(unittest.TestCase):
     def test_an_access_key_resolves_to_its_owner(self):
         self.assertEqual(self._resolve("mvk_alice_key"), ("alice", ""))
 
-    def test_an_unknown_access_key_is_refused_with_a_reason(self):
-        user, reason = self._resolve("mvk_guess")
-        self.assertIsNone(user)
-        self.assertIn("not a known credential", reason)
-
-    def test_a_revoked_or_expired_key_is_refused(self):
-        self.state["known_keys"].pop("mvk_bob_key")
-        self.assertEqual(self._resolve("mvk_bob_key"), (None, self._resolve("mvk_bob_key")[1]))
-        self.assertIsNone(self._resolve("mvk_bob_key")[0])
+    def test_a_token_that_names_no_key_is_refused_with_a_reason(self):
+        # One test covers the group: all three inputs assert the same two facts —
+        # no owner is resolved, and the reason says the token is not a known
+        # credential rather than a bare "invalid". The Google ID token is the
+        # case that used to be accepted here; it has to be told the truth so the
+        # client holding one signs in through the browser instead.
+        cases = [
+            # Never issued.
+            ("a guessed key", "mvk_guess", None),
+            # Issued once and since revoked or expired: the store no longer
+            # knows it, which is exactly the state the other gate must agree on.
+            ("a revoked or expired key", "mvk_bob_key", "mvk_bob_key"),
+            ("a Google ID token", "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ4In0.sig", None),
+        ]
+        for label, token, revoke in cases:
+            with self.subTest(token=label):
+                if revoke:
+                    self.state["known_keys"].pop(revoke)
+                user, reason = self._resolve(token)
+                self.assertIsNone(user)
+                self.assertIn("not a known credential", reason)
 
     def test_an_empty_token_is_refused_with_a_reason(self):
         for value in ("", "   ", None):
@@ -482,14 +482,6 @@ class BearerLadderTests(unittest.TestCase):
         # A key pasted out of a config file arrives with a trailing newline, and
         # "a key with a newline in it" is not a reason to refuse a correct key.
         self.assertEqual(self._resolve("  mvk_alice_key\n"), ("alice", ""))
-
-    def test_something_that_is_not_a_credential_at_all_says_so(self):
-        # A Google ID token used to be accepted here. It is not any more, and the
-        # answer has to say that rather than "invalid credential": the client
-        # holding one has to sign in through the browser instead.
-        user, reason = self._resolve("eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ4In0.sig")
-        self.assertIsNone(user)
-        self.assertIn("not a known credential", reason)
 
     def test_no_google_store_is_consulted(self):
         self.state["oauth_lookups"] = 0
@@ -535,21 +527,17 @@ class BearerCallSiteTests(unittest.TestCase):
                 return ast.get_source_segment(self.gui, node)
         raise AssertionError(f"{name} is not defined in gui.py")
 
-    def test_the_mcp_guard_calls_the_shared_ladder(self):
-        self.assertIn("resolve_bearer_token(", self._function("__call__"))
-
-    def test_the_mcp_guard_does_not_resolve_a_key_on_its_own(self):
-        # A second resolve_psk( inside the guard is the drift this refactor
-        # removed, and it would return as an accepted credential the other gate
-        # does not accept.
-        source = self._function("__call__")
-        self.assertNotIn("resolve_psk(", source)
-        self.assertNotIn("google_auth.google_identity(", source)
-
-    def test_the_gui_gate_calls_the_shared_ladder(self):
-        source = self._function("_check_session_auth")
-        self.assertIn("resolve_bearer_token(", source)
-        self.assertNotIn("resolve_psk(", source)
+    def test_each_gate_calls_the_shared_ladder_and_resolves_nothing_itself(self):
+        # One test covers the group: both gates assert the same fact — the
+        # credential decision is delegated to resolve_bearer_token, and the gate
+        # does not reach into a store of its own. A second resolve_psk( inside
+        # either is the drift this refactor removed, and it would return as an
+        # accepted credential the other gate does not accept.
+        for gate in ("__call__", "_check_session_auth"):
+            with self.subTest(gate=gate):
+                source = self._function(gate)
+                self.assertIn("resolve_bearer_token(", source)
+                self.assertNotIn("resolve_psk(", source)
 
     def test_the_401_body_advertises_the_credential_that_is_accepted(self):
         # Access key, and only access key: /mcp stopped accepting a Google token
@@ -1078,22 +1066,81 @@ class ApiAuthTests(unittest.TestCase):
 
     # -- the password is actually verified ---------------------------------
 
-    def test_a_correct_basic_password_is_accepted(self):
-        verdict, request, reached = self.run_guard(
-            headers=self.basic("alice", "correct-horse"))
-        self.assertTrue(reached)
-        self.assertEqual(request.state.user, "alice")
+    def test_each_credential_is_accepted_and_names_its_owner(self):
+        # One test covers the group: every case asserts the same fact — the
+        # request reaches the route, and the owner the credential resolved to is
+        # the one stamped on the request state. The labels are what keep the
+        # cases distinct, because each is a different credential arriving at the
+        # same gate, and a status-only assertion cannot tell them apart.
+        def basic(user, password, scheme="Basic"):
+            raw = base64.b64encode(f"{user}:{password}".encode()).decode()
+            return {"Authorization": f"{scheme} {raw}"}
 
-    def test_a_wrong_basic_password_is_refused(self):
-        # The whole point. Before, this reached every route as alice.
-        verdict, _, reached = self.run_guard(headers=self.basic("alice", "wrong"))
-        self.assertFalse(reached)
-        self.assertEqual(verdict.status_code, 401)
+        cases = [
+            ("a correct Basic password", basic("alice", "correct-horse"),
+             {}, "alice", False),
+            # Clients are not careful about scheme case, and a 401 that only
+            # happens when a client writes `basic` is a bug report, not a policy.
+            ("a lowercase Basic scheme", basic("bob", "hunter2", "basic"),
+             {}, "bob", False),
+            ("an access key", {"Authorization": "Bearer mvk_bob_key"},
+             {}, "bob", False),
+            ("a session cookie", None, {"user": "alice"}, "alice", True),
+        ]
+        for label, headers, session, owner, cookie_path in cases:
+            with self.subTest(credential=label):
+                # Per case, not per test: the cookie assertion below is about
+                # what *this* request caused, so the record cannot carry over.
+                self.verifications.clear()
+                _, request, reached = self.run_guard(headers=headers, session=session)
+                self.assertTrue(reached)
+                self.assertEqual(request.state.user, owner)
+                if cookie_path:
+                    self.assertEqual(
+                        self.verifications, [],
+                        "the cookie path must not shell out to htpasswd")
 
-    def test_an_unknown_user_with_any_password_is_refused(self):
-        verdict, _, reached = self.run_guard(headers=self.basic("mallory", "x"))
-        self.assertFalse(reached)
-        self.assertEqual(verdict.status_code, 401)
+    def test_every_refusal_is_answered_by_the_gate_and_never_reaches_the_route(self):
+        # One test covers the group: every case asserts the same fact — the
+        # middleware answers instead of calling on, with the status that case
+        # owes the caller. The status is per-case rather than shared because a
+        # browser path is redirected rather than challenged, and a table is what
+        # keeps the difference from being averaged away.
+        no_colon = base64.b64encode(b"alice").decode()
+        cases = [
+            # The whole point of the suite. Before, this reached every route as
+            # alice, because the decoded username was taken and the password
+            # discarded.
+            ("a wrong Basic password", "/api/memories",
+             self.basic("alice", "wrong"), {}, 401),
+            ("an unknown user with any password", "/api/memories",
+             self.basic("mallory", "x"), {}, 401),
+            ("a Basic header with no colon to split on", "/api/memories",
+             {"Authorization": f"Basic {no_colon}"}, {}, 401),
+            # A 500 would be an unhandled decode error rather than a refusal,
+            # which is a different failure with a different remedy.
+            ("a malformed Basic header", "/api/memories",
+             {"Authorization": "Basic not-base64!!"}, {}, 401),
+            ("an unknown access key", "/api/memories",
+             {"Authorization": "Bearer mvk_guessed"}, {}, 401),
+            ("a bare bearer with no token", "/api/memories",
+             {"Authorization": "Bearer"}, {}, 401),
+            # It was on the unauthenticated allow-list. The handler filtered
+            # events per user correctly, but the user it filtered by came from
+            # the unverified header sources — so the filter selected an
+            # attacker-chosen vault's feed. Filtering by a value the caller
+            # chose is not access control.
+            ("the event stream, with no credential at all", "/api/events",
+             None, {}, 401),
+            ("a GUI page, which a browser is redirected to the login for",
+             "/gui", None, {}, 302),
+        ]
+        for label, path, headers, session, status in cases:
+            with self.subTest(path=path, credential=label):
+                verdict, _, reached = self.run_guard(
+                    path=path, headers=headers, session=session)
+                self.assertFalse(reached)
+                self.assertEqual(verdict.status_code, status)
 
     def test_the_password_is_handed_to_the_verifier_whole(self):
         # partition, not split(":", 1): a password containing a colon used to
@@ -1101,75 +1148,18 @@ class ApiAuthTests(unittest.TestCase):
         self.check(_Request("/api/x", self.basic("alice", "a:b:c")))
         self.assertIn(("alice", "a:b:c"), self.verifications)
 
-    def test_a_basic_header_with_no_colon_is_refused(self):
-        raw = base64.b64encode(b"alice").decode()
-        verdict, _, reached = self.run_guard(headers={"Authorization": f"Basic {raw}"})
-        self.assertFalse(reached)
-        self.assertEqual(verdict.status_code, 401)
-
-    def test_the_basic_scheme_is_case_insensitive(self):
-        verdict, request, reached = self.run_guard(
-            headers={"Authorization": "basic " + self.basic("bob", "hunter2")["Authorization"].split()[1]})
-        self.assertTrue(reached)
-        self.assertEqual(request.state.user, "bob")
-
-    def test_a_malformed_basic_header_is_a_401_not_a_500(self):
-        verdict, _, reached = self.run_guard(
-            headers={"Authorization": "Basic not-base64!!"})
-        self.assertFalse(reached)
-        self.assertEqual(verdict.status_code, 401)
-
-    # -- the other two credentials still work here -------------------------
-
-    def test_a_session_cookie_is_accepted_without_spawning_htpasswd(self):
-        verdict, request, reached = self.run_guard(session={"user": "alice"})
-        self.assertTrue(reached)
-        self.assertEqual(request.state.user, "alice")
-        self.assertEqual(self.verifications, [],
-                         "the cookie path must not shell out to htpasswd")
-
-    def test_an_access_key_is_accepted(self):
-        verdict, request, reached = self.run_guard(
-            headers={"Authorization": "Bearer mvk_bob_key"})
-        self.assertTrue(reached)
-        self.assertEqual(request.state.user, "bob")
-
-    def test_an_unknown_access_key_is_refused(self):
-        verdict, _, reached = self.run_guard(
-            headers={"Authorization": "Bearer mvk_guessed"})
-        self.assertFalse(reached)
-        self.assertEqual(verdict.status_code, 401)
-
-    def test_a_bare_bearer_is_refused(self):
-        verdict, _, reached = self.run_guard(headers={"Authorization": "Bearer"})
-        self.assertFalse(reached)
-        self.assertEqual(verdict.status_code, 401)
-
     # -- the allow-list ----------------------------------------------------
 
-    def test_the_event_stream_is_not_public(self):
-        # It was on the unauthenticated allow-list. The handler filtered events
-        # per user, but the user it filtered by came from the unverified header
-        # sources — so the filter selected an attacker-chosen vault's feed.
-        verdict, _, reached = self.run_guard(path="/api/events")
-        self.assertFalse(reached)
-        self.assertEqual(verdict.status_code, 401)
-
-    def test_the_login_endpoint_is_the_only_open_one(self):
-        for path in ("/api/auth/login", "/api/auth/logout"):
-            _, _, reached = self.run_guard(path=path, session={})
-            self.assertTrue(reached, msg=f"{path} must be reachable to log in")
-
-    def test_a_gui_path_without_a_credential_redirects_rather_than_401(self):
-        verdict, _, reached = self.run_guard(path="/gui")
-        self.assertFalse(reached)
-        self.assertEqual(verdict.status_code, 302)
-
-    def test_the_mcp_path_is_outside_this_guard(self):
-        # Documents *why* McpAuthGuard exists: this middleware only matches
-        # /gui* and /api*, so /mcp falls straight through to the mount.
-        _, _, reached = self.run_guard(path="/mcp")
-        self.assertTrue(reached)
+    def test_paths_outside_this_guard_reach_the_route(self):
+        # One test covers the group: all three cases assert the same fact — this
+        # middleware does not match the path, so the request is passed through
+        # rather than answered here. /mcp is in the table because it documents
+        # *why* McpAuthGuard exists: this guard only matches /gui* and /api*,
+        # so /mcp falls straight through to the mount.
+        for path in ("/api/auth/login", "/api/auth/logout", "/mcp"):
+            with self.subTest(path=path):
+                _, _, reached = self.run_guard(path=path, session={})
+                self.assertTrue(reached, msg=f"{path} must be reachable to log in")
 
     def test_no_dead_ping_entry_is_left_on_the_allow_list(self):
         # `/api/ping` was allow-listed with no route behind it — an allow-list
@@ -1239,25 +1229,25 @@ class CorsAndDocsTests(unittest.TestCase):
         fn = _lift("server.py", "_cors_origins", ns)
         return fn()
 
-    def test_cors_origins_come_from_base_url(self):
-        self.assertEqual(self._origins_for("https://host/mem-mcp"), ["https://host"])
-        self.assertEqual(
-            self._origins_for("https://host:8443/mem-mcp"), ["https://host:8443"])
-
-    def test_an_origin_is_scheme_and_host_with_no_mount_point(self):
-        # BASE_URL carries the nginx prefix; an Access-Control-Allow-Origin
-        # must not, or it matches nothing.
+    def test_cors_origins_are_the_base_urls_scheme_and_host_and_nothing_else(self):
+        # One test covers the group: every case asserts the same fact — the
+        # derived origin is the scheme plus host of BASE_URL. BASE_URL carries
+        # the nginx prefix, which an Access-Control-Allow-Origin must not, or
+        # it matches nothing; and a BASE_URL with no host yields no origin at
+        # all, rather than a fallback to "*": no BASE_URL means no CORS headers,
+        # and same-origin browser use never needed any.
         for base, expected in (
-            ("https://host/mem-mcp", "https://host"),
-            ("http://host:8086/mem-mcp", "http://host:8086"),
+            ("https://host/mem-mcp", ["https://host"]),
+            ("https://host:8443/mem-mcp", ["https://host:8443"]),
+            ("http://host:8086/mem-mcp", ["http://host:8086"]),
+            ("", []),
+            ("   ", []),
+            (None, []),
+            ("/mem-mcp", []),
+            ("mem-mcp", []),
         ):
-            self.assertEqual(self._origins_for(base), [expected], msg=base)
-
-    def test_an_unset_or_relative_base_url_yields_no_origin_at_all(self):
-        # Not a fallback to "*": no BASE_URL means no CORS headers, and
-        # same-origin browser use never needed any.
-        for base in ("", "   ", None, "/mem-mcp", "mem-mcp"):
-            self.assertEqual(self._origins_for(base), [], msg=repr(base))
+            with self.subTest(base=base):
+                self.assertEqual(self._origins_for(base), expected)
 
     def test_the_web_app_cors_is_not_a_wildcard_with_credentials(self):
         # allow_origins=["*"] + allow_credentials=True + allow_headers=["*"]

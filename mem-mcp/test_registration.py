@@ -121,13 +121,14 @@ class StoreCase(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class PasswordHashingTests(unittest.TestCase):
-    def test_the_right_password_verifies(self):
+    def test_verification_follows_the_password(self):
+        # A matching and a non-matching password are one property -- the stored
+        # hash decides -- over two inputs.
         stored = sessions.hash_password("correct horse battery staple")
-        self.assertTrue(sessions.verify_password("correct horse battery staple", stored))
-
-    def test_a_wrong_password_does_not(self):
-        stored = sessions.hash_password("correct horse battery staple")
-        self.assertFalse(sessions.verify_password("Correct horse battery staple", stored))
+        for password, expected in (("correct horse battery staple", True),
+                                   ("Correct horse battery staple", False)):
+            with self.subTest(password=password, expected=expected):
+                self.assertEqual(sessions.verify_password(password, stored), expected)
 
     def test_the_same_password_hashes_differently_every_time(self):
         # A per-password salt: identical passwords must not be recognisable as
@@ -199,18 +200,19 @@ class PasswordHashingTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class UsernameTests(unittest.TestCase):
-    def test_a_reasonable_username_is_kept_as_typed(self):
+    def test_a_reasonable_username_is_normalised_not_reshaped(self):
+        # Lowercasing, keeping the allowed characters and trimming are one
+        # property -- a usable canonical key -- over three inputs.
         # Lowercased, and that is not cosmetic: `user_id` *is* the vault key and
         # every store compares it with `=`, so `Alice` and `alice` would otherwise
         # be two vaults nobody can tell apart. The alternative -- keeping the name
         # as typed and case-insensitively matching -- is the same thing with an
         # extra step.
-        self.assertEqual(sessions.normalise_username("Alice"), "alice")
-        self.assertEqual(sessions.normalise_username("bob.smith_1"),
-                         "bob.smith_1")
-
-    def test_the_result_is_stripped(self):
-        self.assertEqual(sessions.normalise_username("  alice  "), "alice")
+        for value, expected in (("Alice", "alice"),
+                                ("bob.smith_1", "bob.smith_1"),
+                                ("  alice  ", "alice")):
+            with self.subTest(value=repr(value), expected=expected):
+                self.assertEqual(sessions.normalise_username(value), expected)
 
     def test_the_allowed_set_is_exactly_letters_digits_dot_underscore_dash(self):
         # Anything else is refused rather than transliterated: two spellings of
@@ -252,28 +254,28 @@ class UsernameTests(unittest.TestCase):
 
 
 class EmailValidationTests(unittest.TestCase):
-    def test_it_normalises(self):
-        self.assertEqual(sessions.validate_email("  Alice@Example.COM "),
-                         "alice@example.com")
+    def test_a_legal_address_comes_back_normalised_but_otherwise_unchanged(self):
+        # Normalising case and whitespace and passing through a domain the server
+        # judges for itself are one property -- the return value -- over two
+        # inputs. Refusing the consecutive dot would reject addresses that work.
+        for value, expected in (("  Alice@Example.COM ", "alice@example.com"),
+                                ("alice@ex..ample.com", "alice@ex..ample.com")):
+            with self.subTest(value=value, expected=expected):
+                self.assertEqual(sessions.validate_email(value), expected)
 
     def test_unusable_shapes_are_refused_with_a_reason(self):
-        for value in ("", "   ", "alice", "alice@", "@example.com", "a b@example.com",
-                      "alice@@example.com", "alice@ex ample.com", None, 42):
-            with self.subTest(value=repr(value)):
+        # Every shape and the oversized address are one property -- refuse rather
+        # than truncate, because the address is where the confirmation goes and a
+        # shortened one is an address nobody can confirm.
+        cases = [("empty", ""), ("blank", "   "), ("no-at", "alice"),
+                 ("no-local-part", "alice@"), ("no-domain", "@example.com"),
+                 ("space-in-local", "a b@example.com"), ("double-at", "alice@@example.com"),
+                 ("space-in-domain", "alice@ex ample.com"), ("none", None), ("int", 42),
+                 ("oversized", "a" * (sessions.MAX_EMAIL_CHARS + 1) + "@x.com")]
+        for label, value in cases:
+            with self.subTest(label=label, value=repr(value)[:40]):
                 with self.assertRaises(ValueError):
                     sessions.validate_email(value)
-
-    def test_oversized_is_refused(self):
-        # Refused rather than truncated: the address is where the confirmation
-        # goes, so a shortened one is an address nobody can confirm.
-        with self.assertRaises(ValueError):
-            sessions.validate_email("a" * (sessions.MAX_EMAIL_CHARS + 1) + "@x.com")
-
-    def test_a_consecutive_dot_in_the_domain_is_accepted(self):
-        # The server decides that, not us; refusing would reject addresses that
-        # work.
-        self.assertEqual(sessions.validate_email("alice@ex..ample.com"),
-                         "alice@ex..ample.com")
 
 
 # ---------------------------------------------------------------------------
@@ -342,18 +344,17 @@ class AccountStoreTests(StoreCase):
         sessions.create_credentials("someone", self.GOOD, "operator@example.com")
         self.assertTrue(sessions.email_taken("operator@example.com"))
 
-    def test_a_short_password_creates_nothing(self):
-        with self.assertRaises(ValueError):
-            sessions.create_credentials("alice", "short", "alice@example.com")
-        self.assertIsNone(sessions.get_credentials("alice"))
-
-    def test_an_unusable_username_or_address_creates_nothing(self):
-        for username, email in (("a b", "alice@example.com"),
-                                ("alice", "not-an-address")):
-            with self.subTest(username=username):
+    def test_an_unusable_input_creates_nothing(self):
+        # A short password, an unusable username and an unusable address are one
+        # property -- the create is refused and leaves no row behind.
+        cases = (("short password", "alice", "alice@example.com", "short"),
+                 ("unusable username", "a b", "alice@example.com", self.GOOD),
+                 ("unusable address", "alice", "not-an-address", self.GOOD))
+        for label, username, email, password in cases:
+            with self.subTest(label=label, username=username):
                 with self.assertRaises(ValueError):
-                    sessions.create_credentials(username, self.GOOD, email)
-        self.assertIsNone(sessions.get_credentials("alice"))
+                    sessions.create_credentials(username, password, email)
+                self.assertIsNone(sessions.get_credentials(username))
 
     def test_deleting_an_account_frees_the_name(self):
         # The undo for a signup whose mail could not be sent. Without it the name
@@ -430,18 +431,13 @@ class VerificationTests(StoreCase):
         sessions.create_credentials("alice", self.GOOD, "alice@example.com")
 
     def test_a_token_verifies_the_account_and_clears_itself(self):
+        # The second click is part of this property, not a separate one: a mail
+        # client that previews a link, or a double-click, must not report a
+        # failure to the second person who opens it.
         token = sessions.issue_verification_token("alice")
         self.assertEqual(sessions.verify_email_token(token), "alice")
         self.assertTrue(sessions.account_verified("alice"))
         self.assertIsNone(sessions.verify_email_token(token))
-
-    def test_a_second_click_on_the_same_link_does_nothing(self):
-        # A mail client that previews a link, or a double-click, must not report
-        # a failure to the second person who opens it.
-        token = sessions.issue_verification_token("alice")
-        self.assertEqual(sessions.verify_email_token(token), "alice")
-        self.assertIsNone(sessions.verify_email_token(token))
-        self.assertTrue(sessions.account_verified("alice"))
 
     def test_a_token_is_stored_only_as_a_hash(self):
         token = sessions.issue_verification_token("alice")
@@ -539,37 +535,45 @@ class RegistrationFlagTests(StoreCase):
         self.assertFalse(sessions.registration_enabled("google"))
 
     def test_the_email_form_needs_a_mail_server(self):
-        self._patch(sessions, REGISTRATION_ENABLED=True)
-        self._patch(sessions, SMTP_HOST="", SMTP_FROM="")
-        self.assertFalse(sessions.registration_enabled("email"))
-        self._patch(sessions, SMTP_HOST="smtp.example.com")
-        self.assertFalse(sessions.registration_enabled("email"))
-        self._patch(sessions, SMTP_FROM="vault@example.com")
-        self.assertTrue(sessions.registration_enabled("email"))
+        # Both entry points read the same two values, so the three stages are one
+        # property -- host *and* from -- checked through the predicate and through
+        # the gate the route enforces. Two blanks is a compose line with no value.
+        stages = (("nothing configured", "", "", False),
+                  ("host only", "smtp.example.com", "", False),
+                  ("from only", "", "vault@example.com", False),
+                  ("host and from", "smtp.example.com", "vault@example.com", True))
+        for label, host, from_address, expected in stages:
+            with self.subTest(label=label):
+                self._patch(sessions, REGISTRATION_ENABLED=True, SMTP_HOST=host,
+                            SMTP_FROM=from_address)
+                self.assertEqual(sessions.smtp_configured(), expected)
+                self.assertEqual(sessions.registration_enabled("email"), expected)
 
     def test_google_needs_a_client_id_and_a_secret(self):
+        # Every configuration state is one property -- configured() is False until
+        # both values are present and non-blank. A client id alone can start a
+        # login and cannot finish it, and the predicate the route and the template
+        # both read has to agree with the module rather than with a stub.
         self._patch(sessions, REGISTRATION_ENABLED=True)
-        # Start from the real predicate so the two stores agree; the flag alone
-        # must be what is holding it back.
-        self.assertFalse(sessions.registration_enabled("google"))
-        os.environ["GOOGLE_CLIENT_ID"] = "cid.apps.googleusercontent.com"
-        os.environ.pop("GOOGLE_CLIENT_SECRET", None)
-        self.assertFalse(google_auth.configured(), msg=(
-            "a client id alone can start a login and cannot finish it"))
-        os.environ["GOOGLE_CLIENT_SECRET"] = "secret"
-        self.assertTrue(google_auth.configured(), msg=(
-            "and the predicate the route and the template both read has to agree "
-            "with the module, not with a stub"))
-        self.assertTrue(sessions.registration_enabled("google"))
-
-    def test_a_blank_value_is_not_a_configured_one(self):
-        # A compose line with no value passes an empty string, and a relay or
-        # Google that has been "configured" with one cannot be reached.
-        self.assertFalse(google_auth.configured())
-        os.environ.update({"GOOGLE_CLIENT_ID": "cid", "GOOGLE_CLIENT_SECRET": "   "})
-        self.assertFalse(google_auth.configured())
-        self._patch(sessions, SMTP_HOST="", SMTP_FROM="")
-        self.assertFalse(sessions.smtp_configured())
+        client_id = "cid.apps.googleusercontent.com"
+        cases = (("nothing configured", {}, False),
+                 ("client id only", {"GOOGLE_CLIENT_ID": client_id}, False),
+                 ("blank secret", {"GOOGLE_CLIENT_ID": client_id,
+                                   "GOOGLE_CLIENT_SECRET": "   "}, False),
+                 ("client id and secret", {"GOOGLE_CLIENT_ID": client_id,
+                                           "GOOGLE_CLIENT_SECRET": "secret"}, True))
+        previous = {name: os.environ.get(name)
+                    for name in ("GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET")}
+        self.addCleanup(lambda: [os.environ.pop(name, None) if value is None
+                                 else os.environ.__setitem__(name, value)
+                                 for name, value in previous.items()])
+        for label, values, expected in cases:
+            with self.subTest(label=label):
+                for name in previous:
+                    os.environ.pop(name, None)
+                os.environ.update(values)
+                self.assertEqual(google_auth.configured(), expected)
+                self.assertEqual(sessions.registration_enabled("google"), expected)
 
     def test_the_truthy_spellings_are_accepted(self):
         for value in ("1", "true", "TRUE", "yes", "on"):
@@ -579,14 +583,6 @@ class RegistrationFlagTests(StoreCase):
                 self.assertEqual(
                     str(os.getenv("X") or "0").strip().lower() in ("1", "true", "yes", "on"),
                     False)
-
-    def test_smtp_configured_needs_only_a_host_and_a_from(self):
-        self._patch(sessions, SMTP_HOST="", SMTP_FROM="")
-        self.assertFalse(sessions.smtp_configured())
-        self._patch(sessions, SMTP_HOST="smtp.example.com")
-        self.assertFalse(sessions.smtp_configured())
-        self._patch(sessions, SMTP_FROM="vault@example.com")
-        self.assertTrue(sessions.smtp_configured())
 
     def test_an_unknown_method_is_refused_rather_than_assumed_on(self):
         # A typo in `_require_registration("gmial", ...)` must surface here, not
@@ -606,10 +602,13 @@ class SignupThrottleTests(unittest.TestCase):
         self.addCleanup(sessions._ATTEMPTS.clear)
 
     def test_the_limit_is_reached_and_then_refused(self):
-        limit = sessions.REGISTRATION_ATTEMPT_LIMIT
-        for _ in range(limit):
-            self.assertTrue(sessions.allow_registration_attempt("1.2.3.4"))
-        self.assertFalse(sessions.allow_registration_attempt("1.2.3.4"))
+        # The quota is per client key, and a key that is not there is still a
+        # bucket: one property, two keys.
+        for client in ("1.2.3.4", ""):
+            with self.subTest(client=client or "<empty>"):
+                for _ in range(sessions.REGISTRATION_ATTEMPT_LIMIT):
+                    self.assertTrue(sessions.allow_registration_attempt(client))
+                self.assertFalse(sessions.allow_registration_attempt(client))
 
     def test_the_window_slides_rather_than_resetting(self):
         for _ in range(sessions.REGISTRATION_ATTEMPT_LIMIT):
@@ -638,11 +637,6 @@ class SignupThrottleTests(unittest.TestCase):
             self.assertLessEqual(len(sessions._ATTEMPTS), 2)
         finally:
             sessions.time.time = saved
-
-    def test_a_missing_client_key_is_still_bucketed(self):
-        for _ in range(sessions.REGISTRATION_ATTEMPT_LIMIT):
-            self.assertTrue(sessions.allow_registration_attempt(""))
-        self.assertFalse(sessions.allow_registration_attempt(""))
 
 
 # ---------------------------------------------------------------------------
@@ -835,23 +829,18 @@ def google_callback_url(base_url):
 
 class VerifyAccountTests(GuardCase):
     def test_a_registered_account_resolves_to_its_exact_username(self):
-        # Uppercase in, lowercased key out: `user_id` *is* the vault key and
-        # every store in the app compares it with `=`, so the canonical spelling
-        # has to be the one that is stored.
+        # Uppercase in, lowercased key out -- one property over two spellings.
+        # `user_id` *is* the vault key and every store in the app compares it with
+        # `=`, so the canonical spelling has to be the one that is stored; signing
+        # up as `Alice` and in as `ALICE` must reach the one stored key, or a
+        # case-sensitive compare opens a second empty vault nobody can tell apart.
         stored = sessions.create_credentials("Alice", self.GOOD, "alice@example.com")
         self.assertEqual(stored["user_id"], "alice")
         sessions.verify_email_token(sessions.issue_verification_token("alice"))
-        self.assertEqual(self.namespace["_verify_account"]("Alice", self.GOOD),
-                         ("alice", ""))
-
-    def test_the_lower_cased_spelling_also_works(self):
-        # Sign up as `Alice`, sign in as `ALICE`: both resolve to the one stored
-        # key, which is what stops a case-sensitive compare from opening a second
-        # empty vault under a spelling nobody can tell apart.
-        sessions.create_credentials("Alice", self.GOOD, "alice@example.com")
-        sessions.verify_email_token(sessions.issue_verification_token("alice"))
-        self.assertEqual(self.namespace["_verify_account"]("ALICE", self.GOOD),
-                         ("alice", ""))
+        for spelling in ("Alice", "ALICE"):
+            with self.subTest(spelling=spelling):
+                self.assertEqual(self.namespace["_verify_account"](spelling, self.GOOD),
+                                 ("alice", ""))
 
     def test_an_unverified_account_is_told_to_check_their_mail(self):
         # Before the password is checked: telling someone their password is wrong
@@ -1003,19 +992,20 @@ class RegistrationGuardTests(GuardCase):
     def test_an_enabled_method_passes(self):
         self.assertIsNone(self.namespace["_require_registration"]("email", _Request()))
 
-    def test_the_client_key_is_the_rightmost_forwarded_hop(self):
-        # nginx appends the peer it saw, so the rightmost entry is the last hop
-        # the client did not choose; the leftmost is whatever the client sent.
-        request = _Request(headers={"x-forwarded-for": "1.2.3.4, 5.6.7.8, 9.10.11.12"})
-        self.assertEqual(self.namespace["_signup_client"](request), "9.10.11.12")
-
-    def test_the_socket_peer_is_the_fallback(self):
-        # Behind the proxy that is nginx itself, so everyone shares one bucket —
-        # the right way for that fallback to fail.
-        request = _Request(client_host="172.17.0.1")
-        self.assertEqual(self.namespace["_signup_client"](request), "172.17.0.1")
-        self.assertEqual(self.namespace["_signup_client"](_Request(client_host="")),
-                         "unknown")
+    def test_the_client_key_is_the_last_hop_the_client_did_not_choose(self):
+        # One property over three request shapes: nginx appends the peer it saw,
+        # so the rightmost entry is the answer and the leftmost is whatever the
+        # client sent; with no header the socket peer is used -- behind the proxy
+        # that is nginx itself, so everyone shares one bucket, which is the right
+        # way for that fallback to fail -- and with neither there is one bucket.
+        cases = (("forwarded hop", {"x-forwarded-for": "1.2.3.4, 5.6.7.8, 9.10.11.12"},
+                  {}, "9.10.11.12"),
+                 ("socket peer", {}, {"client_host": "172.17.0.1"}, "172.17.0.1"),
+                 ("no peer", {}, {"client_host": ""}, "unknown"))
+        for label, headers, peer, expected in cases:
+            with self.subTest(label=label, headers=headers):
+                request = _Request(headers=headers, **peer)
+                self.assertEqual(self.namespace["_signup_client"](request), expected)
 
     def test_registration_config_reports_the_two_methods_separately(self):
         # One "registration is on" flag would have to render a Google form that
@@ -1027,12 +1017,13 @@ class RegistrationGuardTests(GuardCase):
 
     def test_the_landing_redirects_never_carry_request_controlled_text(self):
         # Everything that ends a flow points at the front door with a fixed value
-        # chosen in gui.py.
+        # chosen in gui.py -- one property per outcome, so one case each.
         for params in ({"verified": "1"}, {"google": "state"}, {}):
-            url = self.namespace["_landing"](**params)
-            self.assertTrue(url.startswith("https://hass.example/mem-mcp/"), url)
-            for key, value in params.items():
-                self.assertIn(f"{key}={value}", url)
+            with self.subTest(params=params):
+                url = self.namespace["_landing"](**params)
+                self.assertTrue(url.startswith("https://hass.example/mem-mcp/"), url)
+                for key, value in params.items():
+                    self.assertIn(f"{key}={value}", url)
 
 
 class EmailRegistrationRouteTests(GuardCase):
@@ -1073,29 +1064,26 @@ class EmailRegistrationRouteTests(GuardCase):
         self.assertFalse(sessions.account_verified("alice"))
         self.assertFalse(sessions.verify_account_password("alice", self.GOOD))
 
-    def test_an_unusable_username_is_a_400_and_creates_nothing(self):
-        with self.assertRaises(_HTTPError) as ctx:
-            self.drive(username="alice bob")
-        self.assertEqual(ctx.exception.status_code, 400)
-        self.assertEqual(self.mails, [])
+    def test_a_rejected_signup_is_a_400_and_sends_nothing(self):
+        # Four refusals, one property: the route answers 400 and the mail outbox
+        # stays empty, so a rejected signup leaves nothing half-created behind.
+        cases = (("unusable username", {"username": "alice bob"}),
+                 ("unusable address", {"email": "not-an-address"}),
+                 ("short password", {"password": "short"}))
+        for label, overrides in cases:
+            with self.subTest(label=label):
+                with self.assertRaises(_HTTPError) as ctx:
+                    self.drive(**overrides)
+                self.assertEqual(ctx.exception.status_code, 400)
+                self.assertEqual(self.mails, [])
 
-    def test_an_unusable_address_is_a_400(self):
-        with self.assertRaises(_HTTPError) as ctx:
-            self.drive(email="not-an-address")
-        self.assertEqual(ctx.exception.status_code, 400)
-
-    def test_a_short_password_is_a_400(self):
-        with self.assertRaises(_HTTPError) as ctx:
-            self.drive(password="short")
-        self.assertEqual(ctx.exception.status_code, 400)
-
-    def test_a_taken_username_is_a_400_and_sends_nothing(self):
-        self.drive()
-        self.mails.clear()
-        with self.assertRaises(_HTTPError) as ctx:
-            self.drive(email="other@example.com")
-        self.assertEqual(ctx.exception.status_code, 400)
-        self.assertEqual(self.mails, [])
+        with self.subTest("taken username"):
+            self.drive()
+            self.mails.clear()
+            with self.assertRaises(_HTTPError) as ctx:
+                self.drive(email="other@example.com")
+            self.assertEqual(ctx.exception.status_code, 400)
+            self.assertEqual(self.mails, [])
 
     def test_a_mail_that_cannot_be_sent_leaves_nothing_behind(self):
         # Otherwise the username is held by an account that can never be
@@ -1143,11 +1131,12 @@ class VerifyEmailRouteTests(GuardCase):
     def test_garbage_and_empty_tokens_get_the_same_answer(self):
         # One answer for a bad token, a spent one and an empty one: a message
         # distinguishing them tells an attacker which guesses are live.
-        urls = set()
-        for value in ("", "   ", "nope"):
-            result = self.drive(value)
-            urls.add(result.url)
-        self.assertEqual(len(urls), 1)
+        first = self.drive("").url
+        for label, value in (("blank", "   "), ("garbage", "nope")):
+            with self.subTest(label=label):
+                result = self.drive(value)
+                self.assertEqual(result.url, first)
+                self.assertIn("verified=0", result.url)
 
     def test_the_route_needs_no_session(self):
         # The link comes out of a mail client, which will not POST and has no
@@ -1224,18 +1213,18 @@ class GoogleSignInTests(GuardCase):
         self.assertEqual(result.url, "https://hass.example/mem-mcp/gui")
         self.assertEqual(self.registered, [])
 
-    def test_a_state_that_does_not_match_is_refused(self):
-        # Without it, a code minted for someone else's login could be posted here
-        # and signed in as them.
-        result = self.callback(state="someone-elses-state")
-        self.assertIn("google=state", result.url)
-        self.assertEqual(self.registered, [])
-
-    def test_a_missing_state_is_refused(self):
-        for state in ("", None):
-            with self.subTest(state=state):
-                result = self.callback(session={}, state=state)
+    def test_a_state_that_is_wrong_or_absent_is_refused(self):
+        # Without the comparison, a code minted for someone else's login could be
+        # posted here and signed in as them. One property, three ways of failing
+        # it: a value that is not the one issued, an empty one and a missing one.
+        for label, session, state in (
+                ("mismatched", {"oauth_state": self.STATE}, "someone-elses-state"),
+                ("empty", {}, ""),
+                ("absent", {}, None)):
+            with self.subTest(label=label):
+                result = self.callback(session=session, state=state)
                 self.assertIn("google=state", result.url)
+                self.assertEqual(self.registered, [])
 
     def test_the_state_is_consumed_so_it_cannot_be_replayed(self):
         session = {"oauth_state": self.STATE}
@@ -1289,34 +1278,29 @@ class GoogleSignupTests(GuardCase):
         self.signup()
         self.assertEqual(self.mails, [])
 
-    def test_an_unverified_address_creates_nothing(self):
-        info = dict(self.INFO, email_verified=False)
-        self.assertIsNone(self.signup(info))
-        self.assertEqual(self.linked, {})
-
-    def test_a_missing_address_creates_nothing(self):
-        # The vault key is the address; without one there is nothing to build from.
-        info = dict(self.INFO, email="")
-        self.assertIsNone(self.signup(info))
-        self.assertEqual(self.linked, {})
-
-    def test_registration_being_closed_creates_nothing(self):
-        self.enabled = False
-        self.assertIsNone(self.signup())
-        self.assertEqual(self.linked, {})
-
-    def test_a_name_that_is_already_a_vault_is_not_opened_a_second_way(self):
-        # Google has proved who the person is; it has not proved which of their
-        # accounts they meant, and only a subject link can.
-        # A vault that already answers to this address, created the way a
-        # previous Google sign-in would have created it. The username rules
-        # rightly refuse an "@", so the address-as-vault-key case can only be
-        # reached through a Google signup -- which is exactly the collision this
-        # test is about.
-        sessions.link_google_identity("sub-9", "alice@example.com",
-                                      "alice@example.com")
-        self.assertIsNone(self.signup())
-        self.assertEqual(self.linked, {})
+    def test_every_refusal_creates_no_vault_and_no_subject_link(self):
+        # Four different reasons to say no, one property: nothing is created and
+        # the subject stays unlinked, so the next sign-in has to try again.
+        cases = (
+            # Google has not proved the address is theirs.
+            ("unverified address", dict(self.INFO, email_verified=False), True, False),
+            # The vault key is the address; without one there is nothing to build.
+            ("missing address", dict(self.INFO, email=""), True, False),
+            ("registration closed", self.INFO, False, False),
+            # Google has proved who the person is; it has not proved which of
+            # their accounts they meant, and only a subject link can. The username
+            # rules rightly refuse an "@", so this collision is reachable only
+            # through a Google signup.
+            ("address already a vault", self.INFO, True, True),
+        )
+        for label, info, enabled, preoccupied in cases:
+            with self.subTest(label=label):
+                self.enabled = enabled
+                if preoccupied:
+                    sessions.link_google_identity("sub-9", "alice@example.com",
+                                                  "alice@example.com")
+                self.assertIsNone(self.signup(info))
+                self.assertEqual(self.linked, {})
 
 
 # ---------------------------------------------------------------------------
@@ -1329,25 +1313,27 @@ class LandingPageTests(unittest.TestCase):
         cls.page = _read("mem-mcp/templates/landing.html")
 
     def test_the_signup_card_is_gated_on_what_is_usable(self):
-        self.assertIn("{% if SIGNUP_EMAIL or SIGNUP_GOOGLE %}", self.page)
+        # Three pins of one property: the card renders for a usable method, and
+        # each half is gated on its own flag -- one "registration is on" flag
+        # would have to render a Google button on a deployment that cannot
+        # complete a Google login.
+        for gate in ("{% if SIGNUP_EMAIL or SIGNUP_GOOGLE %}", "{% if SIGNUP_EMAIL %}",
+                     "{% if SIGNUP_GOOGLE %}"):
+            with self.subTest(gate=gate):
+                self.assertIn(gate, self.page)
 
-    def test_each_method_is_gated_on_its_own_flag(self):
-        # One "registration is on" flag would have to render a Google button on a
-        # deployment that cannot complete a Google login.
-        self.assertIn("{% if SIGNUP_EMAIL %}", self.page)
-        self.assertIn("{% if SIGNUP_GOOGLE %}", self.page)
-
-    def test_the_username_rules_match_the_server(self):
+    def test_the_form_constraints_match_the_server(self):
+        # A cross-file contract: a form that rejects a password the backend would
+        # have accepted, or vice versa, fails silently. One attribute per case.
         block = self.page[self.page.find('id="registerForm"'):]
         block = block[:block.find("</form>")]
-        self.assertIn(f'minlength="{sessions.MIN_USERNAME_CHARS}"', block)
-        self.assertIn(f'maxlength="{sessions.MAX_USERNAME_CHARS}"', block)
-        self.assertIn('pattern="[A-Za-z0-9._-]+"', block)
-
-    def test_the_password_minimum_matches_the_server(self):
-        # A cross-file contract: a form that rejects a password the backend would
-        # have accepted, or vice versa, fails silently.
-        self.assertIn(f'minlength="{sessions.MIN_PASSWORD_CHARS}"', self.page)
+        for attribute in (f'minlength="{sessions.MIN_USERNAME_CHARS}"',
+                          f'maxlength="{sessions.MAX_USERNAME_CHARS}"',
+                          'pattern="[A-Za-z0-9._-]+"'):
+            with self.subTest(attribute=attribute):
+                self.assertIn(attribute, block)
+        with self.subTest(attribute="password minimum"):
+            self.assertIn(f'minlength="{sessions.MIN_PASSWORD_CHARS}"', self.page)
 
     def test_the_page_says_the_username_is_what_you_sign_in_with(self):
         self.assertIn("SIGNUP_PASSWORD_MIN", self.page)
@@ -1393,15 +1379,12 @@ class CallSiteTests(unittest.TestCase):
     def test_both_login_paths_go_through_verify_account(self):
         # An address can be in `credentials` *and* htpasswd, and the two stores
         # have different rotation rules; two call sites that each pick a store is
-        # how they end up disagreeing about who can log in.
+        # how they end up disagreeing about who can log in. Both halves of
+        # `_check_session_auth` read the same function, so it is one case each.
         for name in ("api_login", "_check_session_auth"):
             source = _function_source("mem-mcp/gui.py", name)
             self.assertIn("_verify_account(", source, msg=(
                 f"{name} must not verify a password itself"))
-
-    def test_the_basic_branch_of_the_session_check_uses_it_too(self):
-        source = _function_source("mem-mcp/gui.py", "_check_session_auth")
-        self.assertIn("_verify_account(", source)
 
     def test_the_throttle_is_textually_before_the_flag_check(self):
         # Ordering, not presence: a guard that counted only successes would leave

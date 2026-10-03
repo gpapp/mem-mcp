@@ -175,44 +175,49 @@ class IdentityConfidenceTests(unittest.TestCase):
 
 
 class PeopleMatchGateTests(unittest.TestCase):
-    def test_single_name_does_not_match_similar_person(self):
-        result = {"name": "Alice Jones", "score": 2.3, "metadata": {}}
-        self.assertFalse(people_match_allowed("Alice", result))
-
-    def test_full_name_match_is_retained(self):
-        result = {"name": "Alice Smith", "score": 1.7, "metadata": {}}
-        self.assertTrue(people_match_allowed("Alice Smith", result))
-
-    def test_alias_match_is_retained(self):
-        result = {"name": "Alice Smith", "score": 1.2, "metadata": {"aliases": ["Allie"]}}
-        self.assertTrue(people_match_allowed("Allie", result))
-
-    def test_production_near_miss_is_rejected(self):
-        result = {
+    # One test covers the group: the gate is one predicate, so every row below
+    # asserts the same property -- does people_match_allowed keep this
+    # (query, candidate) pair -- over a different pair. Each label names the pair
+    # so a failure says which two people were confused.
+    def test_the_gate_keeps_exactly_the_pairs_that_are_the_same_person(self):
+        zipfel = {
             "name": "Stefan Zipfel",
             "score": 1.627,
             "raw_score": 0.55,
             "metadata": {"first_name": "Stefan", "last_name": "Zipfel"},
         }
-        self.assertFalse(people_match_allowed("Stefan Siprell", result))
-
-    def test_production_conflicting_first_name_is_rejected(self):
-        result = {
+        deutsch = {
             "name": "Lukas Deutsch",
             "score": 1.184,
             "raw_score": 0.78,
             "metadata": {"first_name": "Lukas", "last_name": "Deutsch"},
         }
-        self.assertFalse(people_match_allowed("Ben Deutsche", result))
-
-    def test_production_missing_person_is_rejected(self):
-        result = {
+        tolstashov = {
             "name": "Oleg Tolstashov",
             "score": 1.4,
             "raw_score": 0.55,
             "metadata": {"first_name": "Oleg", "last_name": "Tolstashov"},
         }
-        self.assertFalse(people_match_allowed("Radoslav", result))
+        cases = (
+            # a first name alone is not the person
+            ("single name vs a similar person",
+             "Alice", {"name": "Alice Jones", "score": 2.3, "metadata": {}}, False),
+            ("full name match",
+             "Alice Smith", {"name": "Alice Smith", "score": 1.7, "metadata": {}}, True),
+            ("alias match",
+             "Allie",
+             {"name": "Alice Smith", "score": 1.2, "metadata": {"aliases": ["Allie"]}}, True),
+            # the three production pairs from mcp_tools.log, one per row
+            ("production near miss: 'Stefan Siprell' -> 'Stefan Zipfel'",
+             "Stefan Siprell", zipfel, False),
+            ("production conflicting first name: 'Ben Deutsche' -> 'Lukas Deutsch'",
+             "Ben Deutsche", deutsch, False),
+            ("production missing person: 'Radoslav' -> 'Oleg Tolstashov'",
+             "Radoslav", tolstashov, False),
+        )
+        for label, query, result, expected in cases:
+            with self.subTest(pair=label):
+                self.assertEqual(people_match_allowed(query, result), expected)
 
     def test_weak_flagged_result_is_always_rejected(self):
         result = {
@@ -224,23 +229,31 @@ class PeopleMatchGateTests(unittest.TestCase):
         }
         self.assertFalse(people_match_allowed("Stefan Siprell", result))
 
-    def test_precomputed_confidence_is_honoured(self):
-        result = {"name": "Stefan Zipfel", "score": 1.627, "confidence": 0.9, "metadata": {}}
-        self.assertTrue(people_match_allowed("Stefan Zipfel", result))
+    # One test covers the group: a precomputed confidence is the whole gate, so
+    # both rows assert the same property over a different confidence.
+    def test_a_precomputed_confidence_is_what_the_gate_reads(self):
+        def result(confidence):
+            return {"name": "Stefan Zipfel", "score": 1.627,
+                    "confidence": confidence, "metadata": {}}
 
-    def test_low_precomputed_confidence_rejects(self):
-        result = {"name": "Stefan Zipfel", "score": 1.627, "confidence": 0.2, "metadata": {}}
-        self.assertFalse(people_match_allowed("Stefan Siprell", result))
+        for label, query, confidence, expected in (
+            ("0.9 above the gate", "Stefan Zipfel", 0.9, True),
+            ("0.2 below the gate", "Stefan Siprell", 0.2, False),
+        ):
+            with self.subTest(confidence=label):
+                self.assertEqual(
+                    people_match_allowed(query, result(confidence)), expected)
 
 
 class MatchingRegressionTests(unittest.TestCase):
-    def test_merge_master_cannot_be_a_duplicate(self):
-        with self.assertRaises(ValueError):
-            validate_merge_ids("master", ["master", "duplicate"])
-
-    def test_merge_duplicate_ids_must_be_unique(self):
-        with self.assertRaises(ValueError):
-            validate_merge_ids("master", ["duplicate", "duplicate"])
+    # One test covers the group: both rows assert the same property -- a duplicate
+    # set of ids is refused outright -- over a different duplicate.
+    def test_a_duplicate_id_anywhere_in_the_set_is_refused(self):
+        for label, ids in (("the master is among the duplicates", ["master", "duplicate"]),
+                           ("the same id twice", ["duplicate", "duplicate"])):
+            with self.subTest(duplicate=label):
+                with self.assertRaises(ValueError):
+                    validate_merge_ids("master", ids)
 
     def test_merge_rejects_unresolved_user_owned_record(self):
         with self.assertRaises(ValueError):
@@ -327,21 +340,19 @@ class MatchingRegressionTests(unittest.TestCase):
         self.assertEqual(result, ("master", ["duplicate"]))
         self.assertEqual(calls, [("update", "master"), ("merge", "master", ["duplicate"])])
 
-    def test_different_clients_are_not_compatible(self):
-        self.assertFalse(
-            scopes_compatible(
-                {"clientName": "Acme", "contextName": "Atlas"},
-                {"clientName": "Globex", "contextName": "Atlas"},
-            )
-        )
-
-    def test_same_client_without_conflicting_context_is_compatible(self):
-        self.assertTrue(
-            scopes_compatible(
-                {"clientName": "Acme", "contextName": "Atlas"},
-                {"clientName": "Acme", "contextName": None},
-            )
-        )
+    # One test covers the group: both rows are the same predicate over two
+    # candidate records -- can these two be duplicates of each other at all.
+    def test_two_records_are_compatible_only_within_one_client(self):
+        for label, left, right, expected in (
+            ("same client, no conflicting context",
+             {"clientName": "Acme", "contextName": "Atlas"},
+             {"clientName": "Acme", "contextName": None}, True),
+            ("same project under two different clients",
+             {"clientName": "Acme", "contextName": "Atlas"},
+             {"clientName": "Globex", "contextName": "Atlas"}, False),
+        ):
+            with self.subTest(pair=label):
+                self.assertEqual(scopes_compatible(left, right), expected)
 
     def test_llm_resolver_accepts_only_valid_high_confidence_ids(self):
         captured = {}
@@ -373,42 +384,49 @@ class ScopeNameResolutionTests(unittest.TestCase):
 
     CLIENTS = ["Deutsche Bank (DB)", "Siemens AG", "Acme Corp", "Nordwind Energie"]
 
-    def test_exact_stored_spelling_is_exact_evidence(self):
-        self.assertEqual(resolve_scope_name("Deutsche Bank (DB)", self.CLIENTS),
-                         ("Deutsche Bank (DB)", SCOPE_EVIDENCE_EXACT))
+    # One test covers the group: these are all the same property -- a query the
+    # ladder should match returns the stored spelling, with the evidence of the
+    # rung it matched on -- over a different rung. Each label names that rung, so
+    # a failure says which rung regressed rather than just "a resolution broke".
+    def test_a_matching_query_returns_the_stored_spelling_with_its_rung(self):
+        for label, query, expected in (
+            ("exact stored spelling",
+             "Deutsche Bank (DB)", ("Deutsche Bank (DB)", SCOPE_EVIDENCE_EXACT)),
+            # a partial multiword name: every one of its tokens is stored
+            ("partial multiword name",
+             "Deutsche Bank", ("Deutsche Bank (DB)", SCOPE_EVIDENCE_TOKENS)),
+            # the suffix is not required: "Group (2026)" is not part of the name
+            ("trailing group and year",
+             "Deutsche Bank Group (2026)", ("Deutsche Bank (DB)", SCOPE_EVIDENCE_TOKENS)),
+            ("single token falls back to fuzzy",
+             "Siemens", ("Siemens AG", SCOPE_EVIDENCE_FUZZY)),
+        ):
+            with self.subTest(rung=label):
+                self.assertEqual(resolve_scope_name(query, self.CLIENTS), expected)
 
-    def test_partial_multiword_name_resolves_to_stored_spelling(self):
-        name, evidence = resolve_scope_name("Deutsche Bank", self.CLIENTS)
-        self.assertEqual(name, "Deutsche Bank (DB)")
-        self.assertEqual(evidence, SCOPE_EVIDENCE_TOKENS)
-
-    def test_suffix_is_not_required(self):
-        name, _ = resolve_scope_name("Deutsche Bank Group (2026)", self.CLIENTS)
-        self.assertEqual(name, "Deutsche Bank (DB)")
-
-    def test_single_token_falls_back_to_fuzzy(self):
-        name, evidence = resolve_scope_name("Siemens", self.CLIENTS)
-        self.assertEqual(name, "Siemens AG")
-        self.assertEqual(evidence, SCOPE_EVIDENCE_FUZZY)
-
-    def test_generic_contained_word_does_not_resolve(self):
-        # 'bank' is inside 'Deutsche Bank (DB)' but means nothing on its own.
-        self.assertEqual(resolve_scope_name("bank", self.CLIENTS), (None, SCOPE_EVIDENCE_NONE))
-
-    def test_short_first_token_is_rejected(self):
-        # 'Acme' is 4 chars — below the single-token first-name guard, so a
-        # typo of a 4-letter name is not promoted to a link.
-        self.assertEqual(resolve_scope_name("Acme", self.CLIENTS), (None, SCOPE_EVIDENCE_NONE))
-
-    def test_hallucinated_client_resolves_to_nothing(self):
-        self.assertEqual(resolve_scope_name("Nonexistent Ltd", self.CLIENTS),
-                         (None, SCOPE_EVIDENCE_NONE))
-
-    def test_ambiguous_candidates_resolve_to_nothing(self):
-        # Returning a wrong-but-confident client is worse than returning none,
-        # because it writes a FOR_CLIENT link the user never asked for.
-        self.assertEqual(resolve_scope_name("Alpha", ["Alpha One", "Alpha Two"]),
-                         (None, SCOPE_EVIDENCE_NONE))
+    # One test covers the group: every row is the same refusal -- no stored name,
+    # no link -- reached by a different reason, and each label keeps that reason.
+    def test_a_query_that_does_not_match_a_single_stored_name_resolves_to_nothing(self):
+        for label, query, candidates in (
+            # 'bank' is inside 'Deutsche Bank (DB)' but means nothing on its own
+            ("generic contained word", "bank", self.CLIENTS),
+            # 'Acme' is 4 chars — below the single-token first-name guard, so a
+            # typo of a 4-letter name is not promoted to a link
+            ("short first token", "Acme", self.CLIENTS),
+            ("hallucinated client", "Nonexistent Ltd", self.CLIENTS),
+            # a wrong-but-confident client is worse than none, because it writes a
+            # FOR_CLIENT link the user never asked for
+            ("ambiguous candidates", "Alpha", ["Alpha One", "Alpha Two"]),
+            # both candidates keep two tokens, so token coverage is satisfied,
+            # but they are different projects and the raw answer matches neither
+            ("shared first word", "Atlas Rollout", ["Atlas Migration", "Atlas Reporting"]),
+            ("one shared token with a qualifier", "Deutsche Group", self.CLIENTS),
+            ("empty candidate list", "Anything", []),
+            ("empty query", "", self.CLIENTS),
+        ):
+            with self.subTest(reason=label):
+                self.assertEqual(
+                    resolve_scope_name(query, candidates), (None, SCOPE_EVIDENCE_NONE))
 
     def test_context_names_use_the_same_ladder(self):
         contexts = ["Atlas Migration", "Hedron Replatform", "Platform"]
@@ -418,10 +436,6 @@ class ScopeNameResolutionTests(unittest.TestCase):
         self.assertEqual(resolve_scope_name("Hedron Replatform (2026)", contexts)[0],
                          "Hedron Replatform")
         self.assertEqual(resolve_scope_name("Migration", contexts), (None, SCOPE_EVIDENCE_NONE))
-
-    def test_empty_candidate_list_never_resolves(self):
-        self.assertEqual(resolve_scope_name("Anything", []), (None, SCOPE_EVIDENCE_NONE))
-        self.assertEqual(resolve_scope_name("", self.CLIENTS), (None, SCOPE_EVIDENCE_NONE))
 
     def test_returned_name_is_always_the_stored_spelling(self):
         for raw in ("siemens ag", "SIEMENS AG", "  Nordwind   Energie "):
@@ -443,33 +457,33 @@ class ClientHeaderTests(unittest.TestCase):
     """An explicit 'Client:' header is the strongest scope signal in a note, so
     it is read directly. It arrives in whatever shape the author typed."""
 
-    def test_plain_header(self):
-        self.assertEqual(client_header_value("Client: Acme Corp\n\nMet them today."),
-                         "Acme Corp")
+    # One test covers the group: every row is the same property -- a header
+    # written in this shape yields this value -- over a different shape, and the
+    # label names the shape because the shape is what regressed.
+    def test_a_header_written_in_any_of_these_shapes_yields_its_value(self):
+        for label, text in (
+            ("plain", "Client: Acme Corp\n\nMet them today."),
+            ("bold", "**Client:** Acme Corp"),
+            # A bullet turned the header into a list item; the old regex missed
+            # it and the note was classified with no client signal at all.
+            ("ascii bullet", "- Client: Acme Corp"),
+            ("bullet with bold", "• **Client:** Acme Corp"),
+            ("heading marker and dash separator", "## Client – Acme Corp"),
+            ("upper case", "CLIENT: Acme Corp"),
+        ):
+            with self.subTest(shape=label):
+                self.assertEqual(client_header_value(text), "Acme Corp")
 
-    def test_bold_header(self):
-        self.assertEqual(client_header_value("**Client:** Acme Corp"), "Acme Corp")
-
-    def test_bullet_header(self):
-        # A bullet turned the header into a list item; the old regex missed it
-        # and the note was classified with no client signal at all.
-        self.assertEqual(client_header_value("- Client: Acme Corp"), "Acme Corp")
-        self.assertEqual(client_header_value("• **Client:** Acme Corp"), "Acme Corp")
-
-    def test_heading_marker_and_dash_separator(self):
-        self.assertEqual(client_header_value("## Client – Acme Corp"), "Acme Corp")
-
-    def test_case_insensitive(self):
-        self.assertEqual(client_header_value("CLIENT: Acme Corp"), "Acme Corp")
-
-    def test_trailing_prose_is_cut(self):
-        self.assertEqual(client_header_value("Client: Acme Corp — discussed pricing"),
-                         "Acme Corp")
-        self.assertEqual(client_header_value("Client: Acme Corp | weekly sync"),
-                         "Acme Corp")
-
-    def test_trailing_punctuation_is_stripped(self):
-        self.assertEqual(client_header_value("Client: Acme Corp."), "Acme Corp")
+    # One test covers the group: both rows are the same cut -- whatever follows
+    # the name on the line is not part of the name -- with a different follower.
+    def test_whatever_follows_the_name_on_the_line_is_cut(self):
+        for label, text in (
+            ("em dash and prose", "Client: Acme Corp — discussed pricing"),
+            ("pipe and prose", "Client: Acme Corp | weekly sync"),
+            ("trailing full stop", "Client: Acme Corp."),
+        ):
+            with self.subTest(follower=label):
+                self.assertEqual(client_header_value(text), "Acme Corp")
 
     def test_header_must_start_a_line(self):
         # Mid-sentence "client" mentions are ordinary prose, not a header.
@@ -495,48 +509,55 @@ class TextWindowTests(unittest.TestCase):
         for value in (None, "", "   \n\t "):
             self.assertEqual(text_windows(value), [], value)
 
+    # One test covers the group: a document that fits is a single window
+    # carrying it whole, whether the window is given or the default applies.
     def test_a_document_that_fits_is_a_single_window(self):
-        self.assertEqual(text_windows("short body", window=100, overlap=10), ["short body"])
+        for label, kwargs in (("explicit window", {"window": 100, "overlap": 10}),
+                               ("default window", {})):
+            with self.subTest(window=label):
+                self.assertEqual(text_windows("short body", **kwargs), ["short body"])
 
-    def test_a_long_document_is_split(self):
-        windows = text_windows("x" * 250, window=100, overlap=10)
-        self.assertGreater(len(windows), 1)
-        for window in windows:
-            self.assertLessEqual(len(window), 100)
+    # One test covers the group: both rows assert the same splitting contract --
+    # more than one window, none larger than the window -- including the
+    # degenerate overlap where the step has to be clamped to stay terminating.
+    def test_a_long_document_is_split_into_windows_of_at_most_the_window(self):
+        for label, body, window, overlap in (
+            ("ordinary overlap", "x" * 250, 100, 10),
+            ("overlap equal to the window", "y" * 500, 100, 100),
+        ):
+            with self.subTest(overlap=label):
+                windows = text_windows(body, window=window, overlap=overlap)
+                self.assertGreater(len(windows), 1)
+                self.assertTrue(all(0 < len(w) <= window for w in windows))
 
-    def test_every_character_is_covered(self):
+    # One test covers the group: each row asserts the same contract -- no part of
+    # the document is dropped on the floor -- with a different body to lose.
+    def test_no_part_of_the_document_is_dropped(self):
         # Non-repetitive on purpose: a repetitive body matches at every offset,
         # which is how a coverage test passes while the middle is skipped.
-        body = "".join(f"{i:06d}" for i in range(6000))
-        windows = text_windows(body, window=1000, overlap=100)
-        self.assertTrue(
-            all(marker in "".join(windows) for marker in ("000000", "003000", "005999")),
-            windows,
-        )
-
-    def test_evidence_after_the_old_1500_char_cut_is_still_reachable(self):
-        """The regression itself: a mention past the old slice must be read."""
-        body = "meeting notes. " * 130 + "The account is with Deutsche Bank."
-        self.assertGreater(len(body), 1500)
-        windows = text_windows(body, window=600, overlap=100)
-        self.assertTrue(any("Deutsche Bank" in w for w in windows))
+        marked = "".join(f"{i:06d}" for i in range(6000))
+        # The regression itself: a mention past the old 1500-char slice must be
+        # reachable in some window.
+        tail = "meeting notes. " * 130 + "The account is with Deutsche Bank."
+        self.assertGreater(len(tail), 1500)
+        for label, body, window, marker in (
+            ("markers at the head, middle and tail", marked, 1000, ("000000", "003000", "005999")),
+            ("a mention past the old 1500-char cut", tail, 600, ("Deutsche Bank",)),
+        ):
+            with self.subTest(body=label):
+                windows = text_windows(body, window=window, overlap=100)
+                joined = "".join(windows)
+                for want in marker:
+                    self.assertIn(want, joined, f"{want!r} is not in any window")
 
     def test_overlap_repeats_the_boundary_region(self):
         windows = text_windows("abcdefghij" * 30, window=100, overlap=50)
         self.assertGreaterEqual(len(windows), 2)
         self.assertTrue(windows[0][-50:] in "".join(windows[1:]))
 
-    def test_a_degenerate_overlap_still_terminates(self):
-        windows = text_windows("y" * 500, window=100, overlap=100)
-        self.assertTrue(windows)
-        self.assertTrue(all(0 < len(w) <= 100 for w in windows))
-
     def test_crlf_is_normalised_so_boundaries_are_clean(self):
         windows = text_windows("line\r\n" * 200, window=100, overlap=10)
         self.assertNotIn("\r", "".join(windows))
-
-    def test_defaults_are_used_when_no_window_is_given(self):
-        self.assertEqual(text_windows("tiny"), ["tiny"])
 
 
 class ScopeClassificationInputTests(unittest.TestCase):
@@ -676,14 +697,17 @@ class PeopleResolverWindowTests(unittest.TestCase):
     def _matches(*pairs):
         return json.dumps({"matches": [{"fact_id": i, "confidence": c} for i, c in pairs]})
 
-    def test_a_short_entry_still_costs_exactly_one_call(self):
-        """Windowing must not tax the common case."""
-        _, prompts = self._run(lambda p, n: self._matches(("c1", 0.9)), content="Alice called Bob.")
-        self.assertEqual(len(prompts), 1)
-
-    def test_every_window_is_sent_to_the_model(self):
-        _, prompts = self._run(lambda p, n: self._matches())
-        self.assertEqual(len(prompts), self.window_count)
+    # One test covers the group: both rows assert the same property -- exactly
+    # one LLM call per window of the entry -- over a different entry length, and
+    # the short row is the one that says windowing does not tax the common case.
+    def test_the_llm_is_called_exactly_once_per_window(self):
+        for label, content, expected in (
+            ("a short entry still costs one call", "Alice called Bob.", 1),
+            ("every window of a long entry is sent", self.BODY, self.window_count),
+        ):
+            with self.subTest(entry=label):
+                _, prompts = self._run(lambda p, n: self._matches(), content=content)
+                self.assertEqual(len(prompts), expected)
 
     def test_the_prompt_carries_text_past_the_old_2500_char_cut(self):
         """The defect itself: a binding supported only by the tail was lost."""
@@ -696,42 +720,58 @@ class PeopleResolverWindowTests(unittest.TestCase):
         result, _ = self._run(responder, names=["Bob Jones"], content=body)
         self.assertEqual([c["id"] for c in result], ["c2"])
 
-    def test_bindings_from_several_windows_are_unioned(self):
-        def responder(_prompt, n):
+    # One test covers the group: both rows assert the same property -- the result
+    # is the union of the accepted bindings with no repeats -- over bindings that
+    # arrive from two windows and from one window twice.
+    def test_the_result_is_a_deduplicated_union_of_the_accepted_bindings(self):
+        def spread(_prompt, n):
             return self._matches(("c1", 0.95)) if n == 1 else self._matches(("c2", 0.9))
 
-        result, _ = self._run(responder)
-        self.assertEqual(sorted(c["id"] for c in result), ["c1", "c2"])
-
-    def test_a_candidate_bound_twice_appears_once(self):
-        def responder(_prompt, _n):
+        def repeated(_prompt, _n):
             return self._matches(("c1", 0.95), ("c1", 0.99))
 
-        result, _ = self._run(responder)
-        self.assertEqual([c["id"] for c in result], ["c1"])
+        for label, responder, expected in (
+            ("bound in two different windows", spread, ["c1", "c2"]),
+            ("bound twice in one window", repeated, ["c1"]),
+        ):
+            with self.subTest(bindings=label):
+                result, _ = self._run(responder)
+                self.assertEqual(sorted(c["id"] for c in result), expected)
 
-    def test_one_failing_window_does_not_discard_the_others(self):
-        def responder(_prompt, n):
+    # One test covers the group: both rows assert the same property -- one bad
+    # window is survivable, so the binding from the surviving window still lands.
+    def test_a_bad_window_does_not_discard_the_others(self):
+        def raises(_prompt, n):
             if n == 1:
                 raise RuntimeError("ollama timeout")
             return self._matches(("c1", 0.9))
 
-        result, _ = self._run(responder)
-        self.assertEqual([c["id"] for c in result], ["c1"])
+        def unparseable(_prompt, n):
+            return "not json at all" if n == 1 else self._matches(("c1", 0.9))
 
-    def test_the_confidence_gate_still_applies_in_every_window(self):
-        """A thin window must not become a weaker gate."""
-        def responder(_prompt, _n):
+        for label, responder in (("a window raises", raises),
+                                 ("a window answers with rubbish", unparseable)):
+            with self.subTest(failure=label):
+                result, _ = self._run(responder)
+                self.assertEqual([c["id"] for c in result], ["c1"])
+
+    # One test covers the group: both rows assert the same property -- a stated
+    # confidence under 0.8 binds nothing -- over a different way of stating it,
+    # and a thin window must not become a weaker gate.
+    def test_a_confidence_under_the_gate_binds_nothing(self):
+        def low(_prompt, _n):
             return self._matches(("c1", 0.79))
 
-        result, prompts = self._run(responder)
-        self.assertEqual(len(prompts), self.window_count)
-        self.assertEqual(result, [])
+        def boolean(_prompt, _n):
+            # bool is an int subclass, so ``True >= 0.8`` was reachable.
+            return '{"matches":[{"fact_id":"c1","confidence":true}]}'
 
-    def test_a_boolean_confidence_does_not_clear_the_gate(self):
-        """bool is an int subclass, so ``True >= 0.8`` was reachable."""
-        result, _ = self._run(lambda p, n: '{"matches":[{"fact_id":"c1","confidence":true}]}')
-        self.assertEqual(result, [])
+        for label, responder in (("0.79 float", low), ("True boolean", boolean)):
+            with self.subTest(confidence=label):
+                result, prompts = self._run(responder)
+                self.assertEqual(len(prompts), self.window_count,
+                                 msg="every window was asked")
+                self.assertEqual(result, [])
 
     def test_an_unknown_candidate_id_is_never_returned(self):
         """A hallucinated id must not become a MENTIONS edge."""
@@ -750,14 +790,6 @@ class PeopleResolverWindowTests(unittest.TestCase):
         )
         self.assertEqual(prompts, [], "the exact-identity fast path must not call the LLM")
         self.assertEqual([c["id"] for c in result], ["c1"])
-
-    def test_an_unparseable_reply_in_one_window_is_skipped(self):
-        def responder(_prompt, n):
-            return "not json at all" if n == 1 else self._matches(("c1", 0.9))
-
-        result, _ = self._run(responder)
-        self.assertEqual([c["id"] for c in result], ["c1"])
-
 
 class ResolverInputTests(unittest.TestCase):
     """No prompt in matching_utils may be handed a prefix of the entry.
@@ -877,36 +909,37 @@ class ClientTagTests(unittest.TestCase):
     two Enterprise Architects happened to run it.
     """
 
-    def test_a_tag_is_read(self):
-        self.assertEqual(
-            client_tags_in_text("## Participants\n- Gergely Papp: ... [client: EPAM]"),
-            ["EPAM"],
-        )
+    # One test covers the group: each row is the same rule -- the text between
+    # `[client:` and the closing bracket is the name -- over a different name, so
+    # the qualifier and the padding cases are rows, not separate methods.
+    def test_a_single_tag_yields_the_name_it_carries(self):
+        for label, text, expected in (
+            ("plain",
+             "## Participants\n- Gergely Papp: ... [client: EPAM]", ["EPAM"]),
+            # Client names carry qualifiers; the whole one is the lookup key.
+            ("parenthesised stored spelling",
+             "x [client: Deutsche Bank (DB)] y", ["Deutsche Bank (DB)"]),
+            ("padded with whitespace", "[client:   EPAM  ]", ["EPAM"]),
+        ):
+            with self.subTest(shape=label):
+                self.assertEqual(client_tags_in_text(text), expected)
 
     def test_tags_are_first_seen_order_and_deduplicated(self):
         body = "a [client: EPAM] b [client: SAP SE] c [client: EPAM]"
         self.assertEqual(client_tags_in_text(body), ["EPAM", "SAP SE"])
 
-    def test_a_parenthesised_stored_spelling_survives(self):
-        """Client names carry qualifiers; the whole one is the lookup key."""
-        self.assertEqual(
-            client_tags_in_text("x [client: Deutsche Bank (DB)] y"),
-            ["Deutsche Bank (DB)"],
-        )
-
-    def test_extra_whitespace_is_trimmed(self):
-        self.assertEqual(client_tags_in_text("[client:   EPAM  ]"), ["EPAM"])
-
-    def test_a_tag_does_not_span_lines(self):
-        """A runaway match would swallow the rest of the enriched text."""
-        self.assertEqual(client_tags_in_text("[client: EPAM\nmore text here]"), [])
-
-    def test_blank_and_none_are_empty(self):
-        self.assertEqual(client_tags_in_text(""), [])
-        self.assertEqual(client_tags_in_text(None), [])
-
-    def test_text_without_tags_is_empty(self):
-        self.assertEqual(client_tags_in_text("SAP GRC handover notes"), [])
+    # One test covers the group: each row is the same outcome -- no complete tag
+    # on one line, so no tags -- reached by a different reason.
+    def test_text_carrying_no_whole_tag_yields_no_tags(self):
+        for label, text in (
+            # A runaway match would swallow the rest of the enriched text.
+            ("a tag that spans lines", "[client: EPAM\nmore text here]"),
+            ("no tags at all", "SAP GRC handover notes"),
+            ("empty string", ""),
+            ("none", None),
+        ):
+            with self.subTest(reason=label):
+                self.assertEqual(client_tags_in_text(text), [])
 
 
 class RelatedClientSelectionTests(unittest.TestCase):
@@ -944,37 +977,34 @@ class RelatedClientSelectionTests(unittest.TestCase):
     def _run(self, text, related, primary):
         return self.fn(text, related, [{"name": n} for n in self.CLIENTS], primary)
 
-    def test_a_tag_becomes_a_secondary_link(self):
-        body = "- Gergely Papp [client: EPAM]\n- Oleg Tolstashov [client: EPAM]"
-        self.assertEqual(self._run(body, [], "Deutsche Bank (DB)"), ["EPAM"])
-
-    def test_the_primary_is_never_also_related(self):
-        """An item linked to its own client twice appears twice in a filtered list."""
-        body = "- Gergely Papp [client: EPAM]"
-        self.assertEqual(self._run(body, [], "EPAM"), [])
-
-    def test_the_model_list_and_the_tags_are_unioned(self):
-        body = "- Gergely Papp [client: EPAM]"
-        self.assertEqual(
-            sorted(self._run(body, ["SAP SE"], "Deutsche Bank (DB)")),
-            ["EPAM", "SAP SE"],
-        )
-
-    def test_an_unresolvable_name_is_dropped_not_written(self):
-        """Writing it would either invent a client or silently no-op."""
-        self.assertEqual(self._run("", ["Nonexistent Ltd"], "EPAM"), [])
-
-    def test_a_tag_using_an_abbreviation_still_binds(self):
-        body = "- Gergely Papp [client: Deutsche Bank]"
-        self.assertEqual(self._run(body, [], "SAP SE"), ["Deutsche Bank (DB)"])
-
-    def test_no_tags_and_no_model_list_is_empty(self):
-        self.assertEqual(self._run("plain text", [], "EPAM"), [])
-
-    def test_a_null_primary_does_not_filter_everything_out(self):
-        """A generic item can still be about several clients."""
-        body = "- Gergely Papp [client: EPAM]"
-        self.assertEqual(self._run(body, [], None), ["EPAM"])
+    # One test covers the group: every row asserts the same property -- this
+    # function returns exactly this list of secondary links for this text, this
+    # model list and this primary -- over a different input, and the label names
+    # the case so a failure says which one broke.
+    def test_the_secondary_links_are_exactly_these_for_each_input(self):
+        tag = "- Gergely Papp [client: EPAM]"
+        for label, text, related, primary, expected in (
+            ("a tag becomes a secondary link",
+             "- Gergely Papp [client: EPAM]\n- Oleg Tolstashov [client: EPAM]",
+             [], "Deutsche Bank (DB)", ["EPAM"]),
+            # An item linked to its own client twice appears twice in a filtered
+            # list, so the primary is dropped from the result.
+            ("the primary is never also related", tag, [], "EPAM", []),
+            ("the model list and the tags are unioned",
+             tag, ["SAP SE"], "Deutsche Bank (DB)", ["EPAM", "SAP SE"]),
+            # Writing an unresolvable name would either invent a client or
+            # silently no-op.
+            ("an unresolvable name is dropped", "", ["Nonexistent Ltd"], "EPAM", []),
+            ("a tag using an abbreviation still binds",
+             "- Gergely Papp [client: Deutsche Bank]", [], "SAP SE",
+             ["Deutsche Bank (DB)"]),
+            ("no tags and no model list", "plain text", [], "EPAM", []),
+            # A generic item can still be about several clients.
+            ("a null primary does not filter everything out", tag, [], None, ["EPAM"]),
+        ):
+            with self.subTest(case=label):
+                self.assertEqual(
+                    sorted(self._run(text, related, primary)), sorted(expected))
 
 
 class ScopePromptTests(unittest.TestCase):
@@ -1428,16 +1458,15 @@ class QueryRewriteCacheTests(unittest.TestCase):
     fails on a loaded CI box and passes on a fast one.
     """
 
-    def test_a_fresh_entry_is_returned(self):
-        c = TTLCache(ttl=100.0, max_entries=4)
-        c.put("k", ["a"], now=0.0)
-        self.assertEqual(c.get("k", now=99.9), ["a"])
-
-    def test_expiry_is_exclusive_of_the_boundary_and_inclusive_of_it(self):
-        c = TTLCache(ttl=100.0, max_entries=4)
-        c.put("k", ["a"], now=0.0)
-        self.assertEqual(c.get("k", now=100.0), None,
-                         msg="at exactly ttl the entry is stale, not fresh")
+    # One test covers the group: both rows are the two sides of the one TTL
+    # boundary -- fresh below it, stale at exactly it -- with a different `now`.
+    def test_an_entry_is_fresh_below_the_ttl_and_stale_at_exactly_it(self):
+        for label, now, expected in (("just below the ttl", 99.9, ["a"]),
+                                     ("exactly at the ttl", 100.0, None)):
+            with self.subTest(now=label):
+                c = TTLCache(ttl=100.0, max_entries=4)
+                c.put("k", ["a"], now=0.0)
+                self.assertEqual(c.get("k", now=now), expected)
 
     def test_an_expired_entry_is_removed_on_read(self):
         c = TTLCache(ttl=10.0, max_entries=4)
@@ -1447,25 +1476,27 @@ class QueryRewriteCacheTests(unittest.TestCase):
                          msg="a cache that only evicts on write still holds every "
                              "query ever asked, which is what the bound prevents")
 
-    def test_the_bound_evicts_the_oldest_first(self):
-        c = TTLCache(ttl=1000.0, max_entries=3)
-        for i, k in enumerate("abc"):
-            c.put(k, [k], now=float(i))
-        c.put("d", ["d"], now=3.0)
-        self.assertEqual(len(c), 3)
-        self.assertEqual(c.get("a", now=4.0), None, msg="oldest must go first")
-        self.assertEqual(c.get("d", now=4.0), ["d"])
-
-    def test_reinserting_a_key_refreshes_its_recency(self):
-        c = TTLCache(ttl=1000.0, max_entries=3)
-        c.put("a", ["a"], now=0.0)
-        c.put("b", ["b"], now=1.0)
-        c.put("c", ["c"], now=2.0)
-        c.put("a", ["a2"], now=3.0)
-        c.put("d", ["d"], now=4.0)
-        self.assertEqual(c.get("a", now=5.0), ["a2"],
-                         msg="a re-put is a use, so it must not be the eviction victim")
-        self.assertEqual(c.get("b", now=5.0), None)
+    # One test covers the group: both rows assert the same property -- the key
+    # that has gone longest without being used is the eviction victim -- over
+    # whether recency was refreshed by a re-put or left at the first insert.
+    def test_the_bound_evicts_the_least_recently_used_key(self):
+        for label, refreshed in (("first-seen order", False), ("re-put refreshes recency", True)):
+            with self.subTest(order=label):
+                c = TTLCache(ttl=1000.0, max_entries=3)
+                c.put("a", ["a"], now=0.0)
+                c.put("b", ["b"], now=1.0)
+                c.put("c", ["c"], now=2.0)
+                if refreshed:
+                    # a re-put is a use, so "a" must not be the victim
+                    c.put("a", ["a2"], now=3.0)
+                    c.put("d", ["d"], now=4.0)
+                    self.assertEqual(c.get("a", now=5.0), ["a2"])
+                    self.assertEqual(c.get("b", now=5.0), None)
+                else:
+                    c.put("d", ["d"], now=3.0)
+                    self.assertEqual(c.get("a", now=4.0), None, msg="oldest must go first")
+                    self.assertEqual(c.get("d", now=4.0), ["d"])
+                self.assertEqual(len(c), 3)
 
     def test_a_cache_with_no_ttl_or_no_room_is_disabled_and_inert(self):
         for ttl, mx in ((0.0, 4), (-1.0, 4), (100.0, 0), (100.0, -1)):
@@ -1635,21 +1666,21 @@ class RewriteSearchQueryCallSiteTests(unittest.TestCase):
         self.assertNotIn(("poisoned", 1.0), second,
                          msg="a caller's in-place edit leaked into the cache")
 
-    def test_the_fallback_is_not_cached(self):
-        # A timeout is transient. Pinning the degraded heuristic result for the
-        # TTL would turn one slow call into a permanently worse search.
-        cache = TTLCache(ttl=900.0, max_entries=8)
-        responder = self._responder(raises=RuntimeError("timed out"))
-        self._run(cache, responder, "who is running the ai adoption wave two")
-        self.assertEqual(len(cache), 0,
-                         msg="a failed rewrite must not be cached")
-
-    def test_an_unparseable_answer_is_not_cached(self):
-        cache = TTLCache(ttl=900.0, max_entries=8)
-        responder = self._responder(answer="I could not do that.")
-        self._run(cache, responder, "who is running the ai adoption wave two")
-        self.assertEqual(len(cache), 0,
-                         msg="no keywords means the fallback ran, so nothing to cache")
+    # One test covers the group: both rows assert the same property -- a degraded
+    # result is never stored -- over the two ways the rewrite degrades, and both
+    # leave the caller on the fallback for the whole TTL if they are cached.
+    def test_a_degraded_rewrite_is_not_cached(self):
+        for label, kw in (("the call fails",
+                           {"raises": RuntimeError("timed out")}),
+                          ("the answer carries no keywords",
+                           {"answer": "I could not do that."})):
+            with self.subTest(degraded=label):
+                cache = TTLCache(ttl=900.0, max_entries=8)
+                responder = self._responder(**kw)
+                self._run(cache, responder, "who is running the ai adoption wave two")
+                self.assertEqual(len(cache), 0,
+                                 msg="pinning the fallback would turn one bad "
+                                     "rewrite into a permanently worse search")
 
     def test_a_different_filter_is_a_different_question(self):
         cache = TTLCache(ttl=900.0, max_entries=8)
