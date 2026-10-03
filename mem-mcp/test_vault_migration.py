@@ -227,6 +227,48 @@ class ClientManagerCallSiteTests(unittest.TestCase):
     def setUp(self):
         self.source = _read("client_manager.py")
 
+    def test_every_set_payload_call_uses_the_id_list_form(self):
+        """The production call site, not just the migration's.
+
+        The per-point form needs a `PointStruct` whose `vector` field is
+        required and which `set_payload` ignores -- so it raises a
+        `ValidationError` on the first real point and nothing else, which is
+        exactly what happened in the container. The fake rejects that form, but
+        it only ever drives ``migrate_vault_user``'s own call, so
+        ``client_manager`` was free to drift back to it with the whole suite
+        green. Same argument as the two tests above, applied to the other half
+        of the defect.
+
+        The payload here is a local (`patch`), so its *type* is not visible
+        statically and asserting it would be a guess. What is visible, and what
+        distinguishes the two forms, is that the per-point one requires a
+        `PointStruct` to have been built somewhere -- so that is what is pinned.
+        """
+        tree = ast.parse(self.source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name):
+                self.assertNotEqual(node.id, "PointStruct",
+                                    "PointStruct is how the per-point form is "
+                                    "built; see the docstring")
+            if isinstance(node, ast.Attribute):
+                self.assertNotEqual(node.attr, "PointStruct")
+
+        calls = [node for node in ast.walk(tree)
+                 if isinstance(node, ast.Call)
+                 and (node.func.attr if isinstance(node.func, ast.Attribute)
+                      else getattr(node.func, "id", "")) == "set_payload"]
+        self.assertTrue(calls, "precondition: client_manager still calls "
+                               "set_payload somewhere, or this guard is vacuous")
+        for node in calls:
+            keywords = {kw.arg: kw.value for kw in node.keywords}
+            self.assertIn("points", keywords,
+                          "the id-list form names its points")
+            payload = keywords.get("payload")
+            self.assertFalse(isinstance(payload, (ast.List, ast.comprehension)),
+                             "a list payload is the per-point form: a list of "
+                             "PointStruct, each needing a vector this call "
+                             "would have to invent")
+
     def test_create_client_calls_the_shared_derivation(self):
         self.assertIn("client_id = client_id_for(user_id, name)", self.source)
 
@@ -1709,6 +1751,106 @@ class RunTests(unittest.TestCase):
         self.assertNotIn("mid-move", self.output(),
                          "the credential failure must not borrow the "
                          "occupancy message")
+
+class MoveCredentialsTests(unittest.TestCase):
+    """The credential half is called, not merely mentioned.
+
+    Two guards for this used to live in MigrationScriptTests as `assertIn` over
+    the source — "transfer_psks(" and "delete_sessions_for_user(" appear — and
+    both were removed as the weakest kind of assertion this repo documents.
+    Nothing behavioural replaced them, so a move that handed over no access keys
+    and revoked no live sessions passed the whole suite. Confirmed by stubbing
+    each call to a no-op and running all sixteen suites.
+
+    This is the lesson applied one file over: a test of a helper is not a test
+    of its call site. Here `move_credentials` *is* the call site — it is the only
+    place either call is made, and PerformMoveOrderTests stubs the whole
+    function, so nothing observed the calls.
+
+    ``move_credentials`` does ``import sessions`` inside its own body, so a
+    namespace entry cannot reach it. The real (stdlib-only, importable)
+    ``sessions`` module is therefore the thing to patch, which is also the more
+    honest test: the real functions are what get stubbed, at the module the
+    shipping code will resolve.
+    """
+
+    def setUp(self):
+        import sessions as real_sessions
+
+        self.real = real_sessions
+        self.calls = []
+
+        def init_db():
+            self.calls.append(("init_db",))
+
+        def transfer_psks(old_user, new_user):
+            self.calls.append(("transfer_psks", old_user, new_user))
+            return 3
+
+        def delete_sessions_for_user(user):
+            self.calls.append(("delete_sessions_for_user", user))
+            return 2
+
+        for name, replacement in (("init_db", init_db),
+                                  ("transfer_psks", transfer_psks),
+                                  ("delete_sessions_for_user",
+                                   delete_sessions_for_user)):
+            original = getattr(real_sessions, name)
+            setattr(real_sessions, name, replacement)
+            self.addCleanup(setattr, real_sessions, name, original)
+
+        scope = {"__name__": "migrate_vault_user.credentials"}
+        _lift_shared(_MIGRATE, "move_credentials", scope)
+        self.move_credentials = scope["move_credentials"]
+
+    def test_the_access_keys_are_handed_to_the_new_vault(self):
+        report = self.move_credentials(SOURCE_USER, TARGET_USER)
+        self.assertIn(("transfer_psks", SOURCE_USER, TARGET_USER), self.calls,
+                      "the keys must move to the new vault, not be dropped, "
+                      "and not be copied to the old one")
+        self.assertEqual(report["psks"], 3,
+                         "the number moved has to reach the report, because "
+                         "verify() compares it against the source's count")
+
+    def test_the_old_accounts_live_sessions_are_revoked(self):
+        report = self.move_credentials(SOURCE_USER, TARGET_USER)
+        self.assertIn(("delete_sessions_for_user", SOURCE_USER), self.calls,
+                      "a session open across the move keeps writing under the "
+                      "vault it started with until it is ended")
+        self.assertEqual(report["sessions_revoked"], 2)
+
+    def test_the_credential_store_is_open_before_it_is_touched(self):
+        self.move_credentials(SOURCE_USER, TARGET_USER)
+        self.assertEqual([c[0] for c in self.calls][0], "init_db",
+                         "init_db must come first: transfer_psks would "
+                         "otherwise write to a database that does not exist")
+
+    def test_perform_move_hands_it_the_source_and_the_destination(self):
+        # The other half of the same seam: the arguments. Revoking the
+        # *destination* account's sessions instead would look identical in the
+        # report, and it is the difference between finishing a move and logging
+        # the new owner out of their own vault.
+        seen = {}
+
+        def recorder(old_user, new_user):
+            seen["args"] = (old_user, new_user)
+            return {"psks": 0, "sessions_revoked": 0}
+
+        ns = _module_namespace("move_graph", "retarget_qdrant_scope",
+                               "move_qdrant_user", "_flush")
+        ns["move_credentials"] = recorder
+        _lift_shared(_MIGRATE, "perform_move", ns)
+        old_client = client_id_for(SOURCE_USER, "Acme Holdings")
+        new_client = client_id_for(TARGET_USER, "Acme Holdings")
+        remap = _RemapStub(clients={old_client: new_client},
+                           contexts={}, context_parents={})
+        qdrant = FakeQdrant({"ea_memories": {"f": {
+            "userId": SOURCE_USER, "clientId": old_client, "text": "body"}},
+            "ea_diary": {}})
+        asyncio.run(ns["perform_move"](qdrant, FakeDriver(), SOURCE_USER,
+                                      TARGET_USER, remap))
+        self.assertEqual(seen.get("args"), (SOURCE_USER, TARGET_USER))
+
 
 class MigrationScriptTests(unittest.TestCase):
     """The few properties of the script that are decisions, not behaviour.

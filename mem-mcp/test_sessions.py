@@ -397,6 +397,30 @@ class PskTests(StoreCase):
         # "stolen cookie" to "full MCP access" waiting to be closed by accident.
         created = sessions.create_session("alice")
         self.assertIsNone(sessions.resolve_psk(created["session_id"]))
+        # The claim in this test's name is "before the database", and a None
+        # result is not evidence of that: the row is not in the table, so the
+        # lookup would have answered None anyway. Counting connections is what
+        # makes the absence observable.
+        self._assert_no_lookup(["plain-password", created["session_id"],
+                                "", "  ", "mvk", None, 12345])
+
+    def _assert_no_lookup(self, values):
+        """Every one of these is refused without reaching ``_connect``."""
+        original = sessions._connect
+
+        def counting():
+            counting.calls += 1
+            return original()
+
+        counting.calls = 0
+        sessions._connect = counting
+        self.addCleanup(setattr, sessions, "_connect", original)
+        for candidate in values:
+            with self.subTest(value=repr(candidate)[:30]):
+                self.assertIsNone(sessions.resolve_psk(candidate))
+        self.assertEqual(counting.calls, 0,
+                         "a credential without the prefix must never be "
+                         "hashed and looked up")
 
     # One test covers the group: a revoked key not resolving is one property,
     # and the two cases are the two moments at which it has to hold.
