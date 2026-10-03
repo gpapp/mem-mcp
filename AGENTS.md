@@ -617,6 +617,25 @@ success that patches nothing. A `Context` id in a payload is retargeted the same
 way; `clientName`/`contextName` are not, because a name is not derived from the
 username.
 
+**The scope retarget uses the id-list form of `set_payload`, not per-point
+payloads.** `set_payload` takes either one payload applied to a list of point ids,
+or a list of per-point payloads — and the second needs a `PointStruct`, a pydantic
+model whose **`vector` field is required**, a field `set_payload` ignores
+entirely. An earlier version omitted it, no local test could see it because the
+fake was more permissive than the real model, and the container raised a
+`ValidationError` on the first real point. Points are therefore grouped by their
+patch (a handful of distinct pairs in any vault) and written with
+`points=[ids]` — the form `client_manager` already uses in production, so there
+is no model to construct and no version-sensitive field to get wrong. **A fake
+that is more permissive than the dependency it stands in for is a guard that
+reports green on the defect it is standing in for**; `FakeQdrant.set_payload`
+now rejects the per-point form outright rather than accepting it.
+
+Grouping has a sharp edge worth stating: `set_payload` writes whatever it is
+handed, so the flush **drops the keys it is not changing**. A group key is a
+fixed-width tuple with `None` marking an absent half, and carrying those through
+would write `contextId: null` over a point that never had one.
+
 Note that `move_qdrant_user` **mutates the filter it is paginating over**. That is
 only safe because Qdrant's `offset` is a cursor over the collection's own point
 order with the filter applied per point — not an index into the filtered result.

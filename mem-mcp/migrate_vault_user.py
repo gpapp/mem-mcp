@@ -78,8 +78,12 @@ from qdrant_client.models import (
     Filter,
     FieldCondition,
     MatchValue,
-    PointStruct,
 )
+
+# The payload keys ``retarget_qdrant_scope`` ever writes, in the order they are
+# packed into a group key. A tuple rather than a dict so points sharing a patch
+# hash together, and a list so an absent value is distinct from a present one.
+PATCH_KEYS = ("clientId", "contextId")
 
 from common import COLLECTION_NAME, DIARY_COLLECTION
 
@@ -98,10 +102,11 @@ class DestinationOccupied(ValueError):
 HERE = Path(__file__).resolve().parent
 DEFAULT_ENV = HERE.parent / ".env"
 
-# Scroll page size, and the point at which a retarget batch is flushed. It is a
-# *threshold*, not a cap: `structs` persists across pages and only points that
-# actually need a patch accumulate, so one set_payload can carry up to
-# 2 * QDRANT_BATCH - 1. Harmless, but do not rely on it as a request bound.
+# Scroll page size, and the point at which the accumulated retarget patches are
+# flushed. It is a *threshold*, not a cap: the queue survives a page boundary and
+# only points that actually need a patch accumulate, so one flush can carry up to
+# 2 * QDRANT_BATCH - 1 ids across its groups. Harmless, but do not rely on it as
+# a request bound.
 QDRANT_BATCH = 200
 
 
@@ -207,6 +212,32 @@ async def read_old_user_node_present(neo4j_driver, user_id: str) -> bool:
 # Writing
 # ---------------------------------------------------------------------------
 
+async def _flush(qdrant, collection: str, groups: dict) -> int:
+    """Write the accumulated patches, one request per distinct patch.
+
+    ``set_payload`` takes either a single payload applied to a list of point ids,
+    or a list of per-point payloads. The first form needs no pydantic model at
+    all, and the number of *distinct* patches is the number of distinct
+    (client, context) pairs actually present — a handful in any real vault, and
+    never more than the vault has scope assignments.
+    """
+    written = 0
+    for key, ids in groups.items():
+        if not ids:
+            continue
+        # Only the keys that actually change. ``set_payload`` writes whatever it
+        # is handed, so carrying the absent half of the group key through as
+        # ``None`` would write a null over a real clientId — the opposite of
+        # leaving it alone.
+        payload = {name: value for name, value in zip(PATCH_KEYS, key)
+                   if value is not None}
+        await qdrant.set_payload(collection_name=collection, payload=payload,
+                                 points=ids)
+        written += len(ids)
+    groups.clear()
+    return written
+
+
 async def retarget_qdrant_scope(qdrant, user_id: str, client_map: dict,
                                 context_map: dict) -> int:
     """Point every scope id at its new value, for one user's points.
@@ -214,10 +245,19 @@ async def retarget_qdrant_scope(qdrant, user_id: str, client_map: dict,
     ``clientName`` / ``contextName`` need no rewrite — a name is not derived from
     the username — so this touches ids only. Runs while the points are still
     reachable by the old ``userId``.
+
+    Grouped by patch rather than one ``PointStruct`` per point, and that is not a
+    style choice. ``PointStruct`` is a pydantic model whose ``vector`` field is
+    **required**; ``set_payload`` ignores the value entirely, so an earlier
+    version that omitted it passed the entire test suite and then raised a
+    ValidationError inside the container on the first real point. The id-list
+    form is what ``client_manager`` already uses in production, so it needs no
+    model to be constructed correctly and cannot be version-sensitive.
     """
     patched = 0
     for collection in (COLLECTION_NAME, DIARY_COLLECTION):
-        structs = []
+        groups: dict = {}
+        queued = 0
         offset = None
         while True:
             points, offset = await qdrant.scroll(
@@ -232,23 +272,30 @@ async def retarget_qdrant_scope(qdrant, user_id: str, client_map: dict,
             )
             for point in points:
                 payload = point.payload or {}
-                patch = {}
+                patch = []
                 if payload.get("clientId") in client_map:
-                    patch["clientId"] = client_map[payload["clientId"]]
+                    patch.append(client_map[payload["clientId"]])
+                else:
+                    patch.append(None)
                 if payload.get("contextId") in context_map:
-                    patch["contextId"] = context_map[payload["contextId"]]
-                if patch:
-                    structs.append(PointStruct(id=point.id, payload=patch))
-            if len(structs) >= QDRANT_BATCH:
-                await qdrant.set_payload(collection_name=collection,
-                                         points=structs)
-                patched += len(structs)
-                structs = []
+                    patch.append(context_map[payload["contextId"]])
+                else:
+                    patch.append(None)
+                if not any(patch):
+                    continue
+                key = tuple(patch)
+                groups.setdefault(key, []).append(point.id)
+                queued += 1
+            # A flush *threshold*, not a cap: `queued` counts every point that
+            # needs a patch while a group persists across pages, so one request
+            # can carry up to 2 * QDRANT_BATCH - 1 ids in total across its
+            # groups. Harmless, but do not rely on it as a request bound.
+            if queued >= QDRANT_BATCH:
+                patched += await _flush(qdrant, collection, groups)
+                queued = 0
             if offset is None:
                 break
-        if structs:
-            await qdrant.set_payload(collection_name=collection, points=structs)
-            patched += len(structs)
+        patched += await _flush(qdrant, collection, groups)
     return patched
 
 

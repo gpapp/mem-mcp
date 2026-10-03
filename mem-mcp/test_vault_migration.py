@@ -89,10 +89,6 @@ class MatchValue(_Model):
     pass
 
 
-class PointStruct(_Model):
-    pass
-
-
 class FakeQdrant:
     """Enough of AsyncQdrantClient for scroll and set_payload.
 
@@ -120,14 +116,24 @@ class FakeQdrant:
         return True
 
     async def set_payload(self, collection_name, payload=None, points=None):
+        """Mirrors the call shape ``client_manager`` uses in production.
+
+        A list of point ids plus **one** payload applied to all of them. The
+        per-point form needs a pydantic model whose ``vector`` field is
+        required, which is a runtime error the suite cannot see; this form
+        cannot be version-sensitive, so a permissive stub here no longer hides
+        anything. Rejects a per-point payload outright rather than accepting it,
+        so the shape cannot drift back.
+        """
+        if not isinstance(payload, dict):
+            raise TypeError(
+                "set_payload takes one payload and a list of point ids; a "
+                "per-point payload list needs a PointStruct, whose 'vector' "
+                "field is required and is ignored here")
         self.payload_batches.append((collection_name, len(points)))
-        for point in points:
-            if isinstance(point, PointStruct):
-                pid, patch = point.id, point.payload
-            else:
-                pid, patch = point, payload
-            self.data[collection_name].setdefault(pid, {}).update(patch)
-            self.payload_writes.append((collection_name, pid, dict(patch)))
+        for pid in points:
+            self.data[collection_name].setdefault(pid, {}).update(payload)
+            self.payload_writes.append((collection_name, pid, dict(payload)))
 
     def written_ids(self):
         return [pid for _c, pid, _p in self.payload_writes]
@@ -168,7 +174,6 @@ def _qdrant_namespace():
         "Filter": Filter,
         "FieldCondition": FieldCondition,
         "MatchValue": MatchValue,
-        "PointStruct": PointStruct,
         "COLLECTION_NAME": "ea_memories",
         "DIARY_COLLECTION": "ea_diary",
         "QDRANT_BATCH": 200,
@@ -463,8 +468,8 @@ class RetargetScopeTests(unittest.TestCase):
     """Called against a fake client, because the properties are behavioural."""
 
     def setUp(self):
-        self.retarget = _lift("migrate_vault_user.py", "retarget_qdrant_scope",
-                              _qdrant_namespace())
+        ns = _module_namespace("_flush", "retarget_qdrant_scope")
+        self.retarget = ns["retarget_qdrant_scope"]
         self.old_client = client_id_for(SOURCE_USER, "Acme Holdings")
         self.new_client = client_id_for(TARGET_USER, "Acme Holdings")
         self.old_context = context_id_for(SOURCE_USER, self.old_client, "Phase One")
@@ -539,6 +544,35 @@ class RetargetScopeTests(unittest.TestCase):
         self.assertEqual(qdrant.data["ea_diary"]["other-1"]["clientId"],
                          self.old_client)
 
+    def test_it_never_builds_a_per_point_payload(self):
+        # The container's PointStruct is a pydantic model with a **required**
+        # vector field, and set_payload ignores the value. An earlier version
+        # omitted it, the permissive stub accepted that, and the whole suite
+        # passed — then the container raised a ValidationError on the first real
+        # point. The fake now refuses the per-point form outright, and this
+        # asserts the module never imports the model at all.
+        qdrant = self._fixture()
+        self._retarget(qdrant)
+        # An AST check, not assertNotIn: the module docstring explains *why* the
+        # per-point form is avoided, so a substring guard fails on the
+        # explanation — the assertIn-matches-the-comment lesson again.
+        for node in ast.walk(ast.parse(_read(_MIGRATE))):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                self.assertNotIn("qdrant_client.models",
+                                 [a.name for a in node.names],
+                                 "the per-point payload form needs a pydantic "
+                                 "model whose required 'vector' field "
+                                 "set_payload ignores")
+            if isinstance(node, ast.Call):
+                name = (node.func.attr if isinstance(node.func, ast.Attribute)
+                        else getattr(node.func, "id", ""))
+                self.assertNotEqual(name, "PointStruct")
+        for _collection, pid, payload in qdrant.payload_writes:
+            self.assertIn(payload, ({}, {"clientId": self.new_client},
+                                    {"contextId": self.new_context},
+                                    {"clientId": self.new_client,
+                                     "contextId": self.new_context}))
+
     def test_an_id_that_is_not_in_the_map_is_left_alone(self):
         # A dangling clientId from a deleted client is already broken; blanking
         # it would hide that instead of surfacing it.
@@ -558,12 +592,10 @@ class PaginationTests(unittest.TestCase):
     """
 
     def setUp(self):
-        ns = _qdrant_namespace()
-        ns["QDRANT_BATCH"] = 2
+        ns = _module_namespace(extra=dict(_qdrant_namespace(), QDRANT_BATCH=2))
         self.retarget = ns["retarget_qdrant_scope"] = _lift(
-            "migrate_vault_user.py", "retarget_qdrant_scope", ns)
-        self.move = ns["move_qdrant_user"] = _lift(
-            "migrate_vault_user.py", "move_qdrant_user", ns)
+            _MIGRATE, "retarget_qdrant_scope", _module_namespace("_flush", extra=ns))
+        self.move = ns["move_qdrant_user"] = _lift(_MIGRATE, "move_qdrant_user", ns)
         self.old_client = client_id_for(SOURCE_USER, "Acme")
         self.new_client = client_id_for(TARGET_USER, "Acme")
         self.maps = ({self.old_client: self.new_client}, {})
@@ -611,6 +643,87 @@ class PaginationTests(unittest.TestCase):
                 self.assertEqual(qdrant.data["ea_memories"][f"p{i}"]["userId"],
                                  TARGET_USER, f"p{i} of {total}")
 
+    def test_points_sharing_a_patch_are_written_in_one_request(self):
+        # Grouping by patch is also what keeps the request count sane now that
+        # the per-point form is gone.
+        qdrant = self._points(6, scoped=True).with_pages(6)
+        asyncio.run(self.retarget(qdrant, SOURCE_USER, *self.maps))
+        self.assertEqual(len(qdrant.payload_batches), 1)
+        self.assertEqual(qdrant.payload_batches[0][1], 6)
+
+    def test_a_grouped_patch_never_nulls_a_key_it_is_not_changing(self):
+        """``set_payload`` writes what it is handed, so a carried-through ``None``
+        would blank a real value.
+
+        The group key is a fixed-width tuple with ``None`` marking an absent
+        half, and the flush has to drop those — otherwise a point with a
+        ``clientId`` but no ``contextId`` gets ``contextId: null`` written over
+        nothing, and a point whose context *is* being retargeted loses nothing
+        but gains a null key that every later filter has to special-case.
+        """
+        old_client = self.old_client
+        old_context = context_id_for(SOURCE_USER, old_client, "Phase One")
+        new_client = self.new_client
+        new_context = context_id_for(TARGET_USER, new_client, "Phase One")
+        qdrant = FakeQdrant({"ea_memories": {
+            "with-both": {"userId": SOURCE_USER, "clientId": old_client,
+                          "contextId": old_context},
+            "client-only": {"userId": SOURCE_USER, "clientId": old_client},
+        }, "ea_diary": {}})
+        patched = asyncio.run(self.retarget(
+            qdrant, SOURCE_USER, {old_client: new_client},
+            {old_context: new_context}))
+        self.assertEqual(patched, 2)
+        both = qdrant.data["ea_memories"]["with-both"]
+        self.assertEqual(both["clientId"], new_client)
+        self.assertEqual(both["contextId"], new_context)
+        only = qdrant.data["ea_memories"]["client-only"]
+        self.assertEqual(only["clientId"], new_client)
+        self.assertNotIn("contextId", only,
+                         "a key that is not changing must not be written at all")
+
+    def test_a_point_needing_no_patch_is_not_written(self):
+        qdrant = self._points(2, scoped=True)
+        data = qdrant.data["ea_memories"]
+        del data["p1"]["clientId"]
+        patched = asyncio.run(self.retarget(qdrant, SOURCE_USER, *self.maps))
+        self.assertEqual(patched, 1)
+        self.assertEqual(qdrant.written_ids(), ["p0"])
+
+    def test_the_group_key_order_matches_the_keys_written(self):
+        """The constant and the append order have to agree.
+
+        ``_flush`` turns a group key back into a payload with
+        ``zip(PATCH_KEYS, key)``, so a reordered ``PATCH_KEYS`` writes each id
+        into the *wrong* payload key — silently, and with no error anywhere. The
+        two live in different places (a module constant, and the order of two
+        ``append`` calls), so nothing else connects them.
+        """
+        appends = []
+        for node in ast.walk(ast.parse(_read(_MIGRATE))):
+            if isinstance(node, ast.AsyncFunctionDef) \
+                    and node.name == "retarget_qdrant_scope":
+                for inner in ast.walk(node):
+                    if isinstance(inner, ast.Call) \
+                            and isinstance(inner.func, ast.Attribute) \
+                            and inner.func.attr == "append" \
+                            and isinstance(inner.func.value, ast.Name) \
+                            and inner.func.value.id == "patch" \
+                            and not (isinstance(inner.args[0], ast.Constant)
+                                     and inner.args[0].value is None):
+                        # The `else: patch.append(None)` arms are part of the
+                        # fixed-width tuple too, so they are filtered rather than
+                        # counted — the key order is what is under test.
+                        appends.append(ast.unparse(inner.args[0]))
+        self.assertEqual(len(appends), 2,
+                         f"expected exactly two patch appends, found {appends}")
+        # The first append is guarded on the client key and the second on the
+        # context key, so the order they appear in IS the PATCH_KEYS order.
+        self.assertEqual(appends, ["client_map[payload['clientId']]",
+                                   "context_map[payload['contextId']]"])
+        self.assertEqual(_module_constant(_MIGRATE, "PATCH_KEYS"),
+                         ("clientId", "contextId"))
+
     def test_one_request_can_exceed_the_batch_size(self):
         # Documented as a flush threshold rather than a cap, and this pins the
         # consequence: `structs` survives a page boundary and only the points
@@ -644,10 +757,10 @@ class PaginationTests(unittest.TestCase):
 
 class MoveUserTests(unittest.TestCase):
     def setUp(self):
-        self.move = _lift("migrate_vault_user.py", "move_qdrant_user",
-                          _qdrant_namespace())
-        self.retarget = _lift("migrate_vault_user.py", "retarget_qdrant_scope",
-                              _qdrant_namespace())
+        ns = _module_namespace("_flush", "retarget_qdrant_scope",
+                               "move_qdrant_user")
+        self.retarget = ns["retarget_qdrant_scope"]
+        self.move = ns["move_qdrant_user"]
 
     def _fixture(self):
         return FakeQdrant({
@@ -921,13 +1034,14 @@ class PerformMoveOrderTests(unittest.TestCase):
         # lifted: _lift copies it, so filling it in afterwards leaves
         # perform_move resolving names that do not exist.
         ns = _module_namespace("move_graph", "retarget_qdrant_scope",
-                               "move_qdrant_user")
+                               "move_qdrant_user", "_flush")
         # Stubbed, not lifted: the credential half refuses a same-user move, and
         # the test below needs one in order to populate the unchanged set. That
         # half is covered by RunTests and by test_sessions.PskTransferTests.
         ns["move_credentials"] = lambda *a, **k: {"psks": 0,
                                                    "sessions_revoked": 0}
-        self.perform_move = _lift(_MIGRATE, "perform_move", ns)
+        _lift_shared(_MIGRATE, "perform_move", ns)
+        self.perform_move = ns["perform_move"]
         self.old_client = client_id_for(SOURCE_USER, "Acme Holdings")
         self.new_client = client_id_for(TARGET_USER, "Acme Holdings")
         self.old_context = context_id_for(SOURCE_USER, self.old_client, "Phase One")
@@ -1081,6 +1195,23 @@ _MIGRATE = "migrate_vault_user.py"
 _MIGRATE_EXCEPTIONS = ("DestinationOccupied",)
 
 
+def _module_constant(module_name, name):
+    """Read a module-level constant out of the source by AST.
+
+    A hand-written copy in the harness is a duplicated constant that can drift
+    from the module it stands in for, and a drift here is invisible: swapping
+    the shipping ``PATCH_KEYS`` left the whole suite green because every lifted
+    function read the harness's copy. Reading the real one makes that
+    unrepresentable rather than merely tested for.
+    """
+    for node in ast.parse(_read(module_name)).body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == name:
+                    return ast.literal_eval(node.value)
+    raise AssertionError(f"{name} not found in {module_name}")
+
+
 def _lift_class(module_name, class_name, namespace):
     """Pull a module-level class definition out and exec it.
 
@@ -1099,6 +1230,27 @@ def _lift_class(module_name, class_name, namespace):
     raise AssertionError(f"{class_name} not found in {module_name}")
 
 
+def _lift_shared(module_name, function_name, scope):
+    """Lift a function **into a shared scope**, so order does not matter.
+
+    ``_lift`` copies the namespace it is given, so a lifted function cannot see
+    a collaborator lifted afterwards — and the failure is a NameError that reads
+    as a bug in the code under test. Exec'ing into the caller's own dict means
+    the lifted function's globals *are* that dict, so a second lift is visible to
+    the first. The dependencies here are genuinely order-independent
+    (``_flush`` is referenced by ``retarget_qdrant_scope`` and defined before it
+    in the file, so file order is not call order).
+    """
+    source = _read(module_name)
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                and node.name == function_name:
+            segment = ast.get_source_segment(source, node)
+            exec(compile(segment, f"{module_name}:{function_name}", "exec"), scope)
+            return scope[function_name]
+    raise AssertionError(f"{function_name} not found in {module_name}")
+
+
 def _module_namespace(*names, extra=None):
     """Lift ``names`` out of the migration module, each seeing the others.
 
@@ -1109,11 +1261,13 @@ def _module_namespace(*names, extra=None):
     """
     ns = dict(_qdrant_namespace())
     ns.update(_module_imports(_MIGRATE))
+    # Read from the module, not restated here: see _module_constant.
+    ns["PATCH_KEYS"] = _module_constant(_MIGRATE, "PATCH_KEYS")
     for name in _MIGRATE_EXCEPTIONS:
         ns[name] = _lift_class(_MIGRATE, name, ns)
     ns.update(extra or {})
     for name in names:
-        ns[name] = _lift(_MIGRATE, name, ns)
+        _lift_shared(_MIGRATE, name, ns)
     return ns
 
 
