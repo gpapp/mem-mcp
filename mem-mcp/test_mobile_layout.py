@@ -378,34 +378,63 @@ class StatusWidgetLayoutTests(unittest.TestCase):
 class LayoutInlineStyleTests(unittest.TestCase):
     """An inline style beats a stylesheet rule of any specificity."""
 
+    @classmethod
+    def setUpClass(cls):
+        # Everything from the layout breakpoint onwards is the mobile sheet, so
+        # a declaration has to appear *above* it to be overridable: searched over
+        # the whole stylesheet, the mobile `#graph-container { height: 62vh }`
+        # satisfies a check that the desktop 70vh is still there.
+        cls.desktop = CSS[:CSS.index("@media (max-width: 900px)")]
+
+    # Every box whose mobile rules could be outranked: the five laid out by
+    # `class`, and the graph canvas, which is addressed by `id`. The attribute
+    # pattern is carried per row because a single `class=` form would not match
+    # that last one.
+    _CONTAINERS = (
+        (r'class="memories-layout"', ".memories-layout"),
+        (r'class="diary-layout"', ".diary-layout"),
+        (r'class="graph-layout"', ".graph-layout"),
+        (r'class="graph-sidebar"', ".graph-sidebar"),
+        (r'class="graph-main"', ".graph-main"),
+        (r'id="graph-container"', "#graph-container"),
+    )
+
+    # One test covers the group: "this container carries an inline style" is a
+    # single property, asserted here over every container that could hide a
+    # mobile rule behind one.
     def test_no_layout_container_carries_an_inline_style(self):
-        for cls in ("memories-layout", "diary-layout", "graph-layout",
-                    "graph-sidebar", "graph-main"):
-            with self.subTest(container=cls):
+        for pattern, label in self._CONTAINERS:
+            with self.subTest(container=label):
                 self.assertIsNone(
-                    re.search(r'class="%s"[^>]*\bstyle=' % cls, SOURCE),
-                    f".{cls} has an inline style, which overrides the mobile "
+                    re.search(pattern + r"[^>]*\bstyle=", SOURCE),
+                    f"{label} has an inline style, which overrides the mobile "
                     f"media query no matter what the stylesheet says",
                 )
 
-    def test_the_graph_layout_flex_rule_lives_in_the_stylesheet(self):
-        self.assertRegex(CSS, r"\.graph-layout\s*\{[^}]*display:\s*flex")
+    # The desktop declarations the mobile block has to be able to override, and
+    # which therefore have to come from the stylesheet. `#graph-container` is
+    # in the list because an inline `height: 70vh` outranked the mobile 62vh
+    # rule at every specificity, and vis.js sizes its canvas once from that
+    # box -- so the rule that never applied was the rule deciding how much room
+    # the user has to pan.
+    _FROM_STYLESHEET = (
+        (r"\.graph-layout\s*\{[^}]*display:\s*flex", ".graph-layout",
+         "display: flex", "the mobile block's column override has to beat a side-by-side row"),
+        (r"#graph-container\s*\{[^}]*(?<![\w-])height\s*:", "#graph-container",
+         "height:", "the mobile 62vh share has to override the desktop 70vh floor"),
+    )
 
-    def test_the_graph_container_is_styled_and_carries_no_inline_style(self):
-        """`#graph-container` sized the vis canvas from an inline style.
-
-        The mobile block has a height rule for it, and it was inert: an
-        inline `height: 70vh` outranks it at every specificity. vis.js
-        sizes its canvas once from this box, so the rule that never applied
-        was the rule deciding how much room the user has to pan.
-        """
-        self.assertIsNone(
-            re.search(r'id="graph-container"[^>]*\bstyle=', SOURCE),
-            "#graph-container has an inline style, so the mobile height "
-            "rule for it cannot apply",
-        )
-        self.assertRegex(
-            CSS, r"#graph-container\s*\{[^}]*height:",)
+    # One test covers the group: "this desktop declaration lives in the
+    # stylesheet" is a single property, asserted per row over the elements whose
+    # mobile rules would otherwise be inert.
+    def test_the_graph_desktop_sizes_come_from_the_stylesheet(self):
+        for pattern, label, declaration, why in self._FROM_STYLESHEET:
+            with self.subTest(selector=label):
+                self.assertRegex(
+                    self.desktop, pattern,
+                    f"{label} must declare `{declaration}` in the desktop sheet "
+                    f"so the mobile block can override it: {why}",
+                )
 
 
 class MobileBreakpointTests(unittest.TestCase):

@@ -251,22 +251,21 @@ class PayloadShapeTests(unittest.TestCase):
             for key in ("name", "userId", "category", "client", "context", "keywords"):
                 self.assertEqual(payload.get(key), base[key], f"chunk {index} lost {key}")
 
+    # Facts store the full text under `text`, diary entries under `content`, and
+    # the rule is the same for both: only chunk 0 may carry it, or a search
+    # returns a fragment as though it were the whole record.
     def test_only_chunk_zero_carries_the_full_text(self):
         text = self.long_text()
-        points = build_chunk_payloads("fact-1", text, dict(self.BASE, text=text))
-        self.assertEqual(points[0]["payload"]["text"], text)
-        self.assertNotIn("chunkText", points[0]["payload"])
-        for point in points[1:]:
-            self.assertNotIn("text", point["payload"])
-            self.assertTrue(point["payload"]["chunkText"])
-
-    def test_diary_uses_content_as_the_full_text_key(self):
-        text = self.long_text()
-        points = build_chunk_payloads("d-1", text, {"content": text, "userId": "u"})
-        self.assertEqual(points[0]["payload"]["content"], text)
-        for point in points[1:]:
-            self.assertNotIn("content", point["payload"])
-            self.assertTrue(point["payload"]["chunkText"])
+        cases = (("a fact", "fact-1", "text", {"text": text, "name": "T", "userId": "u"}),
+                 ("a diary entry", "d-1", "content", {"content": text, "name": "T", "userId": "u"}))
+        for label, record_id, full_key, base in cases:
+            with self.subTest(record=label):
+                points = build_chunk_payloads(record_id, text, dict(base))
+                self.assertEqual(points[0]["payload"][full_key], text)
+                self.assertNotIn("chunkText", points[0]["payload"])
+                for index, point in enumerate(points[1:], start=1):
+                    self.assertNotIn(full_key, point["payload"], f"chunk {index} kept the full text")
+                    self.assertTrue(point["payload"]["chunkText"])
 
     def test_rewriting_is_idempotent(self):
         text = self.long_text()
@@ -538,18 +537,24 @@ class RechunkCandidateTests(unittest.TestCase):
             {"id": "d", "text": "", "name": "empty"},
         ]
 
-    def test_picks_only_large_unchunked_records(self):
-        picked = [r["id"] for r in rechunk_candidates(self.records, set())]
-        self.assertEqual(sorted(picked), ["a", "c"])
-
-    def test_already_chunked_records_are_skipped(self):
-        picked = [r["id"] for r in rechunk_candidates(self.records, {"c"})]
-        self.assertEqual(picked, ["a"])
-
-    def test_nothing_left_is_an_empty_list_not_none(self):
-        # The caller does `if not wanted: return`, and a None here would sail
-        # through that check and then fail on iteration.
-        self.assertEqual(rechunk_candidates(self.records, {"a", "c"}), [])
+    # The selection is one rule -- the large records that are not already
+    # chunked -- over four already-chunked sets, including the two empty
+    # results the caller does `if not wanted: return` on. Order is not
+    # asserted here: it is the separate claim test_longest_first makes.
+    def test_picks_exactly_the_large_unchunked_records(self):
+        cases = (
+            ("nothing chunked yet", self.records, set(), ["a", "c"]),
+            ("c is already chunked", self.records, {"c"}, ["a"]),
+            ("everything is chunked", self.records, {"a", "c"}, []),
+            ("no records at all", [], set(), []),
+        )
+        for label, records, chunked, expected in cases:
+            with self.subTest(case=label):
+                picked = rechunk_candidates(records, chunked)
+                # The caller does `if not wanted: return`, and a None here would
+                # sail through that check and then fail on iteration.
+                self.assertIsInstance(picked, list)
+                self.assertEqual(sorted(r["id"] for r in picked), expected)
 
     def test_longest_first(self):
         # A boot that hits its limit must spend it where recall is worst.
@@ -573,9 +578,6 @@ class RechunkCandidateTests(unittest.TestCase):
         self.assertFalse(needs_chunking(just_under))
         self.assertEqual(rechunk_candidates([{"id": "z", "text": just_under}], set()), [])
 
-    def test_empty_input(self):
-        self.assertEqual(rechunk_candidates([], set()), [])
-
 
 class ReindexClassifyTests(unittest.TestCase):
     """reindex_chunks._classify decides whether a record is worth rewriting.
@@ -589,15 +591,20 @@ class ReindexClassifyTests(unittest.TestCase):
     invisible until a real vault was run through the script.
     """
 
-    def test_long_record_is_selected_for_chunking(self):
-        self.assertEqual(_classify({"text": "Meeting notes. " * 400}), "chunk")
-
-    def test_short_record_is_skipped(self):
-        self.assertEqual(_classify({"text": "A short fact."}), "skip-short")
+    # `_classify` routes on one thing -- whether the record would split -- so a
+    # long and a short record are two inputs to the same decision.
+    def test_it_selects_on_whether_the_record_would_split(self):
+        cases = (("a long record", {"text": "Meeting notes. " * 400}, "chunk"),
+                 ("a short record", {"text": "A short fact."}, "skip-short"))
+        for label, record, expected in cases:
+            with self.subTest(case=label):
+                self.assertEqual(_classify(record), expected)
 
     def test_blank_and_missing_text_is_skipped(self):
-        for record in ({"text": ""}, {"text": "   \n\t "}, {}):
-            self.assertEqual(_classify(record), "skip-short", record)
+        cases = (("empty", {"text": ""}), ("whitespace", {"text": "   \n\t "}), ("missing", {}))
+        for label, record in cases:
+            with self.subTest(case=label):
+                self.assertEqual(_classify(record), "skip-short")
 
     def test_the_split_threshold_is_the_target(self):
         # The boundary is what actually decides the branch, so pin it. The

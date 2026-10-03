@@ -106,21 +106,26 @@ class ProcessorLabelTests(unittest.TestCase):
     catches it.
     """
 
-    def test_no_vram_is_cpu_inference(self):
-        self.assertEqual(sm.processor_label(2_630_000_000, 0), "100% CPU")
-
-    def test_all_vram_is_gpu(self):
-        self.assertEqual(sm.processor_label(2_630_000_000, 2_630_000_000), "100% GPU")
-
-    def test_a_split_reports_cpu_first_like_the_cli(self):
-        # 3.8 GB of a model on a 4 GB card measured as 49%/51% CPU/GPU.
-        label = sm.processor_label(100, 51)
-        self.assertEqual(label, "49%/51% CPU/GPU")
-        self.assertTrue(label.startswith("49%/"), msg="the CLI puts CPU first")
+    # The label is one pure function of the two byte counts, so the three
+    # shapes `ollama ps` reports are three inputs to one rule, not three rules.
+    def test_the_label_follows_the_two_byte_counts(self):
+        cases = (
+            ("no VRAM is CPU inference", 2_630_000_000, 0, "100% CPU"),
+            ("all VRAM is GPU", 2_630_000_000, 2_630_000_000, "100% GPU"),
+            # 3.8 GB of a model on a 4 GB card measured as 49%/51% CPU/GPU.
+            ("a split reports CPU first like the CLI", 100, 51, "49%/51% CPU/GPU"),
+        )
+        for label, size, size_vram, expected in cases:
+            with self.subTest(case=label):
+                got = sm.processor_label(size, size_vram)
+                self.assertEqual(got, expected)
+                self.assertEqual(got.split("/")[0], expected.split("/")[0],
+                                 msg="the CLI puts the CPU share first")
 
     def test_an_unknown_size_yields_no_label(self):
-        self.assertEqual(sm.processor_label(0, 0), "")
-        self.assertEqual(sm.processor_label(None, None), "")
+        for label, size, size_vram in (("zero", 0, 0), ("none", None, None)):
+            with self.subTest(case=label):
+                self.assertEqual(sm.processor_label(size, size_vram), "")
 
     def test_junk_sizes_do_not_raise(self):
         self.assertEqual(sm.processor_label("nope", {}), "")
@@ -272,7 +277,11 @@ class SignatureTests(unittest.TestCase):
         `expiresAt` is a per-model key and `checked` a top-level one, so each
         is asserted where it actually lives -- a top-level-only check would
         have reported the countdown as "absent" and passed for the wrong reason.
+        The list's own contents are pinned first: `signature()` whitelists
+        fields explicitly and never reads this tuple, so an emptied list would
+        turn the whole loop into a no-op that still reported green.
         """
+        self.assertEqual(sorted(sm.VOLATILE_SNAPSHOT_KEYS), ["checked", "expiresAt"])
         snap = self._snapshot()
         model = snap["models"][0]
         for key in sm.VOLATILE_SNAPSHOT_KEYS:
@@ -294,21 +303,23 @@ class SignatureTests(unittest.TestCase):
                 msg=f"a change to {key} must not read as a state change",
             )
 
-    def test_a_model_loading_is_a_change(self):
+    # Which models are resident is one property of the fingerprint, checked
+    # over the three transitions a poller can actually see: both directions of
+    # a full load/unload, and the partial eviction that distinguishes "49%/51%"
+    # from "51%/49%".
+    def test_a_change_in_resident_state_is_a_change(self):
         cold = self._snapshot(ps={"models": []})
         warm = self._snapshot()
-        self.assertNotEqual(sm.signature(cold), sm.signature(warm))
-
-    def test_a_model_unloading_is_a_change(self):
-        warm = self._snapshot()
-        cold = self._snapshot(ps={"models": []})
-        self.assertNotEqual(sm.signature(warm), sm.signature(cold))
-
-    def test_a_partial_eviction_shows_up(self):
-        """49%/51% one way and 51%/49% the other are different states."""
         half = self._snapshot(ps={"models": [_ps("nemotron-3-nano:4b", 100, 49)]})
         other = self._snapshot(ps={"models": [_ps("nemotron-3-nano:4b", 100, 51)]})
-        self.assertNotEqual(sm.signature(half), sm.signature(other))
+        cases = (
+            ("a model loading", cold, warm),
+            ("a model unloading", warm, cold),
+            ("a partial eviction", half, other),
+        )
+        for label, before, after in cases:
+            with self.subTest(case=label):
+                self.assertNotEqual(sm.signature(before), sm.signature(after))
 
     def test_going_down_and_coming_back_are_changes(self):
         alive = self._snapshot()
@@ -317,12 +328,14 @@ class SignatureTests(unittest.TestCase):
         self.assertNotEqual(sm.signature(dead), sm.signature(alive))
 
     def test_the_version_a_warning_and_the_lock_are_state(self):
-        for changed in (
-            self._snapshot(version={"version": "0.35.0"}),
-            self._snapshot(warnings=["/api/tags returned HTTP 500"]),
-            self._snapshot(maintenance={"test-user": "reclassify"}),
-        ):
-            self.assertNotEqual(sm.signature(self._snapshot()), sm.signature(changed))
+        cases = (
+            ("a version bump", self._snapshot(version={"version": "0.35.0"})),
+            ("a warning", self._snapshot(warnings=["/api/tags returned HTTP 500"])),
+            ("the maintenance lock", self._snapshot(maintenance={"test-user": "reclassify"})),
+        )
+        for label, changed in cases:
+            with self.subTest(case=label):
+                self.assertNotEqual(sm.signature(self._snapshot()), sm.signature(changed))
 
     def test_the_key_order_of_the_payload_does_not_matter(self):
         """Two observations of the same state fingerprint the same, however built."""
@@ -579,33 +592,28 @@ class UnloadEndpointTests(unittest.TestCase):
         self.assertEqual(queue.qsize(), 1, msg="nobody watching the stream was told")
         self.assertEqual(queue.get_nowait()["residentCount"], 0)
 
-    def test_an_unknown_model_is_refused_before_the_request(self):
-        endpoint, unloaded = self._runner()
+    # A name the live snapshot does not list is refused with 400 before any
+    # request goes out; a blank name and a typo are two inputs to that one
+    # rule, and each refusal has to say something the caller can act on.
+    def test_a_model_that_is_not_loaded_is_refused_before_the_request(self):
+        cases = (
+            ("a typo", "nemotron-3-nano:4", "Loaded models: nemotron-3-nano:4b"),
+            ("a blank name", "   ", "A model name is required"),
+        )
+        for label, model, expected_detail in cases:
+            with self.subTest(case=label):
+                endpoint, unloaded = self._runner()
 
-        async def run():
-            sm.reset()
-            await sm.publish(self._warm())
-            return await endpoint(object(), self._body("nemotron-3-nano:4"))
+                async def run():
+                    sm.reset()
+                    await sm.publish(self._warm())
+                    return await endpoint(object(), self._body(model))
 
-        with self.assertRaises(self._HTTPException) as caught:
-            asyncio.run(run())
-        self.assertEqual(caught.exception.status_code, 400)
-        self.assertEqual(unloaded, [], msg="the request went out anyway")
-        self.assertIn("nemotron-3-nano:4b", caught.exception.detail,
-                      msg="the refusal must name the models that are actually loaded")
-
-    def test_an_empty_model_name_is_a_400(self):
-        endpoint, unloaded = self._runner()
-
-        async def run():
-            sm.reset()
-            await sm.publish(self._warm())
-            return await endpoint(object(), self._body("   "))
-
-        with self.assertRaises(self._HTTPException) as caught:
-            asyncio.run(run())
-        self.assertEqual(caught.exception.status_code, 400)
-        self.assertEqual(unloaded, [])
+                with self.assertRaises(self._HTTPException) as caught:
+                    asyncio.run(run())
+                self.assertEqual(caught.exception.status_code, 400)
+                self.assertEqual(unloaded, [], msg="the request went out anyway")
+                self.assertIn(expected_detail, caught.exception.detail)
 
     def test_an_ollama_failure_becomes_a_503_that_says_why(self):
         """The same argument as every other RuntimeError handler in gui.py."""
@@ -785,25 +793,29 @@ class StatusProbeTests(unittest.TestCase):
         self.assertEqual(snap["maintenance"], {"test-user": "reclassify"})
         self.assertTrue(snap["checked"], msg="the settings page shows how old this is")
 
-    def test_one_moved_route_degrades_the_snapshot_rather_than_emptying_it(self):
-        responses = self._healthy()
-        responses["/api/tags"] = self._Response(404, text="not found")
-        probe, _, _, _ = self._runner(responses)
-        snap = asyncio.run(probe())
-        self.assertTrue(snap["ok"], msg="a moved route painted the whole service down")
-        self.assertEqual(len(snap["warnings"]), 1)
-        self.assertIn("/api/tags", snap["warnings"][0])
-        self.assertIn("404", snap["warnings"][0])
-        self.assertEqual(snap["residentCount"], 1, msg="the part that did answer was discarded")
-
-    def test_an_unparseable_body_is_a_warning_too(self):
-        responses = self._healthy()
-        responses["/api/ps"] = self._Response(200, text="<html>login</html>")
-        probe, _, _, _ = self._runner(responses)
-        snap = asyncio.run(probe())
-        self.assertTrue(snap["ok"])
-        self.assertTrue(any("not JSON" in w for w in snap["warnings"]))
-        self.assertEqual(snap["residentCount"], 0)
+    # One route answering badly degrades the snapshot rather than emptying it:
+    # a moved route and a proxy's login page are two ways the same rule fires,
+    # and each carries its own exact warning text and its own residue.
+    def test_one_bad_route_degrades_the_snapshot_rather_than_emptying_it(self):
+        cases = (
+            ("a moved route", "/api/tags", self._Response(404, text="not found"),
+             "/api/tags returned HTTP 404: not found", 1),
+            ("a body that is not JSON", "/api/ps",
+             self._Response(200, text="<html>login</html>"),
+             "/api/ps returned a body that is not JSON", 0),
+        )
+        for label, endpoint, answer, expected_warning, expected_resident in cases:
+            with self.subTest(case=label):
+                responses = self._healthy()
+                responses[endpoint] = answer
+                probe, _, _, _ = self._runner(responses)
+                snap = asyncio.run(probe())
+                self.assertTrue(snap["ok"], msg="a bad route painted the whole service down")
+                self.assertEqual(snap["warnings"], [expected_warning])
+                self.assertEqual(
+                    snap["residentCount"], expected_resident,
+                    msg="the part that did answer was discarded",
+                )
 
     def test_a_dead_service_is_a_snapshot_not_an_exception(self):
         """The widget has to be able to *show* the service being down."""
@@ -823,24 +835,27 @@ class StatusProbeTests(unittest.TestCase):
         self.assertTrue(posted[0]["url"].endswith("/api/generate"))
         self.assertEqual(posted[0]["body"], {"model": "nemotron-3-nano:4b", "keep_alive": 0})
 
-    def test_a_refused_unload_raises_with_the_reason(self):
-        """Not an HTTPStatusError: nothing upstream catches httpx's."""
-        responses = self._healthy()
-        responses["/api/generate"] = self._Response(500, text="no such model")
-        _, unload, _, _ = self._runner(responses)
-        with self.assertRaises(RuntimeError) as caught:
-            asyncio.run(unload("nemotron-3-nano:4b"))
-        self.assertIn("no such model", str(caught.exception))
-        self.assertIn("nemotron-3-nano:4b", str(caught.exception))
-
-    def test_an_unreachable_ollama_raises_on_unload_rather_than_succeeding(self):
-        """The other half of the silent no-op: a 200 that never arrived."""
-        responses = self._healthy()
-        responses["/api/generate"] = ConnectionError("connection refused")
-        _, unload, _, _ = self._runner(responses)
-        with self.assertRaises(RuntimeError) as caught:
-            asyncio.run(unload("nemotron-3-nano:4b"))
-        self.assertIn("connection refused", str(caught.exception))
+    # An unload that fails must raise RuntimeError -- not httpx.HTTPStatusError,
+    # which nothing upstream catches -- and carry the reason. A refusal and an
+    # unreachable host are the two ways it fails, and they say different things.
+    def test_a_failed_unload_raises_with_the_reason(self):
+        cases = (
+            ("a refusal", self._Response(500, text="no such model"),
+             ("refused to unload nemotron-3-nano:4b", "no such model")),
+            ("an unreachable host", ConnectionError("connection refused"),
+             ("Could not reach Ollama", "connection refused")),
+        )
+        for label, answer, expected_fragments in cases:
+            with self.subTest(case=label):
+                responses = self._healthy()
+                responses["/api/generate"] = answer
+                _, unload, _, _ = self._runner(responses)
+                with self.assertRaises(RuntimeError) as caught:
+                    asyncio.run(unload("nemotron-3-nano:4b"))
+                message = str(caught.exception)
+                for fragment in expected_fragments:
+                    self.assertIn(fragment, message)
+                self.assertIn("nemotron-3-nano:4b", message)
 
 
 class RouteWiringTests(unittest.TestCase):

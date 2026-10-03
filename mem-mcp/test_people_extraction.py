@@ -114,13 +114,19 @@ class PeopleWindowTests(unittest.TestCase):
         self.assertEqual(self.windows("   \n\t "), [])
         self.assertEqual(self.windows(None), [])
 
-    def test_short_entry_is_a_single_window(self):
-        """A short entry must cost exactly what it always did: one call."""
-        self.assertEqual(self.windows("Alice called Bob."), ["Alice called Bob."])
-
-    def test_entry_exactly_at_the_window_is_still_one_call(self):
-        self.assertEqual(len(self.windows("x" * 6000)), 1)
-        self.assertEqual(len(self.windows("x" * 6001)), 2)
+    def test_window_count_at_and_just_past_the_boundary(self):
+        # One fact, three inputs: how many calls an entry of a given length
+        # costs, and what those windows contain. Each case carries its own
+        # expected window list, so "a short entry" and "exactly at the window"
+        # cannot be satisfied by the same answer.
+        cases = (
+            ("short entry", "Alice called Bob.", ["Alice called Bob."]),
+            ("exactly at the window", "x" * 6000, ["x" * 6000]),
+            ("one char past the window", "x" * 6001, ["x" * 6000, "x" * 601]),
+        )
+        for label, content, expected in cases:
+            with self.subTest(label):
+                self.assertEqual(self.windows(content), expected)
 
     def test_every_character_is_seen_by_some_window(self):
         """The defect: content past the first window was never looked at.
@@ -195,16 +201,30 @@ class PeopleWindowTests(unittest.TestCase):
         self.assertTrue(all(w for w in windows))
 
     def test_configured_constants_read_the_environment(self):
+        # Scoped to the assignment statement, not the whole file: `assertIn("6000",
+        # source)` over 2500 lines of diary_manager passes on any 6000 anywhere,
+        # so it could not tell this constant's default from a neighbour's. The
+        # statement is found by AST so the default and the clamp are checked on
+        # the same line that binds the name.
         with open(DIARY_MANAGER, "r", encoding="utf-8") as handle:
             source = handle.read()
+        tree = ast.parse(source)
         for name, default in (
             ("PEOPLE_EXTRACT_WINDOW", "6000"),
             ("PEOPLE_EXTRACT_OVERLAP", "600"),
         ):
-            self.assertIn(
-                f'{name} = max(', source, f"{name} must be clamped at the lower bound"
-            )
-            self.assertIn(default, source)
+            with self.subTest(constant=name):
+                target = next(
+                    node for node in tree.body
+                    if isinstance(node, ast.Assign)
+                    and any(isinstance(t, ast.Name) and t.id == name
+                            for t in node.targets)
+                )
+                stmt = ast.get_source_segment(source, target)
+                self.assertTrue(stmt.startswith(f"{name} = max("),
+                                msg=f"{name} must be clamped at the lower bound, got: {stmt}")
+                self.assertIn(f'"{default}"', stmt,
+                              msg=f"{name} must default to {default}, got: {stmt}")
 
 
 class ExtractLoopTests(unittest.TestCase):
@@ -227,9 +247,21 @@ class ExtractLoopTests(unittest.TestCase):
         self.assertIn("get_llm_response(window", self.body)
 
     def test_it_no_longer_slices_the_content_to_2000_chars(self):
-        self.assertNotIn(
-            "content[:2000]", self.body, "the silent 2000-char truncation is back"
+        self.assertFalse(
+            "content[:2000]" in self.body, "the silent 2000-char truncation is back"
         )
+        # The literal check above is one spelling of the defect; the AST walk is
+        # the rule. `assertNotIn("content[:2000]", body)` alone passes on a
+        # rewrite to `body[:2000]`, which is the same truncation under another
+        # name -- and a substring guard is also what a docstring quoting the
+        # slice trips, so neither half is sufficient alone.
+        for node in ast.walk(ast.parse(self.body)):
+            if not isinstance(node, ast.Slice) or node.lower is not None:
+                continue
+            upper = node.upper
+            if isinstance(upper, ast.Constant) and isinstance(upper.value, int):
+                self.fail(f"a numeric prefix slice is back in _extract_people_names: "
+                          f"{ast.get_source_segment(self.body, node)}")
 
     def test_one_failing_window_does_not_discard_the_others(self):
         """The loop needs a try inside the loop, not around the whole thing."""
@@ -292,11 +324,20 @@ class KeywordCleanTests(unittest.TestCase):
         self.assertEqual(self.clean(None), [])
         self.assertEqual(self.clean([]), [])
 
-    def test_the_limit_keeps_the_front_of_the_list(self):
-        self.assertEqual(self.clean(list("abcdefghij"), limit=3), ["a", "b", "c"])
-
-    def test_no_limit_means_no_truncation(self):
-        self.assertEqual(len(self.clean([f"k{i}" for i in range(50)])), 50)
+    def test_the_limit_applies_only_when_given_and_takes_from_the_front(self):
+        # One fact about `limit`: absent means no truncation, and a limit is a
+        # ceiling on a first-seen list rather than a set-ordering. Each case
+        # carries its own expected list.
+        cases = (
+            ("no limit", 0, list("abcdefghij")),
+            ("limit of 0 is also no limit", 0, list("abcdefghij")),
+            ("limit above the length", 20, list("abcdefghij")),
+            ("limit below the length keeps the front", 3, ["a", "b", "c"]),
+            ("limit of one", 1, ["a"]),
+        )
+        for label, limit, expected in cases:
+            with self.subTest(label):
+                self.assertEqual(self.clean(list("abcdefghij"), limit=limit), expected)
 
 
 class KeywordWindowTests(unittest.TestCase):
@@ -331,11 +372,25 @@ class KeywordWindowTests(unittest.TestCase):
     def _reply(*keywords):
         return json.dumps({"keywords": list(keywords)})
 
-    def test_a_short_entry_still_costs_exactly_one_call(self):
-        extract = self._extractor(lambda p, n: self._reply("atlas"))
-        out = asyncio.run(extract("Tuesday", "Alice called Bob about the migration."))
-        self.assertEqual(len(self.prompts), 1)
-        self.assertEqual(out, ["atlas"])
+    def test_one_model_call_per_window_at_both_ends_of_the_range(self):
+        # The property is one call per window, so both ends of the range belong
+        # in one test: a regression back to a single call still passes on the
+        # short entry alone. Per-case expected call count and expected result.
+        cases = (
+            ("short entry", "Alice called Bob about the migration.",
+             lambda n: self._reply("atlas"), 1, ["atlas"]),
+            ("12k entry, three windows", self.body,
+             lambda n: self._reply(), 3, []),
+        )
+        for label, body, reply, expected_calls, expected_out in cases:
+            with self.subTest(label):
+                self.prompts = []
+                self.models = []
+                extract = self._extractor(lambda p, n: reply(n))
+                out = asyncio.run(extract("Tuesday", body))
+                self.assertEqual(len(self.prompts), expected_calls,
+                                 msg=f"got {len(self.prompts)} prompts")
+                self.assertEqual(out, expected_out)
 
     def test_the_extraction_model_is_the_one_actually_called(self):
         """Behavioural, not a source check: the model is read off the call.
@@ -351,11 +406,6 @@ class KeywordWindowTests(unittest.TestCase):
         asyncio.run(extract("Tuesday", "Alice called Bob about the migration."))
         self.assertEqual(self.models, ["stub-extract-model"])
 
-    def test_every_window_is_sent_to_the_model(self):
-        extract = self._extractor(lambda p, n: self._reply())
-        asyncio.run(extract("Tuesday", self.body))
-        self.assertEqual(len(self.prompts), 3, f"got {len(self.prompts)} prompts")
-
     def test_the_prompt_carries_text_past_the_old_1500_char_cut(self):
         """The defect itself, stated as an assertion."""
         body = ("padding. " * 200) + self.marker + " " + ("tail. " * 400)
@@ -369,18 +419,21 @@ class KeywordWindowTests(unittest.TestCase):
             "atlas-pilot", out, "a keyword visible only late in the entry was lost"
         )
 
-    def test_keywords_from_several_windows_are_unioned(self):
-        def responder(_p, n):
-            return self._reply(f"kw{n}")
-
-        extract = self._extractor(responder)
-        out = asyncio.run(extract("Tuesday", self.body))
-        self.assertEqual(out, ["kw1", "kw2", "kw3"])
-
-    def test_a_keyword_found_in_two_windows_appears_once(self):
-        extract = self._extractor(lambda p, n: self._reply("atlas", "atlas"))
-        out = asyncio.run(extract("Tuesday", self.body))
-        self.assertEqual(out, ["atlas"])
+    def test_the_window_results_are_unioned_and_deduped(self):
+        # One claim about combining the per-window lists: their union, deduped,
+        # in first-seen order. The duplicated case is the same operation on a
+        # different input, not a second property.
+        cases = (
+            ("distinct keyword per window", lambda n: self._reply(f"kw{n}"),
+             ["kw1", "kw2", "kw3"]),
+            ("the same keyword in every window", lambda n: self._reply("atlas", "atlas"),
+             ["atlas"]),
+        )
+        for label, reply, expected in cases:
+            with self.subTest(label):
+                self.prompts = []
+                extract = self._extractor(lambda p, n: reply(n))
+                self.assertEqual(asyncio.run(extract("Tuesday", self.body)), expected)
 
     def test_the_entry_name_reaches_every_window(self):
         """A window from the middle has no other way to know which entry it is."""
@@ -390,22 +443,30 @@ class KeywordWindowTests(unittest.TestCase):
         for prompt in self.prompts:
             self.assertIn("Weekly retro", prompt)
 
-    def test_one_failing_window_does_not_discard_the_others(self):
-        def responder(_p, n):
-            if n == 2:
-                raise RuntimeError("ollama timeout")
-            return self._reply(f"kw{n}")
+    def test_a_failing_window_is_skipped_and_the_others_survive(self):
+        # Two ways a window fails to produce keywords -- it raises, or it
+        # answers with something that is not a keyword object -- and one claim
+        # either way: the windows that worked still apply. Each case names the
+        # window it fails and its own expected union.
+        def raises_on(index):
+            def responder(_p, n):
+                if n == index:
+                    raise RuntimeError("ollama timeout")
+                return self._reply(f"kw{n}")
+            return responder
 
-        extract = self._extractor(responder)
-        out = asyncio.run(extract("Tuesday", self.body))
-        self.assertEqual(out, ["kw1", "kw3"])
-
-    def test_an_unparseable_window_is_skipped(self):
-        def responder(_p, n):
+        def unparseable_first(_p, n):
             return "sorry, I cannot help" if n == 1 else self._reply("kw2")
 
-        extract = self._extractor(responder)
-        self.assertEqual(asyncio.run(extract("Tuesday", self.body)), ["kw2"])
+        cases = (
+            ("middle window raises", raises_on(2), ["kw1", "kw3"]),
+            ("first window is unparseable", unparseable_first, ["kw2"]),
+        )
+        for label, responder, expected in cases:
+            with self.subTest(label):
+                self.prompts = []
+                extract = self._extractor(responder)
+                self.assertEqual(asyncio.run(extract("Tuesday", self.body)), expected)
 
     def test_a_fenced_reply_is_still_parsed(self):
         extract = self._extractor(lambda p, n: "```json\n" + self._reply("atlas") + "\n```")
@@ -445,14 +506,6 @@ class KeywordSourceTests(unittest.TestCase):
     def setUp(self):
         _source, _tree, _target, self.body = _segment("extract_diary_keywords")
 
-    def test_the_1500_char_slice_is_gone(self):
-        self.assertFalse("text[:1500]" in self.body, "the silent 1500-char truncation is back")
-
-    def test_windows_are_not_sliced_to_a_cap(self):
-        self.assertNotRegex(
-            self.body, r"windows\[:\s*\d+\s*\]", "windows must not be sliced to a cap"
-        )
-
     def test_the_window_helper_is_actually_used(self):
         # assertTrue rather than assertIn: the haystack is a whole function and
         # assertIn echoes both operands into the report.
@@ -460,6 +513,33 @@ class KeywordSourceTests(unittest.TestCase):
             "text_windows(content, KEYWORD_EXTRACT_WINDOW, KEYWORD_EXTRACT_OVERLAP)" in self.body,
             "extract_diary_keywords no longer windows the content",
         )
+
+    def test_neither_the_text_nor_the_window_list_is_sliced(self):
+        # Two absences, one claim: this function takes no prefix of the entry
+        # and no prefix of the window list. Each is checked on its own needle,
+        # and the presence assertion runs first so an empty or unparseable
+        # segment cannot make both negatives vacuous.
+        self.assertTrue(
+            "text_windows(content, KEYWORD_EXTRACT_WINDOW, KEYWORD_EXTRACT_OVERLAP)" in self.body,
+            "refusing to slice is only meaningful while the content is windowed",
+        )
+        with self.subTest("the old 1500-char prefix slice"):
+            self.assertFalse("text[:1500]" in self.body,
+                             "the silent 1500-char truncation is back")
+        with self.subTest("no cap on the number of windows"):
+            self.assertNotRegex(
+                self.body, r"windows\[:\s*\d+\s*\]", "windows must not be sliced to a cap"
+            )
+        # The two needles above are spellings of the defect; the walk is the
+        # rule, so a rewrite to `body[:1500]` under another name is caught too.
+        # A docstring quoting the old slice is an ast.Constant and cannot trip it.
+        for node in ast.walk(ast.parse(self.body)):
+            if not isinstance(node, ast.Slice) or node.lower is not None:
+                continue
+            upper = node.upper
+            if isinstance(upper, ast.Constant) and isinstance(upper.value, int):
+                self.fail("a numeric prefix slice is back in extract_diary_keywords: "
+                          f"{ast.get_source_segment(self.body, node)}")
 
 
 class DegenerateArrayParseTests(unittest.TestCase):
@@ -473,12 +553,34 @@ class DegenerateArrayParseTests(unittest.TestCase):
     the fault, it just runs longer.
     """
 
-    def test_a_closed_array_is_unchanged(self):
-        self.assertEqual(parse_people_name_array('["Alice Smith", "Bob Jones"]'),
-                         ["Alice Smith", "Bob Jones"])
+    def test_a_well_formed_array_of_names_parses_exactly(self):
+        # One property -- well-formed input is returned verbatim -- over the
+        # three shapes that used to need different handling. Each case carries
+        # the raw text and the exact names it must yield.
+        cases = (
+            ("plain array", '["Alice Smith", "Bob Jones"]',
+             ["Alice Smith", "Bob Jones"]),
+            ("fenced in a json block", '```json\n["Alice"]\n```', ["Alice"]),
+            ("escaped quotes inside a name", '["Ann \\"Annie\\" Lee"]',
+             ['Ann "Annie" Lee']),
+        )
+        for label, raw, expected in cases:
+            with self.subTest(label):
+                self.assertEqual(parse_people_name_array(raw), expected)
 
-    def test_fenced_json_is_still_parsed(self):
-        self.assertEqual(parse_people_name_array('```json\n["Alice"]\n```'), ["Alice"])
+    def test_input_that_is_not_a_name_array_yields_nothing(self):
+        # One property -- nothing that is not an array of names returns names --
+        # and refusing is the safe direction, because an invented name becomes a
+        # MENTIONS edge. Prose, an empty answer and a JSON *object* all fall here.
+        cases = (
+            ("a sentence that found nobody", "I could not find any people."),
+            ("an empty reply", ""),
+            ("prose with no bracket", "no bracket here"),
+            ("a json object, not an array", '{"names": ["Alice"]}'),
+        )
+        for label, raw in cases:
+            with self.subTest(label):
+                self.assertIsNone(parse_people_name_array(raw))
 
     def test_a_repeating_unterminated_array_yields_the_good_prefix(self):
         raw = '["Priyanka", "Siarhei Bahdanau", "Tim Lohmann"' + ', "Siarhei Bahdanau"' * 300
@@ -487,18 +589,6 @@ class DegenerateArrayParseTests(unittest.TestCase):
         self.assertEqual(names[:3], ["Priyanka", "Siarhei Bahdanau", "Tim Lohmann"],
                          msg="names emitted before the degenerate tail are as "
                              "trustworthy as any other extraction")
-
-    def test_prose_with_no_array_is_none(self):
-        for raw in ("I could not find any people.", "", "no bracket here"):
-            self.assertIsNone(parse_people_name_array(raw))
-
-    def test_a_json_object_is_not_mistaken_for_a_name_array(self):
-        self.assertIsNone(parse_people_name_array('{"names": ["Alice"]}'),
-                          msg="an object is not an array of names")
-
-    def test_escaped_quotes_inside_a_name_survive(self):
-        self.assertEqual(parse_people_name_array('["Ann \\"Annie\\" Lee"]'),
-                         ['Ann "Annie" Lee'])
 
 
 class ReclassifyIsScopeOnlyTests(unittest.TestCase):

@@ -91,11 +91,23 @@ class GraphScopeTests(unittest.TestCase):
         self.assertEqual(ids(result), {"a", "b", "c"})
         self.assertFalse(result["truncated"])
 
-    def test_client_scope_keeps_only_that_clients_facts(self):
-        nodes = [fact("a"), fact("b"), client_node("c1", "Acme"), client_node("c2", "Other")]
-        result = self.scope(nodes, fact_clients={"a": {"c1"}, "b": {"c2"}}, client_id="c1")
-        self.assertIn("a", ids(result))
-        self.assertNotIn("b", ids(result))
+    # One test per axis because both assert the identical rule -- membership is
+    # read from the record's own edge, so the record joined to the requested node
+    # is kept and the one joined elsewhere is dropped -- over the two axes.
+    def test_a_scope_keeps_the_records_on_that_axis_and_drops_the_rest(self):
+        cases = (
+            ("client",
+             [fact("a"), fact("b"), client_node("c1", "Acme"), client_node("c2", "Other")],
+             {"fact_clients": {"a": {"c1"}, "b": {"c2"}}, "client_id": "c1"},
+             {"a", "c1", "c2"}),
+            ("context",
+             [fact("a"), fact("b"), context_node("x1", "Atlas"), context_node("x2", "Hedron")],
+             {"fact_contexts": {"a": {"x1"}, "b": {"x2"}}, "context_id": "x1"},
+             {"a", "x1", "x2"}),
+        )
+        for axis, nodes, kwargs, kept in cases:
+            with self.subTest(axis=axis):
+                self.assertEqual(ids(self.scope(nodes, **kwargs)), kept)
 
     def test_the_other_client_node_is_still_drawn(self):
         """A scoped graph with no client node in it reads as "no facts"."""
@@ -111,14 +123,6 @@ class GraphScopeTests(unittest.TestCase):
         result = self.scope([fact("orphan")], fact_clients={"orphan": set()}, client_id="c1")
         self.assertNotIn("orphan", ids(result))
 
-    def test_context_scope_filters_the_same_way(self):
-        nodes = [fact("a"), fact("b"), context_node("x1", "Atlas"), context_node("x2", "Hedron")]
-        result = self.scope(
-            nodes, fact_contexts={"a": {"x1"}, "b": {"x2"}}, context_id="x1",
-        )
-        self.assertIn("a", ids(result))
-        self.assertNotIn("b", ids(result))
-
     def test_client_and_context_filters_are_conjunctive(self):
         result = self.scope(
             [fact("a"), fact("b")],
@@ -127,15 +131,6 @@ class GraphScopeTests(unittest.TestCase):
             client_id="c1", context_id="x1",
         )
         self.assertEqual(ids(result) - {"c1", "x1"}, {"a"})
-
-    def test_diary_entries_scope_through_their_own_properties(self):
-        result = self.scope(
-            [diary("d1"), diary("d2")],
-            diary_scope={"d1": ("c1", "x1"), "d2": ("c2", "x1")},
-            client_id="c1",
-        )
-        self.assertIn("d1", ids(result))
-        self.assertNotIn("d2", ids(result))
 
     def test_edges_to_dropped_nodes_are_removed(self):
         result = self.scope(
@@ -148,13 +143,24 @@ class GraphScopeTests(unittest.TestCase):
 
 
 class GraphCapTests(unittest.TestCase):
-    def test_under_the_limit_is_not_truncated(self):
-        result = _scope_and_cap_graph(
-            {"a": fact("a"), "b": fact("b"), "c": client_node("c", "Acme")},
-            [edge("a", "b")], {}, {}, {}, "", "", 5,
+    # One test per input because both assert the identical rule -- a limit the
+    # node count never reaches caps nothing and reports no truncation -- over a
+    # finite limit and the `0` sentinel.
+    def test_a_cap_the_node_count_never_reaches_keeps_everything(self):
+        under = {"a": fact("a"), "b": fact("b"), "c": client_node("c", "Acme")}
+        cases = (
+            ("finite limit above the node count", under, [edge("a", "b")], 5, 3),
+            ("zero limit means no cap",
+             {f"f{i}": fact(f"f{i}") for i in range(50)}, [], 0, 50),
         )
-        self.assertFalse(result["truncated"])
-        self.assertEqual(len(result["nodes"]), 3)
+        for label, nodes, edges, limit, kept in cases:
+            with self.subTest(label):
+                result = _scope_and_cap_graph(
+                    nodes, edges, {}, {}, {}, "", "", limit,
+                )
+                self.assertFalse(result["truncated"])
+                self.assertEqual(len(result["nodes"]), kept)
+                self.assertEqual(result["total"], kept)
 
     def test_the_cap_keeps_the_most_connected_records(self):
         """A graph of leaves explains nothing, so degree is what we rank on."""
@@ -194,12 +200,6 @@ class GraphCapTests(unittest.TestCase):
         second = _scope_and_cap_graph(nodes, list(reversed(edges)), {}, {}, {}, "", "", 2)
         self.assertEqual(ids(first), ids(second))
 
-    def test_a_zero_limit_means_no_cap(self):
-        nodes = {f"f{i}": fact(f"f{i}") for i in range(50)}
-        result = _scope_and_cap_graph(nodes, [], {}, {}, {}, "", "", 0)
-        self.assertFalse(result["truncated"])
-        self.assertEqual(len(result["nodes"]), 50)
-
     def test_scoped_out_records_do_not_count_toward_the_cap(self):
         nodes = {f"f{i}": fact(f"f{i}") for i in range(5)}
         result = _scope_and_cap_graph(
@@ -214,38 +214,39 @@ class NeighborhoodScopeTests(unittest.TestCase):
         nodes = [{"id": "a", "label": "Fact"}]
         self.assertIs(_filter_neighborhood_scope(nodes, "", ""), nodes)
 
-    def test_the_scoped_node_survives_its_own_filter(self):
-        """The client node is the scope, so dropping it makes the view look broken."""
-        nodes = [
+    # One test per scope combination because all three assert the identical rule
+    # -- a Client or Context node *is* the scope, so it survives the filter it is
+    # the subject of (drop it and the view looks broken), a record reached under
+    # it is kept, everything else goes -- over the three combinations.
+    def test_the_scoped_nodes_survive_and_the_rest_do_not(self):
+        clients_and_records = [
             {"id": "f1", "label": "Fact"},
             {"id": "c1", "label": "Client"},
             {"id": "c2", "label": "Client"},
             {"id": "x1", "label": "Context"},
         ]
-        kept = {n["id"] for n in _filter_neighborhood_scope(nodes, "c1", "")}
-        # x1 goes: a project node reached from here may belong to another client
-        # entirely, and the client scope is the only thing keeping that honest.
-        # The full project list for a client comes from client.contexts, not here.
-        self.assertEqual(kept, {"f1", "c1"})
-
-    def test_a_context_scope_keeps_the_context_node(self):
-        nodes = [
-            {"id": "f1", "label": "Fact"},
-            {"id": "x1", "label": "Context"},
-            {"id": "x2", "label": "Context"},
-        ]
-        kept = {n["id"] for n in _filter_neighborhood_scope(nodes, "", "x2")}
-        self.assertEqual(kept, {"f1", "x2"})
-
-    def test_both_scopes_keep_both_nodes(self):
-        nodes = [
-            {"id": "c1", "label": "Client"},
-            {"id": "x1", "label": "Context"},
-            {"id": "c9", "label": "Client"},
-            {"id": "x9", "label": "Context"},
-        ]
-        kept = {n["id"] for n in _filter_neighborhood_scope(nodes, "c1", "x1")}
-        self.assertEqual(kept, {"c1", "x1"})
+        cases = (
+            # x1 goes: a project node reached from here may belong to another
+            # client entirely, and the client scope is the only thing keeping
+            # that honest. The full project list for a client comes from
+            # client.contexts, not here.
+            ("client scope", clients_and_records, "c1", "", {"f1", "c1"}),
+            ("context scope",
+             [{"id": "f1", "label": "Fact"},
+              {"id": "x1", "label": "Context"},
+              {"id": "x2", "label": "Context"}],
+             "", "x2", {"f1", "x2"}),
+            ("both scopes",
+             [{"id": "c1", "label": "Client"},
+              {"id": "x1", "label": "Context"},
+              {"id": "c9", "label": "Client"},
+              {"id": "x9", "label": "Context"}],
+             "c1", "x1", {"c1", "x1"}),
+        )
+        for label, nodes, client_id, context_id, kept in cases:
+            with self.subTest(label):
+                result = _filter_neighborhood_scope(nodes, client_id, context_id)
+                self.assertEqual({n["id"] for n in result}, kept)
 
 
 class DiaryScopeSourceTests(unittest.TestCase):
@@ -330,26 +331,33 @@ class DiaryScopeTests(unittest.TestCase):
             node_map, [], {}, {}, diary_scope, client_id, context_id, 0,
         )
 
-    def test_a_diary_entry_scopes_through_its_own_client(self):
-        nodes = [diary("d1"), diary("d2"), client_node("c1", "Acme"), client_node("c2", "Other")]
-        result = self.scope(nodes, {"d1": ["c1", ""], "d2": ["c2", ""]}, client_id="c1")
-        self.assertIn("d1", ids(result))
-        self.assertNotIn("d2", ids(result))
-
-    def test_a_diary_entry_scopes_through_its_own_context(self):
-        nodes = [diary("d1"), diary("d2"), context_node("x1", "Atlas"), context_node("x2", "Hedron")]
-        result = self.scope(nodes, {"d1": ["", "x1"], "d2": ["", "x2"]}, context_id="x1")
-        self.assertIn("d1", ids(result))
-        self.assertNotIn("d2", ids(result))
-
-    def test_an_unscoped_diary_entry_is_dropped_under_a_scope(self):
-        result = self.scope([diary("d1")], {"d1": ["", ""]}, client_id="c1")
-        self.assertNotIn("d1", ids(result))
-
-    def test_a_diary_entry_missing_from_the_scope_map_is_dropped(self):
-        """No entry at all means unlinked, which is not the same as in-scope."""
-        result = self.scope([diary("d1")], {}, client_id="c1")
-        self.assertNotIn("d1", ids(result))
+    # One test per input because all five assert the identical rule -- a diary
+    # entry is in scope only under the axis its own scope row names, and no
+    # client link on either axis means it is out -- over the client axis, the
+    # context axis, a tuple-encoded row and two ways of having no link at all.
+    def test_a_diary_entry_is_in_scope_only_under_the_axis_it_is_linked_on(self):
+        cases = (
+            ("client axis, list-encoded row",
+             [diary("d1"), diary("d2")],
+             {"d1": ["c1", ""], "d2": ["c2", ""]}, "c1", "", {"d1"}),
+            ("context axis, list-encoded row",
+             [diary("d1"), diary("d2")],
+             {"d1": ["", "x1"], "d2": ["", "x2"]}, "", "x1", {"d1"}),
+            ("client axis, tuple-encoded row",
+             [diary("d1"), diary("d2")],
+             {"d1": ("c1", "x1"), "d2": ("c2", "x1")}, "c1", "", {"d1"}),
+            ("row present but no client on it",
+             [diary("d1")], {"d1": ["", ""]}, "c1", "", set()),
+            # No entry at all means unlinked, which is not the same as in-scope:
+            # a missing FOR_CLIENT edge fails the client test.
+            ("absent from the scope map entirely",
+             [diary("d1")], {}, "c1", "", set()),
+        )
+        for label, nodes, diary_scope, client_id, context_id, kept in cases:
+            with self.subTest(label):
+                self.assertEqual(
+                    ids(self.scope(nodes, diary_scope, client_id, context_id)), kept,
+                )
 
 
 class ReturnAliasTests(unittest.TestCase):
@@ -465,38 +473,33 @@ class UnassignedScopeTests(unittest.TestCase):
             diary_scope or {}, client_id, context_id, 0, True,
         )
 
-    def test_a_linked_fact_is_excluded(self):
-        result = self.scope([fact("a"), fact("b")], fact_clients={"a": {"c1"}})
-        self.assertNotIn("a", ids(result))
-
-    def test_an_unlinked_fact_is_kept(self):
-        result = self.scope([fact("a"), fact("b")], fact_clients={"a": {"c1"}})
-        self.assertIn("b", ids(result))
-
-    def test_a_fact_absent_from_the_map_entirely_counts_as_unassigned(self):
-        """No entry means no FOR_CLIENT edge, which is what unassigned selects.
-
-        This is the direction that matters: treating "missing" as "in scope for
-        everyone" is what the old positive test did, and it is correct there --
-        a missing edge fails the client test. Inverting must not carry that
-        assumption over, or every record the pass failed to see would appear
-        under Unassigned.
-        """
-        result = self.scope([fact("ghost")], fact_clients={})
-        self.assertIn("ghost", ids(result))
-
-    def test_a_diary_entry_with_a_client_is_excluded(self):
-        nodes = [diary("d1"), diary("d2")]
-        node_map = {n["id"]: n for n in nodes}
-        result = _scope_and_cap_graph(
-            node_map, [], {}, {}, {"d1": ["c1", ""], "d2": ["", ""]}, "", "", 0, True,
+    # One test per node kind because all five assert the identical rule --
+    # `unassigned` selects on the *absence* of a client link, so a linked record
+    # goes and an unlinked one stays, whichever label it carries -- over facts,
+    # diary entries and the vault-wide category node.
+    def test_the_selection_is_the_absence_of_a_client_link(self):
+        cases = (
+            # The direction that matters on the fact side: treating "missing" as
+            # "in scope for everyone" is what the old positive test did, and it
+            # is correct there -- a missing edge fails the client test. Inverting
+            # must not carry that assumption over, or every record the pass
+            # failed to see would appear under Unassigned.
+            ("fact linked to a client", [fact("a"), fact("b")],
+             {"fact_clients": {"a": {"c1"}}}, {"b"}),
+            ("fact absent from the map entirely", [fact("ghost")],
+             {"fact_clients": {}}, {"ghost"}),
+            ("diary entry with a client", [diary("d1"), diary("d2")],
+             {"diary_scope": {"d1": ["c1", ""], "d2": ["", ""]}}, {"d2"}),
+            ("diary entry absent from the scope map", [diary("d1")],
+             {"diary_scope": {}}, {"d1"}),
+            # Categories are shared across the whole vault and still label what
+            # is shown, so the absence of a client link does not remove one.
+            ("category node", [fact("a"), category_node("g1", "Work")],
+             {}, {"a", "g1"}),
         )
-        self.assertNotIn("d1", ids(result))
-        self.assertIn("d2", ids(result))
-
-    def test_a_diary_entry_missing_from_the_scope_map_counts_as_unassigned(self):
-        result = self.scope([diary("d1")], diary_scope={})
-        self.assertIn("d1", ids(result))
+        for label, nodes, kwargs, kept in cases:
+            with self.subTest(label):
+                self.assertEqual(ids(self.scope(nodes, **kwargs)), kept)
 
     def test_client_and_context_nodes_are_dropped(self):
         """No record in scope is linked to one, so they render as orphan dots.
@@ -508,13 +511,9 @@ class UnassignedScopeTests(unittest.TestCase):
         """
         result = self.scope([fact("a"), client_node("c1", "Acme"),
                              context_node("x1", "Atlas"), category_node("g1", "Work")])
+        self.assertIn("a", ids(result))
         self.assertNotIn("c1", ids(result))
         self.assertNotIn("x1", ids(result))
-
-    def test_category_nodes_are_kept(self):
-        """They are shared across the whole vault and still label what is shown."""
-        result = self.scope([fact("a"), category_node("g1", "Work")])
-        self.assertIn("g1", ids(result))
 
     def test_the_edges_left_dangling_are_dropped(self):
         """Otherwise an edge to a removed client node survives into the response."""
@@ -558,13 +557,10 @@ class UnassignedNeighborhoodTests(unittest.TestCase):
     """
 
     def test_client_and_context_nodes_are_dropped(self):
+        """`test_the_record_survives` is the same call read as a membership test."""
         nodes = [fact("a"), client_node("c1", "Acme"), context_node("x1", "Atlas")]
         kept = {n["id"] for n in _filter_neighborhood_scope(nodes, "", "", True)}
         self.assertEqual(kept, {"a"})
-
-    def test_the_record_survives(self):
-        kept = {n["id"] for n in _filter_neighborhood_scope([fact("a")], "", "", True)}
-        self.assertIn("a", kept)
 
     def test_it_is_distinct_from_a_neighbourhood_with_no_scope(self):
         """Both args empty is the *unfiltered* case, and must stay unfiltered.
@@ -889,12 +885,16 @@ class ScopePrioritySearchTests(unittest.TestCase):
         for, lives under it.
         """
         results = self.search(client="SAP SE")
-        for r in results:
-            if r["name"] == "Joao Bonin":
-                self.assertNotIn("SAP SE", str(r["score"]))
         bonin = next(r for r in results if r["name"] == "Joao Bonin")
         self.assertAlmostEqual(bonin["score"], 0.70, places=6,
                                msg="the inactive penalty was applied to the requested client")
+        # The demotion half, read off the same record under a scope that does not
+        # name SAP SE: the penalty is real, it is just skipped for the client the
+        # caller asked for. Asserting it makes the check above non-vacuous.
+        elsewhere = self.search(client="EPAM")
+        demoted = next(r for r in elsewhere if r["name"] == "Joao Bonin")
+        self.assertAlmostEqual(demoted["score"], 0.70 - 0.4, places=6,
+                               msg="SAP SE is pinned inactive and was not the requested client")
 
     def test_a_null_primary_record_is_still_found_by_its_relevant_link(self):
         """RELEVANT_TO is the only scope evidence a null-primary record has.
