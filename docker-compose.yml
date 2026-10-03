@@ -206,13 +206,32 @@ services:
       - MEM_SESSION_SECURE=${MEM_SESSION_SECURE:-0}
       - HTPASSWD_PATH=/app/htpasswd
 
-      # Self-service registration. Off by default: it opens two
-      # unauthenticated POST endpoints that each create a vault. The landing
-      # page offers email+password whenever this is on, and the Google method
-      # additionally once a client id is saved under Setup -> Google sign-in.
-      # Throttled per client address in-process; that stops a script, not a
-      # botnet, so a real deployment wants a rate limit in the proxy too.
+      # Self-service registration. Off by default: it opens unauthenticated POST
+      # endpoints that each create a vault. The landing page offers each method
+      # only once it is actually usable -- username+password needs the SMTP block,
+      # Google needs both client credentials -- so a half-configured deployment
+      # does not offer a signup it cannot complete. Throttled per client address
+      # in-process; that stops a script, not a botnet, so a real deployment wants
+      # a rate limit in the proxy too. Turning it off does not lock out anyone
+      # who already has an account: Google sign-in works regardless.
       - MEM_REGISTRATION_ENABLED=${MEM_REGISTRATION_ENABLED:-0}
+
+        # Google sign-in. Optional; both values must be set for the landing page
+        # to offer "Continue with Google". The redirect URI to register with
+        # Google is {{BASE_URL}}/api/auth/google/callback.
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
+
+        # Outbound mail, for the registration confirmation link. HOST and FROM
+        # are the two that must be set before the username+password form is even
+        # rendered.
+      - MEM_SMTP_HOST=${MEM_SMTP_HOST:-}
+      - MEM_SMTP_PORT=${MEM_SMTP_PORT:-587}
+      - MEM_SMTP_USER=${MEM_SMTP_USER:-}
+      - MEM_SMTP_PASSWORD=${MEM_SMTP_PASSWORD:-}
+      - MEM_SMTP_FROM=${MEM_SMTP_FROM:-}
+      - MEM_SMTP_STARTTLS=${MEM_SMTP_STARTTLS:-1}
+      - MEM_SMTP_TIMEOUT=${MEM_SMTP_TIMEOUT:-20}
 
         # Daily savepoints (Setup → Maintenance → Backup & Restore)
       - MEM_BACKUP_ENABLED=${MEM_BACKUP_ENABLED:-1}

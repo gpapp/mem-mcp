@@ -1,525 +1,510 @@
-"""
-test_google_auth.py – verification of Google ID tokens.
+"""Tests for google_auth.py — the OAuth 2.0 authorization-code flow.
 
-Every test here *calls* google_auth.py. Unlike most of the suites in this repo
-it does not need `ast.get_source_segment` and a pile of stubs: PyJWT and
-cryptography are real dependencies, so the module under test imports directly
-and the interesting half of it — the RSA signature verification — really runs.
+This module **imports its subject directly**, which is only possible because
+google_auth.py is stdlib-only. Nothing here needs a network, a JWT library or a
+web framework, and the one place the module talks to the network
+(`_request_json`) takes an injected `opener`, so every test drives the real URL
+building, the real parameter validation and the real error text against a fake
+transport.
 
-That matters because the failures worth guarding here are all "this looks right
-and is wrong". A stubbed `get_signing_key_from_jwt` returning a truthy object
-would let a test pass against a verifier that checked no signature at all, which
-is the entire reason this module delegates to a library (see its docstring). So
-the seam is deliberately narrow: only the HTTP fetch of the key set is replaced.
-The key is a real RSA key generated per run, the signature is produced by PyJWT,
-and `jwt.decode` is what accepts or rejects it.
-
-The headline property is the **audience** check, not the signature. A valid,
-correctly-signed token minted by Google for a *different* client id must be
-refused here, because otherwise anyone who can get a token for an application
-they control authenticates against this vault.
-
-Run:  python3 -m unittest -v test_google_auth.py
+Why the network is faked but nothing else is: the attack surface of an OAuth
+client is exactly what sits above the transport. A test that stubbed
+`exchange_code` itself would pass against a client that sends the wrong grant
+type, leaks the client secret into a query string, or forgets `state` — and the
+fake transport is the only part that cannot be exercised without a network.
 """
 
-import base64
 import json
-import logging
-import time
+import os
 import unittest
-
-import jwt
-from cryptography.hazmat.primitives.asymmetric import rsa
+import urllib.error
+import urllib.parse
 
 import google_auth
 
-CLIENT_ID = "1234567890-abcdefghijklmnopqrstuvwxyz.apps.googleusercontent.com"
-OTHER_CLIENT_ID = "9999999999-zzzzzzzzzzzzzzzzzzzzzzzzzz.apps.googleusercontent.com"
-SUBJECT = "110248495921238986420"
-EMAIL = "someone@example.com"
+
+class FakeResponse:
+    """The two things `_request_json` uses from a urlopen result."""
+
+    def __init__(self, payload, raw=None):
+        if raw is None:
+            raw = payload if isinstance(payload, bytes) else json.dumps(payload).encode("utf-8")
+        self._raw = raw
+
+    def read(self):
+        return self._raw
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
 
 
-def _b64u(raw: bytes) -> str:
-    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+class RecordingOpener:
+    """A urlopen stand-in that records every call and returns a fixed body."""
+
+    def __init__(self, *bodies):
+        self.bodies = list(bodies)
+        self.calls = []
+
+    def __call__(self, request, timeout=None):
+        self.calls.append({"url": request.full_url, "data": request.data,
+                           "headers": dict(request.headers), "timeout": timeout})
+        body = self.bodies.pop(0) if self.bodies else {}
+        if isinstance(body, Exception):
+            raise body
+        return FakeResponse(body)
+
+    @property
+    def form(self):
+        """The first call's POST body as a dict."""
+        data = self.calls[0]["data"] or b""
+        return dict(urllib.parse.parse_qsl(data.decode("ascii")))
 
 
-def _b64u_int(value: int) -> str:
-    return _b64u(value.to_bytes((value.bit_length() + 7) // 8, "big"))
+class EnvCase(unittest.TestCase):
+    """Every test runs with the Google env vars set to a known pair."""
+
+    CID = "1234.apps.googleusercontent.com"
+    SECRET = "GOCSPX-test-secret-value"
+    ENV = ("GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET")
+
+    def setUp(self):
+        self._saved = {name: os.environ.get(name) for name in self.ENV}
+        os.environ["GOOGLE_CLIENT_ID"] = self.CID
+        os.environ["GOOGLE_CLIENT_SECRET"] = self.SECRET
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        for name, value in self._saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
-def _generate_key():
-    return rsa.generate_private_key(public_exponent=65537, key_size=2048)
+class ConfigTests(EnvCase):
+    def test_the_credentials_come_from_the_environment(self):
+        self.assertEqual(google_auth.client_id(), self.CID)
+        self.assertEqual(google_auth.client_secret(), self.SECRET)
+
+    def test_a_present_but_empty_variable_reads_as_absent(self):
+        # A compose line with no value passes an empty string, and
+        # `os.getenv(name, "fallback")` would return that empty string rather
+        # than the fallback -- so a half-configured deployment would look
+        # configured. This is the `or ""` form's whole reason for existing.
+        os.environ["GOOGLE_CLIENT_ID"] = ""
+        self.assertEqual(google_auth.client_id(), "")
+        self.assertFalse(google_auth.configured())
+
+    def test_whitespace_around_a_value_is_not_a_value(self):
+        os.environ["GOOGLE_CLIENT_SECRET"] = "   "
+        self.assertEqual(google_auth.client_secret(), "")
+        self.assertFalse(google_auth.configured())
+
+    def test_both_halves_are_required(self):
+        # The secret is what makes the code redemption confidential. With only a
+        # client id, a login can be started and cannot be finished, so offering
+        # the button would send someone to Google and then to an error.
+        self.assertTrue(google_auth.configured())
+        os.environ.pop("GOOGLE_CLIENT_SECRET")
+        self.assertFalse(google_auth.configured())
+        os.environ["GOOGLE_CLIENT_SECRET"] = self.SECRET
+        os.environ.pop("GOOGLE_CLIENT_ID")
+        self.assertFalse(google_auth.configured())
+
+    def test_the_callback_url_is_derived_from_base_url(self):
+        # Not configured separately: a redirect URI that disagrees with the URL
+        # the app is served on fails at Google with an error page naming neither.
+        self.assertEqual(google_auth.callback_url("https://hass.example/mem-mcp"),
+                         "https://hass.example/mem-mcp/api/auth/google/callback")
+        self.assertEqual(google_auth.callback_url("https://hass.example/mem-mcp/"),
+                         "https://hass.example/mem-mcp/api/auth/google/callback")
+
+    def test_an_empty_base_url_still_yields_a_relative_callback(self):
+        self.assertEqual(google_auth.callback_url(""),
+                         "/api/auth/google/callback")
 
 
-def _public_jwk(key, kid: str) -> dict:
-    numbers = key.public_key().public_numbers()
-    return {
-        "kty": "RSA",
-        "use": "sig",
-        "alg": "RS256",
-        "kid": kid,
-        "n": _b64u_int(numbers.n),
-        "e": _b64u_int(numbers.e),
-    }
+class AuthorizationUrlTests(EnvCase):
+    URL = "https://hass.example/mem-mcp/api/auth/google/callback"
+
+    def test_the_url_carries_everything_google_needs(self):
+        url = google_auth.authorization_url("state-abc", self.URL)
+        parsed = urllib.parse.urlparse(url)
+        self.assertEqual(parsed.scheme + "://" + parsed.netloc + parsed.path,
+                         google_auth.GOOGLE_AUTH_URL)
+        q = dict(urllib.parse.parse_qsl(parsed.query))
+        self.assertEqual(q["client_id"], self.CID)
+        self.assertEqual(q["redirect_uri"], self.URL)
+        self.assertEqual(q["response_type"], "code")
+        self.assertEqual(q["state"], "state-abc")
+        self.assertEqual(q["scope"], google_auth.GOOGLE_SCOPES)
+
+    def test_only_openid_email_and_profile_are_asked_for(self):
+        # A consent screen saying the app wants to see and change Gmail is a
+        # consent screen nobody accepts.
+        scopes = google_auth.GOOGLE_SCOPES.split()
+        self.assertEqual(sorted(scopes), ["email", "openid", "profile"])
+
+    def test_the_account_picker_is_forced(self):
+        # Without it, a browser that has signed in before silently re-authorises
+        # the previous Google account — which on a shared machine signs you in as
+        # whoever used it last.
+        q = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(
+            google_auth.authorization_url("s", self.URL)).query))
+        self.assertEqual(q["prompt"], "select_account")
+
+    def test_a_missing_state_is_refused(self):
+        # `state` is the CSRF token for the whole flow. Without it a code minted
+        # for someone else's login can be posted at this app's callback and
+        # signed in as them.
+        for bad in ("", "   ", None):
+            with self.assertRaises(google_auth.GoogleOAuthError) as ctx:
+                google_auth.authorization_url(bad, self.URL)
+            self.assertIn("state", str(ctx.exception))
+
+    def test_a_missing_redirect_uri_is_refused(self):
+        with self.assertRaises(google_auth.GoogleOAuthError):
+            google_auth.authorization_url("s", "")
+
+    def test_building_the_url_does_not_need_a_secret(self):
+        # Only the code exchange needs the secret, so a deployment that has a
+        # client id can at least build a consent URL. Refusing here would be
+        # stricter than the flow requires.
+        os.environ.pop("GOOGLE_CLIENT_SECRET")
+        url = google_auth.authorization_url("s", self.URL)
+        self.assertIn("client_id=", url)
+
+    def test_without_a_client_id_it_is_refused(self):
+        os.environ.pop("GOOGLE_CLIENT_ID")
+        with self.assertRaises(google_auth.GoogleOAuthError) as ctx:
+            google_auth.authorization_url("s", self.URL)
+        self.assertIn("not configured", str(ctx.exception))
+
+    def test_a_state_with_url_specials_is_encoded_not_concatenated(self):
+        url = google_auth.authorization_url("a&b=c d", self.URL)
+        q = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(url).query))
+        self.assertEqual(q["state"], "a&b=c d")
+
+    def test_an_override_beats_the_environment(self):
+        url = google_auth.authorization_url("s", self.URL, client_id_override="other")
+        self.assertIn("client_id=other", url)
 
 
-def _claims(**overrides) -> dict:
-    """A claim set shaped like Google's, with the fields a test wants changed."""
-    now = int(time.time())
-    claims = {
-        "iss": google_auth.GOOGLE_ISSUERS[0],
-        "aud": CLIENT_ID,
-        "sub": SUBJECT,
-        "email": EMAIL,
-        "email_verified": True,
-        "name": "Someone Example",
-        "iat": now,
-        "exp": now + 3600,
-    }
-    for name, value in overrides.items():
-        if value is None:
-            claims.pop(name, None)
-        else:
-            claims[name] = value
-    return claims
+class ExchangeCodeTests(EnvCase):
+    REDIRECT = "https://hass.example/mem-mcp/api/auth/google/callback"
+
+    def test_the_code_is_redeemed_with_the_secret_over_a_form_post(self):
+        opener = RecordingOpener({"access_token": "ya29.a0-token", "expires_in": 3600})
+        token = google_auth.exchange_code("the-code", self.REDIRECT, opener=opener)
+        self.assertEqual(token, "ya29.a0-token")
+        self.assertEqual(opener.calls[0]["url"], google_auth.GOOGLE_TOKEN_URL)
+        self.assertEqual(opener.calls[0]["timeout"], google_auth.HTTP_TIMEOUT)
+        form = opener.form
+        self.assertEqual(form["code"], "the-code")
+        self.assertEqual(form["client_id"], self.CID)
+        self.assertEqual(form["client_secret"], self.SECRET)
+        self.assertEqual(form["redirect_uri"], self.REDIRECT)
+        self.assertEqual(form["grant_type"], "authorization_code")
+        self.assertEqual(opener.calls[0]["headers"].get("Content-type"),
+                         "application/x-www-form-urlencoded")
+
+    def test_the_secret_is_only_ever_in_the_body_never_the_url(self):
+        opener = RecordingOpener({"access_token": "t"})
+        google_auth.exchange_code("c", self.REDIRECT, opener=opener)
+        self.assertNotIn(self.SECRET, opener.calls[0]["url"])
+
+    def test_a_200_with_no_access_token_is_refused(self):
+        # Not a thing Google's server does; a thing a proxy or captive portal
+        # does. Refusing is the only answer that does not sign someone in as
+        # nobody.
+        opener = RecordingOpener({"error": "nope"})
+        with self.assertRaises(google_auth.GoogleOAuthError) as ctx:
+            google_auth.exchange_code("c", self.REDIRECT, opener=opener)
+        self.assertIn("no access token", str(ctx.exception))
+
+    def test_an_implausibly_long_token_is_refused(self):
+        opener = RecordingOpener({"access_token": "t" * (google_auth.MAX_TOKEN_CHARS + 1)})
+        with self.assertRaises(google_auth.GoogleOAuthError):
+            google_auth.exchange_code("c", self.REDIRECT, opener=opener)
+
+    def test_an_empty_code_is_refused_before_any_request(self):
+        opener = RecordingOpener({})
+        for bad in ("", "   ", None):
+            with self.assertRaises(google_auth.GoogleOAuthError):
+                google_auth.exchange_code(bad, self.REDIRECT, opener=opener)
+        self.assertEqual(opener.calls, [])
+
+    def test_an_oversized_code_is_refused_before_any_request(self):
+        opener = RecordingOpener({})
+        with self.assertRaises(google_auth.GoogleOAuthError) as ctx:
+            google_auth.exchange_code("c" * (google_auth.MAX_CODE_CHARS + 1),
+                                      self.REDIRECT, opener=opener)
+        self.assertIn("plausible", str(ctx.exception))
+        self.assertEqual(opener.calls, [])
+
+    def test_the_bound_is_a_ceiling_not_off_by_one(self):
+        opener = RecordingOpener({"access_token": "t"})
+        google_auth.exchange_code("c" * google_auth.MAX_CODE_CHARS,
+                                  self.REDIRECT, opener=opener)
+        self.assertEqual(len(opener.calls), 1)
+
+    def test_a_missing_secret_is_refused_before_any_request(self):
+        # This is the exchange, which is where the secret is actually needed, so
+        # this is the check that matters even though building a URL does not
+        # need one.
+        os.environ.pop("GOOGLE_CLIENT_SECRET")
+        opener = RecordingOpener({"access_token": "t"})
+        with self.assertRaises(google_auth.GoogleOAuthError):
+            google_auth.exchange_code("c", self.REDIRECT, opener=opener)
+        self.assertEqual(opener.calls, [])
+
+    def test_a_missing_redirect_uri_is_refused(self):
+        opener = RecordingOpener({})
+        with self.assertRaises(google_auth.GoogleOAuthError):
+            google_auth.exchange_code("c", "", opener=opener)
+        self.assertEqual(opener.calls, [])
+
+    def test_google_refusal_is_reported_in_its_own_words(self):
+        # invalid_grant is the single most common failure here — the code was
+        # spent or expired — and it looks like nothing else.
+        err = urllib.error.HTTPError(google_auth.GOOGLE_TOKEN_URL, 400, "Bad Request", {},
+                                     None)
+        err.read = lambda: json.dumps(
+            {"error": "invalid_grant",
+             "error_description": "Bad Request"}).encode("utf-8")
+        opener = RecordingOpener(err)
+        with self.assertRaises(google_auth.GoogleOAuthError) as ctx:
+            google_auth.exchange_code("c", self.REDIRECT, opener=opener)
+        message = str(ctx.exception)
+        self.assertIn("Bad Request", message)
+        self.assertIn("authorization code", message)
+
+    def test_an_unreadable_error_body_still_produces_a_usable_message(self):
+        err = urllib.error.HTTPError(google_auth.GOOGLE_TOKEN_URL, 500, "x", {}, None)
+        err.read = lambda: b"<html>proxy error</html>"
+        opener = RecordingOpener(err)
+        with self.assertRaises(google_auth.GoogleOAuthError) as ctx:
+            google_auth.exchange_code("c", self.REDIRECT, opener=opener)
+        self.assertIn("500", str(ctx.exception))
+
+    def test_a_network_failure_says_try_again_rather_than_refused(self):
+        opener = RecordingOpener(
+            urllib.error.URLError(TimeoutError("timed out")))
+        with self.assertRaises(google_auth.GoogleOAuthError) as ctx:
+            google_auth.exchange_code("c", self.REDIRECT, opener=opener)
+        self.assertIn("try again", str(ctx.exception))
+
+    def test_a_200_that_is_not_json_is_refused(self):
+        # A captive portal or intercepting proxy. Parsing it leniently is how an
+        # HTML error page becomes a username.
+        opener = RecordingOpener(b"<html>hi</html>")
+        with self.assertRaises(google_auth.GoogleOAuthError) as ctx:
+            google_auth.exchange_code("c", self.REDIRECT, opener=opener)
+        self.assertIn("could not be read", str(ctx.exception))
+
+    def test_json_that_is_not_an_object_is_refused(self):
+        opener = RecordingOpener(b"[1, 2, 3]")
+        with self.assertRaises(google_auth.GoogleOAuthError):
+            google_auth.exchange_code("c", self.REDIRECT, opener=opener)
+
+    def test_overrides_beat_the_environment(self):
+        opener = RecordingOpener({"access_token": "t"})
+        google_auth.exchange_code("c", self.REDIRECT, client_id_override="cid2",
+                                  client_secret_override="sec2", opener=opener)
+        self.assertEqual(opener.form["client_id"], "cid2")
+        self.assertEqual(opener.form["client_secret"], "sec2")
 
 
-def _sign(key, claims: dict, kid: str = "test-key-1", algorithm: str = "RS256") -> str:
-    return jwt.encode(claims, key, algorithm=algorithm, headers={"kid": kid})
+class FetchUserinfoTests(EnvCase):
+    BODY = {"sub": "1234567890", "email": "Alice@Example.COM",
+            "email_verified": True, "name": "Alice Example"}
+
+    def test_the_signed_in_user_is_returned_normalised(self):
+        opener = RecordingOpener(self.BODY)
+        info = google_auth.fetch_userinfo("ya29.token", opener=opener)
+        self.assertEqual(info["subject"], "1234567890")
+        self.assertEqual(info["email"], "alice@example.com")
+        self.assertIs(info["email_verified"], True)
+        self.assertEqual(info["name"], "Alice Example")
+        self.assertEqual(sorted(info),
+                         ["email", "email_verified", "name", "subject"])
+
+    def test_the_token_is_sent_as_a_bearer_credential(self):
+        opener = RecordingOpener(self.BODY)
+        google_auth.fetch_userinfo("ya29.token", opener=opener)
+        self.assertEqual(opener.calls[0]["url"], google_auth.GOOGLE_USERINFO_URL)
+        self.assertEqual(opener.calls[0]["headers"].get("Authorization"),
+                         "Bearer ya29.token")
+        self.assertEqual(opener.calls[0]["timeout"], google_auth.HTTP_TIMEOUT)
+
+    def test_the_subject_is_never_derived_from_the_address(self):
+        # An address can be renamed, reassigned or made an alias; `sub` cannot.
+        # Everything that keys a vault off Google keys off this.
+        opener = RecordingOpener({"sub": "s1", "email": "a@example.com"})
+        first = google_auth.fetch_userinfo("t", opener=opener)
+        opener.bodies.append({"sub": "s1", "email": "b@elsewhere.com"})
+        second = google_auth.fetch_userinfo("t", opener=opener)
+        self.assertEqual(first["subject"], second["subject"])
+        self.assertNotEqual(first["email"], second["email"])
+
+    def test_a_response_with_no_subject_is_refused(self):
+        # Inventing one would produce a vault whose owner cannot sign in again.
+        opener = RecordingOpener({"email": "a@example.com"})
+        with self.assertRaises(google_auth.GoogleOAuthError) as ctx:
+            google_auth.fetch_userinfo("t", opener=opener)
+        self.assertIn("no account id", str(ctx.exception))
+
+    def test_only_an_explicit_true_counts_as_verified(self):
+        # The failure that matters is the one where a non-boolean reads as
+        # present, so "true", 1 and a non-empty string are all unverified.
+        for value, expected in ((True, True), (False, False), ("true", False),
+                                (1, False), (None, False), ("", False)):
+            opener = RecordingOpener({"sub": "s", "email_verified": value})
+            info = google_auth.fetch_userinfo("t", opener=opener)
+            self.assertIs(info["email_verified"], expected, msg=repr(value))
+
+    def test_a_missing_address_is_empty_rather_than_fatal(self):
+        # The address is display text and the vault key for a new account; an
+        # absent one is handled where it is used, not here.
+        opener = RecordingOpener({"sub": "s"})
+        info = google_auth.fetch_userinfo("t", opener=opener)
+        self.assertEqual(info["email"], "")
+        self.assertEqual(info["name"], "")
+
+    def test_oversized_display_fields_are_truncated(self):
+        opener = RecordingOpener({"sub": "s", "email": "a" * 400 + "@x.com",
+                                  "name": "n" * 400})
+        info = google_auth.fetch_userinfo("t", opener=opener)
+        self.assertLessEqual(len(info["email"]), google_auth.MAX_EMAIL_CHARS)
+        self.assertLessEqual(len(info["name"]), google_auth.MAX_NAME_CHARS)
+
+    def test_an_empty_token_is_refused_before_any_request(self):
+        opener = RecordingOpener(self.BODY)
+        for bad in ("", "   ", None):
+            with self.assertRaises(google_auth.GoogleOAuthError):
+                google_auth.fetch_userinfo(bad, opener=opener)
+        self.assertEqual(opener.calls, [])
+
+    def test_an_oversized_token_is_refused_before_any_request(self):
+        opener = RecordingOpener(self.BODY)
+        with self.assertRaises(google_auth.GoogleOAuthError):
+            google_auth.fetch_userinfo("t" * (google_auth.MAX_TOKEN_CHARS + 1),
+                                       opener=opener)
+        self.assertEqual(opener.calls, [])
 
 
-def _unsigned_token(claims: dict) -> str:
-    """A hand-built `alg: none` JWS. Assembled by hand on purpose: asking a
-    library to mint one would test the library, not this module's refusal."""
-    header = _b64u(json.dumps({"alg": "none", "typ": "JWT"}).encode())
-    payload = _b64u(json.dumps(claims).encode())
-    return f"{header}.{payload}."
+class SecrecyTests(EnvCase):
+    """No failure message may carry a credential. The text reaches a browser."""
+
+    def _collect_messages(self, opener):
+        messages = []
+        with self.assertRaises(google_auth.GoogleOAuthError) as ctx:
+            google_auth.exchange_code("the-secret-code", "https://x/cb", opener=opener)
+        messages.append(str(ctx.exception))
+        return messages
+
+    def test_the_code_never_appears_in_a_failure_message(self):
+        err = urllib.error.HTTPError(google_auth.GOOGLE_TOKEN_URL, 400, "Bad", {}, None)
+        err.read = lambda: b'{"error":"invalid_grant"}'
+        for message in self._collect_messages(RecordingOpener(err)):
+            self.assertNotIn("the-secret-code", message)
+
+    def test_the_client_secret_never_appears_in_a_failure_message(self):
+        err = urllib.error.HTTPError(google_auth.GOOGLE_TOKEN_URL, 401, "no", {}, None)
+        err.read = lambda: b'{"error":"invalid_client"}'
+        for message in self._collect_messages(RecordingOpener(err)):
+            self.assertNotIn(self.SECRET, message)
+
+    def test_a_very_long_error_description_is_bounded(self):
+        # The string is interpolated into a message that reaches the browser,
+        # and a proxy's error page can be arbitrarily long.
+        err = urllib.error.HTTPError(google_auth.GOOGLE_TOKEN_URL, 400, "Bad", {}, None)
+        err.read = lambda: json.dumps(
+            {"error_description": "x" * 5000}).encode("utf-8")
+        with self.assertRaises(google_auth.GoogleOAuthError) as ctx:
+            google_auth.exchange_code("c", "https://x/cb", opener=RecordingOpener(err))
+        self.assertLess(len(str(ctx.exception)), 400)
 
 
-class StaticSource:
-    """A key source backed by literal keys, standing in for PyJWKClient's fetch.
+class FailureReportingTests(EnvCase):
+    """One exception type, and every failure is logged with its reason."""
 
-    Duck-typed on `get_signing_key_from_jwt` because that is the only method
-    google_auth.py calls. Raises the same exception type PyJWKClient raises for
-    an unknown kid, so the "Google rotated and we do not have that key" path is
-    reachable in a test rather than only in production.
-    """
+    def test_every_failure_is_the_same_exception_type(self):
+        cases = [
+            lambda: google_auth.authorization_url("", "https://x/cb"),
+            lambda: google_auth.exchange_code("c", "https://x/cb",
+                                              opener=RecordingOpener({})),
+            lambda: google_auth.exchange_code(
+                "c", "https://x/cb",
+                opener=RecordingOpener(urllib.error.URLError("boom"))),
+            lambda: google_auth.fetch_userinfo("",
+                                               opener=RecordingOpener({})),
+        ]
+        for call in cases:
+            with self.assertRaises(google_auth.GoogleOAuthError):
+                call()
 
-    def __init__(self, keys: dict):
-        self.keys = dict(keys)
-        self.calls = 0
+    def test_a_network_failure_is_logged_with_its_reason(self):
+        # The defect this repo has been bitten by before was a missing log line,
+        # and only a call that genuinely raises can assert one.
+        with self.assertLogs("memory-vault", level="WARNING") as captured:
+            with self.assertRaises(google_auth.GoogleOAuthError):
+                google_auth.exchange_code(
+                    "c", "https://x/cb",
+                    opener=RecordingOpener(urllib.error.URLError("dns is down")))
+        joined = "\n".join(captured.output)
+        self.assertIn("could not reach Google", joined)
+        self.assertIn("dns is down", joined)
 
-    def get_signing_key_from_jwt(self, token):
-        self.calls += 1
+    def test_a_refusal_is_logged_with_the_google_detail(self):
+        err = urllib.error.HTTPError(google_auth.GOOGLE_TOKEN_URL, 400, "Bad", {}, None)
+        err.read = lambda: b'{"error_description":"Bad Request"}'
+        with self.assertLogs("memory-vault", level="WARNING") as captured:
+            with self.assertRaises(google_auth.GoogleOAuthError):
+                google_auth.exchange_code("c", "https://x/cb", opener=RecordingOpener(err))
+        joined = "\n".join(captured.output)
+        self.assertIn("400", joined)
+        self.assertIn("Bad Request", joined)
+
+    def test_nothing_is_logged_on_a_successful_exchange(self):
+        with self.assertNoLogs("memory-vault", level="WARNING"):
+            google_auth.exchange_code("c", "https://x/cb",
+                                      opener=RecordingOpener({"access_token": "t"}))
+            google_auth.fetch_userinfo("t", opener=RecordingOpener({"sub": "s"}))
+
+
+class EndpointTests(unittest.TestCase):
+    """The endpoints are the ones Google documents, pinned so they cannot drift."""
+
+    def test_the_endpoints_are_googles_https_urls(self):
+        for url in (google_auth.GOOGLE_AUTH_URL, google_auth.GOOGLE_TOKEN_URL,
+                    google_auth.GOOGLE_USERINFO_URL):
+            self.assertTrue(url.startswith("https://"), url)
+        self.assertIn("accounts.google.com", google_auth.GOOGLE_AUTH_URL)
+        # Not the legacy accounts.google.com/o/oauth2/token: the
+        # oauth2.googleapis.com host is current and returns JSON.
+        self.assertIn("oauth2.googleapis.com", google_auth.GOOGLE_TOKEN_URL)
+
+    def test_the_module_imports_without_a_jwt_library(self):
+        # The whole reason this module is stdlib-only: it can be imported and
+        # called on a machine with no web framework, no network and no
+        # cryptography, which is what the suite runs on.
+        import importlib
+        import sys
+        saved = {name: sys.modules.get(name) for name in ("jwt", "cryptography")}
+        sys.modules.pop("jwt", None)
+        sys.modules.pop("cryptography", None)
         try:
-            kid = jwt.get_unverified_header(token).get("kid")
-        except jwt.DecodeError:
-            raise jwt.PyJWKClientError("Not enough segments") from None
-        if kid not in self.keys:
-            raise jwt.PyJWKClientError(
-                f"Unable to find a signing key that matches: {kid}"
-            )
-        return jwt.PyJWK(self.keys[kid])
-
-
-class GoogleTokenTests(unittest.TestCase):
-    """verify_google_token and google_identity, against a real RSA key."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.key = _generate_key()
-        cls.other_key = _generate_key()
-        cls.jwk = _public_jwk(cls.key, "test-key-1")
-        cls.source = StaticSource({"test-key-1": cls.jwk})
-
-    def setUp(self):
-        self.source.calls = 0
-
-    # -- the happy path ----------------------------------------------------
-    def test_a_valid_token_is_accepted_and_its_claims_survive(self):
-        token = _sign(self.key, _claims())
-        verified = google_auth.verify_google_token(token, CLIENT_ID, source=self.source)
-        self.assertEqual(verified["sub"], SUBJECT)
-        self.assertEqual(verified["aud"], CLIENT_ID)
-
-    def test_google_identity_returns_the_subject_and_display_fields(self):
-        token = _sign(self.key, _claims())
-        identity = google_auth.google_identity(token, CLIENT_ID, source=self.source)
-        self.assertEqual(
-            identity,
-            {
-                "subject": SUBJECT,
-                "email": EMAIL,
-                "email_verified": True,
-                "name": "Someone Example",
-                "audience": CLIENT_ID,
-            },
-        )
-
-    def test_the_subject_is_the_identity_not_the_email(self):
-        # Two tokens for the same person with different emails must resolve to
-        # the same subject, because that is what a vault is keyed on.
-        first = _sign(self.key, _claims(email="old@example.com"))
-        second = _sign(self.key, _claims(email="new@example.org", name="X Y"))
-        one = google_auth.google_identity(first, CLIENT_ID, source=self.source)
-        two = google_auth.google_identity(second, CLIENT_ID, source=self.source)
-        self.assertEqual(one["subject"], two["subject"])
-        self.assertNotEqual(one["email"], two["email"])
-
-    def test_both_issuer_spellings_are_accepted(self):
-        # Google has used both, and which one a token carries has changed over
-        # time; rejecting one of them is an outage that looks like a bug.
-        for issuer in google_auth.GOOGLE_ISSUERS:
-            with self.subTest(issuer=issuer):
-                token = _sign(self.key, _claims(iss=issuer))
-                verified = google_auth.verify_google_token(
-                    token, CLIENT_ID, source=self.source
-                )
-                self.assertEqual(verified["iss"], issuer)
-
-    def test_a_bare_key_object_from_the_source_is_accepted(self):
-        # PyJWKClient returns a PyJWK wrapper; verify_google_token uses
-        # getattr(signing_key, "key", signing_key) so a source handing back the
-        # cryptography key directly also works. If the getattr were dropped this
-        # is the test that notices, because the key object has no `.key`.
-        class BareSource:
-            def get_signing_key_from_jwt(self, token):
-                return self.key.public_key()
-
-        source = BareSource()
-        source.key = self.key
-        verified = google_auth.verify_google_token(
-            _sign(self.key, _claims()), CLIENT_ID, source=source
-        )
-        self.assertEqual(verified["sub"], SUBJECT)
-
-    # -- the audience check: the headline property -------------------------
-    def test_a_token_minted_for_another_client_is_refused(self):
-        token = _sign(self.key, _claims(aud=OTHER_CLIENT_ID))
-        with self.assertRaises(google_auth.GoogleTokenError) as caught:
-            google_auth.verify_google_token(token, CLIENT_ID, source=self.source)
-        self.assertIn("InvalidAudienceError", str(caught.exception))
-
-    def test_a_token_with_no_audience_is_refused(self):
-        token = _sign(self.key, _claims(aud=None))
-        with self.assertRaises(google_auth.GoogleTokenError):
-            google_auth.verify_google_token(token, CLIENT_ID, source=self.source)
-
-    def test_the_audience_check_is_not_skipped_when_no_client_id_is_configured(self):
-        # An unset client id must be refused, not treated as "check the
-        # signature and nobody's audience".
-        token = _sign(self.key, _claims())
-        for empty in ("", "   ", None):
-            with self.subTest(client_id=empty):
-                with self.assertRaises(google_auth.GoogleTokenError) as caught:
-                    google_auth.verify_google_token(token, empty, source=self.source)
-                self.assertIn("client id", str(caught.exception))
-        # And the key source is never even consulted in that case.
-        self.assertEqual(self.source.calls, 0)
-
-    # -- the other required claims -----------------------------------------
-    def test_a_token_from_someone_other_than_google_is_refused(self):
-        token = _sign(self.key, _claims(iss="https://accounts.evil.example"))
-        with self.assertRaises(google_auth.GoogleTokenError) as caught:
-            google_auth.verify_google_token(token, CLIENT_ID, source=self.source)
-        self.assertIn("InvalidIssuerError", str(caught.exception))
-
-    def test_an_expired_token_is_refused(self):
-        token = _sign(self.key, _claims(exp=int(time.time()) - 120))
-        with self.assertRaises(google_auth.GoogleTokenError) as caught:
-            google_auth.verify_google_token(token, CLIENT_ID, source=self.source)
-        self.assertIn("ExpiredSignatureError", str(caught.exception))
-
-    def test_a_token_just_inside_the_clock_skew_is_accepted(self):
-        # The whole point of the leeway: a token that expired one second ago is
-        # not a security event, and rejecting it only trades a refusal for a
-        # support ticket. Pinned at both sides of the boundary so the constant
-        # cannot drift without this noticing.
-        just_expired = _sign(self.key, _claims(exp=int(time.time()) - 10))
-        self.assertTrue(
-            google_auth.verify_google_token(just_expired, CLIENT_ID, source=self.source)
-        )
-        well_past = _sign(self.key, _claims(exp=int(time.time()) - 120))
-        with self.assertRaises(google_auth.GoogleTokenError):
-            google_auth.verify_google_token(well_past, CLIENT_ID, source=self.source)
-
-    def test_leeway_is_not_applied_when_the_caller_explicitly_forbids_it(self):
-        # Otherwise CLOCK_SKEW_SECONDS is not a constant, it is a suggestion:
-        # `leeway=0` has to actually mean zero for anything that wants it.
-        token = _sign(self.key, _claims(exp=int(time.time()) - 10))
-        with self.assertRaises(google_auth.GoogleTokenError):
-            google_auth.verify_google_token(
-                token, CLIENT_ID, source=self.source, leeway=0
-            )
-
-    def test_every_required_claim_is_required(self):
-        # `require` is a whitelist, not a hint. A token missing any of them is
-        # refused rather than defaulted, and defaulting `sub` would mean
-        # inventing the identity a vault is keyed on.
-        for name in google_auth.REQUIRED_CLAIMS:
-            with self.subTest(missing=name):
-                token = _sign(self.key, _claims(**{name: None}))
-                with self.assertRaises(google_auth.GoogleTokenError) as caught:
-                    google_auth.verify_google_token(token, CLIENT_ID, source=self.source)
-                self.assertIn("MissingRequiredClaimError", str(caught.exception))
-
-    def test_a_token_whose_subject_is_empty_is_refused_by_the_identity_helper(self):
-        # google_identity re-checks `sub` after verification. A whitespace-only
-        # subject is *present*, so `require` passes it and the defence below is
-        # the only thing standing between it and a vault keyed on "".
-        token = _sign(self.key, _claims(sub="   "))
-        verified = google_auth.verify_google_token(token, CLIENT_ID, source=self.source)
-        self.assertEqual(verified["sub"].strip(), "")
-        with self.assertRaises(google_auth.GoogleTokenError) as caught:
-            google_auth.google_identity(token, CLIENT_ID, source=self.source)
-        self.assertIn("subject", str(caught.exception))
-
-    # -- the signature -----------------------------------------------------
-    def test_a_token_signed_by_a_different_key_is_refused(self):
-        # Same kid, same header, different key material: this is the attack a
-        # signature check exists for, and a stubbed verifier would pass it.
-        token = _sign(self.other_key, _claims(), kid="test-key-1")
-        with self.assertRaises(google_auth.GoogleTokenError) as caught:
-            google_auth.verify_google_token(token, CLIENT_ID, source=self.source)
-        self.assertIn("InvalidSignatureError", str(caught.exception))
-
-    def test_a_tampered_payload_is_refused(self):
-        token = _sign(self.key, _claims())
-        header, payload, signature = token.split(".")
-        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
-        claims["sub"] = "999999999999999999999"
-        claims["email"] = "attacker@example.com"
-        forged = ".".join([header, _b64u(json.dumps(claims).encode()), signature])
-        with self.assertRaises(google_auth.GoogleTokenError) as caught:
-            google_auth.verify_google_token(forged, CLIENT_ID, source=self.source)
-        self.assertIn("InvalidSignatureError", str(caught.exception))
-
-    def test_a_token_declaring_itself_unsigned_is_refused(self):
-        # `alg: none` — the token asks to skip verification. google_auth pins
-        # algorithms=["RS256"] from its own side, so the token's own header is a
-        # request and not a decision.
-        token = _unsigned_token(_claims())
-        with self.assertRaises(google_auth.GoogleTokenError) as caught:
-            google_auth.verify_google_token(token, CLIENT_ID, source=self.source)
-        message = str(caught.exception)
-        self.assertIn("none", message)
-        self.assertIn("RS256", message)
-        # Refused *before* the key lookup, so the RS256 pin is never the thing
-        # that caught it and no key set is fetched for a token that asked to
-        # skip verification. Pinning only the outcome would still pass if the
-        # key lookup had refused it first for want of a kid.
-        self.assertEqual(self.source.calls, 0)
-
-    def test_a_token_signed_with_a_symmetric_algorithm_is_refused(self):
-        # HMAC confusion: the public key used as an HMAC secret. RS256-only
-        # means the token's declared algorithm never selects the verifier.
-        token = jwt.encode(_claims(), "secret", algorithm="HS256",
-                           headers={"kid": "test-key-1"})
-        with self.assertRaises(google_auth.GoogleTokenError):
-            google_auth.verify_google_token(token, CLIENT_ID, source=self.source)
-
-    def test_an_unknown_kid_reports_a_key_problem_not_a_token_problem(self):
-        # "Google rotated and we do not have that key yet" and "that is not a
-        # JWT" send an operator to completely different places, so the reasons
-        # must stay distinguishable.
-        token = _sign(self.key, _claims(), kid="a-key-we-do-not-have")
-        with self.assertRaises(google_auth.GoogleTokenError) as caught:
-            google_auth.verify_google_token(token, CLIENT_ID, source=self.source)
-        self.assertIn("signing keys", str(caught.exception))
-        self.assertNotIn("JSON Web Token", str(caught.exception))
-
-    def test_something_that_is_not_a_jwt_is_reported_as_such(self):
-        for value in ("mvk_abcdef", "not-a-token", "a.b", "...."):
-            with self.subTest(value=value):
-                with self.assertRaises(google_auth.GoogleTokenError) as caught:
-                    google_auth.verify_google_token(value, CLIENT_ID, source=self.source)
-                self.assertIn("JSON Web Token", str(caught.exception))
-
-    def test_a_key_fetch_failure_fails_closed(self):
-        class BrokenSource:
-            def get_signing_key_from_jwt(self, token):
-                raise TimeoutError("connection timed out")
-
-        token = _sign(self.key, _claims())
-        with self.assertRaises(google_auth.GoogleTokenError) as caught:
-            google_auth.verify_google_token(token, CLIENT_ID, source=BrokenSource())
-        self.assertIn("signing keys", str(caught.exception))
-
-    # -- the cheap refusals ------------------------------------------------
-    def test_an_empty_or_non_string_token_is_refused_before_any_lookup(self):
-        for value in ("", "   ", None, 12345, b"bytes", ["a"]):
-            with self.subTest(value=repr(value)):
-                with self.assertRaises(google_auth.GoogleTokenError) as caught:
-                    google_auth.verify_google_token(value, CLIENT_ID, source=self.source)
-                self.assertIn("no token", str(caught.exception))
-        self.assertEqual(self.source.calls, 0)
-
-    def test_an_oversized_token_is_refused_before_any_lookup(self):
-        # The bound is about not base64-decoding an arbitrary attacker-supplied
-        # string on a path an MCP client retries, so it has to happen before the
-        # key fetch rather than after.
-        value = "eyJ." + "x" * google_auth.MAX_TOKEN_CHARS
-        with self.assertRaises(google_auth.GoogleTokenError) as caught:
-            google_auth.verify_google_token(value, CLIENT_ID, source=self.source)
-        self.assertIn("too large", str(caught.exception))
-        self.assertEqual(self.source.calls, 0)
-
-    def test_a_token_exactly_at_the_size_bound_is_not_rejected_for_its_size(self):
-        # A guard that rejects at the bound and accepts at bound+1 passes a test
-        # asserting only the rejection. Assert the other side too, so the bound
-        # is a ceiling and not an off-by-one that eats a real token.
-        token = _sign(self.key, _claims())
-        padding = google_auth.MAX_TOKEN_CHARS - len(token)
-        self.assertGreater(padding, 0)
-        padded = token + "x" * padding
-        self.assertEqual(len(padded), google_auth.MAX_TOKEN_CHARS)
-        # It is no longer a valid signature, so this is refused — but for the
-        # signature, which is the point: the size check let it through.
-        with self.assertRaises(google_auth.GoogleTokenError) as caught:
-            google_auth.verify_google_token(padded, CLIENT_ID, source=self.source)
-        self.assertIn("InvalidSignatureError", str(caught.exception))
-        self.assertNotIn("too large", str(caught.exception))
-
-    def test_surrounding_whitespace_on_a_pasted_token_is_ignored(self):
-        # The value arrives from a textarea, so it arrives with a newline.
-        token = "\n  " + _sign(self.key, _claims()) + "  \n"
-        verified = google_auth.verify_google_token(token, CLIENT_ID, source=self.source)
-        self.assertEqual(verified["sub"], SUBJECT)
-
-    # -- nothing sensitive escapes ----------------------------------------
-    def test_no_failure_message_contains_any_part_of_the_token(self):
-        # An exception message is the one thing here that routinely reaches a log
-        # file, a response body and a client's stderr. PyJWT's own messages quote
-        # the token, so the wrapper's reason must not be built from str(exc).
-        token = _sign(self.key, _claims(aud=OTHER_CLIENT_ID))
-        fragments = [token, token.split(".")[0], token.split(".")[1]]
-        cases = [
-            (token, CLIENT_ID, "wrong audience"),
-            (_sign(self.other_key, _claims()), CLIENT_ID, "wrong key"),
-            (_sign(self.key, _claims(iss="evil")), CLIENT_ID, "wrong issuer"),
-            (_unsigned_token(_claims()), CLIENT_ID, "alg none"),
-            ("mvk_secret_value_here", CLIENT_ID, "not a jwt"),
-        ]
-        for value, client_id, label in cases:
-            with self.subTest(case=label):
-                with self.assertRaises(google_auth.GoogleTokenError) as caught:
-                    google_auth.verify_google_token(value, client_id, source=self.source)
-                message = str(caught.exception)
-                for fragment in fragments + ["mvk_secret_value_here"]:
-                    if fragment:
-                        self.assertNotIn(fragment, message)
-
-    def test_nothing_logged_contains_any_part_of_the_token(self):
-        token = _sign(self.key, _claims(aud=OTHER_CLIENT_ID))
-        with self.assertLogs("memory-vault", level="DEBUG") as captured:
-            with self.assertRaises(google_auth.GoogleTokenError):
-                google_auth.verify_google_token(token, CLIENT_ID, source=self.source)
-        blob = "\n".join(captured.output)
-        self.assertNotIn(token, blob)
-        for segment in token.split("."):
-            self.assertNotIn(segment, blob)
-        # The reason is still there — a log line that says only "rejected" is the
-        # absence-of-a-log-line bug this repo has been bitten by before.
-        self.assertIn("InvalidAudienceError", blob)
-
-    def test_every_failure_is_the_one_exception_type_the_caller_catches(self):
-        # A caller cannot act differently on "expired" than on "signed by
-        # someone else" without learning something about tokens it does not hold,
-        # so there is exactly one type and the reason rides inside it.
-        for value, label in (
-            (_sign(self.key, _claims(aud=OTHER_CLIENT_ID)), "audience"),
-            (_sign(self.other_key, _claims()), "signature"),
-            ("garbage", "shape"),
-            ("", "empty"),
-        ):
-            with self.subTest(case=label):
-                with self.assertRaises(google_auth.GoogleTokenError):
-                    google_auth.verify_google_token(value, CLIENT_ID, source=self.source)
-
-
-class PrefilterTests(unittest.TestCase):
-    """looks_like_a_google_token — the cheap gate before a key fetch."""
-
-    def test_a_real_token_passes(self):
-        self.assertTrue(
-            google_auth.looks_like_a_google_token(_sign(_generate_key(), _claims()))
-        )
-
-    def test_an_access_key_does_not(self):
-        # This is the reason the function exists: an `mvk_…` lookup must not
-        # trigger a network round trip to Google.
-        self.assertFalse(google_auth.looks_like_a_google_token("mvk_abcdef0123456789"))
-        self.assertFalse(google_auth.looks_like_a_google_token("mvk_REPLACE_ME"))
-
-    def test_a_session_id_does_not(self):
-        session_id = "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MA"
-        self.assertFalse(google_auth.looks_like_a_google_token(session_id))
-
-    def test_the_truth_table(self):
-        cases = [
-            ("eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiIxIn0.sig", True),
-            ("eyJ.a.b", True),
-            ("a.b.c", False),            # no JWT header prefix
-            ("eyJ..b", False),           # empty payload segment
-            ("eyJ.a.", False),           # empty signature segment
-            ("eyJ.a", False),            # two segments
-            ("eyJ.a.b.c", False),        # four segments
-            ("", False),
-            ("   ", False),
-            (None, False),
-            (12345, False),
-            (b"eyJ.a.b", False),
-        ]
-        for value, expected in cases:
-            with self.subTest(value=repr(value)):
-                self.assertIs(google_auth.looks_like_a_google_token(value), expected)
-
-    def test_a_padded_token_still_passes(self):
-        # Padded with whitespace because it came out of a textarea.
-        self.assertTrue(
-            google_auth.looks_like_a_google_token(
-                "\n eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiIxIn0.sig \n"
-            )
-        )
-
-
-class KeySourceTests(unittest.TestCase):
-    """jwk_source() caching — a new client per request defeats cache_keys."""
-
-    def setUp(self):
-        google_auth.reset_jwk_source()
-
-    def tearDown(self):
-        google_auth.reset_jwk_source()
-
-    def test_the_same_source_is_returned_every_time(self):
-        first = google_auth.jwk_source()
-        self.assertIs(first, google_auth.jwk_source())
-        self.assertIsInstance(first, google_auth.GoogleJWKSource)
-
-    def test_reset_rebuilds_it(self):
-        first = google_auth.jwk_source()
-        google_auth.reset_jwk_source()
-        self.assertIsNot(first, google_auth.jwk_source())
-
-    def test_building_the_source_does_no_io(self):
-        # It is on the authentication path of an MCP client that retries, so a
-        # constructor that fetched would turn a cache into a latency source.
-        source = google_auth.GoogleJWKSource()
-        self.assertIsNotNone(source.url)
-        self.assertEqual(source.url, google_auth.GOOGLE_JWKS_URL)
-
-    def test_the_cache_settings_are_the_ones_the_comment_claims(self):
-        # The comment says the fetched key set is retained for `lifespan`. If
-        # cache_jwk_set or the lifespan were dropped the comment becomes false
-        # and every request refetches, which is the original defect (a client
-        # rebuilt per call) in a subtler form. Pin the value rather than the prose.
-        source = google_auth.GoogleJWKSource()
-        self.assertEqual(source._client.jwk_set_cache.lifespan,
-                         google_auth.JWKS_CACHE_SECONDS)
-        self.assertEqual(source._client.timeout, google_auth.JWKS_FETCH_TIMEOUT)
+            reloaded = importlib.reload(google_auth)
+            self.assertTrue(reloaded.configured() in (True, False))
+        finally:
+            for name, module in saved.items():
+                if module is not None:
+                    sys.modules[name] = module
 
 
 if __name__ == "__main__":
-    logging.getLogger("memory-vault").addHandler(logging.NullHandler())
     unittest.main()

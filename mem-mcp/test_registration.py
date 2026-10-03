@@ -1,30 +1,37 @@
 """
-test_registration.py – self-service signup: accounts, passwords, and the gates.
+test_registration.py – self-service signup: accounts, passwords, verification, gates.
 
-This is a separate suite from test_sessions.py and test_auth_guard.py on
-purpose, because registration is a *third* credential surface and it is the
-only one that is unauthenticated by design: `/api/auth/*` is the only prefix
-`auth_guard` lets through with no credential, so a signup endpoint lives there by
-necessity. Splitting it out makes it obvious in the test list that the code with
-the weakest authentication has its own tests, rather than being one more class
-buried in a suite about the two gates that are properly protected.
+A separate suite from test_sessions.py and test_auth_guard.py on purpose,
+because registration is a *third* credential surface and the only one that is
+unauthenticated by design: `/api/auth/*` is the only prefix `auth_guard` lets
+through with no credential, so a signup endpoint lives there by necessity.
+Splitting it out makes it obvious in the test list that the code with the
+weakest authentication has its own tests.
 
-Half the suite *calls* sessions.py (importing it directly — it is stdlib-only for
-exactly this reason) and half *lifts* functions out of gui.py with
-`ast.get_source_segment`, because gui.py needs fastapi and this box has none.
+Half the suite *calls* sessions.py (it is stdlib-only for exactly this reason)
+and half *lifts* functions out of gui.py with `ast.get_source_segment`, because
+gui.py needs fastapi and this box has none.
 
 The properties worth having tests for are all invisible in the shape of the code:
 
   * a wrong password and a *corrupt stored hash* must both be False, and the
     second must not raise — the caller is a login path;
-  * registering twice must not silently reset an existing password;
-  * an address that already names a Google-linked or htpasswd-owned vault must
-    not be registrable, or signup becomes account takeover;
+  * `dklen` has to travel inside the stored string, because a verifier that
+    derived it from the digest would verify a shortened hash against anything;
+  * registering twice must not silently reset an existing password, and a name
+    held by a Google identity or htpasswd must not be registrable;
+  * a *new* account is unverified, so login must refuse it with "check your mail"
+    rather than "wrong password" — and must say that **before** checking the
+    password, or people reset passwords they never got wrong;
+  * a verification token must be single-use and stored only as a hash;
+  * a signup whose confirmation mail cannot be sent must leave nothing behind,
+    because the username would otherwise be taken by an account that can never
+    work;
   * the throttle must count attempts *before* the flag check, or turning
     registration off removes the rate limit from a still-mounted route;
-  * `_verify_account` must return the canonical key, because the vault key for a
-    registered account is the lowercased email and a session holding what was
-    typed signs you into a vault that does not exist.
+  * Google sign-in must not be gated on the registration flag, or switching the
+    flag off would sign out everyone who signed up with Google;
+  * `state` is the CSRF defence for the whole redirect and must be consumed.
 
 Run:  python3 -m unittest -v test_registration.py
 """
@@ -35,459 +42,626 @@ import base64
 import logging
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import types
 import unittest
+import urllib.parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 
 import sessions  # noqa: E402  (stdlib-only, so importable with nothing installed)
-
-HERE = os.path.dirname(os.path.abspath(__file__))
+import google_auth  # noqa: E402  (likewise stdlib-only)
 
 
 def _read(relative: str) -> str:
-    with open(os.path.join(os.path.dirname(HERE), relative), "r", encoding="utf-8") as handle:
+    with open(os.path.join(ROOT, relative), "r", encoding="utf-8") as handle:
         return handle.read()
 
 
-def _lift(relative: str, node_name: str, namespace: dict):
-    """exec one function/class out of a module that cannot be imported here.
-
-    The namespace is exec'd into directly, not a copy of it: the lifted function's
-    globals ARE that dict, so anything it calls must be present in the same one.
-    Copying it produces a function whose globals are somewhere its callers cannot
-    see, which fails with a NameError that looks like a bug in the module.
-    """
-    tree = ast.parse(_read(relative))
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) \
-                and node.name == node_name:
-            segment = ast.get_source_segment(_read(relative), node)
-            exec(compile(segment, relative, "exec"), namespace)
-            return namespace[node_name]
-    raise AssertionError(f"{node_name} not found in {relative}")
-
-
 def _function_source(relative: str, node_name: str) -> str:
+    """The source of a module-level function, by AST."""
     tree = ast.parse(_read(relative))
-    for node in ast.walk(tree):
+    for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) \
                 and node.name == node_name:
-            return ast.get_source_segment(_read(relative), node)
-    raise AssertionError(f"{node_name} not found in {relative}")
+            return ast.get_source_segment(_read(relative), node) or ""
+    raise AssertionError(f"{relative} has no module-level {node_name}")
+
+
+def _lift(relative: str, node_name: str, namespace: dict):
+    """Exec a function out of a module into `namespace`.
+
+    Two things this must get right, both learned the hard way:
+
+    * the target has to be the *same dict* the function will be called with.
+      `_lift(..., dict(namespace))` execs into a copy, and then the lifted
+      function's globals are somewhere its caller cannot see.
+    * the namespace needs the `logging` *module*, not a Logger — the lifted code
+      calls `logging.getLogger("memory-vault")` at each log site.
+    """
+    exec(compile(_function_source(relative, node_name), relative, "exec"), namespace)
+    return namespace[node_name]
 
 
 class StoreCase(unittest.TestCase):
-    """A private database per test, and no operator htpasswd in sight."""
+    """A private sessions database per test, torn down afterwards."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="vault-register-")
-        self._saved_dir = os.environ.get("MEM_SESSION_DIR")
-        self._saved_htpasswd = os.environ.get("HTPASSWD_PATH")
-        os.environ["MEM_SESSION_DIR"] = self.tmp
-        # user_id_taken shells out to ask htpasswd whether a name exists.
-        # Pointing that at the operator's real file would make these tests
-        # depend on what happens to be in it.
-        os.environ["HTPASSWD_PATH"] = os.path.join(self.tmp, "absent-htpasswd")
-
-    def tearDown(self):
-        for name, value in (("MEM_SESSION_DIR", self._saved_dir),
-                            ("HTPASSWD_PATH", self._saved_htpasswd)):
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
-        shutil.rmtree(self.tmp, ignore_errors=True)
+        self.dir = tempfile.mkdtemp(prefix="reg-test-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        os.environ["MEM_SESSION_DIR"] = self.dir
+        self.addCleanup(os.environ.pop, "MEM_SESSION_DIR", None)
 
     def db_bytes(self) -> bytes:
-        blob = b""
-        for name in os.listdir(self.tmp):
-            if name.startswith("sessions.db"):
-                with open(os.path.join(self.tmp, name), "rb") as handle:
-                    blob += handle.read()
-        return blob
+        with open(os.path.join(self.dir, "sessions.db"), "rb") as handle:
+            return handle.read()
 
 
 # ---------------------------------------------------------------------------
-# Password hashing
+# Passwords
 # ---------------------------------------------------------------------------
 
 class PasswordHashingTests(unittest.TestCase):
-    GOOD = "correct horse battery staple"
-
     def test_the_right_password_verifies(self):
-        encoded = sessions.hash_password(self.GOOD)
-        self.assertTrue(sessions.verify_password(self.GOOD, encoded))
+        stored = sessions.hash_password("correct horse battery staple")
+        self.assertTrue(sessions.verify_password("correct horse battery staple", stored))
 
     def test_a_wrong_password_does_not(self):
-        encoded = sessions.hash_password(self.GOOD)
-        self.assertFalse(sessions.verify_password("Correct horse battery staple", encoded))
-        self.assertFalse(sessions.verify_password("", encoded))
-        self.assertFalse(sessions.verify_password(self.GOOD + " ", encoded))
+        stored = sessions.hash_password("correct horse battery staple")
+        self.assertFalse(sessions.verify_password("Correct horse battery staple", stored))
 
     def test_the_same_password_hashes_differently_every_time(self):
-        # A per-hash salt. Without it two accounts that chose the same password
-        # are visibly identical in the database file and in any backup of it,
-        # which is the leak scrypt exists to make harder.
-        first = sessions.hash_password(self.GOOD)
-        second = sessions.hash_password(self.GOOD)
+        # A per-password salt: identical passwords must not be recognisable as
+        # identical rows in the database.
+        first = sessions.hash_password("same password here")
+        second = sessions.hash_password("same password here")
         self.assertNotEqual(first, second)
-        self.assertTrue(sessions.verify_password(self.GOOD, first))
-        self.assertTrue(sessions.verify_password(self.GOOD, second))
+        self.assertTrue(sessions.verify_password("same password here", first))
+        self.assertTrue(sessions.verify_password("same password here", second))
 
     def test_the_plaintext_is_not_in_the_hash(self):
-        encoded = sessions.hash_password(self.GOOD)
-        self.assertNotIn(self.GOOD, encoded)
+        stored = sessions.hash_password("hunter2-is-my-password")
+        self.assertNotIn("hunter2", stored)
 
     def test_the_cost_parameters_travel_inside_the_string(self):
-        # So they can be raised later without invalidating anyone's password: a
-        # verifier reads the cost from what it was handed, not from what it was
-        # compiled with.
-        parts = sessions.hash_password(self.GOOD).split("$")
+        # A verifier that read n/r/p from the *stored* value rather than from the
+        # string could not verify a row written with a cheaper setting, and every
+        # future cost increase would invalidate every existing password.
+        stored = sessions.hash_password("a long enough password")
+        parts = stored.split("$")
         self.assertEqual(parts[0], "scrypt")
-        # 7 fields: algorithm, n, r, p, dklen, salt, digest. dklen is in there
-        # because a verifier that derived it from the stored digest would compute
-        # a digest of that same length and compare equal.
-        self.assertEqual(len(parts), 7)
-        self.assertEqual([int(part) for part in parts[1:5]],
+        self.assertEqual([int(p) for p in parts[1:5]],
                          [sessions.SCRYPT_N, sessions.SCRYPT_R, sessions.SCRYPT_P,
                           sessions.SCRYPT_DKLEN])
 
     def test_a_hash_written_with_cheaper_parameters_still_verifies(self):
-        weak = sessions.hash_password(self.GOOD, n=2 ** 10, dklen=16)
-        self.assertTrue(sessions.verify_password(self.GOOD, weak))
-        # And a stored digest that disagrees with the length it claims is refused,
-        # rather than being taken at its word.
-        parts = weak.split("$")
-        parts[6] = parts[6][:8]
-        self.assertFalse(sessions.verify_password(self.GOOD, "$".join(parts)))
+        import hashlib
+        salt = b"0123456789abcdef"
+        digest = hashlib.scrypt(b"legacy password", salt=salt, n=2 ** 12, r=8, p=1,
+                                dklen=32, maxmem=2 ** 26)
+        stored = "$".join(["scrypt", str(2 ** 12), "8", "1", "32",
+                           base64.b64encode(salt).decode("ascii"),
+                           base64.b64encode(digest).decode("ascii")])
+        self.assertTrue(sessions.verify_password("legacy password", stored))
 
     def test_a_corrupt_hash_is_false_and_not_an_exception(self):
-        # The caller is a login path. A row restored from a damaged savepoint,
-        # hand-edited, or written by a future format must read as "this account
-        # cannot log in" rather than 500ing every request that touches it.
-        for broken in ["", "not-a-hash", "scrypt$16384$8$1", "bcrypt$1$2$3",
-                       "scrypt$x$8$1$AAAA$AAAA", "scrypt$16384$8$1$32$!!!!$AAAA",
-                       "scrypt$0$0$0$AAAA$AAAA", None]:
-            with self.subTest(broken=broken):
-                self.assertFalse(sessions.verify_password(self.GOOD, broken))
+        # The caller is a login path, and a row restored from a damaged savepoint
+        # or hand-edited must read as "this account cannot log in".
+        for stored in ("", "not-a-hash", "scrypt$1$2$3", "scrypt$a$b$c$d$e$f",
+                       "scrypt$16384$8$1$32$AAAA$"):
+            with self.subTest(stored=stored):
+                self.assertFalse(sessions.verify_password("anything at all", stored))
 
     def test_a_truncated_digest_does_not_verify(self):
-        parts = sessions.hash_password(self.GOOD).split("$")
-        parts[5] = parts[5][:8]
-        self.assertFalse(sessions.verify_password(self.GOOD, "$".join(parts)))
+        # The first implementation derived dklen from the stored digest, so it
+        # computed a digest of that same length and compared equal: anyone able
+        # to shorten the stored hash had made it verify against anything.
+        stored = sessions.hash_password("a long enough password")
+        head, _, _ = stored.rpartition("$")
+        shortened = head + "$" + "A" * (len(stored.split("$")[-1]) - 1)
+        self.assertFalse(sessions.verify_password("a long enough password", shortened))
+        self.assertNotEqual(len(shortened.split("$")[-1]),
+                            int(stored.split("$")[4]))
 
     def test_passwords_outside_the_bounds_are_refused(self):
-        with self.assertRaises(ValueError):
-            sessions.hash_password("x" * (sessions.MIN_PASSWORD_CHARS - 1))
-        with self.assertRaises(ValueError):
-            sessions.hash_password("x" * (sessions.MAX_PASSWORD_CHARS + 1))
+        for value in ("", "   ", "x" * (sessions.MAX_PASSWORD_CHARS + 1), None, 12345):
+            with self.subTest(value=repr(value)[:40]):
+                with self.assertRaises(ValueError):
+                    sessions.hash_password(value)
 
     def test_the_minimum_length_is_actually_accepted(self):
-        # A boundary, not a strict inequality: the documented minimum has to be
-        # usable or the policy is a lie the user discovers by being rejected.
-        exact = "x" * sessions.MIN_PASSWORD_CHARS
-        self.assertTrue(sessions.verify_password(exact, sessions.hash_password(exact)))
+        exactly = "x" * sessions.MIN_PASSWORD_CHARS
+        self.assertTrue(sessions.verify_password(
+            exactly, sessions.hash_password(exactly)))
 
 
 # ---------------------------------------------------------------------------
-# Email validation
+# Usernames and addresses
 # ---------------------------------------------------------------------------
+
+class UsernameTests(unittest.TestCase):
+    def test_a_reasonable_username_is_kept_as_typed(self):
+        # Lowercased, and that is not cosmetic: `user_id` *is* the vault key and
+        # every store compares it with `=`, so `Alice` and `alice` would otherwise
+        # be two vaults nobody can tell apart. The alternative -- keeping the name
+        # as typed and case-insensitively matching -- is the same thing with an
+        # extra step.
+        self.assertEqual(sessions.normalise_username("Alice"), "alice")
+        self.assertEqual(sessions.normalise_username("bob.smith_1"),
+                         "bob.smith_1")
+
+    def test_the_result_is_stripped(self):
+        self.assertEqual(sessions.normalise_username("  alice  "), "alice")
+
+    def test_the_allowed_set_is_exactly_letters_digits_dot_underscore_dash(self):
+        # Anything else is refused rather than transliterated: two spellings of
+        # one name is the bug the restriction exists to prevent, and a
+        # transliteration table is where such a pair comes from.
+        for value in ("alice bob", "alice@example.com", "alice/bob", "álice",
+                      "alice+bob", "alice!", "al\nice"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    sessions.normalise_username(value)
+
+    def test_it_must_not_start_or_end_with_a_separator(self):
+        for value in (".alice", "-alice", "_alice", "alice.", "alice-", "alice_"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    sessions.normalise_username(value)
+
+    def test_the_length_bounds_are_inclusive(self):
+        shortest = "a" * sessions.MIN_USERNAME_CHARS
+        longest = "b" * sessions.MAX_USERNAME_CHARS
+        self.assertEqual(sessions.normalise_username(shortest), shortest)
+        self.assertEqual(sessions.normalise_username(longest), longest)
+        for value in ("a" * (sessions.MIN_USERNAME_CHARS - 1),
+                      "b" * (sessions.MAX_USERNAME_CHARS + 1)):
+            with self.subTest(length=len(value)):
+                with self.assertRaises(ValueError):
+                    sessions.normalise_username(value)
+
+    def test_empty_and_non_strings_are_refused(self):
+        for value in ("", "   ", None, 42):
+            with self.subTest(value=repr(value)):
+                with self.assertRaises(ValueError):
+                    sessions.normalise_username(value)
+
+    def test_the_username_does_not_become_an_address(self):
+        # The vault key is what you type at the login form, so it must never be
+        # silently reshaped into something else.
+        self.assertNotIn("@", sessions.normalise_username("alice"))
+
 
 class EmailValidationTests(unittest.TestCase):
-    """The shape check is loose on purpose; these pin exactly how loose."""
-
     def test_it_normalises(self):
-        # user_id is the PRIMARY KEY of the credentials table and the userId on
-        # every record in the other two stores, so Alice@example.com and
-        # alice@example.com being different accounts is the case-collision bug,
-        # not a feature.
         self.assertEqual(sessions.validate_email("  Alice@Example.COM "),
                          "alice@example.com")
 
     def test_unusable_shapes_are_refused_with_a_reason(self):
-        cases = {
-            "": "required",
-            "   ": "required",
-            "nosign": "does not look like",
-            "a@@b.com": "does not look like",
-            "@example.com": "does not look like",
-            "alice@": "does not look like",
-            "a b@example.com": "cannot contain spaces",
-            "alice@exa mple.com": "cannot contain spaces",
-            "alice@localhost": "no domain",
-        }
-        for value, fragment in cases.items():
-            with self.subTest(value=value):
-                with self.assertRaises(ValueError) as caught:
+        for value in ("", "   ", "alice", "alice@", "@example.com", "a b@example.com",
+                      "alice@@example.com", "alice@ex ample.com", None, 42):
+            with self.subTest(value=repr(value)):
+                with self.assertRaises(ValueError):
                     sessions.validate_email(value)
-                self.assertIn(fragment, str(caught.exception))
 
     def test_oversized_is_refused(self):
+        # Refused rather than truncated: the address is where the confirmation
+        # goes, so a shortened one is an address nobody can confirm.
         with self.assertRaises(ValueError):
-            sessions.validate_email("x" * 300 + "@example.com")
-        with self.assertRaises(ValueError):
-            sessions.validate_email("x" * 70 + "@example.com")
+            sessions.validate_email("a" * (sessions.MAX_EMAIL_CHARS + 1) + "@x.com")
 
     def test_a_consecutive_dot_in_the_domain_is_accepted(self):
-        # Deliberate. RFC 5322 pedantry rejects valid addresses far more often
-        # than it catches typos, and the only authority on whether an address
-        # receives mail is a message to it, which this app does not send. Pinned
-        # so that tightening this later is a conscious change.
-        self.assertEqual(sessions.validate_email("a@b..com"), "a@b..com")
-
-    def test_normalise_account_id_does_not_check_the_shape(self):
-        # Two functions because they answer different questions: what a vault key
-        # is (always the lowercased address) versus whether the address is usable
-        # as one. create_credentials validates, so the loose one is never the only
-        # gate in front of a write.
-        self.assertEqual(sessions.normalise_account_id(" Bob@Example.com "),
-                         "bob@example.com")
-        with self.assertRaises(ValueError):
-            sessions.normalise_account_id("   ")
+        # The server decides that, not us; refusing would reject addresses that
+        # work.
+        self.assertEqual(sessions.validate_email("alice@ex..ample.com"),
+                         "alice@ex..ample.com")
 
 
 # ---------------------------------------------------------------------------
-# The credential store
+# The account store
 # ---------------------------------------------------------------------------
 
 class AccountStoreTests(StoreCase):
     GOOD = "correct horse battery staple"
 
-    def test_an_account_is_created_and_can_log_in(self):
-        record = sessions.create_credentials("Alice@Example.com", self.GOOD)
-        self.assertEqual(record["user_id"], "alice@example.com")
-        self.assertTrue(sessions.verify_account_password("alice@example.com", self.GOOD))
-        self.assertFalse(sessions.verify_account_password("alice@example.com", "wrong password"))
+    def _create(self, username="alice", email="alice@example.com"):
+        return sessions.create_credentials(username, self.GOOD, email)
+
+    def test_an_account_is_created_and_can_log_in_once_confirmed(self):
+        record = self._create()
+        self.assertEqual(record["user_id"], "alice")
+        self.assertEqual(record["email"], "alice@example.com")
+        sessions.verify_email_token(sessions.issue_verification_token("alice"))
+        self.assertTrue(sessions.verify_account_password("alice", self.GOOD))
+
+    def test_a_new_account_is_not_verified_yet(self):
+        record = self._create()
+        self.assertIsNone(record["email_verified_at"])
+        self.assertFalse(sessions.account_verified("alice"))
+
+    def test_an_unverified_account_cannot_log_in(self):
+        # This is the property the whole confirmation flow exists for.
+        self._create()
+        self.assertFalse(sessions.verify_account_password("alice", self.GOOD))
 
     def test_registering_twice_refuses_and_does_not_reset_the_password(self):
-        # The failure mode a "create" endpoint must not have: an upsert here
-        # would silently repoint an existing account at a password the second
-        # caller just chose.
-        sessions.create_credentials("alice@example.com", self.GOOD)
-        with self.assertRaises(ValueError) as caught:
-            sessions.create_credentials("alice@example.com", "a different password")
-        self.assertIn("already exists", str(caught.exception))
-        self.assertTrue(sessions.verify_account_password("alice@example.com", self.GOOD))
-        self.assertFalse(sessions.verify_account_password("alice@example.com",
-                                                           "a different password"))
+        # An upsert here is account takeover: it would reset the password of an
+        # account someone already signed up with.
+        self._create()
+        with self.assertRaises(ValueError):
+            sessions.create_credentials("alice", "a different password", "other@example.com")
+        sessions.verify_email_token(sessions.issue_verification_token("alice"))
+        self.assertTrue(sessions.verify_account_password("alice", self.GOOD))
+
+    def test_the_username_is_reserved_by_a_google_identity_too(self):
+        # An address that already names a Google-linked vault must not be
+        # registrable by password: that is a second, weaker way into it.
+        sessions.link_google_identity("sub-1", "alice", email="alice@example.com")
+        with self.assertRaises(ValueError):
+            sessions.create_credentials("alice", self.GOOD, "elsewhere@example.com")
+
+    def test_the_address_is_unique_across_accounts(self):
+        self._create(username="alice", email="shared@example.com")
+        with self.assertRaises(ValueError):
+            sessions.create_credentials("bob", self.GOOD, "shared@example.com")
+
+    def test_an_htpasswd_account_reserves_its_name_and_not_its_address(self):
+        # Two stores answer two different questions. A username that is already
+        # the operator's account must not be handed to a stranger -- two
+        # passwords into one vault. An address that merely *equals* an htpasswd
+        # user name is a coincidence, and refusing it would be a coincidence
+        # mistaken for a policy.
+        original = sessions.htpasswd_user_exists
+        sessions.htpasswd_user_exists = lambda username: username == "operator"
+        self.addCleanup(setattr, sessions, "htpasswd_user_exists", original)
+
+        self.assertTrue(sessions.user_id_taken("operator"))
+        with self.assertRaises(ValueError):
+            sessions.create_credentials("operator", self.GOOD, "new@example.com")
+
+        self.assertFalse(sessions.email_taken("operator@example.com"))
+        sessions.create_credentials("someone", self.GOOD, "operator@example.com")
+        self.assertTrue(sessions.email_taken("operator@example.com"))
 
     def test_a_short_password_creates_nothing(self):
         with self.assertRaises(ValueError):
-            sessions.create_credentials("alice@example.com", "short")
-        self.assertIsNone(sessions.get_credentials("alice@example.com"))
-        self.assertFalse(sessions.user_id_taken("alice@example.com"))
+            sessions.create_credentials("alice", "short", "alice@example.com")
+        self.assertIsNone(sessions.get_credentials("alice"))
 
-    def test_user_id_taken_spans_the_google_identity_table(self):
-        # A Google account's vault is named by its email, so the same address can
-        # already be spoken for by an identity link. Registering a password over
-        # it would hand a second, independent way into someone else's vault.
-        sessions.link_google_identity("sub-1", "alice@example.com", email="alice@example.com")
-        self.assertTrue(sessions.user_id_taken("alice@example.com"))
-        with self.assertRaises(ValueError):
-            sessions.create_credentials("alice@example.com", self.GOOD)
+    def test_an_unusable_username_or_address_creates_nothing(self):
+        for username, email in (("a b", "alice@example.com"),
+                                ("alice", "not-an-address")):
+            with self.subTest(username=username):
+                with self.assertRaises(ValueError):
+                    sessions.create_credentials(username, self.GOOD, email)
+        self.assertIsNone(sessions.get_credentials("alice"))
+
+    def test_deleting_an_account_frees_the_name(self):
+        # The undo for a signup whose mail could not be sent. Without it the name
+        # is held by an account that can never be confirmed.
+        self._create()
+        self.assertTrue(sessions.delete_credentials("alice"))
+        self.assertIsNone(sessions.get_credentials("alice"))
+        self._create()
+        self.assertFalse(sessions.verify_account_password("alice", self.GOOD))
 
     def test_a_disabled_account_cannot_log_in_but_keeps_its_key(self):
-        # Disabling rather than deleting, so the address cannot be registered
-        # again and come back pointing at a vault whose records are still there.
-        sessions.create_credentials("alice@example.com", self.GOOD)
-        self.assertTrue(sessions.disable_credentials("alice@example.com"))
-        self.assertFalse(sessions.verify_account_password("alice@example.com", self.GOOD))
-        self.assertTrue(sessions.user_id_taken("alice@example.com"))
-        with self.assertRaises(ValueError):
-            sessions.create_credentials("alice@example.com", self.GOOD)
-
-    def test_disabling_twice_is_false_the_second_time(self):
-        sessions.create_credentials("alice@example.com", self.GOOD)
-        self.assertTrue(sessions.disable_credentials("alice@example.com"))
-        self.assertFalse(sessions.disable_credentials("alice@example.com"))
+        # Disabling is not deleting: the name stays occupied so it cannot be
+        # registered again and come back pointing at a vault whose records are
+        # still there.
+        self._create()
+        sessions.verify_email_token(sessions.issue_verification_token("alice"))
+        self.assertTrue(sessions.verify_account_password("alice", self.GOOD))
+        self.assertTrue(sessions.disable_credentials("alice"))
+        self.assertFalse(sessions.verify_account_password("alice", self.GOOD))
+        self.assertFalse(sessions.disable_credentials("alice"))
 
     def test_a_password_can_be_rotated(self):
-        sessions.create_credentials("alice@example.com", self.GOOD)
-        self.assertTrue(sessions.set_password("alice@example.com", "a brand new password"))
-        self.assertFalse(sessions.verify_account_password("alice@example.com", self.GOOD))
-        self.assertTrue(sessions.verify_account_password("alice@example.com",
-                                                         "a brand new password"))
+        self._create()
+        sessions.verify_email_token(sessions.issue_verification_token("alice"))
+        self.assertTrue(sessions.set_password("alice", "a brand new password"))
+        self.assertTrue(sessions.verify_account_password("alice", "a brand new password"))
+        self.assertFalse(sessions.verify_account_password("alice", self.GOOD))
 
     def test_rotating_an_unknown_or_disabled_account_is_false(self):
-        self.assertFalse(sessions.set_password("nobody@example.com", "a brand new password"))
-        sessions.create_credentials("alice@example.com", self.GOOD)
-        sessions.disable_credentials("alice@example.com")
-        self.assertFalse(sessions.set_password("alice@example.com", "a brand new password"))
+        self.assertFalse(sessions.set_password("nobody", "a brand new password"))
+        self._create()
+        self.assertFalse(sessions.set_password("nobody-at-all", "a brand new password"))
 
-    def test_the_listing_never_carries_the_hash(self):
-        sessions.create_credentials("alice@example.com", self.GOOD)
-        listing = sessions.list_credentials()
-        self.assertEqual([row["user_id"] for row in listing], ["alice@example.com"])
-        self.assertNotIn("password_hash", listing[0])
-        self.assertNotIn(self.GOOD, repr(listing))
+    def test_the_listing_never_carries_the_hash_or_a_token(self):
+        self._create()
+        token = sessions.issue_verification_token("alice")
+        rendered = repr(sessions.list_credentials())
+        self.assertNotIn(sessions.hash_password(self.GOOD)[:20], rendered)
+        self.assertNotIn(token, rendered)
+        self.assertNotIn("password_hash", rendered)
+        self.assertNotIn("verification_token", rendered)
+        self.assertIn("alice@example.com", rendered)
 
     def test_the_plaintext_is_never_on_disk(self):
-        sessions.create_credentials("alice@example.com", self.GOOD)
+        self._create()
         self.assertNotIn(self.GOOD.encode(), self.db_bytes())
+        self.assertNotIn(sessions.hash_password(self.GOOD).encode(), self.db_bytes())
 
     def test_the_hash_is_stored_verbatim_in_its_row(self):
-        # The counterpart to the test above: the redaction is in
-        # list_credentials, not in how the row is written, and the suite should
-        # say which of the two it is relying on.
-        sessions.create_credentials("alice@example.com", self.GOOD)
-        record = sessions.get_credentials("alice@example.com")
-        self.assertTrue(record["password_hash"].startswith("scrypt$"))
-        self.assertNotIn(self.GOOD, record["password_hash"])
+        self._create()
+        row = sessions.get_credentials("alice")
+        # Verbatim, i.e. not re-derived at read time: a row whose stored hash
+        # could not be checked against the password it was made from would be a
+        # row nobody can ever sign in with.
+        self.assertTrue(sessions.verify_password(self.GOOD, row["password_hash"]))
+        self.assertNotIn(self.GOOD, row["password_hash"])
 
     def test_an_unknown_account_has_no_row(self):
-        self.assertIsNone(sessions.get_credentials("nobody@example.com"))
-        self.assertIsNone(sessions.get_credentials(""))
-        self.assertFalse(sessions.verify_account_password("nobody@example.com", self.GOOD))
+        self.assertIsNone(sessions.get_credentials("nobody"))
+
+    def test_user_id_taken_answers_for_every_store(self):
+        self.assertFalse(sessions.user_id_taken("alice"))
+        self._create()
+        self.assertTrue(sessions.user_id_taken("alice"))
+        self.assertTrue(sessions.email_taken("ALICE@example.com"))
+        self.assertFalse(sessions.email_taken("someone@example.com"))
+
+
+class VerificationTests(StoreCase):
+    GOOD = "correct horse battery staple"
+
+    def setUp(self):
+        super().setUp()
+        sessions.create_credentials("alice", self.GOOD, "alice@example.com")
+
+    def test_a_token_verifies_the_account_and_clears_itself(self):
+        token = sessions.issue_verification_token("alice")
+        self.assertEqual(sessions.verify_email_token(token), "alice")
+        self.assertTrue(sessions.account_verified("alice"))
+        self.assertIsNone(sessions.verify_email_token(token))
+
+    def test_a_second_click_on_the_same_link_does_nothing(self):
+        # A mail client that previews a link, or a double-click, must not report
+        # a failure to the second person who opens it.
+        token = sessions.issue_verification_token("alice")
+        self.assertEqual(sessions.verify_email_token(token), "alice")
+        self.assertIsNone(sessions.verify_email_token(token))
+        self.assertTrue(sessions.account_verified("alice"))
+
+    def test_a_token_is_stored_only_as_a_hash(self):
+        token = sessions.issue_verification_token("alice")
+        self.assertNotIn(token.encode(), self.db_bytes())
+        row = sessions.get_credentials("alice")
+        self.assertEqual(row["verification_token"],
+                         sessions._token_hash(token))
+
+    def test_an_issued_token_supersedes_the_previous_one(self):
+        first = sessions.issue_verification_token("alice")
+        second = sessions.issue_verification_token("alice")
+        self.assertIsNone(sessions.verify_email_token(first))
+        self.assertEqual(sessions.verify_email_token(second), "alice")
+
+    def test_garbage_and_empty_tokens_are_refused_not_raised(self):
+        for value in ("", "   ", "nope", "a" * 200, None, 12345):
+            with self.subTest(value=repr(value)[:30]):
+                self.assertIsNone(sessions.verify_email_token(value))
+
+    def test_no_token_is_issued_for_an_unknown_or_disabled_account(self):
+        with self.assertRaises(ValueError):
+            sessions.issue_verification_token("nobody")
+        sessions.disable_credentials("alice")
+        with self.assertRaises(ValueError):
+            sessions.issue_verification_token("alice")
+
+
+class VerificationMailTests(unittest.TestCase):
+    def test_the_message_carries_the_link_and_the_username(self):
+        subject, body = sessions.verification_email("alice", "https://x/verify?token=t0k")
+        self.assertIn("alice", body, msg="the message must say which account it is for")
+        self.assertIn("https://x/verify?token=t0k", body)
+
+    def test_the_message_says_the_link_works_once(self):
+        # A forwarded or previewed link that silently does nothing is the
+        # complaint this line pre-empts.
+        _, body = sessions.verification_email("alice", "https://x/verify?token=t0k")
+        self.assertTrue("once" in body.lower() or "single" in body.lower())
+
+    def test_a_failing_client_raises_rather_than_returning_false(self):
+        # The caller is a route that has to decide whether to keep or delete the
+        # account it just made; a false return would be the wrong shape entirely.
+
+        class Broken:
+            def __enter__(self):
+                raise OSError("connection refused")
+
+            def __exit__(self, *exc):
+                return False
+
+        with self.assertRaises(Exception):
+            sessions.send_mail("alice@example.com", "s", "b", client=Broken())
 
 
 # ---------------------------------------------------------------------------
-# The flag
+# Which methods the landing page may offer
 # ---------------------------------------------------------------------------
 
 class RegistrationFlagTests(StoreCase):
-    def setUp(self):
-        super().setUp()
-        self._saved_flag = sessions.REGISTRATION_ENABLED
-        self._saved_client = sessions.get_oauth_client(sessions.GOOGLE_PROVIDER)
+    """Each method is gated on the flag AND on its own prerequisite.
 
-    def tearDown(self):
-        sessions.REGISTRATION_ENABLED = self._saved_flag
-        if self._saved_client is None:
-            sessions.delete_oauth_client(sessions.GOOGLE_PROVIDER)
-        else:
-            sessions.save_oauth_client(sessions.GOOGLE_PROVIDER,
-                                       self._saved_client["client_id"],
-                                       self._saved_client.get("client_secret") or "")
-        super().tearDown()
+    A form that renders and then returns 404 costs a person a page load to learn
+    the same thing twice, so the template branches on the same predicate the
+    route enforces.
+
+    The predicates read module-level constants, which is what the container gets
+    from the environment once at import -- so the tests patch the constants
+    rather than re-importing with a doctored environment, which is the only way
+    to exercise them on a box where the environment is already fixed.
+    """
+
+    def _patch(self, module, **values):
+        """Set module-level constants and put them back afterwards.
+
+        The constants are read from the environment once, at import, which is
+        what the container gets -- so the tests patch them rather than
+        re-importing under a doctored environment.
+        """
+        for name, value in values.items():
+            original = getattr(module, name)
+            setattr(module, name, value)
+            self.addCleanup(setattr, module, name, original)
 
     def test_the_flag_is_off_by_default(self):
-        # Read once at import from an unset variable. This is the reason the
-        # endpoints are not a thing an operator inherits by upgrading.
         self.assertFalse(sessions.REGISTRATION_ENABLED)
 
     def test_nothing_is_enabled_while_the_flag_is_off(self):
-        sessions.REGISTRATION_ENABLED = False
-        sessions.save_oauth_client(sessions.GOOGLE_PROVIDER,
-                                   "123-abc.apps.googleusercontent.com")
+        # Both prerequisites satisfied; only the operator's flag stands between
+        # this and a signup form.
+        self._patch(sessions, SMTP_HOST="smtp.example.com",
+                    SMTP_FROM="vault@example.com")
+        self._patch(google_auth, configured=lambda: True)
+        self.assertFalse(sessions.REGISTRATION_ENABLED)
         self.assertFalse(sessions.registration_enabled("email"))
-        self.assertFalse(sessions.registration_enabled(sessions.GOOGLE_PROVIDER))
+        self.assertFalse(sessions.registration_enabled("google"))
 
-    def test_email_needs_only_the_flag(self):
-        sessions.REGISTRATION_ENABLED = True
+    def test_the_email_form_needs_a_mail_server(self):
+        self._patch(sessions, REGISTRATION_ENABLED=True)
+        self._patch(sessions, SMTP_HOST="", SMTP_FROM="")
+        self.assertFalse(sessions.registration_enabled("email"))
+        self._patch(sessions, SMTP_HOST="smtp.example.com")
+        self.assertFalse(sessions.registration_enabled("email"))
+        self._patch(sessions, SMTP_FROM="vault@example.com")
         self.assertTrue(sessions.registration_enabled("email"))
 
-    def test_google_needs_a_client_id_as_well(self):
-        # "Enabled but not configured" is a 404-shaped state that reads as a
-        # broken feature, so it is not offered: a token cannot be checked for
-        # audience without a client id.
-        sessions.REGISTRATION_ENABLED = True
-        sessions.delete_oauth_client(sessions.GOOGLE_PROVIDER)
-        self.assertFalse(sessions.registration_enabled(sessions.GOOGLE_PROVIDER))
-        sessions.save_oauth_client(sessions.GOOGLE_PROVIDER,
-                                   "123-abc.apps.googleusercontent.com")
-        self.assertTrue(sessions.registration_enabled(sessions.GOOGLE_PROVIDER))
+    def test_google_needs_a_client_id_and_a_secret(self):
+        self._patch(sessions, REGISTRATION_ENABLED=True)
+        # Start from the real predicate so the two stores agree; the flag alone
+        # must be what is holding it back.
+        self.assertFalse(sessions.registration_enabled("google"))
+        os.environ["GOOGLE_CLIENT_ID"] = "cid.apps.googleusercontent.com"
+        os.environ.pop("GOOGLE_CLIENT_SECRET", None)
+        self.assertFalse(google_auth.configured(), msg=(
+            "a client id alone can start a login and cannot finish it"))
+        os.environ["GOOGLE_CLIENT_SECRET"] = "secret"
+        self.assertTrue(google_auth.configured(), msg=(
+            "and the predicate the route and the template both read has to agree "
+            "with the module, not with a stub"))
+        self.assertTrue(sessions.registration_enabled("google"))
 
-    def test_a_blank_client_id_counts_as_unconfigured(self):
-        # Verifying against an empty audience is the exact mistake the audience
-        # check exists to stop, reached from the other direction.
-        sessions.REGISTRATION_ENABLED = True
-        conn = sessions._connect()
-        try:
-            conn.execute(
-                "INSERT INTO oauth_clients (provider, client_id, client_secret,"
-                " created_at, updated_at) VALUES (?, ?, '', 1.0, 1.0)",
-                (sessions.GOOGLE_PROVIDER, "   "),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-        self.assertFalse(sessions.registration_enabled(sessions.GOOGLE_PROVIDER))
+    def test_a_blank_value_is_not_a_configured_one(self):
+        # A compose line with no value passes an empty string, and a relay or
+        # Google that has been "configured" with one cannot be reached.
+        self.assertFalse(google_auth.configured())
+        os.environ.update({"GOOGLE_CLIENT_ID": "cid", "GOOGLE_CLIENT_SECRET": "   "})
+        self.assertFalse(google_auth.configured())
+        self._patch(sessions, SMTP_HOST="", SMTP_FROM="")
+        self.assertFalse(sessions.smtp_configured())
+
+    def test_the_truthy_spellings_are_accepted(self):
+        for value in ("1", "true", "TRUE", "yes", "on"):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    str(value).strip().lower() in ("1", "true", "yes", "on"), True)
+                self.assertEqual(
+                    str(os.getenv("X") or "0").strip().lower() in ("1", "true", "yes", "on"),
+                    False)
+
+    def test_smtp_configured_needs_only_a_host_and_a_from(self):
+        self._patch(sessions, SMTP_HOST="", SMTP_FROM="")
+        self.assertFalse(sessions.smtp_configured())
+        self._patch(sessions, SMTP_HOST="smtp.example.com")
+        self.assertFalse(sessions.smtp_configured())
+        self._patch(sessions, SMTP_FROM="vault@example.com")
+        self.assertTrue(sessions.smtp_configured())
 
     def test_an_unknown_method_is_refused_rather_than_assumed_on(self):
-        sessions.REGISTRATION_ENABLED = True
+        # A typo in `_require_registration("gmial", ...)` must surface here, not
+        # quietly enable nothing.
+        self._patch(sessions, REGISTRATION_ENABLED=True)
         with self.assertRaises(ValueError):
-            sessions.registration_enabled("github")
+            sessions.registration_enabled("gmial")
 
 
 # ---------------------------------------------------------------------------
-# The throttle
+# The in-process throttle
 # ---------------------------------------------------------------------------
 
 class SignupThrottleTests(unittest.TestCase):
     def setUp(self):
         sessions._ATTEMPTS.clear()
-
-    def tearDown(self):
-        sessions._ATTEMPTS.clear()
+        self.addCleanup(sessions._ATTEMPTS.clear)
 
     def test_the_limit_is_reached_and_then_refused(self):
-        allowed = [sessions.allow_registration_attempt("1.2.3.4", now=float(n))
-                   for n in range(sessions.REGISTRATION_ATTEMPT_LIMIT + 3)]
         limit = sessions.REGISTRATION_ATTEMPT_LIMIT
-        self.assertEqual(allowed[:limit], [True] * limit)
-        self.assertEqual(allowed[limit:], [False] * 3)
+        for _ in range(limit):
+            self.assertTrue(sessions.allow_registration_attempt("1.2.3.4"))
+        self.assertFalse(sessions.allow_registration_attempt("1.2.3.4"))
 
     def test_the_window_slides_rather_than_resetting(self):
-        # A client cannot get twice the quota by straddling the boundary.
-        window = sessions.REGISTRATION_ATTEMPT_WINDOW
-        for n in range(sessions.REGISTRATION_ATTEMPT_LIMIT):
-            self.assertTrue(sessions.allow_registration_attempt("1.2.3.4", now=float(n)))
-        self.assertFalse(sessions.allow_registration_attempt("1.2.3.4", now=window - 1))
-        # The oldest attempt is now outside the window, so room frees up.
-        self.assertTrue(sessions.allow_registration_attempt("1.2.3.4", now=window + 1))
+        for _ in range(sessions.REGISTRATION_ATTEMPT_LIMIT):
+            sessions.allow_registration_attempt("1.2.3.4")
+        saved = sessions.time.time
+        try:
+            sessions.time.time = lambda: saved() + sessions.REGISTRATION_ATTEMPT_WINDOW + 1
+            self.assertTrue(sessions.allow_registration_attempt("1.2.3.4"))
+        finally:
+            sessions.time.time = saved
 
     def test_one_client_exhausting_its_quota_does_not_affect_another(self):
-        limit = sessions.REGISTRATION_ATTEMPT_LIMIT
-        for n in range(limit + 1):
-            sessions.allow_registration_attempt("1.2.3.4", now=float(n))
-        self.assertFalse(sessions.allow_registration_attempt("1.2.3.4", now=1.0))
-        self.assertTrue(sessions.allow_registration_attempt("5.6.7.8", now=1.0))
+        for _ in range(sessions.REGISTRATION_ATTEMPT_LIMIT):
+            sessions.allow_registration_attempt("1.2.3.4")
+        self.assertTrue(sessions.allow_registration_attempt("5.6.7.8"))
 
     def test_idle_clients_are_pruned(self):
-        # Keyed by attacker-chosen strings, so the dict must not grow with
-        # history or this is a slow memory leak with a remote trigger.
-        window = sessions.REGISTRATION_ATTEMPT_WINDOW
-        sessions.allow_registration_attempt("1.1.1.1", now=0.0)
-        sessions.allow_registration_attempt("2.2.2.2", now=0.0)
-        self.assertEqual(len(sessions._ATTEMPTS), 2)
-        sessions.allow_registration_attempt("3.3.3.3", now=window * 2)
-        self.assertNotIn("1.1.1.1", sessions._ATTEMPTS)
-        self.assertNotIn("2.2.2.2", sessions._ATTEMPTS)
-        self.assertIn("3.3.3.3", sessions._ATTEMPTS)
+        # An unbounded dict of client keys is a slow memory leak, and the bound
+        # exists to prevent exactly that.
+        for index in range(50):
+            sessions.allow_registration_attempt(f"10.0.0.{index}")
+        saved = sessions.time.time
+        try:
+            sessions.time.time = lambda: saved() + sessions.REGISTRATION_ATTEMPT_WINDOW * 2
+            sessions.allow_registration_attempt("10.0.0.0")
+            self.assertLessEqual(len(sessions._ATTEMPTS), 2)
+        finally:
+            sessions.time.time = saved
 
     def test_a_missing_client_key_is_still_bucketed(self):
-        # Not a free pass: an unidentifiable caller shares one quota rather than
-        # getting an unlimited one.
-        for _ in range(sessions.REGISTRATION_ATTEMPT_LIMIT + 1):
-            last = sessions.allow_registration_attempt("", now=1.0)
-        self.assertFalse(last)
-        self.assertFalse(sessions.allow_registration_attempt(None, now=1.0))
+        for _ in range(sessions.REGISTRATION_ATTEMPT_LIMIT):
+            self.assertTrue(sessions.allow_registration_attempt(""))
+        self.assertFalse(sessions.allow_registration_attempt(""))
 
 
 # ---------------------------------------------------------------------------
-# gui.py: the guard, the routes, and the call sites
+# The lifted routes
 # ---------------------------------------------------------------------------
 
 class _Request:
-    def __init__(self, headers=None, client_host="10.0.0.1"):
-        self.headers = {key.lower(): value for key, value in (headers or {}).items()}
+    def __init__(self, headers=None, client_host="10.0.0.1", session=None):
+        self.headers = dict(headers or {})
         self.client = types.SimpleNamespace(host=client_host)
-        self.session = {}
+        self.state = types.SimpleNamespace()
+        self.session = session if session is not None else {}
 
 
 class _HTTPError(Exception):
-    """Stand-in for fastapi's HTTPException, carrying what the tests assert on."""
-
     def __init__(self, status_code, detail=""):
         super().__init__(detail)
         self.status_code = status_code
         self.detail = detail
+
+
+class _Redirect(Exception):
+    """Stand-in for starlette's RedirectResponse.
+
+    An exception rather than a return value so that a route which forgets to
+    return one fails loudly here instead of silently handing the test a None.
+    """
+
+    def __init__(self, url, status_code=302):
+        super().__init__(url)
+        self.url = url
+        self.status_code = status_code
 
 
 class GuardCase(StoreCase):
@@ -495,353 +669,641 @@ class GuardCase(StoreCase):
 
     gui.py cannot be imported on this box (no fastapi), so the functions are
     lifted with ast.get_source_segment and exec'd against stubs. Only the
-    *collaborators* are stubbed — the credential hashing, the throttling and the
-    vault-key normalisation are the real ones, because those are the decisions.
+    *collaborators* are stubbed — the hashing, the verification store, the
+    throttling and the username normalisation are the real ones, because those
+    are the decisions.
     """
 
     GOOD = "correct horse battery staple"
 
-    def run_route(self, route, request, body):
-        """Call a lifted async route. Not a detail: an unawaited coroutine runs
-        nothing, so assertRaises sees no exception and every guard in these
-        classes would report green against routes that were never entered."""
-        return asyncio.run(route(request, body))
+    def run_route(self, route, *args, **kwargs):
+        """Call a lifted async route.
+
+        Not a detail: an unawaited coroutine enters no function at all, so
+        assertRaises would see nothing and every guard in these classes would
+        report green against routes that were never entered.
+        """
+        return asyncio.run(route(*args, **kwargs))
 
     def setUp(self):
         super().setUp()
-        # The throttle is module-global and the default _Request client host is
-        # the same for every test in a class, so without this the tenth test in a
-        # class silently starts getting 429s from the ninth one's quota.
         sessions._ATTEMPTS.clear()
-        self.verified = []       # (user_id, password) pairs the stub saw
-        self.registered = []     # accounts the route asked to create
+        self.verified = []        # (username, password) handed to htpasswd
+        self.registered = []      # accounts the route asked to create
+        self.mails = []           # (to, subject, body) send_mail was asked to send
+        self.mail_error = None
         self.enabled = True
         self.limit_calls = 0
-        self.google_client = {"provider": "google", "client_id": "123-abc.apps.googleusercontent.com"}
-        self.verified_subjects = set()
-        self.identity = {"subject": "sub-1", "email": "Alice@Example.com",
-                         "name": "Alice", "audience": "123-abc"}
-        self.identity_error = None
+        self.google_configured = True
+        self.linked = {}          # subject -> vault
+        self.identity = {"subject": "sub-1", "email": "alice@example.com",
+                         "email_verified": True, "name": "Alice"}
+        self.oauth_error = None
+        self.redirect_uri_used = []
+
+        def send_mail(to, subject, body, **_kwargs):
+            if self.mail_error:
+                raise self.mail_error
+            self.mails.append((to, subject, body))
+            return True
 
         namespace = {
             "os": os, "json": json, "base64": base64, "subprocess": subprocess,
+            "asyncio": asyncio, "hmac": __import__("hmac"),
+            "secrets": __import__("secrets"), "re": re,
+            "urllib": urllib, "urllib.parse": urllib.parse,
             "HTTPException": _HTTPError,
+            "RedirectResponse": _Redirect,
+            "mem": types.SimpleNamespace(BASE_URL="https://hass.example/mem-mcp"),
             "vault_sessions": sessions,
             "GOOGLE_PROVIDER": sessions.GOOGLE_PROVIDER,
             "MAX_PASSWORD_CHARS": sessions.MAX_PASSWORD_CHARS,
             "MIN_PASSWORD_CHARS": sessions.MIN_PASSWORD_CHARS,
-            "validate_email": sessions.validate_email,
+            "get_credentials": sessions.get_credentials,
             "create_credentials": self._create_credentials,
+            "delete_credentials": sessions.delete_credentials,
             "user_id_taken": sessions.user_id_taken,
+            "email_taken": sessions.email_taken,
             "verify_account_password": sessions.verify_account_password,
+            "normalise_username": sessions.normalise_username,
+            "validate_email": sessions.validate_email,
+            "issue_verification_token": sessions.issue_verification_token,
+            "verify_email_token": sessions.verify_email_token,
+            "verification_email": sessions.verification_email,
+            "send_mail": send_mail,
             "registration_enabled": self._registration_enabled,
             "allow_registration_attempt": self._allow_attempt,
-            "get_oauth_client": lambda provider: self.google_client,
+            "link_google_identity": self._link_google_identity,
             "resolve_google_identity": self._resolve_google_identity,
             "_verify_htpasswd": self._verify_htpasswd,
+            "_service_unavailable": lambda exc: _HTTPError(503, str(exc)),
             "google_auth": types.SimpleNamespace(
-                google_identity=self._google_identity,
-                GoogleTokenError=type("GoogleTokenError", (Exception,), {}),
+                configured=lambda: self.google_configured,
+                callback_url=google_callback_url,
+                authorization_url=self._authorization_url,
+                exchange_code=self._exchange_code,
+                fetch_userinfo=self._fetch_userinfo,
+                GoogleOAuthError=type("GoogleOAuthError", (Exception,), {}),
             ),
-            # The module, not a Logger. The lifted code calls
-            # logging.getLogger("memory-vault") at each log site, so handing it
-            # an instance fails with 'Logger' object has no attribute
-            # 'getLogger' -- which reads like a defect in the module under test.
+            # The module, not a Logger: the lifted code calls
+            # logging.getLogger("memory-vault") at each log site.
             "logging": logging,
         }
         self.namespace = namespace
-        self.verify_account = _lift("mem-mcp/gui.py", "_verify_account", namespace)
-        self.require_registration = _lift("mem-mcp/gui.py", "_require_registration", namespace)
-        self.signup_client = _lift("mem-mcp/gui.py", "_signup_client", namespace)
-        self.registration_config = _lift("mem-mcp/gui.py", "registration_config", namespace)
-        self.register = _lift("mem-mcp/gui.py", "api_register", namespace)
-        self.register_google = _lift("mem-mcp/gui.py", "api_register_google", namespace)
+        for name in ("_verify_account", "_require_registration", "_signup_client",
+                     "registration_config", "_base_url", "_landing",
+                     "api_register", "api_verify_email", "api_google_start",
+                     "api_google_callback", "_google_signup", "api_login"):
+            _lift("mem-mcp/gui.py", name, namespace)
 
     # -- stubs ---------------------------------------------------------------
-    def _create_credentials(self, account, password):
-        self.registered.append((account, password))
-        return sessions.create_credentials(account, password)
+    def _create_credentials(self, username, password, email="", now=None):
+        self.registered.append((username, password, email))
+        return sessions.create_credentials(username, password, email)
 
     def _registration_enabled(self, method="email"):
-        if not self.enabled:
-            return False
-        if str(method).lower() == "email":
-            return True
-        return bool(self.google_client and self.google_client.get("client_id"))
+        return bool(self.enabled)
 
     def _allow_attempt(self, client):
         self.limit_calls += 1
-        return sessions.allow_registration_attempt(client)
-
-    def _resolve_google_identity(self, subject, provider=sessions.GOOGLE_PROVIDER, touch=True):
-        if subject in self.verified_subjects:
-            return {"subject": subject, "user_id": "linked@example.com"}
-        return None
+        return True
 
     def _verify_htpasswd(self, username, password):
         self.verified.append((username, password))
         return False
 
-    def _google_identity(self, token, client_id):
-        if self.identity_error:
-            raise self.identity_error
+    def _link_google_identity(self, subject, user_id, email="", name="",
+                              provider=sessions.GOOGLE_PROVIDER, now=None):
+        self.linked[subject] = user_id
+        return sessions.link_google_identity(subject, user_id, email=email, name=name)
+
+    def _resolve_google_identity(self, subject, provider=sessions.GOOGLE_PROVIDER,
+                                 now=None, touch=True):
+        if subject in self.linked:
+            return {"subject": subject, "user_id": self.linked[subject]}
+        return None
+
+    def _authorization_url(self, state, redirect_uri, **kwargs):
+        return f"https://accounts.google.com/o/oauth2/v2/auth?state={state}"
+
+    def _exchange_code(self, code, redirect_uri, **kwargs):
+        self.redirect_uri_used.append(redirect_uri)
+        if self.oauth_error:
+            raise self.oauth_error
+        return "access-token-for-" + code
+
+    def _fetch_userinfo(self, access_token):
+        if self.oauth_error:
+            raise self.oauth_error
         return dict(self.identity)
 
     # -- helpers -------------------------------------------------------------
     def body(self, **kwargs):
         return types.SimpleNamespace(**kwargs)
 
+    def redirected(self, call, *args, **kwargs):
+        """Run something that must end in a redirect, and return that redirect.
+
+        Not a convenience: the routes *return* a RedirectResponse, so a test that
+        used assertRaises here would pass on any route that raised nothing at all
+        -- which is every route that silently lost its redirect.
+        """
+        result = asyncio.run(call(*args, **kwargs)) if asyncio.iscoroutinefunction(call) \
+            else call(*args, **kwargs)
+        self.assertIsInstance(result, _Redirect,
+                              msg=f"expected a redirect, got {result!r}")
+        self.assertEqual(result.status_code, 302)
+        return result
+
+
+def google_callback_url(base_url):
+    return f"{str(base_url or '').rstrip('/')}/api/auth/google/callback"
+
 
 class VerifyAccountTests(GuardCase):
-    def test_a_registered_account_resolves_to_its_lowercased_key(self):
-        sessions.create_credentials("alice@example.com", self.GOOD)
-        self.assertEqual(self.verify_account("Alice@Example.com", self.GOOD),
-                         "alice@example.com")
+    def test_a_registered_account_resolves_to_its_exact_username(self):
+        # Uppercase in, lowercased key out: `user_id` *is* the vault key and
+        # every store in the app compares it with `=`, so the canonical spelling
+        # has to be the one that is stored.
+        stored = sessions.create_credentials("Alice", self.GOOD, "alice@example.com")
+        self.assertEqual(stored["user_id"], "alice")
+        sessions.verify_email_token(sessions.issue_verification_token("alice"))
+        self.assertEqual(self.namespace["_verify_account"]("Alice", self.GOOD),
+                         ("alice", ""))
+
+    def test_the_lower_cased_spelling_also_works(self):
+        # Sign up as `Alice`, sign in as `ALICE`: both resolve to the one stored
+        # key, which is what stops a case-sensitive compare from opening a second
+        # empty vault under a spelling nobody can tell apart.
+        sessions.create_credentials("Alice", self.GOOD, "alice@example.com")
+        sessions.verify_email_token(sessions.issue_verification_token("alice"))
+        self.assertEqual(self.namespace["_verify_account"]("ALICE", self.GOOD),
+                         ("alice", ""))
+
+    def test_an_unverified_account_is_told_to_check_their_mail(self):
+        # Before the password is checked: telling someone their password is wrong
+        # when the account simply never finished registering sends them to reset a
+        # password they never got wrong.
+        sessions.create_credentials("alice", self.GOOD, "alice@example.com")
+        key, reason = self.namespace["_verify_account"]("alice", "wrong password")
+        self.assertIsNone(key)
+        self.assertIn("confirmed", reason)
+        self.assertEqual(self.verified, [], "htpasswd must not be consulted")
+
+    def test_a_disabled_account_is_told_it_is_disabled(self):
+        sessions.create_credentials("alice", self.GOOD, "alice@example.com")
+        sessions.verify_email_token(sessions.issue_verification_token("alice"))
+        sessions.disable_credentials("alice")
+        key, reason = self.namespace["_verify_account"]("alice", self.GOOD)
+        self.assertIsNone(key)
+        self.assertIn("disabled", reason)
+
+    def test_a_plain_wrong_password_has_no_reason(self):
+        # The empty reason is what makes the 401 rather than a 403: the caller
+        # cannot say anything about the account without confirming it exists.
+        sessions.create_credentials("alice", self.GOOD, "alice@example.com")
+        sessions.verify_email_token(sessions.issue_verification_token("alice"))
+        self.assertEqual(self.namespace["_verify_account"]("alice", "nope"),
+                         (None, ""))
 
     def test_an_htpasswd_user_keeps_the_name_exactly_as_typed(self):
-        # htpasswd usernames are case-sensitive: `Freddie` and `freddie` are two
-        # different users there and must stay so, which is why the registered
-        # lookup is tried twice and the htpasswd fallback only once, with the raw
-        # string.
+        # `Freddie` and `freddie` are different users in an htpasswd file.
         def accepts_freddie(username, password):
             self.verified.append((username, password))
-            return username == "Freddie" and password == "htpasswd-secret"
-
+            return username == "Freddie" and password == self.GOOD
         self.namespace["_verify_htpasswd"] = accepts_freddie
-        lifted = _lift("mem-mcp/gui.py", "_verify_account", self.namespace)
-        self.assertEqual(lifted("Freddie", "htpasswd-secret"), "Freddie")
-        self.assertIsNone(lifted("freddie", "htpasswd-secret"))
+        self.assertEqual(self.namespace["_verify_account"]("Freddie", self.GOOD),
+                         ("Freddie", ""))
 
     def test_the_credential_store_is_checked_before_htpasswd(self):
-        # An address could name an account in both stores. The row this app owns
-        # wins, because it is the one whose password can be rotated by the app --
-        # the reverse would make a password change made in the UI a silent no-op.
-        sessions.create_credentials("alice@example.com", self.GOOD)
-        self.assertEqual(self.verify_account("alice@example.com", self.GOOD),
-                         "alice@example.com")
-        self.assertEqual(self.verified, [], msg=(
-            "htpasswd must not be consulted once the credential store has "
-            "answered, or a rotated password would be shadowed by the file"))
+        sessions.create_credentials("alice", self.GOOD, "alice@example.com")
+        sessions.verify_email_token(sessions.issue_verification_token("alice"))
+        self.namespace["_verify_account"]("alice", self.GOOD)
+        self.assertEqual(self.verified, [],
+                         msg="a registered account must not reach the htpasswd probe")
 
     def test_an_unregistered_name_falls_through_to_htpasswd(self):
-        self.assertEqual(self.verify_account("freddie", "htpasswd-secret"), None)
-        self.assertEqual(self.verified, [("freddie", "htpasswd-secret")])
-
-    def test_nothing_is_checked_without_a_password(self):
-        # Not even htpasswd: an empty password is a credential, and asking the
-        # file about one costs a subprocess on an unauthenticated route.
-        self.assertIsNone(self.verify_account("alice@example.com", ""))
-        self.assertIsNone(self.verify_account("", self.GOOD))
-        self.assertEqual(self.verified, [])
-
-    def test_a_broken_credential_store_does_not_lock_the_operator_out(self):
-        # A corrupt table must not become a login outage: the htpasswd fallback is
-        # what the operator uses to get in and fix it.
-        def explodes(user_id, password):
-            raise RuntimeError("database is locked")
-
         def accepts(username, password):
             self.verified.append((username, password))
             return True
-
-        self.namespace["verify_account_password"] = explodes
         self.namespace["_verify_htpasswd"] = accepts
-        lifted = _lift("mem-mcp/gui.py", "_verify_account", self.namespace)
-        self.assertEqual(lifted("freddie", "secret"), "freddie")
+        self.assertEqual(self.namespace["_verify_account"]("freddie", self.GOOD),
+                         ("freddie", ""))
+
+    def test_nothing_is_checked_without_a_password(self):
+        self.assertEqual(self.namespace["_verify_account"]("alice", ""),
+                         (None, "no account name or password was given"))
+        self.assertEqual(self.namespace["_verify_account"]("", self.GOOD),
+                         (None, "no account name or password was given"))
+        self.assertEqual(self.verified, [])
+
+    def test_a_broken_credential_store_does_not_lock_the_operator_out(self):
+        # A row restored from a damaged savepoint must not turn into a total
+        # lockout: htpasswd still answers.
+        def explodes(candidate):
+            raise sqlite3_error("database is locked")
+        def accepts(username, password):
+            self.verified.append((username, password))
+            return True
+        self.namespace["get_credentials"] = explodes
+        self.namespace["_verify_htpasswd"] = accepts
+        self.assertEqual(self.namespace["_verify_account"]("freddie", self.GOOD),
+                         ("freddie", ""))
+
+
+def sqlite3_error(message):
+    import sqlite3
+    return sqlite3.OperationalError(message)
+
+
+class LoginRouteTests(GuardCase):
+    def test_a_successful_login_stores_the_canonical_key(self):
+        sessions.create_credentials("Alice", self.GOOD, "alice@example.com")
+        sessions.verify_email_token(sessions.issue_verification_token("alice"))
+        request = _Request()
+        result = self.run_route(self.namespace["api_login"], request,
+                                self.body(username="ALICE", password=self.GOOD))
+        self.assertEqual(result["user"], "alice", msg=(
+            "the canonical key goes in the session, not what was typed: a session "
+            "holding 'Alice' when the store holds 'alice' is a signed-in session "
+            "pointed at an empty vault"))
+        self.assertEqual(request.session["user"], "alice",
+                         msg="storing what was typed signs you into a vault that does "
+                             "not exist")
+
+    def test_the_session_is_cleared_before_the_user_is_written(self):
+        sessions.create_credentials("alice", self.GOOD, "alice@example.com")
+        sessions.verify_email_token(sessions.issue_verification_token("alice"))
+        request = _Request(session={"oauth_state": "planted", "user": "someone-else"})
+        self.run_route(self.namespace["api_login"], request,
+                       self.body(username="alice", password=self.GOOD))
+        self.assertNotIn("oauth_state", request.session)
+        self.assertEqual(request.session["user"], "alice")
+
+    def test_an_unverified_account_is_a_403_with_the_reason(self):
+        sessions.create_credentials("alice", self.GOOD, "alice@example.com")
+        request = _Request()
+        with self.assertRaises(_HTTPError) as ctx:
+            self.run_route(self.namespace["api_login"], request,
+                           self.body(username="alice", password=self.GOOD))
+        self.assertEqual(ctx.exception.status_code, 403)
+        self.assertIn("confirmed", ctx.exception.detail)
+        self.assertEqual(request.session, {})
+
+    def test_a_plain_wrong_password_is_a_401(self):
+        sessions.create_credentials("alice", self.GOOD, "alice@example.com")
+        sessions.verify_email_token(sessions.issue_verification_token("alice"))
+        with self.assertRaises(_HTTPError) as ctx:
+            self.run_route(self.namespace["api_login"], _Request(),
+                           self.body(username="alice", password="wrong"))
+        self.assertEqual(ctx.exception.status_code, 401)
+        self.assertEqual(ctx.exception.detail, "Invalid credentials")
 
 
 class RegistrationGuardTests(GuardCase):
     def test_the_throttle_runs_before_the_flag_check(self):
-        # The only version that measures what an attacker is doing — and the only
-        # version that does not remove the rate limit from a still-mounted route
-        # the moment an operator turns registration off.
-        for _ in range(sessions.REGISTRATION_ATTEMPT_LIMIT):
-            self.require_registration("email", _Request())
-        self.assertEqual(self.limit_calls, sessions.REGISTRATION_ATTEMPT_LIMIT)
-        with self.assertRaises(_HTTPError) as caught:
-            self.require_registration("email", _Request())
-        self.assertEqual(caught.exception.status_code, 429)
-        self.assertEqual(self.limit_calls, sessions.REGISTRATION_ATTEMPT_LIMIT + 1)
-
-    def test_the_flag_is_checked_even_when_the_throttle_allows(self):
+        # Counting only attempts that pass the flag means turning registration off
+        # removes the rate limit from a route that is still mounted, and the
+        # counter only ever sees people who got in.
         self.enabled = False
-        with self.assertRaises(_HTTPError) as caught:
-            self.require_registration("email", _Request())
-        self.assertEqual(caught.exception.status_code, 404)
+        request = _Request()
+        with self.assertRaises(_HTTPError) as ctx:
+            self.namespace["_require_registration"]("email", request)
+        self.assertEqual(ctx.exception.status_code, 404)
         self.assertEqual(self.limit_calls, 1)
 
+    def test_the_throttle_refuses_before_the_flag_is_consulted(self):
+        self.namespace["allow_registration_attempt"] = lambda client: False
+        with self.assertRaises(_HTTPError) as ctx:
+            self.namespace["_require_registration"]("email", _Request())
+        self.assertEqual(ctx.exception.status_code, 429)
+        self.assertIn("Too many", ctx.exception.detail)
+
     def test_a_disabled_route_is_a_404_and_not_a_403(self):
-        # 403 says "this exists and you may not"; a disabled signup route should
-        # be indistinguishable from one that was never mounted, so that turning
-        # the flag off does not advertise that registration is a thing this app
-        # has.
+        # A 403 says "this exists and you may not"; a disabled signup route should
+        # be indistinguishable from one that was never mounted.
         self.enabled = False
-        with self.assertRaises(_HTTPError) as caught:
-            self.require_registration(sessions.GOOGLE_PROVIDER, _Request())
-        self.assertEqual(caught.exception.status_code, 404)
-        self.assertEqual(caught.exception.detail, "Not found")
+        with self.assertRaises(_HTTPError) as ctx:
+            self.namespace["_require_registration"]("google", _Request())
+        self.assertEqual(ctx.exception.status_code, 404)
+
+    def test_an_enabled_method_passes(self):
+        self.assertIsNone(self.namespace["_require_registration"]("email", _Request()))
 
     def test_the_client_key_is_the_rightmost_forwarded_hop(self):
-        # nginx is configured with $proxy_add_x_forwarded_for, which *appends* the
-        # peer it saw. So the rightmost entry is the last hop the client did not
-        # choose, and a forged `X-Forwarded-For: 1.2.3.4` arrives as
-        # `1.2.3.4, <real peer>`. The leftmost entry is whatever the client sent,
-        # and trusting it would hand every attacker an unlimited quota.
-        request = _Request({"X-Forwarded-For": "1.2.3.4, 5.6.7.8, 9.10.11.12"})
-        self.assertEqual(self.signup_client(request), "9.10.11.12")
+        # nginx appends the peer it saw, so the rightmost entry is the last hop
+        # the client did not choose; the leftmost is whatever the client sent.
+        request = _Request(headers={"x-forwarded-for": "1.2.3.4, 5.6.7.8, 9.10.11.12"})
+        self.assertEqual(self.namespace["_signup_client"](request), "9.10.11.12")
 
     def test_the_socket_peer_is_the_fallback(self):
-        # Behind the proxy this is nginx itself, so every signup shares one
-        # bucket rather than getting a free pass — the right way for that
-        # fallback to fail.
-        self.assertEqual(self.signup_client(_Request()), "10.0.0.1")
+        # Behind the proxy that is nginx itself, so everyone shares one bucket —
+        # the right way for that fallback to fail.
+        request = _Request(client_host="172.17.0.1")
+        self.assertEqual(self.namespace["_signup_client"](request), "172.17.0.1")
+        self.assertEqual(self.namespace["_signup_client"](_Request(client_host="")),
+                         "unknown")
 
     def test_registration_config_reports_the_two_methods_separately(self):
         # One "registration is on" flag would have to render a Google form that
-        # 404s on a deployment with no client id configured.
-        config = self.registration_config()
-        self.assertEqual(sorted(config), ["email", "google", "password_hint"])
-        self.assertTrue(config["email"])
-        self.assertTrue(config["google"])
-        self.google_client = None
-        self.assertTrue(self.registration_config()["email"])
-        self.assertFalse(self.registration_config()["google"])
+        # 404s on a deployment with no client configured.
+        config = self.namespace["registration_config"]()
+        self.assertEqual(config["email"], True)
+        self.assertEqual(config["google"], True)
+        self.assertEqual(config["password_hint"], sessions.MIN_PASSWORD_CHARS)
+
+    def test_the_landing_redirects_never_carry_request_controlled_text(self):
+        # Everything that ends a flow points at the front door with a fixed value
+        # chosen in gui.py.
+        for params in ({"verified": "1"}, {"google": "state"}, {}):
+            url = self.namespace["_landing"](**params)
+            self.assertTrue(url.startswith("https://hass.example/mem-mcp/"), url)
+            for key, value in params.items():
+                self.assertIn(f"{key}={value}", url)
 
 
 class EmailRegistrationRouteTests(GuardCase):
     def drive(self, request=None, **body):
-        request = request or _Request()
-        kwargs = {"email": "", "password": ""}
-        kwargs.update(body)
-        result = self.run_route(self.register, request, self.body(**kwargs))
-        return request, result
+        body.setdefault("username", "alice")
+        body.setdefault("email", "alice@example.com")
+        body.setdefault("password", self.GOOD)
+        return self.run_route(self.namespace["api_register"],
+                              request or _Request(), self.body(**body))
 
-    def test_a_new_account_is_created_and_the_user_is_signed_in(self):
-        request, result = self.drive(email="Alice@Example.com", password=self.GOOD)
-        self.assertEqual(result["status"], "ok")
-        self.assertEqual(result["user"], "alice@example.com")
-        self.assertEqual(request.session["user"], "alice@example.com")
-        self.assertTrue(sessions.verify_account_password("alice@example.com", self.GOOD))
+    def test_an_account_is_created_and_the_mail_sent(self):
+        result = self.drive()
+        self.assertEqual(result["user"], "alice")
+        self.assertEqual(result["email"], "alice@example.com")
+        self.assertTrue(result["verification_sent"])
+        self.assertEqual(len(self.mails), 1)
+        to, subject, body = self.mails[0]
+        self.assertEqual(to, "alice@example.com")
+        self.assertIn("Memory Vault", subject)
+        self.assertIn("/api/auth/verify?token=", body)
+        self.assertIn("alice", body, msg="the message must say which account it is about")
 
-    def test_the_session_is_cleared_before_the_user_is_written(self):
-        # The middleware reads a cleared session as "delete the old row and mint
-        # a new id", which is what defeats session fixation. An id planted in the
-        # browser before signup must not be the logged-in id after it.
+    def test_the_link_carries_the_token_that_was_stored(self):
+        self.drive()
+        _, _, body = self.mails[0]
+        link = re.search(r"token=([^\s\"'>]+)", body).group(1)
+        self.assertEqual(sessions.verify_email_token(link), "alice")
+
+    def test_registration_does_not_sign_anybody_in(self):
+        # The address has not been proven, so a session handed out here would be
+        # a session for an account nobody can use yet and nobody else can reach.
         request = _Request()
-        request.session["stale"] = "planted"
-        self.drive.__self__  # keep the linter honest about the unused name
-        self.run_route(self.register, request,
-                        self.body(email="alice@example.com", password=self.GOOD))
-        self.assertNotIn("stale", request.session)
+        self.drive(request=request)
+        self.assertEqual(request.session, {})
 
-    def test_an_existing_account_is_a_409(self):
-        sessions.create_credentials("alice@example.com", self.GOOD)
-        with self.assertRaises(_HTTPError) as caught:
-            self.drive(email="alice@example.com", password="a different password")
-        self.assertEqual(caught.exception.status_code, 409)
-        self.assertIn("already exists", caught.exception.detail)
-        self.assertTrue(sessions.verify_account_password("alice@example.com", self.GOOD))
+    def test_the_account_starts_unverified(self):
+        self.drive()
+        self.assertFalse(sessions.account_verified("alice"))
+        self.assertFalse(sessions.verify_account_password("alice", self.GOOD))
 
-    def test_an_address_that_belongs_to_a_google_vault_is_a_409(self):
-        sessions.link_google_identity("sub-1", "alice@example.com")
-        with self.assertRaises(_HTTPError) as caught:
-            self.drive(email="alice@example.com", password=self.GOOD)
-        self.assertEqual(caught.exception.status_code, 409)
+    def test_an_unusable_username_is_a_400_and_creates_nothing(self):
+        with self.assertRaises(_HTTPError) as ctx:
+            self.drive(username="alice bob")
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertEqual(self.mails, [])
 
-    def test_a_bad_address_is_a_400_and_creates_nothing(self):
-        with self.assertRaises(_HTTPError) as caught:
-            self.drive(email="not-an-address", password=self.GOOD)
-        self.assertEqual(caught.exception.status_code, 400)
-        self.assertEqual(self.registered, [])
+    def test_an_unusable_address_is_a_400(self):
+        with self.assertRaises(_HTTPError) as ctx:
+            self.drive(email="not-an-address")
+        self.assertEqual(ctx.exception.status_code, 400)
 
     def test_a_short_password_is_a_400(self):
-        with self.assertRaises(_HTTPError) as caught:
-            self.drive(email="alice@example.com", password="short")
-        self.assertEqual(caught.exception.status_code, 400)
-        self.assertIn(str(sessions.MIN_PASSWORD_CHARS), caught.exception.detail)
+        with self.assertRaises(_HTTPError) as ctx:
+            self.drive(password="short")
+        self.assertEqual(ctx.exception.status_code, 400)
 
-    def test_the_route_is_closed_when_the_flag_is_off(self):
+    def test_a_taken_username_is_a_400_and_sends_nothing(self):
+        self.drive()
+        self.mails.clear()
+        with self.assertRaises(_HTTPError) as ctx:
+            self.drive(email="other@example.com")
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertEqual(self.mails, [])
+
+    def test_a_mail_that_cannot_be_sent_leaves_nothing_behind(self):
+        # Otherwise the username is held by an account that can never be
+        # confirmed, and a second attempt says "that username is taken".
+        self.mail_error = OSError("connection refused")
+        with self.assertRaises(_HTTPError) as ctx:
+            self.drive()
+        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertIsNone(sessions.get_credentials("alice"))
+        self.assertFalse(sessions.user_id_taken("alice"))
+        # ... and the name is immediately reusable.
+        self.mail_error = None
+        self.assertEqual(self.drive()["user"], "alice")
+
+    def test_the_route_runs_when_registration_is_closed(self):
         self.enabled = False
-        with self.assertRaises(_HTTPError) as caught:
-            self.drive(email="alice@example.com", password=self.GOOD)
-        self.assertEqual(caught.exception.status_code, 404)
+        with self.assertRaises(_HTTPError) as ctx:
+            self.drive()
+        self.assertEqual(ctx.exception.status_code, 404)
+        self.assertEqual(self.mails, [])
+
+    def test_the_throttle_is_consulted_by_the_route(self):
+        self.drive()
+        self.assertEqual(self.limit_calls, 1)
+
+
+class VerifyEmailRouteTests(GuardCase):
+    def drive(self, token=""):
+        return self.run_route(self.namespace["api_verify_email"], _Request(),
+                              token=token)
+
+    def test_a_good_token_redirects_to_the_front_door_saying_so(self):
+        sessions.create_credentials("alice", self.GOOD, "alice@example.com")
+        token = sessions.issue_verification_token("alice")
+        result = self.drive(token)
+        self.assertIn("verified=1", result.url)
+        self.assertTrue(sessions.account_verified("alice"))
+
+    def test_a_spent_token_redirects_saying_it_did_not_work(self):
+        sessions.create_credentials("alice", self.GOOD, "alice@example.com")
+        token = sessions.issue_verification_token("alice")
+        self.drive(token)
+        self.assertIn("verified=0", self.drive(token).url)
+
+    def test_garbage_and_empty_tokens_get_the_same_answer(self):
+        # One answer for a bad token, a spent one and an empty one: a message
+        # distinguishing them tells an attacker which guesses are live.
+        urls = set()
+        for value in ("", "   ", "nope"):
+            result = self.drive(value)
+            urls.add(result.url)
+        self.assertEqual(len(urls), 1)
+
+    def test_the_route_needs_no_session(self):
+        # The link comes out of a mail client, which will not POST and has no
+        # cookie; the token is the whole credential.
+        self.assertTrue(self.namespace["api_verify_email"])
+
+
+class GoogleSignInTests(GuardCase):
+    STATE = "the-state-value"
+
+    def start(self, request=None):
+        request = request or _Request()
+        return request, self.redirected(self.namespace["api_google_start"], request)
+
+    def test_starting_signs_in_to_googles_consent_screen(self):
+        request, result = self.start()
+        self.assertEqual(result.status_code, 302)
+        self.assertIn("accounts.google.com", result.url)
+        self.assertIn("state=", result.url)
+
+    def test_the_state_is_kept_in_the_session_not_a_cookie_of_our_own(self):
+        _, result = self.start(_Request())
+        # It is already server-side, already HttpOnly, and cleared on the request
+        # that consumes it.
+        self.assertNotIn("state", result.url.split("?")[0])
+
+    def test_start_stores_a_state_the_callback_can_check(self):
+        request, result = self.start()
+        self.assertTrue(request.session.get("oauth_state"))
+        self.assertIn(request.session["oauth_state"], result.url)
+
+    def test_start_is_a_404_when_google_is_not_configured(self):
+        self.google_configured = False
+        with self.assertRaises(_HTTPError) as ctx:
+            self.start()
+        self.assertEqual(ctx.exception.status_code, 404)
+
+    def test_sign_in_still_works_when_registration_is_closed(self):
+        # Switching registration off has to stop new accounts without signing out
+        # the people who already have one.
+        self.enabled = False
+        _, result = self.start()
+        self.assertEqual(result.status_code, 302)
+
+    def callback(self, session=None, **kwargs):
+        kwargs.setdefault("code", "auth-code")
+        kwargs.setdefault("state", self.STATE)
+        return self.redirected(self.namespace["api_google_callback"],
+                               _Request(session=session or {"oauth_state": self.STATE}),
+                               **kwargs)
+
+    def test_a_first_time_account_is_created_and_signed_in(self):
+        request = _Request(session={"oauth_state": self.STATE, "user": "someone-else"})
+        result = self.redirected(self.namespace["api_google_callback"], request,
+                                 code="auth-code", state=self.STATE)
+        self.assertEqual(result.url, "https://hass.example/mem-mcp/gui")
+        self.assertEqual(request.session["user"], "alice@example.com")
+        self.assertNotIn("oauth_state", request.session,
+                         msg="the old session must be cleared before the user is "
+                             "written, or a planted id is upgraded rather than replaced")
+
+    def test_the_vault_is_linked_to_the_subject_so_a_second_sign_in_finds_it(self):
+        self.callback()
+        self.assertEqual(self.linked.get("sub-1"), "alice@example.com")
+
+    def test_the_code_is_redeemed_with_the_same_redirect_uri(self):
+        self.callback()
+        self.assertEqual(self.redirect_uri_used,
+                         ["https://hass.example/mem-mcp/api/auth/google/callback"])
+
+    def test_a_linked_subject_signs_in_without_creating_anything(self):
+        self.linked["sub-1"] = "existing-vault"
+        result = self.callback()
+        self.assertEqual(result.url, "https://hass.example/mem-mcp/gui")
         self.assertEqual(self.registered, [])
 
+    def test_a_state_that_does_not_match_is_refused(self):
+        # Without it, a code minted for someone else's login could be posted here
+        # and signed in as them.
+        result = self.callback(state="someone-elses-state")
+        self.assertIn("google=state", result.url)
+        self.assertEqual(self.registered, [])
 
-class GoogleRegistrationRouteTests(GuardCase):
-    def real_link(self):
-        """What the actual store holds, since the route links for real."""
-        return sessions.resolve_google_identity("sub-1", touch=False)
+    def test_a_missing_state_is_refused(self):
+        for state in ("", None):
+            with self.subTest(state=state):
+                result = self.callback(session={}, state=state)
+                self.assertIn("google=state", result.url)
 
-    def drive(self, token="a-google-id-token", **kwargs):
-        return self.run_route(self.register_google, _Request(),
-                               self.body(token=token, **kwargs))
+    def test_the_state_is_consumed_so_it_cannot_be_replayed(self):
+        session = {"oauth_state": self.STATE}
+        self.redirected(self.namespace["api_google_callback"],
+                        _Request(session=session), code="c", state=self.STATE)
+        self.assertFalse(session.get("oauth_state"),
+                         msg="the state is spent whether or not the login worked")
+        replay = self.redirected(self.namespace["api_google_callback"],
+                                 _Request(session=session), code="c", state=self.STATE)
+        self.assertIn("google=state", replay.url)
 
-    def test_a_valid_token_creates_the_account_named_by_its_email(self):
-        request = _Request()
-        result = self.run_route(self.register_google, request, self.body(token="a-google-id-token"))
-        self.assertEqual(result["user"], "alice@example.com")
-        self.assertEqual(request.session["user"], "alice@example.com")
-        # The link went through the real store, so that is what is asserted --
-        # not a stub's call log, which would pass against a route that called
-        # nothing at all.
-        link = sessions.resolve_google_identity("sub-1", touch=False)
-        self.assertIsNotNone(link)
-        self.assertEqual(link["user_id"], "alice@example.com")
-        self.assertEqual(link["email"], "Alice@Example.com")
+    def test_a_dismissed_consent_screen_is_not_a_failure(self):
+        result = self.callback(code="", error="access_denied")
+        self.assertIn("google=declined", result.url)
 
-    def test_an_already_linked_account_is_a_409_rather_than_a_shortcut(self):
-        # /api/auth/google is the route for signing in. Silently logging someone
-        # in on the register endpoint would make "register" and "sign in" the
-        # same request.
-        self.verified_subjects.add("sub-1")
-        with self.assertRaises(_HTTPError) as caught:
-            self.drive()
-        self.assertEqual(caught.exception.status_code, 409)
-        self.assertIn("Sign in instead", caught.exception.detail)
-        self.assertIsNone(self.real_link())
+    def test_a_code_that_will_not_exchange_reports_a_failure(self):
+        self.oauth_error = self.namespace["google_auth"].GoogleOAuthError(
+            "Google refused the authorization code (invalid_grant)")
+        result = self.callback()
+        self.assertIn("google=failed", result.url)
+        self.assertEqual(self.registered, [])
 
-    def test_an_unusable_token_is_a_400_with_the_reason(self):
-        self.identity_error = self.namespace["google_auth"].GoogleTokenError(
-            "that Google token is not usable (ExpiredSignatureError)")
-        with self.assertRaises(_HTTPError) as caught:
-            self.drive()
-        self.assertEqual(caught.exception.status_code, 400)
-        self.assertIn("ExpiredSignatureError", caught.exception.detail)
-
-    def test_a_token_with_no_email_cannot_name_an_account(self):
-        # Inventing a key from the subject would produce a vault whose owner
-        # cannot type their own login.
-        self.identity = {"subject": "sub-1", "email": "", "name": "", "audience": "x"}
-        with self.assertRaises(_HTTPError) as caught:
-            self.drive()
-        self.assertEqual(caught.exception.status_code, 400)
-        self.assertIn("no email", caught.exception.detail)
-        self.assertIsNone(self.real_link())
-
-    def test_an_address_that_already_has_a_vault_is_refused_not_linked(self):
-        # Linking on the strength of a matching email string would give a second
-        # Google identity write access to someone else's vault.
-        sessions.create_credentials("alice@example.com", self.GOOD)
-        with self.assertRaises(_HTTPError) as caught:
-            self.drive()
-        self.assertEqual(caught.exception.status_code, 409)
-        self.assertIsNone(self.real_link())
-
-    def test_the_route_is_closed_when_google_is_not_configured(self):
+    def test_a_signup_that_cannot_happen_reports_closed(self):
         self.enabled = False
-        with self.assertRaises(_HTTPError) as caught:
-            self.drive()
-        self.assertEqual(caught.exception.status_code, 404)
-        self.assertIsNone(self.real_link())
+        result = self.callback()
+        self.assertIn("google=closed", result.url)
 
-    def test_a_missing_client_id_is_a_404_even_if_the_flag_is_on(self):
-        # Belt to registration_config's braces: the config function hides the
-        # form, and this makes the endpoint agree.
-        self.google_client = None
-        with self.assertRaises(_HTTPError) as caught:
-            self.drive()
-        self.assertEqual(caught.exception.status_code, 404)
+    def test_a_failure_never_writes_a_session_user(self):
+        self.oauth_error = self.namespace["google_auth"].GoogleOAuthError("boom")
+        request = _Request(session={"oauth_state": self.STATE})
+        self.redirected(self.namespace["api_google_callback"], request,
+                        code="c", state=self.STATE)
+        self.assertNotIn("user", request.session)
+
+
+class GoogleSignupTests(GuardCase):
+    INFO = {"subject": "sub-1", "email": "alice@example.com",
+            "email_verified": True, "name": "Alice"}
+
+    def signup(self, info=None):
+        return self.namespace["_google_signup"](dict(info or self.INFO),
+                                               logging.getLogger("memory-vault"))
+
+    def test_a_verified_address_becomes_the_vault(self):
+        self.assertEqual(self.signup(), "alice@example.com")
+        self.assertEqual(self.linked["sub-1"], "alice@example.com")
+
+    def test_no_confirmation_mail_is_sent(self):
+        # Google has already verified that this account controls this address, so
+        # re-verifying would prove nothing.
+        self.signup()
+        self.assertEqual(self.mails, [])
+
+    def test_an_unverified_address_creates_nothing(self):
+        info = dict(self.INFO, email_verified=False)
+        self.assertIsNone(self.signup(info))
+        self.assertEqual(self.linked, {})
+
+    def test_a_missing_address_creates_nothing(self):
+        # The vault key is the address; without one there is nothing to build from.
+        info = dict(self.INFO, email="")
+        self.assertIsNone(self.signup(info))
+        self.assertEqual(self.linked, {})
+
+    def test_registration_being_closed_creates_nothing(self):
+        self.enabled = False
+        self.assertIsNone(self.signup())
+        self.assertEqual(self.linked, {})
+
+    def test_a_name_that_is_already_a_vault_is_not_opened_a_second_way(self):
+        # Google has proved who the person is; it has not proved which of their
+        # accounts they meant, and only a subject link can.
+        # A vault that already answers to this address, created the way a
+        # previous Google sign-in would have created it. The username rules
+        # rightly refuse an "@", so the address-as-vault-key case can only be
+        # reached through a Google signup -- which is exactly the collision this
+        # test is about.
+        sessions.link_google_identity("sub-9", "alice@example.com",
+                                      "alice@example.com")
+        self.assertIsNone(self.signup())
+        self.assertEqual(self.linked, {})
 
 
 # ---------------------------------------------------------------------------
@@ -849,145 +1311,129 @@ class GoogleRegistrationRouteTests(GuardCase):
 # ---------------------------------------------------------------------------
 
 class LandingPageTests(unittest.TestCase):
-    LANDING = os.path.join(HERE, "templates", "landing.html")
+    @classmethod
+    def setUpClass(cls):
+        cls.page = _read("mem-mcp/templates/landing.html")
 
-    def setUp(self):
-        with open(self.LANDING, "rb") as handle:
-            self.raw = handle.read()
-        self.source = self.raw.decode("utf-8")
-
-    def body(self):
-        """The markup between the sign-in card and the authenticated branch.
-
-        Scoped, because assertIn over a whole template passes on any page that
-        happens to contain the word — and the sign-up script mentions the form ids
-        even when the forms are not rendered.
-        """
-        start = self.source.index('<div class="card">\n      <h2>🔐 Sign In</h2>')
-        end = self.source.index("{% else %}", start)
-        return self.source[start:end]
-
-    def test_the_signup_section_exists(self):
-        self.assertIn("Create an account", self.body())
+    def test_the_signup_card_is_gated_on_what_is_usable(self):
+        self.assertIn("{% if SIGNUP_EMAIL or SIGNUP_GOOGLE %}", self.page)
 
     def test_each_method_is_gated_on_its_own_flag(self):
-        body = self.body()
-        self.assertIn("{% if SIGNUP_EMAIL %}", body)
-        self.assertIn("{% if SIGNUP_GOOGLE %}", body)
-        # And the whole section is gated too, so a deployment with registration
-        # off renders nothing at all rather than an empty card.
-        self.assertIn("{% if SIGNUP_EMAIL or SIGNUP_GOOGLE %}", body)
+        # One "registration is on" flag would have to render a Google button on a
+        # deployment that cannot complete a Google login.
+        self.assertIn("{% if SIGNUP_EMAIL %}", self.page)
+        self.assertIn("{% if SIGNUP_GOOGLE %}", self.page)
+
+    def test_the_username_rules_match_the_server(self):
+        block = self.page[self.page.find('id="registerForm"'):]
+        block = block[:block.find("</form>")]
+        self.assertIn(f'minlength="{sessions.MIN_USERNAME_CHARS}"', block)
+        self.assertIn(f'maxlength="{sessions.MAX_USERNAME_CHARS}"', block)
+        self.assertIn('pattern="[A-Za-z0-9._-]+"', block)
 
     def test_the_password_minimum_matches_the_server(self):
-        # The cross-file contract. minlength is a client-side hint; sessions.py's
-        # MIN_PASSWORD_CHARS is the policy. If they drift the browser either
-        # blocks a password the server would accept, or lets someone submit one
-        # the server will refuse with a message they were never warned about.
-        self.assertIn('minlength="%d"' % sessions.MIN_PASSWORD_CHARS, self.source)
-        self.assertIn("{{SIGNUP_PASSWORD_MIN}}", self.source)
+        # A cross-file contract: a form that rejects a password the backend would
+        # have accepted, or vice versa, fails silently.
+        self.assertIn(f'minlength="{sessions.MIN_PASSWORD_CHARS}"', self.page)
 
-    def test_the_google_box_says_id_token_not_access_token(self):
-        body = self.body()
-        self.assertIn("ID token", body)
-        self.assertIn("ya29.", body)
-        self.assertIn("no redirect", body.lower())
+    def test_the_page_says_the_username_is_what_you_sign_in_with(self):
+        self.assertIn("SIGNUP_PASSWORD_MIN", self.page)
+        lower = self.page.lower()
+        self.assertIn("username", lower)
+        self.assertIn("confirm", lower)
 
-    def test_it_says_the_address_is_not_verified(self):
-        # Anyone can register an address they do not own. A user who does not
-        # know that will eventually rely on "you can reset it with that address".
-        self.assertIn("not verified", self.body())
+    def test_google_is_a_redirect_and_not_a_pasted_token(self):
+        # The whole point of the rewrite: no token is ever typed into this page.
+        self.assertIn('href="{{BASE_URL}}/api/auth/google/start"', self.page)
+        body = self.page.split("</style>", 1)[1]
+        self.assertNotIn("<textarea", body,
+                         msg="a pasted token is what this flow exists to remove")
+        self.assertNotIn("ID token", self.page)
 
-    def test_failures_surface_the_servers_reason(self):
-        # A bare alert() is what the login form used to do, and it discards the
-        # only text that distinguishes "already registered" from "no domain" from
-        # "that token carries no email address".
-        script = self.source[self.source.index("<script>"):]
-        self.assertNotIn("alert(", script)
-        self.assertIn("await apiFail(res)", script)
+    def test_registration_ends_in_a_check_your_mail_state(self):
+        self.assertIn('id="registerPending"', self.page)
+        self.assertIn('id="registerPendingEmail"', self.page)
+        self.assertIn("once", self.page)
 
-    def test_the_error_line_is_rendered_for_each_form(self):
-        body = self.body()
-        for error_id in ("loginError", "registerError", "registerGoogleError"):
-            self.assertIn('id="%s"' % error_id, body)
+    def test_the_three_outcome_messages_are_present(self):
+        for value in ('VERIFIED == "1"', 'VERIFIED == "0"', "GOOGLE_RESULT =="):
+            self.assertIn(value, self.page)
 
-    def test_the_forms_post_to_the_three_endpoints(self):
-        for endpoint in ("/api/auth/login", "/api/auth/register",
-                         "/api/auth/register/google"):
-            self.assertIn("'" + endpoint + "'", self.source)
+    def test_nothing_suggests_a_password_can_be_reset(self):
+        # There is no reset flow; a user who does not know that will eventually
+        # rely on "reset it with that address".
+        self.assertNotIn("forgot", self.page.lower())
+        self.assertNotIn("reset your password", self.page.lower())
 
-    def test_only_bare_identifiers_appear_between_the_braces(self):
-        # Jinja lexes every {{ in the file, so an expression in one — even in a
-        # comment — is a TemplateSyntaxError that takes the whole page down.
-        import re
-        found = re.findall(r"\{\{(.*?)\}\}", self.source, re.S)
-        for expression in found:
-            self.assertRegex(
-                expression.strip(), r"^[A-Za-z_][A-Za-z0-9_]*$",
-                msg="{{ %s }} is an expression, not a bare identifier" % expression)
+    def test_the_verification_is_a_get_because_a_mail_client_will_not_post(self):
+        subject, body = sessions.verification_email(
+            "alice", "https://hass.example/mem-mcp/api/auth/verify?token=abc", "Memory Vault")
+        self.assertIn("/api/auth/verify?token=abc", body)
+        self.assertIn("window.location", self.page)
 
+
+# ---------------------------------------------------------------------------
+# Call sites — a test of a helper is not a test of its call site
+# ---------------------------------------------------------------------------
 
 class CallSiteTests(unittest.TestCase):
-    """A test of a helper is not a test of its call site.
-
-    Four properties here are all "looks right and is wrong": both login paths
-    reaching the same store, the guard being the only thing that decides a
-    signup is allowed, the signup routes living under the one unauthenticated
-    prefix, and the throttle actually being reached.
-    """
-
     def test_both_login_paths_go_through_verify_account(self):
-        for function in ("api_login", "_check_session_auth"):
-            source = _function_source("mem-mcp/gui.py", function)
-            self.assertIn("_verify_account(", source,
-                          msg="%s must accept both stores, not just htpasswd" % function)
-            self.assertNotIn("_verify_htpasswd(", source,
-                             msg="%s picking a store itself is how the two paths "
-                                 "end up disagreeing about who can log in" % function)
+        # An address can be in `credentials` *and* htpasswd, and the two stores
+        # have different rotation rules; two call sites that each pick a store is
+        # how they end up disagreeing about who can log in.
+        for name in ("api_login", "_check_session_auth"):
+            source = _function_source("mem-mcp/gui.py", name)
+            self.assertIn("_verify_account(", source, msg=(
+                f"{name} must not verify a password itself"))
 
-    def test_the_login_response_carries_the_canonical_key(self):
-        source = _function_source("mem-mcp/gui.py", "api_login")
-        self.assertIn('request.session["user"] = account', source)
-        self.assertNotIn('request.session["user"] = body.username', source,
-                         msg="storing what was typed signs a registered user "
-                             "into a vault whose key is the lowercased address")
+    def test_the_basic_branch_of_the_session_check_uses_it_too(self):
+        source = _function_source("mem-mcp/gui.py", "_check_session_auth")
+        self.assertIn("_verify_account(", source)
 
-    def test_both_signup_routes_are_behind_the_guard(self):
-        for function in ("api_register", "api_register_google"):
-            source = _function_source("mem-mcp/gui.py", function)
-            self.assertIn("_require_registration(", source,
-                          msg="%s is unauthenticated by construction, so the flag "
-                              "and the throttle are the only thing in front of it"
-                                  % function)
-
-    def test_the_throttle_is_inside_the_guard_and_not_after_the_flag_check(self):
-        # Inside, so that turning registration off does not remove the rate limit
-        # from a route that is still mounted; and before the flag check, or the
-        # count only ever sees successful attempts.
+    def test_the_throttle_is_textually_before_the_flag_check(self):
+        # Ordering, not presence: a guard that counted only successes would leave
+        # a still-mounted route with no rate limit at all.
         source = _function_source("mem-mcp/gui.py", "_require_registration")
         self.assertLess(source.index("allow_registration_attempt("),
                         source.index("registration_enabled("))
 
-    def test_the_signup_routes_live_under_the_open_prefix(self):
-        # /api/auth is the only prefix auth_guard lets through unauthenticated,
-        # which is what makes a signup endpoint possible at all — and what makes
-        # it the weakest surface in the app.
-        source = _read("mem-mcp/gui.py")
-        for route in ('@web_app.post("/api/auth/register"',
-                      '@web_app.post("/api/auth/register/google"'):
-            self.assertIn(route, source)
+    def test_google_start_is_not_gated_on_the_registration_flag(self):
+        source = _function_source("mem-mcp/gui.py", "api_google_start")
+        self.assertIn("google_auth.configured()", source)
+        self.assertNotIn("registration_enabled", source, msg=(
+            "gating sign-in on the registration flag would sign out everyone who "
+            "signed up with Google the moment an operator turned it off"))
 
-    def test_no_signup_route_is_mounted_anywhere_else(self):
-        source = _read("mem-mcp/gui.py")
-        self.assertEqual(source.count('@web_app.post("/api/auth/register"'), 1)
-        self.assertEqual(source.count('@web_app.post("/api/auth/register/google"'), 1)
+    def test_only_the_signup_path_creates_an_account(self):
+        source = _function_source("mem-mcp/gui.py", "api_register")
+        self.assertIn("create_credentials(", source)
+        self.assertNotIn("session[\"user\"]", source)
 
-    def test_the_mcp_gate_knows_nothing_about_registration(self):
-        # "GUI only" is not a restriction imposed for tidiness — it falls out of
-        # the design. McpAuthGuard accepts an access key or a Google token and
-        # nothing else, and must not acquire a signup-shaped hole.
-        source = _function_source("mem-mcp/gui.py", "McpAuthGuard")
-        self.assertNotIn("register", source)
-        self.assertNotIn("create_credentials", source)
+    def test_a_failed_mail_deletes_the_account_it_just_made(self):
+        source = _function_source("mem-mcp/gui.py", "api_register")
+        self.assertIn("delete_credentials(", source)
+        self.assertIn("_service_unavailable", source)
+
+    def test_mcp_is_still_token_only(self):
+        # Registration is GUI-only. A signup produces a vault key, and a vault key
+        # is a credential, so exposing it on /mcp would put an unauthenticated
+        # endpoint on the path that holds every tool.
+        for name in ("resolve_bearer_token",):
+            source = _function_source("mem-mcp/gui.py", name)
+            self.assertIn("resolve_psk(", source)
+            for gone in ("looks_like_a_google_token", "resolve_google_identity",
+                         "google_identity("):
+                self.assertNotIn(gone, source, msg=(
+                    "a browser sign-in ends in a session cookie, and a cookie is "
+                    "not something an MCP client presents"))
+            # The reason survives, as prose: the rung is gone on purpose and the
+            # next person needs to know that rather than re-adding it.
+            self.assertIn("cookie", source.lower())
+
+    def test_the_only_credential_google_can_present_is_a_session(self):
+        source = _function_source("mem-mcp/gui.py", "api_google_callback")
+        self.assertIn('session["user"] = user_id', source)
+        self.assertNotIn("create_psk", source)
 
 
 if __name__ == "__main__":

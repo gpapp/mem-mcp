@@ -67,39 +67,68 @@
       </form>
       <p class="form-error" id="loginError"></p>
     </div>
+    {% if VERIFIED == "1" %}
+    <div class="card" style="border-color: var(--primary);">
+      <h2>✅ Account confirmed</h2>
+      <p class="note" style="margin-bottom:0;">That is everything — sign in below with
+        the username you chose and your password.</p>
+    </div>
+    {% elif VERIFIED == "0" %}
+    <div class="card">
+      <h2>⚠️ That confirmation link did not work</h2>
+      <p class="form-error" style="margin-bottom:0;">Confirmation links work once, and they
+        are tied to the address they were sent to. Sign in below: if your account is
+        still unconfirmed the page will say so.</p>
+    </div>
+    {% elif GOOGLE_RESULT %}
+    <div class="card">
+      <h2>🔑 Google sign-in did not finish</h2>
+      <p class="form-error" style="margin-bottom:0;">
+        {% if GOOGLE_RESULT == "declined" %}The consent screen was dismissed or refused, so nothing was changed. Try again, or sign in with a password below.
+        {% elif GOOGLE_RESULT == "state" %}The sign-in did not come back from the browser that started it — usually a second tab or a refresh. Start again from this page.
+        {% elif GOOGLE_RESULT == "closed" %}We could not open an account for that Google account. One already exists here, so sign in with that account's own username and password.
+        {% else %}Google did not complete the request. Nothing was changed — try again in a moment.
+        {% endif %}
+      </p>
+    </div>
+    {% endif %}
     {% if SIGNUP_EMAIL or SIGNUP_GOOGLE %}
     <div class="card">
       <h2>✨ Create an account</h2>
       <p class="note" style="margin-top:0;">
-        Your email address becomes your account name, and each account gets its
-        own vault. Nothing is shared between accounts except this one server.
+        Each account gets its own vault. Nothing is shared between accounts except
+        this one server.
       </p>
       {% if SIGNUP_EMAIL %}
       <form id="registerForm">
+        <input type="text" name="username" placeholder="Username" required minlength="3" maxlength="64" pattern="[A-Za-z0-9._-]+" autocomplete="username" spellcheck="false">
         <input type="email" name="email" placeholder="Email address" required autocomplete="email">
         <input type="password" name="password" placeholder="Password" required minlength="10" autocomplete="new-password">
         <button type="submit" class="btn">Create account</button>
       </form>
       <p class="note">
-        At least {{SIGNUP_PASSWORD_MIN}} characters. The address is not verified —
-        anyone can register one, so do not use an address you would mind losing.
+        Your <strong>username</strong> is what you sign in with; the email address is
+        only used to confirm it. Password at least {{SIGNUP_PASSWORD_MIN}} characters.
+        We send one confirmation link and the account stays unusable until it is
+        followed.
       </p>
       <p class="form-error" id="registerError"></p>
+      <div id="registerPending" style="display:none;">
+        <p class="note" style="color:var(--primary);">
+          ✅ Check your mail — we sent a confirmation link to
+          <strong id="registerPendingEmail"></strong>. It works once, and the account
+          cannot be signed into until it is followed.
+        </p>
+      </div>
       {% endif %}
       {% if SIGNUP_GOOGLE %}
       {% if SIGNUP_EMAIL %}<hr style="border:none;border-top:1px solid var(--border);margin:1.5rem 0;">{% endif %}
-      <h3 style="font-size:1rem;margin:0 0 .5rem;">🔵 Or with a Google ID token</h3>
-      <p class="note" style="margin-top:0;">
-        Paste a Google <strong>ID token</strong> (<code>eyJ…</code> — not an access
-        token, not a <code>ya29.…</code> one). It is checked against Google's
-        signature and this app's client id, and the account it names is created
-        from its email address. There is no redirect and no callback URL.
+      <p class="note" style="margin-top:0;">🔵 Or continue with Google</p>
+      <a class="btn btn-secondary" href="{{BASE_URL}}/api/auth/google/start">Continue with Google</a>
+      <p class="note">
+        Google already confirms who you are, so there is no password and no
+        confirmation email — the account is named after the address Google gives us.
       </p>
-      <form id="registerGoogleForm">
-        <textarea name="token" id="googleTokenInput" rows="3" placeholder="eyJhbGciOiJSUzI1NiIs…" required autocomplete="off" spellcheck="false"></textarea>
-        <button type="submit" class="btn btn-secondary">Create account with Google</button>
-      </form>
-      <p class="form-error" id="registerGoogleError"></p>
       {% endif %}
     </div>
     {% endif %}
@@ -142,9 +171,9 @@
 
     // The reason lives in the response body, and a bare Response throws it away.
     // That was fine when the only failure was "Invalid credentials"; it is not
-    // fine now that a signup can say "that address is already registered" or
-    // "that Google token carries no email address", which are different problems
-    // with different fixes and both of which the user has to act on.
+    // fine now that the same form can say "that username is taken", "that address
+    // is already registered" or "this account has not been confirmed yet", which
+    // are different problems with different fixes.
     async function apiFail(res) {
       let detail = '';
       try {
@@ -159,11 +188,11 @@
       if (el) el.textContent = message || '';
     }
 
-    // Submit handler shared by all three forms: post JSON, send the user to the
-    // dashboard on success, and put the server's own reason in the form's error
-    // line on failure. Kept in one place so a new form cannot accidentally fall
-    // back to a blocking alert box and lose the detail.
-    function wireForm(formId, errorId, url, fields, buttonText) {
+    // Submit handler shared by both forms: post JSON, hand the result to `onOk`,
+    // and put the server's own reason in the form's error line on failure. Kept
+    // in one place so a new form cannot accidentally fall back to a blocking
+    // alert box and lose the detail.
+    function wireForm(formId, errorId, url, fields, buttonText, onOk) {
       const form = document.getElementById(formId);
       if (!form) return;
       form.addEventListener('submit', async (e) => {
@@ -180,7 +209,11 @@
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(data)
           });
-          if (res.ok) { window.location.href = BASE_URL + '/gui'; return; }
+          if (res.ok) {
+            const body = await res.json().catch(() => ({}));
+            onOk(body);
+            return;
+          }
           showError(errorId, await apiFail(res));
         } catch (err) {
           showError(errorId, 'Could not reach the server.');
@@ -190,12 +223,29 @@
       });
     }
 
+    // Signing in gets you a session, so it goes straight to the dashboard.
     wireForm('loginForm', 'loginError', '/api/auth/login',
-              { username: 'username', password: 'password' }, 'Signing in…');
+              { username: 'username', password: 'password' }, 'Signing in…',
+              () => { window.location.href = BASE_URL + '/gui'; });
+
+    // Registering does NOT get you a session — the address is not confirmed yet,
+    // so there is nothing useful to sign in to. Hide the form and show the one
+    // instruction that matters instead, rather than bouncing to a login page that
+    // would refuse the account the user just made.
     wireForm('registerForm', 'registerError', '/api/auth/register',
-              { email: 'email', password: 'password' }, 'Creating account…');
-    wireForm('registerGoogleForm', 'registerGoogleError', '/api/auth/register/google',
-              { token: 'token' }, 'Checking token…');
+              { username: 'username', email: 'email', password: 'password' },
+              'Creating account…', (body) => {
+      const form = document.getElementById('registerForm');
+      const note = form ? form.parentNode.querySelector('p.note') : null;
+      if (form) form.style.display = 'none';
+      if (note) note.style.display = 'none';
+      const box = document.getElementById('registerPending');
+      const where = document.getElementById('registerPendingEmail');
+      // textContent, never innerHTML: this is the one place an address typed by a
+      // stranger is written back into the page.
+      if (where) where.textContent = body.email || '';
+      if (box) box.style.display = 'block';
+    });
   </script>
 </body>
 </html>

@@ -68,21 +68,22 @@ Two gates check credentials, and they do not accept the same ones:
 |---|---|---|
 | Dashboard session cookie | Issued by `POST /api/auth/login` against `htpasswd` | Browsing the dashboard and `/api/*` from a browser |
 | `Authorization: Basic <base64 user:pass>` | `auth_guard`, against the app's own `htpasswd` | Scripted calls to `/api/*` |
-| `Authorization: Bearer mvk_…` | `McpAuthGuard`, against the access-key store | **All MCP clients** |
-| `Authorization: Bearer eyJ…` (a Google **ID token**) | `McpAuthGuard`, against Google | Signing in as an account linked under Setup → Google sign-in |
+| `Authorization: Bearer mvk_…` | `McpAuthGuard`, against the access-key store | **All MCP clients** — the only thing `/mcp` accepts |
+| Google sign-in (OAuth redirect) | `GET /api/auth/google/start` → `…/callback` | Signing in from the browser; ends in the same session cookie |
 
 MCP requests are authenticated **by the application**, not by nginx. This is a
 change from earlier versions, where nginx's `auth_basic` on the `/mem-mcp/mcp`
 location was the only check and the app trusted whatever it was handed.
 
-The MCP endpoint takes only a **per-call token**: an access key or a Google ID
-token. It refuses a session cookie and a `Basic` header, and that is deliberate:
+The MCP endpoint takes only a **per-call access key**. It refuses a session
+cookie, a `Basic` header and a Google sign-in, and that is deliberate:
 a cookie is a credential the browser replays on its own and cannot be scoped to
 one device, and Basic is the account password, which also unlocks `/api/*` and
 cannot be revoked for one lost laptop without changing it for everyone. So an MCP
-client that used to send a username and password needs a key or a Google token
-instead. Your dashboard login is unaffected; it authenticates `/gui` and `/api/*`
-exactly as before.
+client that used to send a username and password needs a key instead. Your
+dashboard login is unaffected; it authenticates `/gui` and `/api/*` exactly as
+before, and signing in with Google is a browser flow that ends in the same
+session cookie.
 
 **Access keys** are created in **Setup → Access Keys**. A key is shown exactly
 once, at creation: only a SHA-256 hash is stored, so it cannot be displayed
@@ -105,68 +106,58 @@ password — that is what the access key replaced.
 
 ### Google sign-in
 
-Setup → **Google sign-in** lets you authenticate with a Google **ID
-token** instead of an access key. It is deliberately *not* an OAuth redirect: the
-app never redeems a code, so there is no callback URL to register and **no client
-secret is needed** — just the client id, which you paste into the Setup
-page.
+Sign in from the front door: the landing page's **Continue with Google** button
+runs a normal **OAuth 2.0 authorization-code redirect**. Set `GOOGLE_CLIENT_ID` and
+`GOOGLE_CLIENT_SECRET` in `.env` (both are required — the secret is what makes the
+code redemption confidential), register `{BASE_URL}/api/auth/google/callback` as the
+callback in Google Cloud, and the button appears.
 
-1. Paste your **client id** (and, optionally, a client secret) under
-   **🔁 Google sign-in** and save. Only a hash-free client id is
-   required; the secret is stored in the app's SQLite file and is never shown
-   back.
-2. Paste a Google **ID token** (it starts `eyJ…`, not `ya29.…`) into the
-   box and press **Verify**. The app checks the signature, the audience (your
-   client id) and the expiry against Google.
-3. Press **Link to my vault**. Nothing is granted until you do that: a Google
-   account that is not linked is refused, never given a new empty vault. One
-   Google account maps to exactly one vault, forever.
-
-The linked accounts are listed underneath, with an **Unlink** button. Unlinking
-takes effect on the next request.
-
-Note that the client id and secret are saved **into SQLite**, not read from the
-environment — so a Google client secret now lives in a file the app
-writes. The secret is never returned by any endpoint; the Setup page only tells
-you whether one is set.
+A first-time Google account needs no setup at all: the app creates the vault,
+keyed on the email address Google reports, and signs you in. A returning account
+resolves to the same vault. No paste box, no token, no Setup section.
 
 ### Registration
 
 Self-service sign-up is **off unless you turn it on**: set
-`MEM_REGISTRATION_ENABLED=1` and restart. With it off there is no signup route at
-all, so nothing is exposed by upgrading. With it on, the login page grows a
-**✨ Create an account** card with two methods:
+`MEM_REGISTRATION_ENABLED=1` and restart. With it off the signup card is not
+rendered and the routes answer 404, so nothing is exposed by upgrading. Each
+method has its own further requirement, so turning the flag on is not the same as
+having a usable form:
 
-- **Email and password** — an address and a password of at least 10 characters.
-- **A Google ID token** — the same `eyJ…` token as above, pasted in. This
-  additionally requires a client id saved under Setup → Google sign-in; without
-  one the Google method is not offered at all, because nothing could verify the
-  token.
+- **Email and password** — a **username**, an address and a password of at least
+  10 characters. Needs an SMTP server (`MEM_SMTP_HOST`, `MEM_SMTP_USER`,
+  `MEM_SMTP_PASSWORD`, `MEM_SMTP_FROM`, and `MEM_SMTP_STARTTLS`); with SMTP
+  unconfigured the form is **not shown at all**, because a form whose only job is
+  to send a confirmation mail would take an address and then refuse to use it.
+- **Continue with Google** — needs `GOOGLE_CLIENT_ID` *and*
+  `GOOGLE_CLIENT_SECRET`, as above.
 
-Your **email address becomes the account name**, and every account gets its own
-vault — accounts share only the server, nothing in the data.
+**Your username is the account name**, and every account gets its own vault —
+accounts share only the server, nothing in the data. A Google sign-in is named
+after the address Google reports, since there is no username to choose.
 
-**The address is not verified and there is no password reset.** Anyone can
-register an address they do not own, and there is no mail sent, no confirmation
-link and no recovery path, so an address that gets reassigned later would reach
-the old account. Do not use an address you would mind losing.
+**The address is verified by a confirmation link**, so the account cannot sign in
+until it is clicked. **There is no password reset** and no address change; the
+landing page says so, because a user who does not know that will eventually rely
+on "reset it with that address".
 
 Registered passwords are stored as **scrypt hashes in the app's own SQLite
 database**, not in `htpasswd`, which stays read-only. Existing htpasswd accounts
 are therefore completely unaffected, and an account registered here cannot
-overwrite one that already exists — an address already known to either store is
-refused.
+overwrite one that already exists — a name or address already known is refused.
 
-`/mcp` is **unchanged** by this: it still accepts only an access key or a Google
-ID token, never a session cookie. Signing up gives you a dashboard, not an MCP
-credential.
+The signup route is rate-limited per client address (10 attempts / 10 minutes).
+That is in-process, so a deployment behind more than one worker wants a limit in
+the proxy as well.
+
+`/mcp` is **unchanged** by this: it still accepts only an access key, never a
+session cookie. Signing up gives you a dashboard, not an MCP credential.
 
 ### Proxy header trust
 
 **The GUI, the REST API and `/mcp` all require a verified credential.** A
-dashboard session, a `Basic` password checked against the app's `htpasswd`, an
-access key, or a Google ID token whose subject is linked to a vault. Nothing
-else names a user.
+dashboard session, a `Basic` password checked against the app's credential store
+or its `htpasswd`, or an access key. Nothing else names a user.
 
 In particular, `Authorization: Basic` is *verified*. It used to be decoded and
 its username trusted without ever checking the password, which meant

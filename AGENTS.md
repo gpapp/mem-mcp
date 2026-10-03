@@ -38,9 +38,22 @@ The dependency-light regression suite covers matching, scope compatibility, scop
 
 `test_auth_guard.py` is the thirteenth, and it covers *which credential wins* rather than whether one is valid, so it is separate on purpose: `HeaderPrecedenceTests` pins the order, `McpAuthGuardTests` drives the real guard class with each credential carrying a **distinguishable owner** so a status-only assertion cannot hide having picked the wrong one, and `WiringTests` pins the things that would silently re-open the hole — no `auth_basic` in the nginx MCP location, `session.clear()` before login writes `user`, no template rendering `AUTH_PASS`, the bridge reading `MEM_VAULT_PSK`. `ApiAuthTests` and `CorsAndDocsTests` cover the *other* half of the chain (the `/gui` + `/api/*` gate and the two unmatched surfaces), and every one of the six defects they guard was verified to bite by re-injection. That matters because every defect worth guarding there is a "this looks right and is wrong" — a cold model labelled `100% CPU`, a fingerprint that fires on every poll, a publish that blocks on a browser that stopped reading — and none is visible in the shape of the code. The same file also lifts `fetch_ollama_status` / `unload_ollama_model` out of `common.py` and `api_unload_model` / `_status_snapshot` out of `gui.py` with `ast.get_source_segment`, because those three cannot be imported here. `ImportDisciplineTests` imports the module in a **subprocess with httpx blocked at the import hook** rather than searching the source for the string: a docstring mentioning httpx is not an import of it, and that is the `assertIn`-over-a-whole-file lesson again. `test_mobile_layout.py::StatusWidgetLayoutTests` pins where the widget is allowed to sit — see "Server Status Widget" for why that is not a free choice.
 
-`test_google_auth.py` is the fourteenth, and it is the second suite that **imports its subject directly** — `PyJWT` and `cryptography` are real dependencies, which is the trade this feature deliberately made: hand-rolling RSA verification would have kept the module stdlib-only, but signature verification *is* the attack surface, and twenty lines of `pow()` is exactly where an `alg: none` bug goes to hide. It generates a real 2048-bit key with `cryptography` and signs real tokens, replacing only the **HTTP fetch of the key set** — a stubbed `get_signing_key_from_jwt` returning a truthy object would let every test pass against a verifier that checked no signature at all. `GoogleTokenTests` therefore covers the audience check (the headline property), both sides of the clock-skew boundary, tampering, `alg: none`, an unknown `kid`, and the fact that neither an exception message nor a log line may contain any part of the token. `PrefilterTests` pins the cheap shape test `resolve_bearer_token` uses to decide whether a JWKS lookup is worth attempting, and `KeySourceTests` pins the cache settings *by value* rather than by trusting the comment beside them. One of its findings was a real defect — the dead `except jwt.DecodeError` branch, described under "Authentication".
+`test_google_auth.py` is the fourteenth, and after the OAuth rewrite it is a
+stdlib suite that **imports its subject directly** — `google_auth.py` depends on
+nothing but `urllib`, which is the practical payoff of dropping the pasted-token
+flow. It has one test seam, the `opener` argument threaded through
+`_request_json`, and everything else is the real function: `ExchangeCodeTests`
+asserts the *form* posted to Google's token endpoint (the secret in the body, never
+in the URL), `FetchUserinfoTests` covers the profile mapping including that `sub`
+is never derived from the address and that only `is True` counts as verified, and
+`SecrecyTests` plus `FailureReportingTests` pin that no code, token or secret
+appears in any exception message — the message reaches a response body, and one
+exception type for every failure is deliberate, because a caller distinguishing
+six classes will render the wrong one. `assertLogs` there is not decoration: a
+network failure that raises without logging is the absence-of-a-log-line bug this
+repo has already been bitten by once.
 
-`test_registration.py` is the fifteenth suite, and it is deliberately its own file rather than more classes in `test_sessions.py`: registration is a **third** credential surface, and the only one that is *unauthenticated by design* — the signup routes live under the `/api/auth` allow-list, which is what makes an account creatable at all — so burying it in a suite about the two properly-protected gates would hide the one fact that matters about it. It **calls** `sessions.py` directly for the credential store, the scrypt hashing and the throttle, and lifts `_verify_account`, `_require_registration`, `registration_config` and both signup routes out of `gui.py` with `ast.get_source_segment` (gui.py is not importable on a machine with no fastapi). The lifted routes are async, and the harness drives them through `asyncio.run` for a reason that is worth stating because it is not visible in the code: an un-awaited coroutine enters no function at all, so every guard in the class would have reported green against routes that were never called. That was a real harness bug while the suite was being written, and it is invisible from the outside — the tests pass either way, they just test nothing. `CallSiteTests` pins what no source test above can otherwise see: both login paths going through `_verify_account` rather than each picking a store for itself (an address can be in `credentials` *and* htpasswd, and the two stores have different rotation rules); the throttle textually *before* the flag check, so turning registration **off** removes the rate limit from a route that is still mounted and the counter only ever sees successful attempts; and `McpAuthGuard` containing no `register` at all, which is the `/mcp` half of the rule stated above. `LandingPageTests` pins the template's `minlength` against `sessions.MIN_PASSWORD_CHARS` — a cross-file contract between two modules nothing else would notice drifting, and one that fails silently as a signup form that rejects passwords the backend would have accepted.
+`test_registration.py` is the fifteenth suite, and it is deliberately its own file rather than more classes in `test_sessions.py`: registration is a **third** credential surface, and the only one that is *unauthenticated by design* — the signup routes live under the `/api/auth` allow-list, which is what makes an account creatable at all — so burying it in a suite about the two properly-protected gates would hide the one fact that matters about it. It **calls** `sessions.py` directly for the credential store, the scrypt hashing and the throttle, and lifts `_verify_account`, `_require_registration`, `registration_config` and both signup routes out of `gui.py` with `ast.get_source_segment` (gui.py is not importable on a machine with no fastapi). The lifted routes are async, and the harness drives them through `asyncio.run` for a reason that is worth stating because it is not visible in the code: an un-awaited coroutine enters no function at all, so every guard in the class would have reported green against routes that were never called. That was a real harness bug while the suite was being written, and it is invisible from the outside — the tests pass either way, they just test nothing. `CallSiteTests` pins what no source test above can otherwise see: both login paths going through `_verify_account` rather than each picking a store for itself (an address can be in `credentials` *and* htpasswd, and the two stores have different rotation rules); the throttle textually *before* the flag check, so turning registration **off** removes the rate limit from a route that is still mounted and the counter only ever sees successful attempts; and `McpAuthGuard` containing no `register` at all, which is the `/mcp` half of the rule stated above. `LandingPageTests` pins the template's `minlength` against `sessions.MIN_PASSWORD_CHARS` — a cross-file contract between two modules nothing else would notice drifting, and one that fails silently as a signup form that rejects passwords the backend would have accepted. After the rewrite to username + verified email it also pins each half of the form to **its own** flag, and asserts the page contains no pasted-token field at all; `VerificationMailTests` covers the confirmation mail, and `GoogleSignInTests` / `GoogleSignupTests` drive the redirect endpoints end to end with a fake opener. One harness lesson from that rewrite is worth keeping: **the routes `return` a `RedirectResponse`, they do not raise**, so `assertRaises(_Redirect)` against a route that forgets to return one passes on a route that was never correct — the helper asserts the return value is a redirect, which fails loudly instead.
 
 ```bash
 cd mem-mcp
@@ -92,57 +105,54 @@ none: `extract_user_from_headers` trusts it (see Authentication).
 
 | | gate | accepts | covers |
 |---|---|---|---|
-| `/mcp` | `McpAuthGuard` (gui.py:1531), wrapping the mount | **`Authorization: Bearer mvk_…` or a Google ID token** | every route fastmcp registers |
-| `/gui`, `/api/*` | `auth_guard` (gui.py:206) via `_check_session_auth` (gui.py:140) | session cookie → `Basic` (verified) → `Bearer mvk_…` or Google ID token | ~60 handlers |
-| `/api/auth/*` | **none** — this *is* the allow-list | nothing, by design | login, logout, the Google token exchange, and the two signup routes |
+| `/mcp` | `McpAuthGuard` (gui.py), wrapping the mount | **`Authorization: Bearer mvk_…` and nothing else** | every route fastmcp registers |
+| `/gui`, `/api/*` | `auth_guard` via `_check_session_auth` | session cookie → `Basic` (verified) → `Bearer mvk_…` | ~60 handlers |
+| `/api/auth/*` | **none** — this *is* the allow-list | nothing, by design | login, logout, signup, email confirmation, and the two Google OAuth routes |
 
-`/mcp` takes only a per-call token: an access key or a Google ID token. Anything
-else — no header, a session cookie, or a Basic header — is a 401 whose body names
-the ways in and whose `WWW-Authenticate` header says `Bearer` (it used to say
-`Basic`, which pointed at a credential this endpoint no longer accepts). On
-`/gui` and `/api/*` the order is session → `Basic` → `Bearer`, and only
-`/api/auth/*` is reachable without one, because that is where you exchange a
-credential for a session.
+`/mcp` takes only an access key. A session cookie, a `Basic` header and a Google
+sign-in are each refused with a 401 whose body names the one way in and whose
+`WWW-Authenticate` header says `Bearer` (it used to say `Basic`, which pointed at
+a credential this endpoint no longer accepts). On `/gui` and `/api/*` the order
+is session → `Basic` → `Bearer`, and only `/api/auth/*` is reachable without a
+credential, because that is where you exchange one for a session.
 
 **Both gates resolve a `Bearer` token through one function,
-`resolve_bearer_token` (gui.py), and that is the point.** It ran its own ladder
-when there was only one kind of token; there are now two, and a second copy of
-the ladder would drift from the first — one gate accepting a revoked key the
-other rejects is exactly the bug that shape invites. The ladder is `resolve_psk`
-first, then Google (and only if `google_auth.looks_like_a_google_token`, so an
-access key never costs a JWKS lookup), then `resolve_google_identity`.
-`BearerLadderTests` drives every rung; **`BearerCallSiteTests` pins that both
-gates actually call it**, because a test of a helper is not a test of its call
-site — and it asserts neither gate contains `resolve_psk(` or
-`google_auth.google_identity(`, which is how a second ladder announces itself.
+`resolve_bearer_token` (gui.py), and the point of that survives the ladder
+collapsing to one rung.** It had three once — access key, then two steps for a
+Google ID token — and one shared function is what stopped the two gates drifting,
+because one gate accepting a revoked key the other rejects is exactly the bug a
+second copy of the ladder invites. **A Google sign-in is deliberately not a rung
+here.** It was one, for as long as a pasted ID token was something an MCP client
+could hold. The redirect flow ends in a session cookie instead, and a cookie is
+not a credential a client presents — so a rung for it would be a way in that no
+other gate offers. `BearerLadderTests` drives what remains and asserts the Google
+store is **never consulted**, with two must-not-be-called counters, because "no
+rung" is a property of what is *not* called. `BearerCallSiteTests` pins that both
+gates call the ladder and that the MCP guard's own `__call__` resolves no identity
+of its own.
 
 **Every failure returns an actionable reason, not a bare 401**, because the
-reason reaches the client body and a generic one is indistinguishable between
-the four ways a token can be wrong. "Google sign-in is not configured", "that
-Google token is not usable (ExpiredSignatureError)", "not linked to a vault —
-sign in and link it under Setup → Google sign-in" name three different remedies.
-The last one is deliberately **not** a silent new vault: see "Google sign-in"
-under Features.
+reason reaches the client body and a generic one is indistinguishable between the
+ways a token can be wrong. "no token was presented" and "that is not a known
+credential" name two different fixes — send a header at all, or mint a key. The
+second is deliberately **not** phrased as an invalid credential, because a client
+holding a Google ID token has to sign in through a browser and needs to be told
+that; a remedy pointing at the wrong thing costs the reader more than the
+rejection does. The reason never quotes the token
+(`test_a_reason_never_quotes_the_token`).
 
-**A Google token's *audience* is the client id, and verifying one needs no
-client secret.** The secret is only used to redeem a code for a token, which
-this app never does — the operator pastes an ID token they already hold. That is
-why `oauth_clients.client_secret` is optional and why `POST /api/google/verify`
-works with nothing but a client id saved.
-
-**`PyJWKClientError` is not a `DecodeError`, and that collapsed two true reasons
-into one false one.** The malformed-token branch was written as
-`except jwt.DecodeError`, which the real client never raises — it raises
-`PyJWKClientError` (MRO: `PyJWKClientError → PyJWTError → Exception`). So every
-garbage paste reported *"could not resolve Google's signing keys"*, sending an
-operator to look at a key cache instead of at their own clipboard, and an
-`alg: none` token was rejected by the key lookup for want of a `kid` — meaning
-the `algorithms=["RS256"]` pin was never actually exercised. `verify_google_token`
-now calls `jwt.get_unverified_header` first: not-a-JWT raises `DecodeError` →
-"that is not a JSON Web Token", and `header["alg"] != "RS256"` raises "the token
-declares <alg> signature algorithm, and only RS256 is accepted" **before** any
-network round trip. `GoogleTokenTests` asserts `source.calls == 0` for both, so
-the proof is that *this* check caught it rather than the key lookup.
+**`google_auth.py` no longer parses or verifies a JWT, and that is the point of
+the redirect flow.** It is an OAuth 2.0 authorization-code client over stdlib
+`urllib`: build the authorization URL, redeem the code at Google's token endpoint
+*with the client secret*, read the profile from userinfo. There is nothing to
+verify locally because nothing arrives signed — the code and the userinfo both
+cross TLS, and the secret is what makes the redemption confidential. Hand-rolled
+RSA verification bought nothing here and cost two dependencies, one dead
+`except jwt.DecodeError` branch (`PyJWKClientError` is not a `DecodeError`, so it
+collapsed "that is not a JWT" into "could not resolve Google's signing keys"), and
+a second credential to leak. **A leaked `GOOGLE_CLIENT_SECRET` is now a real
+credential** — normal for a confidential client, and the reason it lives in the
+environment rather than in SQLite where the Setup page used to write it.
 
 **`/mcp` is token-only on purpose; the other two credentials are the point, not
 an oversight.** A session cookie is a *bearer* credential the browser replays by
@@ -171,9 +181,10 @@ nginx has no `auth_basic` on the GUI location, so that decode was the entire
 gate for every route — `Authorization: Basic base64(alice:anything)` was alice's
 vault, including `POST /api/backup/restore/{id}` and `POST /api/psks`. A
 username is not a secret and the header is client-supplied, so returning one is
-not authentication. Verified with `_verify_htpasswd`, which costs a subprocess
-per request and is only reached when there is no session — a browser on the
-cookie path never pays it, and Basic is for scripted clients.
+not authentication. Verified with `_verify_account`, which consults the
+`credentials` table first and only shells out to `htpasswd -vb` when the name is
+not one registration created — a browser on the cookie path never pays it, a
+registered user's Basic auth never pays it, and Basic is for scripted clients.
 
 **`auth_guard` must match `/gui` and `/api` only, and `/api/events` must not be
 on its allow-list.** The SSE stream used to be public. Its handler filtered
@@ -336,6 +347,9 @@ Python.
 - Server status widget: `MEM_STATUS_POLL_SECONDS` (default 10) and `MEM_STATUS_HTTP_TIMEOUT` (default 8) — see "Server Status Widget"
 - User vault resolved from a session cookie, `Authorization: Basic`, an access key, or proxy headers — see Authentication
 - Sessions and access keys: `MEM_SESSION_DIR` (must be the bind mount, or a container rebuild logs everyone out) and `MEM_SESSION_SECURE` (adds `Secure` to the session cookie; only enable when the app is reached over HTTPS, since the process cannot detect the proxy's scheme and a `Secure` cookie on a plain-HTTP visit is silently dropped). `MEM_SESSION_SECRET` is no longer used to sign anything.
+- Registration: `MEM_REGISTRATION_ENABLED` (default 0, and it should stay 0 — a route that creates accounts is something an operator turns on). The two methods have their own further requirements: email/password needs `MEM_SMTP_*`, Google needs `GOOGLE_CLIENT_ID` **and** `GOOGLE_CLIENT_SECRET`. Each is checked separately, so turning the flag on is not the same as having a usable form.
+- Outbound mail: `MEM_SMTP_HOST`, `MEM_SMTP_PORT` (587), `MEM_SMTP_USER`, `MEM_SMTP_PASSWORD`, `MEM_SMTP_FROM`, `MEM_SMTP_STARTTLS` (default 1) and `MEM_SMTP_TIMEOUT` (20s). `smtp_configured()` needs only host and From, because those are what a signup attempt must have to be worth offering a form at all.
+- Google sign-in (OAuth 2.0 redirect): `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`, plus the callback `{BASE_URL}/api/auth/google/callback` registered in Google Cloud. **Both are required** — the secret is what makes the code redemption confidential. Note `test_env_wiring._DECL` had to grow a `GOOGLE_[A-Z0-9_]+` branch: without it a documented `GOOGLE_*` variable silently escapes the "every documented variable reaches the container" test, which is the same class of quiet as an unwired knob.
 - `BASE_URL` must include `/mcp` prefix when behind nginx
 
 ## Diary Consistency & Auto-Fix
@@ -674,43 +688,42 @@ A `GET /api/psks` that leaked a plaintext would defeat the whole design, so
 `test_auth_guard.WiringTests` pins that no route other than the POST reaches it.
 
 ### Google sign-in
-Setup → **🔵 Google sign-in** lets an operator paste an existing Google **ID
-token** (`eyJ…`, not an access token, not `ya29.…`) and exchange it for a session.
-There is **no redirect flow and no callback URL** — the app never redeems a code,
-so it needs no client secret to verify anything, only a client id.
+Setup → nothing. A Google account signs in **from the front door**: the landing
+page's "Continue with Google" button is a link to `/api/auth/google/start`, and
+there is **no Setup section and no token box any more** — the pasted-ID-token flow
+is gone, along with its `oauth_clients` table and the seven `/api/google/*` routes
+it needed.
 
-- **The client id and secret are saved from the UI into SQLite**, not read from
-  the environment (`oauth_clients`, one row per provider). This is a deliberate
-  consequence of that choice: a Google client secret now lives in a file the app
-  writes. It is never shown back — `oauth_client_public` is the single redaction
-  point and returns `secret_set: bool`, and the UI puts a *placeholder* in the
-  password field rather than the value. An absent secret means **keep the stored
-  one**; `""` means **clear it**, which is why the parameter is
-  `Optional[str] = None` and not a string.
-- **A Google identity grants nothing until a human links it.** The primary key is
-  `(provider, subject)` and *not* `(provider, subject, user_id)`, precisely so a
-  second link cannot be created even by accident: one Google subject maps to
-  exactly one vault, forever, chosen by a human under Setup. An unlinked subject
-  is **refused with a reason**, not auto-provisioned — `userId` is the htpasswd
-  username and there is no user table, so an automatic mapping would have to come
-  from an email, and emails get reassigned. `link_google_identity` raises
-  `ValueError` (a 409) if the subject already belongs to another vault.
-- **The identity is `sub`, never `email`.** `google_identity` returns both, and
-  the vault is resolved from `sub` only; the email is display.
-- **`POST /api/auth/google`** turns a pasted token into a dashboard session, and
-  it calls `request.session.clear()` **before** writing `user` — the same
+- **It is a real OAuth 2.0 authorization-code redirect**, so the client id *and*
+  secret come from `.env` (`GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`) and not from
+  a form. The operator registers the callback as
+  `{BASE_URL}/api/auth/google/callback` in Google Cloud. `configured()` demands
+  **both**, because the secret is what makes the redemption confidential and a
+  half-configured deployment can start a login it cannot finish.
+- **`/api/auth/google/start` is gated on `configured()` and deliberately *not* on
+  the registration flag.** Switching registration off must not lock out existing
+  users; signing in and creating an account are different requests.
+- **The state lives in the server-side session, and is consumed once.** The
+  callback compares with `hmac.compare_digest` and deletes it, so a replayed
+  callback has nothing to match. A mismatch is `/?google=state`, and Google's own
+  `error` parameter is `/?google=declined`.
+- **A first-time Google account just works; there is no link step.** `_google_signup`
+  creates the vault keyed on the **Google email address** and links the subject.
+  It refuses when registration is closed, when Google reports the address
+  unverified or absent, and when `user_id_taken(address)` — because Google proved
+  *who the person is*, not *which of their accounts* they meant, and only an
+  explicit name can say that. A returning subject resolves straight through
+  `google_identities` and never reaches that function.
+- **The identity is `sub`, never `email`.** The address names the vault on first
+  sign-in and is display after that; the primary key is `(provider, subject)`, so
+  one subject maps to exactly one vault forever.
+- **No verification mail for a Google signup, deliberately.** Google already
+  verified the address, and sending a link the person cannot act on (the account
+  is signed in already) would be theatre.
+- **`session.clear()` before writing `user`** on the callback, the same
   session-fixation defence as the password path.
-- **`POST /api/google/link` trusts the subject string from the caller**, which is
-  a real limitation and is documented as one: a signed-in user can name any
-  subject and attach it to their own vault. That is self-harm, not an attack —
-  it grants nothing they did not already have, and it cannot take a subject away
-  from another vault (the store refuses that).
-- `sessions.py` **must not import `google_auth`** — it is stdlib-only so
-  `test_sessions.py` can import it on a box with no web framework, and
-  `google_auth` needs PyJWT. That is why `MAX_EMAIL_CHARS`/`MAX_NAME_CHARS` are
-  duplicated as locals in `sessions.py`, and why the *display* fields truncate
-  while the *credential* fields are refused when oversized: a truncated name is
-  still the right name, a truncated client id is a wrong credential.
+- The whole exchange runs in `asyncio.to_thread` — `urllib` is blocking, and this
+  runs in front of a page load.
 
 ### Registration
 
@@ -726,11 +739,15 @@ in front of them.
   someone turned on.
 - **Two methods, reported separately.** `registration_config()` (gui.py) returns
   `{"email", "google"}` and the template branches on each, because the two halves
-  fail independently — the flag opens the routes, and a Google client id is what
-  makes a token verifiable at all. One "registration is on" flag would have to
-  render a Google form that 404s on a deployment with no client id.
+  fail independently — the flag opens the routes, an email form needs
+  `smtp_configured()` and a Google button needs both client values. One
+  "registration is on" flag would have to render a form that 404s.
   `registration_enabled()` takes a **method** name, not a provider key, and an
   unknown one raises rather than being assumed on.
+- **The email form is not rendered at all when SMTP is unset**, rather than
+  rendered and refused. A signup form whose only purpose is to send a
+  confirmation mail is worse than no form when there is no mail server: it takes
+  an address and then refuses to use it.
 - **A disabled route answers 404, not 403.** A 403 says "this exists and you may
   not"; a disabled signup route should be indistinguishable from one that was
   never mounted, so turning the flag off does not advertise the feature.
@@ -754,29 +771,39 @@ in front of them.
   is whatever the client sent, and trusting it would hand every attacker a fresh
   quota per request. The socket-peer fallback is nginx itself behind the proxy,
   which buckets everyone together — the right way for that fallback to fail.
-- **The vault key is the lowercased email address.** `user_id` *is* the `userId`
-  on every Fact, DiaryEntry and Client in the other two stores, so making it the
-  email means no mapping layer and no existing query changes. `user_id` is the
-  PRIMARY KEY of `credentials`, so `Alice@example.com` and `alice@example.com`
-  being two accounts with two vaults is not reachable — that case collision is
-  the failure the normalising prevents.
-  **The cost, stated plainly: an address is a vault key, so a reassigned address
-  would reach the old vault.** That is exactly why Google keys on `sub`, and this
-  app cannot have both while the email *is* the identity. There is **no email
-  verification** and no password reset; the landing page says so, because a user
-  who does not know that will eventually rely on "reset it with that address".
-- **`user_id_taken` checks all three stores, not just `credentials`.** An address
-  can already name an htpasswd user (the operator's own account) or a vault a
-  Google account is linked to. Creating a password row over either produces two
+- **The vault key is the lowercased *username*, not the address.** `user_id` *is*
+  the `userId` on every Fact, DiaryEntry and Client in the other two stores, so
+  whatever string is chosen is the key and no existing query changes. The address
+  is stored separately, in its own column with a partial unique index
+  (`credentials_email_unique ... WHERE email <> ''`), because it is for
+  confirmation and not for identity. `create_credentials` **refuses** a taken
+  name or a taken address rather than upserting, and creates the row **unverified**.
+- **A password signup is not usable until the address is confirmed**, and
+  `verify_account_password` treats an unverified account exactly like a wrong
+  password. The *reason* is what differs, and it matters: "open the link we sent to
+  your email address" is the difference between a person who can fix the problem
+  and one who resets a password that was never wrong. `api_login` answers **403**
+  when it has a reason and 401 when it does not.
+- **The confirmation token is spent by a single UPDATE** that stamps
+  `email_verified_at` *and* clears the token, so a link clicked twice verifies
+  once and a double-click cannot leave two callers each believing they verified.
+  There is **no password reset** and no address change; the landing page says so,
+  because a user who does not know that will eventually rely on "reset it with
+  that address".
+- **`user_id_taken` checks the htpasswd file as well as `credentials`.** A name
+  can already belong to an htpasswd user (the operator's own account), or to a
+  vault a Google sign-in created. `email_taken` deliberately does **not** consult
+  htpasswd: an htpasswd file holds no addresses, so there is nothing to collide
+  with, and refusing on a coincidence would lock out a legitimate signup. Creating a password row over either produces two
   ways into one vault with independent passwords — or silently re-points an
   existing vault at a password the registrant just chose, which is account
   takeover dressed as a signup. `create_credentials` **refuses** rather than
   upserting, because an upsert here would reset an existing account's password.
-- **Google registration verifies exactly as sign-in does, then *links* rather than
-  resolves.** That is the whole difference: signing in needs an identity already
-  pointing at a vault, and registering is the act of pointing it at one. An
-  already-linked subject is a 409, not a shortcut into signing in — otherwise
-  "register" and "sign in" would be the same request.
+- **There is no separate Google registration request.** The Google button is the
+  same endpoint as Google sign-in: `_google_signup` creates the vault on a first
+  arrival and does nothing on a later one. That is the point of removing the
+  pasted-token flow — "register" and "sign in" are now literally the same click,
+  because the only thing that used to distinguish them was a box to paste into.
 - **Registered passwords live in SQLite, not in htpasswd.** The htpasswd file is
   mounted **`./mem-mcp-data/htpasswd:/app/htpasswd:ro`** — read-only — precisely
   so the app cannot rewrite a file an operator also edits by hand. Login goes
@@ -784,9 +811,11 @@ in front of them.
   falls back to htpasswd. The order matters: an address could be in both stores,
   and the row this app owns wins because it is the one the app can rotate. The
   reverse makes a password change made in the UI a silent no-op.
-  **`_verify_account` returns the vault key, not a bool** — a session holding
-  `Alice@Example.com` when the key is `alice@example.com` is a session that looks
-  signed in and sees an empty vault.
+  **`_verify_account` returns `(key, reason)`, not a bool** — a session holding
+  `Alice` when the key is `alice` is a session that looks signed in and sees an
+  empty vault, and the reason is what lets login say *why* rather than "invalid
+  credentials". It checks disabled and unverified **before** the password, and
+  only falls through to the subprocess when the name is not one it registered.
 - **Passwords are scrypt, and `dklen` travels inside the stored string.** scrypt
   over PBKDF2 because PBKDF2's only cost knob is iterations, and iterations are
   cheap on a GPU. `n/r/p/dklen` are all in the encoded value so they can be raised
@@ -797,11 +826,20 @@ in front of them.
 - **A corrupt stored hash is a False, not an exception.** The caller is a login
   path; a row restored from a damaged savepoint or hand-edited must read as "this
   account cannot log in" rather than 500ing every request that touches it.
-- **Disabling is not deleting.** `disable_credentials` keeps the vault key
-  occupied, so the address cannot be registered again and come back pointing at a
-  vault whose records are still there.
+- **Disabling is not deleting, and `delete_credentials` is neither.** The first
+  keeps the name occupied, so it cannot be registered again and come back
+  pointing at a vault whose records are still there. The second is the undo for a
+  signup whose confirmation mail could not be sent — `api_register` calls it on
+  that failure rather than leaving an account that can never be verified and whose
+  name cannot be reclaimed.
 - **No `:User` node is created at signup.** It appears by itself the first time
   the new account writes anything, and an empty account has nothing to write.
+- **`sessions.py` still must not import `google_auth`.** It is stdlib-only so the
+  suites can import it on a box with no web framework; the OAuth module no longer
+  needs PyJWT, so the rule is now about the *dependency direction* rather than
+  about a heavy import, and it is still worth keeping: `registration_enabled("google")`
+  needs `configured()` and a plain function call is cheaper than reasoning about a
+  module cycle.
 
 ### Build Graph Mode
 Build your own focused subgraph starting from any memory.

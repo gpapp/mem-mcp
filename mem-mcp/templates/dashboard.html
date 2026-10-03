@@ -935,14 +935,15 @@
         <div style="display:flex; gap:0.75rem; padding:0.55rem 0.75rem; border-bottom: 1px solid var(--border);">
           <code style="flex:0 0 130px;">/mcp</code>
           <span style="flex:1;">An access key, <code>Authorization: Bearer {{PSK_PREFIX}}…</code>, on every call.
-            A session cookie and a username/password (Basic) header are both <strong>refused here</strong>
-            with a 401. This is what an MCP client uses.</span>
+            A session cookie, a username/password (Basic) header and a Google sign-in are all
+            <strong>refused here</strong> with a 401 — a browser sign-in ends in a cookie, and a
+            cookie is not something you can hand to a client. This is what an MCP client uses.</span>
         </div>
         <div style="display:flex; gap:0.75rem; padding:0.55rem 0.75rem; border-bottom: 1px solid var(--border);">
           <code style="flex:0 0 130px;">/gui, /api/*</code>
-          <span style="flex:1;">Your dashboard login (a session cookie), a <code>Basic</code>
-            username and password, or an access key. This is the browser and the setup
-            scripts — <strong>not</strong> the MCP endpoint.</span>
+          <span style="flex:1;">Your dashboard login — a username and password from the front door,
+            a Google sign-in, or a <code>Basic</code> header — as a session cookie. Or an access key.
+            This is the browser and the setup scripts, <strong>not</strong> the MCP endpoint.</span>
         </div>
         <div style="display:flex; gap:0.75rem; padding:0.55rem 0.75rem;">
           <code style="flex:0 0 130px;">any other path</code>
@@ -989,50 +990,6 @@
         <div style="font-size:.9rem; color:var(--muted);">Loading access keys…</div>
       </div>
       <div id="session-list" style="margin-top:1rem; font-size:.85rem; color:var(--muted);"></div>
-    </div>
-
-    <div style="margin-top: 2.5rem; padding-top: 1.5rem; border-top: 1px solid var(--border);">
-      <h3 style="margin-top:0;">🔵 Google sign-in</h3>
-      <p style="font-size: 0.9rem; color: var(--muted); margin-bottom: 1rem;">
-        Optional. Lets a Google account open this vault, with no password of its own — an
-        MCP client can send a Google token instead of an access key, and a person can sign
-        in to the dashboard by pasting one.
-        <strong>There is no redirect and no callback URL.</strong> You paste a Google
-        <strong>ID token</strong> (the <code>eyJ…</code> value, not the <code>ya29.…</code>
-        access token), the app checks Google's signature on it, and it is exchanged for a
-        session. Verifying a token needs no client secret; the secret is stored so a Google
-        sign-in popup would work later, and is never shown back to you.
-      </p>
-
-      <div style="display:flex; gap:.5rem; flex-wrap:wrap; align-items:center;">
-        <input id="google-client-id" type="text" placeholder="OAuth client id" style="flex:1; min-width:220px;">
-        <input id="google-client-secret" type="password" placeholder="Client secret (optional)" style="flex:1; min-width:180px;">
-        <button id="google-save-btn" class="btn btn-primary btn-sm" onclick="saveGoogleConfig()">💾 Save client</button>
-      </div>
-      <div id="google-config-status" style="margin-top:.75rem; font-size:.9rem; color:var(--muted);"></div>
-
-      <div style="margin-top:1.25rem; padding-top:1rem; border-top:1px dashed var(--border);">
-        <div style="font-size:.85rem; color:var(--muted); margin-bottom:.5rem;">
-          Paste a token to see which account it belongs to, then link that account to
-          <code>{{AUTH_USER}}</code>'s vault.
-        </div>
-        <textarea id="google-token-input" rows="3" placeholder="eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9…" style="width:100%; font-family:var(--mono); font-size:.8rem;"></textarea>
-        <div style="display:flex; gap:.5rem; flex-wrap:wrap; align-items:center; margin-top:.5rem;">
-          <button id="google-verify-btn" class="btn btn-sm" onclick="verifyGoogleToken()">🔎 Check token</button>
-          <span id="google-status" style="font-size:.9rem; color:var(--muted);"></span>
-        </div>
-        <div id="google-ident" style="display:none; margin-top:.75rem; background:var(--bg); padding:.75rem 1rem; border-radius:8px; border:1px solid var(--primary);">
-          <div style="font-size:.85rem;"></div>
-          <div style="display:flex; gap:.5rem; flex-wrap:wrap; align-items:center; margin-top:.5rem;">
-            <button id="google-link-btn" class="btn btn-primary btn-sm" onclick="linkGoogleIdentity()">🔗 Link to this vault</button>
-            <span style="font-size:.8rem; color:var(--muted);"></span>
-          </div>
-        </div>
-      </div>
-
-      <div id="google-list" style="margin-top:1rem; max-height:220px; overflow-y:auto;">
-        <div style="font-size:.9rem; color:var(--muted);">Loading linked accounts…</div>
-      </div>
     </div>
 
     <div style="margin-top: 2.5rem; padding-top: 1.5rem; border-top: 1px solid var(--border);">
@@ -1389,7 +1346,6 @@ npm install @modelcontextprotocol/sdk</code></pre>
     loadClients();   // populate clientListCache + clientActiveMap for the filter dropdown
     loadSavepoints();  // once on initial load; deduped against switchTab('setup')
     loadPSKs();  // same deal as loadSavepoints
-    loadGoogle();  // and the Google sign-in section
     initSSE();
     initStatusStream();
     switchTab(activeTab);
@@ -1776,7 +1732,6 @@ npm install @modelcontextprotocol/sdk</code></pre>
       loadReclassifyStatus();
       loadSavepoints();
       loadPSKs();
-      loadGoogle();
       if (!duplicateClusters.length) renderDuplicateEmptyState();
     }
     saveSessionState();
@@ -2242,201 +2197,6 @@ npm install @modelcontextprotocol/sdk</code></pre>
   let psksInFlight = null;
   let psksCache = [];
 
-  let googleLoaded = false;
-  let googleInFlight = null;
-  // The identity returned by the last successful "Check token". Held so the link
-  // button submits a subject the server itself just verified, and deliberately
-  // discarded the moment a link succeeds.
-  let googlePending = null;
-  // Mirrors psksCache: kept so the unlink confirmation can name the account it is
-  // about to revoke, rather than saying "this Google account" and leaving the
-  // reader to work out which row the button belonged to.
-  let googleIdentitiesCache = [];
-
-  function loadPSKs(opts) {
-    const force = !!(opts && opts.force);
-    if (psksInFlight) return psksInFlight;
-    if (psksLoaded && !force) return Promise.resolve();
-    psksInFlight = fetchPSKs().finally(() => { psksInFlight = null; });
-    return psksInFlight;
-  }
-
-  function loadGoogle(opts) {
-    const force = !!(opts && opts.force);
-    if (googleInFlight) return googleInFlight;
-    if (googleLoaded && !force) return Promise.resolve();
-    googleInFlight = fetchGoogle().finally(() => { googleInFlight = null; });
-    return googleInFlight;
-  }
-
-  async function fetchGoogle() {
-    const list = document.getElementById('google-list');
-    try {
-      const data = await api.get('google');
-      googleLoaded = true;
-      renderGoogleConfig(data);
-      renderGoogleIdentities(data.identities || []);
-    } catch (e) {
-      googleLoaded = false;
-      if (list) list.innerHTML = `<div style="font-size:.9rem; color:var(--danger);">⚠️ Could not load Google settings${e && e.status ? ' (' + e.status + ')' : ''}</div>`;
-    }
-  }
-
-  // Pure renderer for the client-id row. The secret is never rendered into the
-  // page: the server answers with secret_set, and the field is filled with a
-  // placeholder rather than the value, so a password manager cannot offer to
-  // save it and a screenshot of this section cannot leak it.
-  function renderGoogleConfig(data) {
-    const client = data && data.client;
-    const idEl = document.getElementById('google-client-id');
-    const secretEl = document.getElementById('google-client-secret');
-    const status = document.getElementById('google-config-status');
-    if (idEl) {
-      idEl.value = client && client.client_id ? client.client_id : '';
-      idEl.disabled = false;
-    }
-    if (secretEl) {
-      secretEl.value = '';
-      secretEl.placeholder = client && client.secret_set
-        ? '••• saved — leave blank to keep'
-        : 'Client secret (optional)';
-    }
-    if (status) {
-      status.textContent = client && client.client_id
-        ? `Client id configured · secret ${client.secret_set ? 'saved' : 'not set'} · updated ${fmtWhen(client.updated_at)}`
-        : 'No client id yet — Google sign-in is off.';
-    }
-  }
-
-  function renderGoogleIdentities(rows) {
-    const el = document.getElementById('google-list');
-    if (!el) return;
-    googleIdentitiesCache = rows;
-    if (!rows.length) {
-      el.innerHTML = '<div style="font-size:.9rem; color:var(--muted);">No Google accounts linked. A valid Google token for this client is refused until its account is linked here.</div>';
-      return;
-    }
-    el.innerHTML = rows.map(row => {
-      const who = row.email ? escHtml(row.email) : '<em style="color:var(--muted)">no email claim</em>';
-      const nm = row.display_name ? escHtml(row.display_name) + ' · ' : '';
-      return '<div style="display:flex; gap:.75rem; align-items:center; padding:.5rem 0; border-bottom:1px solid var(--border);">' +
-          '<div style="flex:1; min-width:0;">' +
-            '<div>' + nm + '<strong>' + who + '</strong> <span style="color:var(--success)">linked</span></div>' +
-            '<div style="font-size:.8rem; color:var(--muted);">subject ' + escHtml(row.subject) +
-              ' · linked ' + fmtWhen(row.created_at) + ' · last used ' + fmtWhen(row.last_used_at) + '</div>' +
-          '</div>' +
-          '<button class="btn btn-sm" onclick="unlinkGoogleIdentity(\'' + escHtml(row.subject) + '\')">🗑️ Unlink</button>' +
-        '</div>';
-    }).join('');
-  }
-
-  async function saveGoogleConfig() {
-    const btn = document.getElementById('google-save-btn');
-    const idEl = document.getElementById('google-client-id');
-    const secretEl = document.getElementById('google-client-secret');
-    if (btn) btn.disabled = true;
-    const body = { clientId: idEl ? idEl.value.trim() : '' };
-    // Omitted rather than sent empty. The server reads an absent secret as
-    // "leave the stored one alone", so correcting a client id cannot silently
-    // wipe a secret — and this page never receives the secret to send back,
-    // which is the same reason the field renders as a placeholder above.
-    const typed = secretEl ? secretEl.value.trim() : '';
-    if (typed) body.clientSecret = typed;
-    try {
-      await api.post('google/config', body);
-      if (secretEl) secretEl.value = '';
-      toast('🔵 Google client saved');
-      await loadGoogle({ force: true });
-    } catch (e) {
-      toastApiError(e, 'Could not save the Google client');
-    } finally {
-      if (btn) btn.disabled = false;
-    }
-  }
-
-  async function verifyGoogleToken() {
-    const btn = document.getElementById('google-verify-btn');
-    const input = document.getElementById('google-token-input');
-    const status = document.getElementById('google-status');
-    const panel = document.getElementById('google-ident');
-    const token = input ? input.value.trim() : '';
-    if (!token) { toast('⚠️ Paste a Google ID token first'); return; }
-    // A stale identity from an earlier paste must not be linkable: the button
-    // below submits whatever is in this variable, so leaving the previous one in
-    // place would link the account that was on screen when you pressed Check,
-    // not the one whose token is in the box now.
-    googlePending = null;
-    if (btn) btn.disabled = true;
-    if (status) status.textContent = 'Checking…';
-    try {
-      const data = await api.post('google/verify', { token });
-      const id = data.identity || {};
-      googlePending = id;
-      const who = id.email || id.subject;
-      if (panel) {
-        panel.style.display = 'block';
-        const line = panel.querySelector('div');
-        if (line) line.innerHTML = 'This token is <strong>' + escHtml(who) + '</strong>' +
-            (id.email_verified ? ' <span style="color:var(--success)">(email verified)</span>' : '') +
-            ' · subject <code>' + escHtml(id.subject) + '</code>';
-        const linkBtn = document.getElementById('google-link-btn');
-        const note = linkBtn ? linkBtn.parentElement.querySelector('span') : null;
-        if (linkBtn) linkBtn.style.display = data.alreadyLinked ? 'none' : '';
-        if (note) note.textContent = data.alreadyLinked
-          ? 'Already linked to this vault — nothing to do.'
-          : 'Linking grants this Google account access to this vault.';
-      }
-      if (status) status.textContent = data.alreadyLinked
-        ? `✅ ${who} is already linked to this vault.`
-        : `✅ Token is valid for ${who}. Link it below to grant access.`;
-    } catch (e) {
-      if (panel) panel.style.display = 'none';
-      if (status) status.textContent = '';
-      toastApiError(e, 'That token could not be verified');
-    } finally {
-      if (btn) btn.disabled = false;
-    }
-  }
-
-  async function linkGoogleIdentity() {
-    if (!googlePending) { toast('⚠️ Check a token first'); return; }
-    const btn = document.getElementById('google-link-btn');
-    if (btn) btn.disabled = true;
-    try {
-      await api.post('google/link', {
-        subject: googlePending.subject,
-        email: googlePending.email || '',
-        name: googlePending.name || ''
-      });
-      googlePending = null;
-      const panel = document.getElementById('google-ident');
-      const input = document.getElementById('google-token-input');
-      if (panel) panel.style.display = 'none';
-      if (input) input.value = '';
-      toast('🔗 Google account linked to this vault');
-      await loadGoogle({ force: true });
-    } catch (e) {
-      if (e && e.status === 409) toastApiError(e, 'That account belongs to another vault');
-      else toastApiError(e, 'Could not link that account');
-    } finally {
-      if (btn) btn.disabled = false;
-    }
-  }
-
-  async function unlinkGoogleIdentity(subject) {
-    const who = (googleIdentitiesCache || []).find(r => r.subject === subject);
-    const label = who && who.email ? who.email : 'this Google account';
-    if (!confirm(`Unlink ${label}?\n\nIt loses access to this vault immediately. Re-linking later needs a token for that account again.`)) return;
-    try {
-      await api.delete(`google/link/${encodeURIComponent(subject)}`);
-      toast('🔗 Unlinked');
-      await loadGoogle({ force: true });
-    } catch (e) {
-      if (e && e.status === 404) { toast('⚠️ That link is already gone'); await loadGoogle({ force: true }); return; }
-      toastApiError(e, 'Could not unlink that account');
-    }
-  }
-
   async function fetchPSKs() {
     const list = document.getElementById('psk-list');
     try {
@@ -2449,6 +2209,16 @@ npm install @modelcontextprotocol/sdk</code></pre>
       if (list) list.innerHTML = `<div style="font-size:.9rem; color:var(--danger);">\u26a0\ufe0f Could not load access keys${e && e.status ? ' (' + e.status + ')' : ''}</div>`;
     }
   }
+
+  function loadPSKs(opts) {
+    const force = !!(opts && opts.force);
+    if (psksInFlight) return psksInFlight;
+    if (psksLoaded && !force) return Promise.resolve();
+    psksInFlight = fetchPSKs().finally(() => { psksInFlight = null; });
+    return psksInFlight;
+  }
+
+  function refreshPSKs() { return loadPSKs({ force: true }); }
 
   function fmtWhen(ts) {
     if (!ts) return 'never';

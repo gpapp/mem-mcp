@@ -31,7 +31,12 @@ ENV_EXAMPLE = os.path.join(_ROOT, ".env.example")
 COMPOSE = os.path.join(_ROOT, "docker-compose.yml")
 
 # A line in .env.example that declares a variable the operator can set.
+# GOOGLE_ is here for the OAuth client credentials: without it a GOOGLE_*
+# variable documented in .env.example would be invisible to this suite and so
+# would silently escape "every documented variable reaches the container" --
+# the same failure as not documenting it at all.
 _DECL = re.compile(r"^(MEM_[A-Z0-9_]+|LLM_[A-Z0-9_]+|OLLAMA_[A-Z0-9_]+|"
+                   r"GOOGLE_[A-Z0-9_]+|"
                    r"LOG_LEVEL|BASE_URL|NEO_PASS|HTPASSWD_[A-Z0-9_]+)=", re.M)
 # Either interpolated from the host .env, or assigned a literal value.
 _INTERPOLATED = re.compile(r"\$\{([A-Z0-9_]+)")

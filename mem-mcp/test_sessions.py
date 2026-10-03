@@ -781,164 +781,23 @@ class IdentityHeaderTests(AsgiCase):
 
 
 class GoogleIdentityStoreTests(StoreCase):
-    """The oauth_clients and google_identities tables.
+    """The google_identities table: what a signed-in Google account may open.
 
-    google_auth.py decides whether a presented token is a *real* Google ID
-    token; these tests cover the other half, which is what a verified subject is
-    allowed to open. That is the property that decides whether the integration is
-    a convenience or a way for anyone with a Google account to walk in, and it is
-    entirely in the store.
+    google_auth.py has already established that the person completed Google's
+    consent screen; these tests cover the other half, which is which vault that
+    subject belongs to. The design rule underneath all of it: one Google subject
+    maps to exactly one vault, and the primary key is (provider, subject) rather
+    than (provider, subject, user_id) precisely so a second link is impossible to
+    create even by accident.
 
-    The design rule underneath all of it: one Google subject maps to exactly one
-    vault, forever, chosen by a human. Nothing here provisions a vault from a
-    token, and the primary key is (provider, subject) rather than
-    (provider, subject, user_id) precisely so that a second link is impossible
-    to create even by accident.
+    There is no oauth_clients row here any more. The client id and secret moved
+    to the environment when the flow became a real redirect -- a secret that can
+    mint authorization codes should not live in a table the app writes and an
+    operator's database dump carries.
     """
 
     PROVIDER = sessions.GOOGLE_PROVIDER
     SUBJECT = "110248495921238986420"
-
-    # -- the client id / secret --------------------------------------------
-
-    def test_a_saved_client_round_trips(self):
-        record = sessions.save_oauth_client(self.PROVIDER, "vault-client-id",
-                                            "vault-secret")
-        self.assertEqual(record["client_id"], "vault-client-id")
-        self.assertEqual(record["client_secret"], "vault-secret")
-
-        loaded = sessions.get_oauth_client(self.PROVIDER)
-        self.assertEqual(loaded["client_id"], "vault-client-id")
-
-    def test_the_secret_is_optional(self):
-        # Some setups use a client id with no secret at all, and refusing that
-        # would be a configuration the operator cannot express.
-        record = sessions.save_oauth_client(self.PROVIDER, "public-client-id")
-        self.assertEqual(record["client_secret"], "")
-
-    def test_saving_twice_updates_rather_than_duplicating(self):
-        # Otherwise a second visit to the Setup page silently creates a second
-        # row and it is a coin flip which one is read.
-        first = sessions.save_oauth_client(self.PROVIDER, "cid-1", "secret-1")
-        second = sessions.save_oauth_client(self.PROVIDER, "cid-2", "secret-2")
-        self.assertEqual(second["client_id"], "cid-2")
-        self.assertEqual(second["client_secret"], "secret-2")
-        self.assertEqual(second["created_at"], first["created_at"],
-                         "an update must not reset the creation time")
-        # Read back through the store, not through the returned dicts: a second
-        # row would still leave both return values looking right.
-        self.assertEqual(sessions.get_oauth_client(self.PROVIDER)["client_id"],
-                         "cid-2")
-
-    def test_an_omitted_secret_is_kept_and_an_empty_one_clears_it(self):
-        # The UI cannot show the stored secret, so saving a new client id must
-        # not wipe the secret the user never retyped. But an explicitly empty
-        # field is how a secret is *removed*, and reading those two the same way
-        # leaves no way to delete one.
-        sessions.save_oauth_client(self.PROVIDER, "cid", "the-secret")
-
-        sessions.save_oauth_client(self.PROVIDER, "cid-2")
-        self.assertEqual(
-            sessions.get_oauth_client(self.PROVIDER)["client_secret"],
-            "the-secret")
-
-        sessions.save_oauth_client(self.PROVIDER, "cid-3", "")
-        self.assertEqual(
-            sessions.get_oauth_client(self.PROVIDER)["client_secret"], "")
-
-    def test_the_public_view_never_carries_the_secret(self):
-        # This dict is what the API returns. One redaction point, used by every
-        # route -- a route that returned the raw row would leak it into a
-        # response body and into the browser's devtools.
-        record = sessions.save_oauth_client(self.PROVIDER, "cid", "s3cr3t")
-        public = sessions.oauth_client_public(record)
-        self.assertNotIn("s3cr3t", repr(public))
-        self.assertNotIn("client_secret", public)
-        self.assertIs(public["secret_set"], True)
-
-        sessions.save_oauth_client(self.PROVIDER, "cid", "")
-        self.assertIs(
-            sessions.oauth_client_public(
-                sessions.get_oauth_client(self.PROVIDER))["secret_set"],
-            False)
-
-    def test_the_public_view_works_on_a_row_that_has_no_secret(self):
-        # Defensive: a config written before the secret column was honoured, or
-        # by hand, must not turn a GET into a 500.
-        self.assertIs(sessions.oauth_client_public({})["secret_set"], False)
-
-    def test_no_saved_client_is_none(self):
-        self.assertIsNone(sessions.get_oauth_client(self.PROVIDER))
-
-    def test_asking_about_another_provider_is_refused_not_answered(self):
-        # The table is keyed by provider, so "is one configured for github?"
-        # reads like a question the function could answer. It cannot: only
-        # google is wired up, and answering it would let a caller treat an
-        # unsupported provider as a configured-but-unconfigured one.
-        with self.assertRaises(ValueError):
-            sessions.get_oauth_client("github")
-
-    def test_only_google_is_accepted_as_a_provider(self):
-        # The table is keyed by provider so a second IdP needs no migration, but
-        # nothing else is wired up, and accepting one now would store a row that
-        # no code path can ever read.
-        for provider in ("github", "", None, "google2", "goog le"):
-            with self.subTest(provider=provider):
-                with self.assertRaises(ValueError):
-                    sessions.save_oauth_client(provider, "cid", "secret")
-
-    def test_the_provider_is_matched_case_insensitively_and_stored_normalised(self):
-        # A case-sensitive key would make "Google" and "google" two different
-        # providers, and the second one would silently never be read.
-        sessions.save_oauth_client("  GoOgLe ", "cid", "secret")
-        stored = sessions.get_oauth_client("google")
-        self.assertEqual(stored["provider"], "google")
-        self.assertEqual(stored["client_id"], "cid")
-
-    def test_an_empty_client_id_is_refused(self):
-        # An empty audience is the mistake the whole audience check exists to
-        # prevent; it must not be storable.
-        for value in ("", "   "):
-            with self.subTest(value=repr(value)):
-                with self.assertRaises(ValueError):
-                    sessions.save_oauth_client(self.PROVIDER, value, "secret")
-
-    def test_oversized_credentials_are_refused_rather_than_truncated(self):
-        # A display field that loses its tail is still readable. A credential
-        # that loses its tail is a wrong credential: it would be stored, shown as
-        # saved, and fail later against Google with an error that says nothing
-        # about a length limit here.
-        with self.assertRaises(ValueError):
-            sessions.save_oauth_client(self.PROVIDER, "c" * 5000, "secret")
-        with self.assertRaises(ValueError):
-            sessions.save_oauth_client(self.PROVIDER, "cid", "s" * 5000)
-
-    def test_a_refused_credential_leaves_the_stored_one_alone(self):
-        # The refusal has to happen before the write, not after it has clobbered
-        # the row -- otherwise a paste that is too long takes out a working
-        # configuration.
-        sessions.save_oauth_client(self.PROVIDER, "cid", "secret")
-        with self.assertRaises(ValueError):
-            sessions.save_oauth_client(self.PROVIDER, "c" * 5000)
-        stored = sessions.get_oauth_client(self.PROVIDER)
-        self.assertEqual(stored["client_id"], "cid")
-        self.assertEqual(stored["client_secret"], "secret")
-
-    def test_deleting_the_client_leaves_the_identity_links_alone(self):
-        # Removing the client id makes every existing token unverifiable (the
-        # audience no longer matches anything), so the links are already inert.
-        # Deleting them too would mean that putting the client id back does not
-        # restore access -- the operator would have to re-link every account by
-        # hand to undo a thing that never actually revoked their identities.
-        sessions.save_oauth_client(self.PROVIDER, "cid", "secret")
-        sessions.link_google_identity(self.SUBJECT, "alice")
-        self.assertTrue(sessions.delete_oauth_client(self.PROVIDER))
-        self.assertIsNone(sessions.get_oauth_client(self.PROVIDER))
-        self.assertEqual(sessions.list_google_identities("alice")[0]["subject"],
-                         self.SUBJECT)
-
-    def test_deleting_a_client_that_was_never_saved_is_not_an_error(self):
-        self.assertFalse(sessions.delete_oauth_client(self.PROVIDER))
 
     # -- identity links ----------------------------------------------------
 
@@ -1017,9 +876,10 @@ class GoogleIdentityStoreTests(StoreCase):
         self.assertEqual(second["last_used_at"], 1500.0)
 
     def test_touch_false_leaves_last_used_at_alone(self):
-        # /api/google/verify uses this: "does this token resolve to me?" is not
-        # a use of the account, and a preview that writes a timestamp every time
-        # somebody opens the Setup page makes last_used_at meaningless.
+        # The login callback uses touch=False to answer "is this Google account
+        # already linked to me?" without counting as a use: a sign-in that is then
+        # refused must not leave a timestamp, and a caller that polls would make
+        # last_used_at meaningless.
         sessions.link_google_identity(self.SUBJECT, "alice")
         sessions.resolve_google_identity(self.SUBJECT, self.PROVIDER, now=1000.0)
         sessions.resolve_google_identity(self.SUBJECT, self.PROVIDER, now=9000.0,
@@ -1095,23 +955,7 @@ class GoogleIdentityStoreTests(StoreCase):
                 with self.assertRaises(ValueError):
                     sessions.link_google_identity(self.SUBJECT, value)
 
-    def test_the_client_secret_is_on_disk_but_out_of_every_listing(self):
-        # The secret IS stored -- that is the chosen design, and asserting it here
-        # is more honest than pretending otherwise -- so what matters is that it
-        # never reaches a response. Both listings below are rendered by the Setup
-        # page, so this is the property that keeps a config screen from becoming
-        # a secret screen.
-        sessions.save_oauth_client(self.PROVIDER, "cid", "s3cr3t")
-        sessions.link_google_identity(self.SUBJECT, "alice")
-        sessions.create_psk("alice", label="a key")
 
-        self.assertIn(b"s3cr3t", self.db_bytes(), msg=(
-            "the secret is expected to be stored; if this now fails, the "
-            "redaction is doing the work this test assumed was not needed"))
-        self.assertNotIn("s3cr3t", repr(sessions.list_google_identities("alice")))
-        self.assertNotIn("s3cr3t", repr(sessions.list_psks("alice")))
-        self.assertNotIn("s3cr3t", repr(sessions.oauth_client_public(
-            sessions.get_oauth_client(self.PROVIDER))))
 
 if __name__ == "__main__":
     unittest.main()

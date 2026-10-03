@@ -95,26 +95,18 @@ CREATE TABLE IF NOT EXISTS psks (
 CREATE INDEX IF NOT EXISTS psks_user_id_index ON psks (user_id);
 CREATE INDEX IF NOT EXISTS sessions_expires_index ON sessions (expires_at);
 
--- The OAuth client this app registered with an external provider, entered
--- through the Setup page rather than the environment, so an operator can change
--- it without a redeploy. Google is the only provider implemented; the column
--- exists so adding one is a row rather than a second table.
-CREATE TABLE IF NOT EXISTS oauth_clients (
-    provider      TEXT PRIMARY KEY,
-    client_id     TEXT NOT NULL,
-    client_secret TEXT NOT NULL DEFAULT '',
-    created_at    REAL NOT NULL,
-    updated_at    REAL NOT NULL
-);
-
 -- Which external identity may open which vault. `user_id` is the same plain
 -- username string every other store in this app uses — there is no user table —
--- so linking a Google account is the act of pointing a subject at a name.
+-- so signing in with Google is the act of pointing a subject at a name.
+--
+-- `subject` is Google's `sub`, not the email address. An address can be renamed,
+-- reassigned or turned into an alias; `sub` cannot, so this is what a lookup
+-- keys on. The address is kept alongside purely for display.
 --
 -- The primary key is (provider, subject) and NOT (provider, subject, user_id):
--- one subject resolves to exactly one vault, forever. That is what makes an
--- unlinked account a refusal rather than a new empty vault, and it is why
--- link_google_identity refuses to move an existing link instead of upserting.
+-- one subject resolves to exactly one vault, forever. That is what stops a
+-- second link being created by accident, and why link_google_identity refuses to
+-- move an existing link rather than upserting.
 CREATE TABLE IF NOT EXISTS google_identities (
     provider     TEXT NOT NULL DEFAULT 'google',
     subject      TEXT NOT NULL,
@@ -137,22 +129,45 @@ CREATE INDEX IF NOT EXISTS google_identities_user_index ON google_identities (us
 -- hands the app the ability to rewrite a file a human also edits by hand -- a
 -- registration writes here and login checks here first.
 --
--- `user_id` is the vault key every other store in this app already scopes by,
--- so it is the PRIMARY KEY and a registered account needs no mapping layer. For
--- a registered account it is the lowercased email address; the pre-existing
--- htpasswd accounts keep their usernames and have no row here at all.
+-- `user_id` is the vault key every other store in this app already scopes by, so
+-- it is the PRIMARY KEY and a registered account needs no mapping layer. For a
+-- registered account it is the *username the person chose*, lowercased --
+-- deliberately not the email address, so an address that later gets reassigned
+-- cannot reach the old vault. The pre-existing htpasswd accounts keep their
+-- usernames and have no row here at all.
 --
--- There is deliberately no `email` column: `user_id` *is* the email for a
--- registered account, and a second copy of the same string is a second thing to
--- keep in agreement.
+-- `email` is stored separately and is NOT the key. It exists to send a
+-- verification message to and to say "this address is already registered" on a
+-- second attempt, and the unique index below is what makes the second answer
+-- possible without a scan.
 CREATE TABLE IF NOT EXISTS credentials (
-    user_id       TEXT PRIMARY KEY,
-    password_hash TEXT NOT NULL,
-    created_at    REAL NOT NULL,
-    updated_at    REAL NOT NULL,
-    disabled_at   REAL
+    user_id            TEXT PRIMARY KEY,
+    password_hash      TEXT NOT NULL,
+    email              TEXT NOT NULL DEFAULT '',
+    email_verified_at  REAL,
+    verification_token TEXT,
+    verification_sent_at REAL,
+    created_at         REAL NOT NULL,
+    updated_at         REAL NOT NULL,
+    disabled_at        REAL
 );
 """
+
+# Columns added to `credentials` after it shipped, as (name, declaration) pairs.
+#
+# `init_db` only ever creates tables, so a database written by an earlier build
+# has the older, narrower table and would fail every query naming one of these
+# with "no such column". Adding a column is the one schema change that cannot be
+# expressed as CREATE TABLE IF NOT EXISTS, hence this list. One account per
+# address is enforced by a partial unique index built in init_db *after* these
+# migrations, because an index naming `email` cannot be created on the older
+# narrower table.
+_ADDED_CREDENTIAL_COLUMNS = (
+    ("email", "TEXT NOT NULL DEFAULT ''"),
+    ("email_verified_at", "REAL"),
+    ("verification_token", "TEXT"),
+    ("verification_sent_at", "REAL"),
+)
 
 _INIT_LOCK = threading.Lock()
 # Keyed by path, not a bare bool: the suite points MEM_SESSION_DIR at a temp
@@ -192,9 +207,14 @@ def _connect() -> sqlite3.Connection:
 def init_db() -> None:
     """Create the schema. Idempotent, and called before every other function.
 
-    Every statement is CREATE ... IF NOT EXISTS, so a database written by an
-    older build gains the tables added since without a migration step: the only
-    thing a new column needs is a default, and only new tables have been added.
+    Every *table* is CREATE ... IF NOT EXISTS, so a database written by an older
+    build gains the tables added since without a migration step. A *column* is
+    the exception, and that is what `_ADDED_CREDENTIAL_COLUMNS` is for: a new
+    column cannot be expressed as CREATE TABLE IF NOT EXISTS, so an existing
+    database would keep the older, narrower table and every query naming the new
+    column would fail with "no such column". Each ALTER is guarded by reading the
+    table's own columns first, which makes the whole step a no-op on a fresh
+    database and on one that has already been migrated.
     """
     global _initialised_path
     path = db_path()
@@ -208,6 +228,23 @@ def init_db() -> None:
             # from here, so this file is the only contention that exists.
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(_SCHEMA)
+            # PRAGMA table_info columns are (cid, name, type, ...), and this
+            # connection has no row_factory -- it predates the one _connect()
+            # sets -- so the name is positional here.
+            existing = {row[1] for row in conn.execute("PRAGMA table_info(credentials)")}
+            for column, decl in _ADDED_CREDENTIAL_COLUMNS:
+                if column not in existing:
+                    conn.execute(f"ALTER TABLE credentials ADD COLUMN {column} {decl}")
+            # After the ALTERs, never before: this index names `email`, and on a
+            # database from the older build the column does not exist yet. Partial,
+            # because an operator-created account may have no address at all and
+            # several such rows must not collide on ''. A genuine duplicate
+            # address can only arrive from a hand-edited file, and it surfaces as
+            # a failed index creation rather than as a silently dropped account.
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS credentials_email_unique"
+                " ON credentials (email) WHERE email <> ''"
+            )
             conn.commit()
         finally:
             conn.close()
@@ -603,19 +640,14 @@ def revoke_psk(psk_id: str, user_id: str, now=None) -> bool:
 
 GOOGLE_PROVIDER = "google"
 
-# Google's client ids are of the form "<number>-<slug>.apps.googleusercontent.com",
-# around 40-120 characters. A generous bound rejects a pasted paragraph without
-# needing the real shape, which is a documentation detail not a security control.
-MAX_CLIENT_ID_CHARS = 255
-MAX_CLIENT_SECRET_CHARS = 512
-
 # The display fields are bounded here as well as in google_auth, for the reason
 # PSK labels are: these store functions are public, so a caller that bypasses
 # google_auth entirely (a script, a future provider) still cannot write an
-# unbounded string into the database. sessions.py cannot import the constants
-# from google_auth because google_auth needs PyJWT and this module is
-# stdlib-only precisely so the test suite can import and call it with nothing
-# installed — the duplication is the price of that, and it is two integers.
+# unbounded string into the database. sessions.py does not import the constants
+# from google_auth because this module is stdlib-only precisely so the test
+# suite can import and call it with nothing installed, and it must not know
+# which identity providers exist at all — the duplication is the price, and it is
+# two integers.
 MAX_EMAIL_CHARS = 254   # RFC 5321's practical maximum
 MAX_NAME_CHARS = 120
 
@@ -628,140 +660,19 @@ def _normalise_provider(provider) -> str:
     return name
 
 
-def save_oauth_client(provider, client_id, client_secret=None, now=None) -> dict:
-    """Store (or replace) the OAuth client for a provider. Returns the record.
-
-    `client_secret=None` keeps whatever secret is already stored; `""` clears it.
-    That distinction is the whole reason it is not a plain string: the Setup page
-    never receives the secret back, so a save that only meant to correct a client
-    id cannot send the stored value, and "absent means keep" is what stops it
-    wiping the secret instead.
-
-    The secret is stored as typed. That is a deliberate consequence of letting an
-    operator configure this from the Setup page rather than the environment: the
-    value has to be written somewhere the app owns, and this database is already
-    the place sessions and key hashes live, on the operator's bind mount. It is
-    not encrypted at rest, and pretending otherwise in a comment would be worse
-    than saying it. What keeps it from mattering is that verifying a Google ID
-    token needs no secret at all — the signature is checked against Google's
-    public keys — so the stored secret is only read if a code-exchange flow is
-    added later.
-    """
-    init_db()
-    name = _normalise_provider(provider)
-    client_id = str(client_id or "").strip()
-    if not client_id:
-        raise ValueError("A client id is required")
-    # Refused, not truncated. A display field that loses its tail is still
-    # readable, but a credential that loses its tail is simply a wrong
-    # credential: it would be stored, shown as saved, and fail later at the point
-    # of use with a Google-side error that says nothing about a length limit
-    # here. The bound is generous relative to what Google issues, so exceeding it
-    # means a paste went wrong and should be refused at the point of entry.
-    if len(client_id) > MAX_CLIENT_ID_CHARS:
-        raise ValueError("That client id is too long to be a Google client id")
-    if client_secret is not None and len(str(client_secret).strip()) > MAX_CLIENT_SECRET_CHARS:
-        raise ValueError("That client secret is too long to be a Google client secret")
-    moment = _now(now)
-    conn = _connect()
-    try:
-        existing = conn.execute(
-            "SELECT * FROM oauth_clients WHERE provider = ?", (name,)
-        ).fetchone()
-        if client_secret is None:
-            # Absent: keep the stored secret, or "" when there was never one.
-            secret = (existing["client_secret"] if existing is not None else "") or ""
-        else:
-            secret = str(client_secret).strip()
-        created_at = existing["created_at"] if existing is not None else moment
-        conn.execute(
-            "INSERT INTO oauth_clients (provider, client_id, client_secret, created_at, updated_at)"
-            " VALUES (?, ?, ?, ?, ?)"
-            " ON CONFLICT(provider) DO UPDATE SET"
-            " client_id = excluded.client_id,"
-            " client_secret = excluded.client_secret,"
-            " updated_at = excluded.updated_at",
-            (name, client_id, secret, created_at, moment),
-        )
-        conn.commit()
-        row = conn.execute(
-            "SELECT * FROM oauth_clients WHERE provider = ?", (name,)
-        ).fetchone()
-    finally:
-        conn.close()
-    return dict(row)
-
-
-def get_oauth_client(provider=GOOGLE_PROVIDER) -> dict | None:
-    """The stored client, secret included, or None. Internal: see the public_* pair.
-
-    Returning the secret here and stripping it one layer out is deliberate, and
-    it is only safe because oauth_client_public is the single place that builds a
-    client record for a response. A caller that wants to show the configuration
-    must go through that.
-    """
-    init_db()
-    name = _normalise_provider(provider)
-    conn = _connect()
-    try:
-        row = conn.execute(
-            "SELECT * FROM oauth_clients WHERE provider = ?", (name,)
-        ).fetchone()
-    finally:
-        conn.close()
-    return dict(row) if row is not None else None
-
-
-def oauth_client_public(record) -> dict:
-    """A client record safe to send to a browser: the secret becomes a flag.
-
-    The Setup page needs to show whether a secret is configured so an operator
-    can tell "never set one" from "set one and forgot it", and it must not be
-    able to read the secret back — this app has exactly one place a Google secret
-    is ever needed (a future code exchange), and that is not the UI.
-    """
-    record = dict(record or {})
-    secret = record.get("client_secret") or ""
-    return {
-        "provider": record.get("provider") or GOOGLE_PROVIDER,
-        "client_id": record.get("client_id") or "",
-        "secret_set": bool(secret),
-        "created_at": record.get("created_at"),
-        "updated_at": record.get("updated_at"),
-    }
-
-
-def delete_oauth_client(provider=GOOGLE_PROVIDER) -> bool:
-    """Forget the OAuth client. Identity links are deliberately left alone.
-
-    Removing the client id makes every token unverifiable, because the audience
-    check has nothing to compare against — so the links stop granting access at
-    that moment without the links themselves being rewritten. Deleting them too
-    would mean that restoring a client id did not restore access, which is the
-    opposite of what an operator who fat-fingered the field wants.
-    """
-    init_db()
-    name = _normalise_provider(provider)
-    conn = _connect()
-    try:
-        cursor = conn.execute("DELETE FROM oauth_clients WHERE provider = ?", (name,))
-        conn.commit()
-        return cursor.rowcount > 0
-    finally:
-        conn.close()
-
-
 def link_google_identity(subject, user_id, email="", name="", provider=GOOGLE_PROVIDER, now=None) -> dict:
     """Point an external subject at a vault, and return the record.
 
     Raises ValueError if the subject is already linked to a *different* vault. A
     subject is one account at one provider, so a second link is a contradiction
-    rather than a second grant — and silently reassigning would let anyone who can
-    log in as any vault claim another vault's account by pasting its token,
-    which is a privilege escalation dressed up as a convenience.
+    rather than a second grant — and silently reassigning would let whoever holds
+    a working Google login for one address take over a different vault, which is a
+    privilege escalation dressed up as a convenience.
 
     Re-linking the same subject to the same vault is an update of the display
-    fields, so an operator can correct a mistyped email without a delete.
+    fields, so an operator can correct a mistyped email without a delete. That is
+    why this is an upsert on the *same* pair and still a refusal on a *different*
+    one.
     """
     init_db()
     subject = str(subject or "").strip()
@@ -1032,37 +943,53 @@ def verify_password(password: str, encoded: str) -> bool:
     return hmac.compare_digest(digest, expected)
 
 
-def normalise_account_id(email) -> str:
-    """The vault key for a registered account: the email, lowercased and trimmed.
+# A username is the vault key for an account that registers with a password, so
+# the rules are about one thing: two people must never end up with the same key,
+# and a key must never contain anything that would need escaping in a URL, a log
+# line or a Cypher parameter. Lowercase-only also means `Alice` and `alice` are
+# one account rather than two vaults.
+MIN_USERNAME_CHARS = 3
+MAX_USERNAME_CHARS = 64
+_USERNAME_ALLOWED = set("abcdefghijklmnopqrstuvwxyz0123456789._-")
 
-    Lowercasing is not cosmetic. `user_id` is the PRIMARY KEY of this table and
-    the `userId` on every Fact, DiaryEntry and Client in the other two stores, so
-    `Alice@example.com` and `alice@example.com` would otherwise be two accounts
-    with two vaults and two sets of records -- the exact shape of the
-    case-collision bugs that surface as "my notes disappeared".
 
-    It also means the email is the vault key, which is a deliberate trade (see
-    AGENTS.md "Registration"): a reassigned address would reach the old vault.
-    That is why registration is opt-in rather than always available.
+def normalise_username(username) -> str:
+    """The vault key for a password account: lowercased, trimmed, validated.
+
+    The character set is the whole policy. Letters, digits, dot, underscore and
+    hyphen cannot collide with a separator in a URL path, cannot be confused with
+    each other in most fonts, and cannot smuggle a quote or a backslash into a
+    log line or a query. Anything else is refused rather than transliterated,
+    because a transliteration is a second spelling of the same name and two
+    spellings are the bug this function exists to prevent.
     """
-    text = str(email or "").strip().lower()
+    text = str(username or "").strip().lower()
     if not text:
-        raise ValueError("an email address is required")
-    if len(text) > MAX_EMAIL_CHARS:
-        raise ValueError(f"that email address is longer than {MAX_EMAIL_CHARS} characters")
+        raise ValueError("a username is required")
+    if len(text) < MIN_USERNAME_CHARS:
+        raise ValueError(f"a username must be at least {MIN_USERNAME_CHARS} characters")
+    if len(text) > MAX_USERNAME_CHARS:
+        raise ValueError(f"a username must be at most {MAX_USERNAME_CHARS} characters")
+    if not text[0].isalnum() or not text[-1].isalnum():
+        # A leading or trailing separator makes two keys that look identical at a
+        # glance ("alice" and "alice_") and reads as a typo in every log line.
+        raise ValueError("a username must start and end with a letter or digit")
+    if any(character not in _USERNAME_ALLOWED for character in text):
+        raise ValueError(
+            "a username may only contain letters, digits, dots, underscores and hyphens"
+        )
     return text
 
 
 def validate_email(email) -> str:
-    """Return the normalised account id, or raise ValueError with a usable reason.
+    """Return the normalised address, or raise ValueError with a usable reason.
 
     The shape check is deliberately loose -- one `@`, something on each side, a
     dot in the domain, no whitespace. A strict RFC 5322 parser rejects valid
     addresses (`a@b` is legal, `user@localhost` is legal in practice) and the
-    only authority on whether an address receives mail is a message to it, which
-    this app does not send. What is being stopped here is a string that could not
-    be an address at all, and a string long enough or shaped oddly enough to be
-    something else.
+    only authority on whether an address receives mail is a message to it. What is
+    being stopped here is a string that could not be an address at all, and a
+    string long enough or shaped oddly enough to be something else.
     """
     text = str(email or "").strip().lower()
     if not text:
@@ -1086,10 +1013,10 @@ def validate_email(email) -> str:
 def user_id_taken(user_id: str) -> bool:
     """True if this vault key already exists in *any* of the three stores.
 
-    A registered account's `user_id` is its email, and an email can already name
-    something: an htpasswd user (the operator's own account, or one they added by
-    hand) or the vault a Google account is already linked to. Creating a
-    credentials row for either would produce two ways into one vault with two
+    A registered account's `user_id` is its username, and a username can already
+    name something: an htpasswd user (the operator's own account, or one they
+    added by hand) or the vault a Google account is already signed into. Creating
+    a credentials row for either would produce two ways into one vault with two
     independent passwords -- or, worse, silently re-point an existing vault at a
     password the person registering just chose, which is an account takeover
     dressed as a signup.
@@ -1115,6 +1042,31 @@ def user_id_taken(user_id: str) -> bool:
     # candidate name that is not already known to be free, and registration is a
     # rare event behind an opt-in flag.
     return htpasswd_user_exists(key)
+
+
+def email_taken(email) -> bool:
+    """True if some account is already registered against this address.
+
+    Separate from `user_id_taken` because the two answer different questions.
+    One address per account is enforced by a unique index, so this is how a
+    second signup for an address is turned into "sign in instead" rather than a
+    database error. It deliberately does not consult htpasswd or Google: an
+    operator's account has no address in this table, and refusing a signup
+    because an unrelated account shares a name somewhere else would be a
+    coincidence mistaken for a policy.
+    """
+    address = str(email or "").strip().lower()
+    if not address:
+        return False
+    init_db()
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM credentials WHERE email = ?", (address,)
+        ).fetchone()
+    finally:
+        conn.close()
+    return row is not None
 
 
 def htpasswd_user_exists(username: str) -> bool:
@@ -1143,30 +1095,70 @@ def htpasswd_user_exists(username: str) -> bool:
     return result.returncode == 0
 
 
-def create_credentials(email, password: str, now=None) -> dict:
-    """Register an email/password account and return the stored record.
+def create_credentials(username, password: str, email: str = "", now=None) -> dict:
+    """Register a username/password account and return the stored record.
 
-    Refuses if the vault key is already spoken for, rather than upserting: an
-    upsert here would silently reset the password of an existing account, which
-    is the failure mode a "create" endpoint must not have.
+    Three refusals, and each one is a different question: the username must be
+    free (`user_id_taken`, across all three stores), the address must be free
+    (`email_taken`), and the password must satisfy the policy. None of them
+    upserts. An upsert here would silently reset the password of an existing
+    account, which is the failure mode a "create" endpoint must not have.
+
+    The row is created **unverified**. That is not an oversight to be tidied up
+    later by a flag: the address has not been proven to belong to whoever typed
+    it, and until it has, the account cannot sign in. `verify_account_password`
+    is what refuses it.
     """
-    key = validate_email(email)
+    key = normalise_username(username)
+    address = validate_email(email) if str(email or "").strip() else ""
     if user_id_taken(key):
-        raise ValueError("that account already exists")
+        raise ValueError("that username is taken")
+    if address and email_taken(address):
+        raise ValueError("that email address is already registered")
     moment = _now(now)
     encoded = hash_password(password)
     init_db()
     conn = _connect()
     try:
         conn.execute(
-            "INSERT INTO credentials (user_id, password_hash, created_at, updated_at, disabled_at)"
-            " VALUES (?, ?, ?, ?, NULL)",
-            (key, encoded, moment, moment),
+            "INSERT INTO credentials (user_id, password_hash, email, created_at, updated_at, disabled_at)"
+            " VALUES (?, ?, ?, ?, ?, NULL)",
+            (key, encoded, address, moment, moment),
         )
         conn.commit()
     finally:
         conn.close()
-    return {"user_id": key, "created_at": moment, "updated_at": moment, "disabled_at": None}
+    return {
+        "user_id": key,
+        "email": address,
+        "email_verified_at": None,
+        "created_at": moment,
+        "updated_at": moment,
+        "disabled_at": None,
+    }
+
+
+def delete_credentials(user_id, now=None) -> bool:
+    """Remove an account row outright. Used only to undo a failed signup.
+
+    This is not how an account is turned off -- `disable_credentials` keeps the
+    vault key occupied so the name cannot be registered again and come back
+    pointing at a vault whose records are still there. This exists for one case:
+    a signup created a row and the verification message could not be sent, so
+    leaving the row behind would strand a half-account that can never sign in and
+    whose name the person cannot reclaim.
+    """
+    key = str(user_id or "").strip()
+    if not key:
+        return False
+    init_db()
+    conn = _connect()
+    try:
+        cursor = conn.execute("DELETE FROM credentials WHERE user_id = ?", (key,))
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        conn.close()
 
 
 def get_credentials(user_id) -> dict | None:
@@ -1178,7 +1170,8 @@ def get_credentials(user_id) -> dict | None:
     conn = _connect()
     try:
         row = conn.execute(
-            "SELECT user_id, password_hash, created_at, updated_at, disabled_at"
+            "SELECT user_id, password_hash, email, email_verified_at,"
+            " verification_token, verification_sent_at, created_at, updated_at, disabled_at"
             " FROM credentials WHERE user_id = ?",
             (key,),
         ).fetchone()
@@ -1187,16 +1180,31 @@ def get_credentials(user_id) -> dict | None:
     return dict(row) if row is not None else None
 
 
+def account_verified(user_id) -> bool:
+    """True if this account may sign in, on the address question.
+
+    Only meaningful for a row in `credentials`. An htpasswd account has no row
+    and is never asked -- the operator manages those by hand and there is nothing
+    to verify -- so this is called only after a credentials row was found.
+    """
+    record = get_credentials(user_id)
+    if record is None:
+        return False
+    return record.get("email_verified_at") is not None
+
+
 def verify_account_password(user_id, password: str) -> bool:
     """True if `password` is the registered password for this vault key.
 
-    A disabled account is False even with the right password. Disabling is not
-    deleting so that the row keeps the vault key occupied: without that, the
-    address could be registered again and would come back pointing at a vault
-    whose records are still there.
+    Two independent refusals, both False. A disabled account is refused even with
+    the right password, and so is an account whose email address has never been
+    verified -- the password can be exactly right and the account still not be
+    usable, which is the entire point of verifying an address.
     """
     record = get_credentials(user_id)
     if not record or record.get("disabled_at") is not None:
+        return False
+    if record.get("email_verified_at") is None:
         return False
     return verify_password(password, record["password_hash"])
 
@@ -1241,12 +1249,12 @@ def disable_credentials(user_id, now=None) -> bool:
 
 
 def list_credentials() -> list:
-    """Every registered account, newest first. Never includes the hash."""
+    """Every registered account, newest first. Never includes the hash or token."""
     init_db()
     conn = _connect()
     try:
         rows = conn.execute(
-            "SELECT user_id, created_at, updated_at, disabled_at"
+            "SELECT user_id, email, email_verified_at, created_at, updated_at, disabled_at"
             " FROM credentials ORDER BY created_at DESC"
         ).fetchall()
     finally:
@@ -1286,33 +1294,227 @@ def allow_registration_attempt(client: str, now=None) -> bool:
     return True
 
 
+def issue_verification_token(user_id, now=None) -> str:
+    """Mint and store a fresh verification token for a password account.
+
+    Returns the plaintext, which goes in the emailed link and is never stored: the
+    row holds the SHA-256, so a copy of the database is not a list of working
+    verification links. Same rule as an access key, and for the same reason -- a
+    link in an inbox is a credential until it is spent or until it expires.
+    """
+    key = str(user_id or "").strip()
+    if not key:
+        raise ValueError("an account is required")
+    moment = _now(now)
+    token = secrets.token_urlsafe(32)
+    init_db()
+    conn = _connect()
+    try:
+        cursor = conn.execute(
+            "UPDATE credentials SET verification_token = ?, verification_sent_at = ?"
+            " WHERE user_id = ? AND disabled_at IS NULL AND email <> ''",
+            (_token_hash(token), moment, key),
+        )
+        conn.commit()
+        if cursor.rowcount == 0:
+            # Either no such account, or one with no address to send to. Both are
+            # "cannot verify this", and the caller's only correct response is the
+            # same, so one message covers them.
+            raise ValueError("that account cannot be verified")
+    finally:
+        conn.close()
+    return token
+
+
+def _token_hash(token) -> str:
+    """The stored form of a verification token. Same shape as a PSK digest."""
+    return hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()
+
+
+def verify_email_token(token, now=None) -> str | None:
+    """Spend a verification token; return the account it verified, or None.
+
+    Single-use by construction: the UPDATE that stamps `email_verified_at` also
+    clears `verification_token`, so a link clicked twice verifies once and the
+    second click is a miss. Doing it in one statement rather than a SELECT then
+    an UPDATE is what makes that true under two simultaneous clicks -- the race
+    would otherwise leave the second caller believing it had verified something.
+    """
+    text = str(token or "").strip()
+    if not text:
+        return None
+    moment = _now(now)
+    init_db()
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT user_id FROM credentials WHERE verification_token = ?",
+            (_token_hash(text),),
+        ).fetchone()
+        if row is None:
+            return None
+        key = row["user_id"]
+        conn.execute(
+            "UPDATE credentials SET email_verified_at = ?, verification_token = NULL,"
+            " updated_at = ? WHERE verification_token = ?",
+            (moment, moment, _token_hash(text)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return key
+
+
+# ---------------------------------------------------------------------------
+# Outbound mail
+#
+# Verification needs somewhere to send a message, so SMTP settings are part of
+# whether registration is available at all: see registration_enabled("email").
+# They live here, in the stdlib-only module, because smtplib is stdlib and
+# because a half-sent verification is a store problem as much as a mail problem.
+#
+# There is no other mail this app sends. No password reset, no notification, no
+# digest -- which is why there is no template engine here and the message below is
+# the whole of it.
+# ---------------------------------------------------------------------------
+
+SMTP_HOST = str(os.getenv("MEM_SMTP_HOST") or "").strip()
+SMTP_PORT = int(os.getenv("MEM_SMTP_PORT") or "587")
+SMTP_USER = str(os.getenv("MEM_SMTP_USER") or "").strip()
+SMTP_PASSWORD = str(os.getenv("MEM_SMTP_PASSWORD") or "")
+SMTP_FROM = str(os.getenv("MEM_SMTP_FROM") or "").strip()
+# STARTTLS on by default because port 587 is the submission port and plaintext
+# credentials on it are the failure everyone regrets. A relay on 25 with no TLS
+# is a legitimate choice for a self-hosted mail server, hence the switch.
+SMTP_STARTTLS = str(os.getenv("MEM_SMTP_STARTTLS") or "1").strip().lower() in ("1", "true", "yes", "on")
+SMTP_TIMEOUT = float(os.getenv("MEM_SMTP_TIMEOUT") or "20")
+
+
+def smtp_configured() -> bool:
+    """True when a verification message could actually be sent.
+
+    Host and a From address are the two that make a message meaningful; the
+    credentials are optional because a relay on a trusted network may take none.
+    """
+    return bool(SMTP_HOST and SMTP_FROM)
+
+
+def verification_email(username: str, link: str, site_name: str = "Memory Vault") -> tuple:
+    """The message to send. Returns `(subject, body)` so it is testable as text.
+
+    A function returning strings rather than sending is what lets the test suite
+    assert that the link really is in the body and that the address is not leaked
+    into a header it should not be in.
+    """
+    subject = f"Confirm your {site_name} account"
+    body = "\n".join([
+        f"Hello {username},",
+        "",
+        f"Confirm this address to finish setting up your {site_name} account:",
+        "",
+        link,
+        "",
+        "The link works once. If you did not ask for an account, ignore this",
+        "message and nothing will happen.",
+        "",
+    ])
+    return subject, body
+
+
+def send_mail(to_address: str, subject: str, body: str, *, client=None) -> None:
+    """Send one message. Raises RuntimeError on any failure.
+
+    `client` is the seam: it is anything with `send_message(msg)`, and the
+    default builds an `smtplib.SMTP` over the configured settings. The caller is
+    a signup route, which must be able to tell "the account was created" from
+    "the account was created and the message did not go out" -- so this raises
+    rather than returning a flag nobody checks.
+    """
+    address = str(to_address or "").strip()
+    if not address:
+        raise ValueError("an address is required")
+    if not smtp_configured():
+        raise RuntimeError("outbound mail is not configured on this server")
+    if client is None:
+        import smtplib
+        from email.message import EmailMessage
+
+        message = EmailMessage()
+        message["From"] = SMTP_FROM
+        message["To"] = address
+        message["Subject"] = subject
+        message.set_content(body)
+        client = _smtp_client()
+        try:
+            client.send_message(message)
+        finally:
+            _close_quietly(client)
+        return
+
+    message = _plain_message(address, subject, body)
+    client.send_message(message)
+
+
+def _plain_message(to_address: str, subject: str, body: str):
+    from email.message import EmailMessage
+
+    message = EmailMessage()
+    message["From"] = SMTP_FROM
+    message["To"] = to_address
+    message["Subject"] = subject
+    message.set_content(body)
+    return message
+
+
+def _smtp_client():
+    """An authenticated SMTP connection, or an unauthenticated one if no user is set."""
+    import smtplib
+
+    client = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT)
+    if SMTP_STARTTLS:
+        client.starttls()
+    if SMTP_USER:
+        client.login(SMTP_USER, SMTP_PASSWORD)
+    return client
+
+
+def _close_quietly(client) -> None:
+    try:
+        client.quit()
+    except Exception:
+        pass
+
+
 def registration_enabled(method="email") -> bool:
-    """Whether this signup *method* may be used right now.
+    """Whether this signup *method* may be offered right now.
 
-    Both halves are required, and the second is the one that is easy to forget:
-    the flag turns the *route* on, but a Google signup cannot verify anything
-    without a client id, and one without a client id would accept a token it has
-    no way to check the audience of. "Enabled but not configured" is a 404-shaped
-    state that reads as a broken feature, so it is not offered.
+    Two things are required and they are not the same axis. `MEM_REGISTRATION_ENABLED`
+    is the operator's decision to have signup at all -- off by default, because
+    an endpoint that creates accounts should be something an operator turned on
+    rather than something a deployment inherits by upgrading. The second half is
+    whether the method could actually work:
 
-    This takes a method name ("email" / "google"), not a provider key, because
-    the two are not the same axis: the flag is about registration as a whole and
-    the client id is about Google specifically. A Google-only deployment and an
-    email-only one are both reachable without touching the flag.
+      * **email** needs somewhere to send the verification message. Without SMTP
+        settings every account would be created and none could ever be verified,
+        so the form is not shown at all rather than shown and useless.
+      * **google** needs a client id *and* a client secret. The secret is not
+        optional for the code exchange, so a half-configured deployment can start
+        a login and not finish it.
+
+    "Enabled but not configured" is a broken feature rather than a feature, so it
+    is not offered. The unknown method raises rather than defaulting, because a
+    typo in the caller should be a loud failure and not a silently hidden form.
     """
     if not REGISTRATION_ENABLED:
         return False
     name = str(method or "").strip().lower()
     if name == "email":
-        return True
+        return smtp_configured()
     if name != GOOGLE_PROVIDER:
         raise ValueError(f"unknown registration method: {method!r}")
-    client = get_oauth_client(GOOGLE_PROVIDER)
-    # stripped, not just truthy: a client id of "   " is the client id you get
-    # from a form that was submitted with an empty box, and verifying a token
-    # against it as an audience is the exact mistake the audience check exists
-    # to stop -- reached from the other direction.
-    return bool(client and str(client.get("client_id") or "").strip())
+    import google_auth
+
+    return google_auth.configured()
 
 
 # ---------------------------------------------------------------------------

@@ -154,62 +154,28 @@ class _StubStore:
 def _build_bearer_ladder(known_keys):
     """Namespace for exec'ing gui.py's resolve_bearer_token, with the store stubbed.
 
-    `google_auth` is partly real and partly injected. `looks_like_a_google_token`
-    and `GoogleTokenError` come from the real module because both must agree
-    with each other and with the shape of a Google token: a stub prefilter that
-    accepts something the real one rejects would let the tests below pass against
-    a ladder that sends real tokens to a network fetch on every bad key. Only
-    `google_identity` is replaced, because it is the one call that would
-    otherwise reach the network, and its verdicts are the ladder's business
-    rather than google_auth's — those are tested for real in test_google_auth.py.
+    Only the access-key store is injected, and the Google counters are kept so a
+    test can assert that *nothing* was consulted: the ladder is one rung deep
+    now, and "no rung" is a property of what is not called rather than of what
+    the code visibly does.
     """
-    state = {
-        "known_keys": dict(known_keys),
-        "client": {"client_id": "vault-client-id", "client_secret": "shh"},
-        "links": {},          # subject -> user_id
-        "identity_error": None,
-        "identity_calls": 0,
-        "oauth_lookups": 0,
-        "resolved_subjects": [],
-    }
+    state = {"known_keys": dict(known_keys), "oauth_lookups": 0,
+             "identity_calls": 0}
 
     def resolve_psk(key, **kwargs):
         user = state["known_keys"].get(key)
         return None if user is None else {"user_id": user, "id": "k"}
 
-    def get_oauth_client(provider):
+    def get_oauth_client(provider):  # pragma: no cover - must not be called
         state["oauth_lookups"] += 1
-        return state["client"] if provider == "google" else None
+        return None
 
-    def google_identity(token, client_id, source=None):
+    def google_identity(*a, **k):  # pragma: no cover - must not be called
         state["identity_calls"] += 1
-        if state["identity_error"]:
-            raise state["identity_error"]
-        return {
-            "subject": "google-sub-1",
-            "email": "someone@example.com",
-            "email_verified": True,
-            "name": "Someone",
-            "audience": client_id,
-        }
+        raise AssertionError("the bearer ladder must not resolve a Google token")
 
-    def resolve_google_identity(subject, provider, **kwargs):
-        state["resolved_subjects"].append((subject, provider))
-        user = state["links"].get(subject)
-        return None if user is None else {"user_id": user}
-
-    google = types.SimpleNamespace(
-        looks_like_a_google_token=google_auth.looks_like_a_google_token,
-        google_identity=google_identity,
-        GoogleTokenError=google_auth.GoogleTokenError,
-    )
-    return state, {
-        "resolve_psk": resolve_psk,
-        "google_auth": google,
-        "get_oauth_client": get_oauth_client,
-        "resolve_google_identity": resolve_google_identity,
-        "GOOGLE_PROVIDER": "google",
-    }
+    return state, {"resolve_psk": resolve_psk, "get_oauth_client": get_oauth_client,
+                   "google_identity": google_identity}
 
 
 # ---------------------------------------------------------------------------
@@ -469,137 +435,82 @@ class McpAuthGuardTests(GuardCase):
 class BearerLadderTests(unittest.TestCase):
     """resolve_bearer_token -- the one ladder both gates call.
 
-    Two credential types reach it, and the properties that matter are about the
-    *reasons*, not just the verdicts. Every refusal returns a sentence an
-    operator can act on, and the reasons must distinguish "your key is wrong"
-    from "that account has no vault yet", because the second is not a failure at
-    all -- it is a person standing in front of a working credential with one
-    click left to take. Collapsing both into an opaque 401 is how a correct
-    configuration ends up reading as a broken one.
+    One credential type reaches it now. A Google sign-in ends in a session
+    cookie, and a cookie is not something an MCP client presents, so the Google
+    rung is gone rather than merely unused: a rung that still resolved a Google
+    subject would be a way in that no other gate offers, which is the drift the
+    shared ladder exists to prevent.
+
+    What is left still has to be right about *reasons*. A 401 that says only
+    "unauthorized" is indistinguishable between a revoked key, a typo and a
+    client sending the wrong header, so the reason is part of the contract.
     """
 
     KEYS = {"mvk_alice_key": "alice", "mvk_bob_key": "bob"}
 
-    def setUp(self):
-        self.state, ns = _build_bearer_ladder(self.KEYS)
-        self.ladder = _lift("gui.py", "resolve_bearer_token", dict(ns))
-        self.state["links"] = {"google-sub-1": "alice"}
+    @classmethod
+    def setUpClass(cls):
+        cls.state, ns = _build_bearer_ladder(cls.KEYS)
+        # staticmethod, or `self.ladder(token)` binds it and the call arrives
+        # with an extra self -- the same trap as HeaderPrecedenceTests.extract.
+        cls.ladder = staticmethod(_lift("gui.py", "resolve_bearer_token", dict(ns)))
 
-    def _jwt_looking_token(self):
-        # Only the prefilter inspects the shape; identity() is stubbed, so the
-        # payload is never decoded. "eyJ" is a base64url-encoded '{"', which is
-        # what the real prefilter keys on.
-        return "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJnLW9vZ2xlLXN1Yi0xIn0.c2ln"
+    def _resolve(self, token):
+        return self.ladder(token)
 
-    # -- the access key ----------------------------------------------------
     def test_an_access_key_resolves_to_its_owner(self):
-        user, reason = self.ladder("mvk_alice_key")
-        self.assertEqual(user, "alice")
-        self.assertEqual(reason, "")
+        self.assertEqual(self._resolve("mvk_alice_key"), ("alice", ""))
 
-    def test_an_unknown_access_key_is_refused(self):
-        user, reason = self.ladder("mvk_guessed")
-        self.assertIsNone(user)
-        self.assertTrue(reason)
-
-    def test_the_key_is_checked_before_google_is_considered(self):
-        # Order is not cosmetic: an mvk_ key must never trigger a Google lookup,
-        # or a vault full of keys puts a network fetch in front of every request.
-        self.ladder("mvk_alice_key")
-        self.assertEqual(self.state["oauth_lookups"], 0)
-        self.assertEqual(self.state["identity_calls"], 0)
-
-    def test_surrounding_whitespace_is_ignored(self):
-        # The value comes out of an Authorization header or a textarea.
-        self.assertEqual(self.ladder("  mvk_alice_key \n")[0], "alice")
-
-    def test_an_empty_token_is_refused_with_a_reason(self):
-        for value in ("", "   ", None):
-            with self.subTest(value=repr(value)):
-                user, reason = self.ladder(value)
-                self.assertIsNone(user)
-                self.assertIn("no token", reason)
-
-    def test_something_that_is_not_a_known_credential_says_so(self):
-        # "not a known credential" and "no token was presented" are different
-        # user errors, and conflating them makes the first look like the second.
-        user, reason = self.ladder("just-a-string")
+    def test_an_unknown_access_key_is_refused_with_a_reason(self):
+        user, reason = self._resolve("mvk_guess")
         self.assertIsNone(user)
         self.assertIn("not a known credential", reason)
 
-    # -- a Google token that verifies and is linked -----------------------
-    def test_a_linked_google_token_resolves_to_its_vault(self):
-        user, reason = self.ladder(self._jwt_looking_token())
-        self.assertEqual(user, "alice")
-        self.assertEqual(reason, "")
-        self.assertEqual(self.state["identity_calls"], 1)
+    def test_a_revoked_or_expired_key_is_refused(self):
+        self.state["known_keys"].pop("mvk_bob_key")
+        self.assertEqual(self._resolve("mvk_bob_key"), (None, self._resolve("mvk_bob_key")[1]))
+        self.assertIsNone(self._resolve("mvk_bob_key")[0])
 
-    def test_the_google_lookup_is_scoped_to_the_google_provider(self):
-        self.ladder(self._jwt_looking_token())
-        self.assertEqual(self.state["resolved_subjects"],
-                         [("google-sub-1", "google")])
+    def test_an_empty_token_is_refused_with_a_reason(self):
+        for value in ("", "   ", None):
+            with self.subTest(value=value):
+                user, reason = self._resolve(value)
+                self.assertIsNone(user)
+                self.assertIn("no token", reason)
 
-    # -- a Google token that is not usable ---------------------------------
-    def test_a_token_that_does_not_verify_says_why(self):
-        self.state["identity_error"] = google_auth.GoogleTokenError(
-            "the token was rejected (ExpiredSignatureError)")
-        user, reason = self.ladder(self._jwt_looking_token())
+    def test_surrounding_whitespace_is_ignored(self):
+        # A key pasted out of a config file arrives with a trailing newline, and
+        # "a key with a newline in it" is not a reason to refuse a correct key.
+        self.assertEqual(self._resolve("  mvk_alice_key\n"), ("alice", ""))
+
+    def test_something_that_is_not_a_credential_at_all_says_so(self):
+        # A Google ID token used to be accepted here. It is not any more, and the
+        # answer has to say that rather than "invalid credential": the client
+        # holding one has to sign in through the browser instead.
+        user, reason = self._resolve("eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ4In0.sig")
         self.assertIsNone(user)
-        self.assertIn("ExpiredSignatureError", reason)
+        self.assertIn("not a known credential", reason)
 
-    def test_an_unconfigured_client_is_told_to_configure_one(self):
-        # The distinguishing property: this is the one refusal an operator fixes
-        # in the UI. "Google sign-in is not configured" and a 401 with no detail
-        # are the same event to the person reading it.
-        self.state["client"] = None
-        user, reason = self.ladder(self._jwt_looking_token())
-        self.assertIsNone(user)
-        self.assertIn("not configured", reason)
+    def test_no_google_store_is_consulted(self):
+        self.state["oauth_lookups"] = 0
+        self.state["identity_calls"] = 0
+        self._resolve("mvk_alice_key")
+        self._resolve("not-a-key")
+        self.assertEqual(self.state["oauth_lookups"], 0)
+        self.assertEqual(self.state["identity_calls"], 0)
 
-    def test_a_client_row_with_no_client_id_is_treated_as_unconfigured(self):
-        # A half-saved row is not a usable configuration: verifying against an
-        # empty audience would be the exact mistake the audience check exists to
-        # stop, reached from the other direction.
-        self.state["client"] = {"client_id": "", "client_secret": "shh"}
-        user, reason = self.ladder(self._jwt_looking_token())
-        self.assertIsNone(user)
-        self.assertIn("not configured", reason)
+    def test_the_ladder_never_raises(self):
+        # Both gates call this from a middleware, so an exception here is a 500 on
+        # every request carrying a header rather than the 401 it should be.
+        for value in (object(), 12345, b"mvk_alice_key", "\x00"):
+            with self.subTest(value=value):
+                user, _ = self._resolve(value)
+                self.assertIsNone(user)
 
-    def test_an_unlinked_account_is_told_it_has_no_vault_yet(self):
-        # The most consequential reason in the file. The person holds a valid
-        # Google token; the remedy is linking it in Setup. A generic refusal
-        # here reads as "Google is broken", which is how a working integration
-        # gets reported as unauthenticatable.
-        self.state["links"] = {}
-        user, reason = self.ladder(self._jwt_looking_token())
-        self.assertIsNone(user)
-        self.assertIn("not linked", reason)
-        self.assertIn("someone@example.com", reason)
-
-    def test_a_valid_but_unlinked_token_is_not_a_new_vault(self):
-        # The failure this whole design is arranged around. If the ladder
-        # synthesised a user from the subject, every Google account that ever
-        # pasted a token would silently acquire an empty vault of its own.
-        self.state["links"] = {}
-        user, _ = self.ladder(self._jwt_looking_token())
-        self.assertIsNone(user)
-
-    def test_an_unusable_token_is_not_reported_as_an_unknown_credential(self):
-        # A Google-shaped string must not fall through to the "not a known
-        # credential" answer. That answer means "try an access key"; this one
-        # means "your Google token was rejected", and sending someone to mint a
-        # key for a working Google login is the wrong remedy entirely.
-        self.state["links"] = {}
-        self.state["identity_error"] = google_auth.GoogleTokenError("nope")
-        _, reason = self.ladder(self._jwt_looking_token())
-        self.assertNotIn("not a known credential", reason)
-
-    def test_the_client_secret_is_never_part_of_a_reason(self):
-        # Reasons are returned to the caller and end up in a 401 body.
-        self.state["client"] = {"client_id": "cid", "client_secret": "s3cr3t"}
-        self.state["identity_error"] = google_auth.GoogleTokenError("nope")
-        _, reason = self.ladder(self._jwt_looking_token())
-        self.assertNotIn("s3cr3t", reason)
+    def test_a_reason_never_quotes_the_token(self):
+        _, reason = self._resolve("mvk_guess_secret_value")
+        self.assertNotIn("mvk_guess_secret_value", reason,
+                         msg="the reason reaches a response body the client reads")
 
 
 class BearerCallSiteTests(unittest.TestCase):
@@ -640,14 +551,27 @@ class BearerCallSiteTests(unittest.TestCase):
         self.assertIn("resolve_bearer_token(", source)
         self.assertNotIn("resolve_psk(", source)
 
-    def test_the_401_body_advertises_both_credentials(self):
-        # /mcp takes an access key *or* a Google token now, so a 401 naming only
-        # one of them points an operator at the wrong Setup section.
+    def test_the_401_body_advertises_the_credential_that_is_accepted(self):
+        # Access key, and only access key: /mcp stopped accepting a Google token
+        # when the pasted-token flow went, so a 401 still naming Google would send
+        # an operator to a Setup section that no longer exists.
         source = self._function("__call__")
         self.assertTrue("access key" in source or "Access Key" in source,
                         msg="the MCP 401 must still name the access key")
-        self.assertTrue("Google" in source,
-                        msg="the MCP 401 must name the Google token")
+        self.assertTrue("session cookie" in source,
+                        msg="the 401 should say what it refuses as well as what it accepts")
+
+    def test_the_guard_resolves_no_identity_of_its_own(self):
+        # Scoped to the guard, not the file: `_google_signup` legitimately reads a
+        # Google subject -- it is how a vault is created for a first sign-in. What
+        # must not exist is a second place that turns a *presented credential*
+        # into a vault, which is what a resolution call inside the guard would be.
+        source = self._function("__call__")
+        for gone in ("google_identity(", "resolve_google_identity",
+                     "looks_like_a_google_token", "_google_signup"):
+            self.assertNotIn(gone, source,
+                             msg="a browser sign-in ends in a cookie; the MCP gate "
+                                 "must not resolve a vault from anything else")
 
     def test_the_guard_exposes_no_second_verification_hook(self):
         # verify_basic was removed when Basic left /mcp. A reintroduced hook is
@@ -1099,9 +1023,13 @@ class ApiAuthTests(unittest.TestCase):
         # htpasswd: htpasswd usernames are case-sensitive, and a stub that folded
         # case on both stores would hide the property the wrong-password and
         # unknown-user tests exist to pin.
+        # The real _verify_account returns a *pair*: the key that verified, and a
+        # reason when there is one. _check_session_auth unpacks two values, and a
+        # stub returning a bare key would make every "unverified account" reason
+        # unpinnable here.
         ns["_verify_account"] = lambda u, p: (
-            u if ApiAuthTests._registered(u, p) else
-            (u if ApiAuthTests._verify(u, p) else None))
+            (u, "") if ApiAuthTests._registered(u, p) else
+            ((u, "") if ApiAuthTests._verify(u, p) else (None, "")))
         cls.check = staticmethod(_lift("gui.py", "_check_session_auth", ns))
         # staticmethod, or `self.user` binds it and every call arrives with
         # an extra self -- the same trap as HeaderPrecedenceTests.extract.

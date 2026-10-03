@@ -12,5 +12,3 @@ openai
 itsdangerous
 jinja2
 structlog
-PyJWT
-cryptography
