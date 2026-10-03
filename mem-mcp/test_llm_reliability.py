@@ -211,19 +211,12 @@ class TimeoutLoggingTests(unittest.TestCase):
     def setUp(self):
         self.rec = Recorder()
 
-    def _timed_out(self):
-        ns = _load(self.rec, lambda u, b, n: FakeTimeoutException("read timeout"))
-        return ns
-
-    def test_a_timeout_is_logged_at_error(self):
-        ns = self._timed_out()
-        with self.assertRaises(RuntimeError):
-            asyncio.run(ns[_FUNCTION]("a " * 200))
-        self.assertTrue(
-            self.rec.errors, "a chat timeout wrote no ERROR line at all — this is the defect"
-        )
-
-    def test_the_timeout_log_names_the_model_prompt_and_budget(self):
+    def test_the_timeout_log_records_the_model_prompt_budget_and_knob(self):
+        """One test covers the group because all four checks read the *same*
+        ERROR record: asserting them together is strictly stronger than three
+        separate searches, since one surviving line cannot satisfy it, and each
+        substring is still checked individually.
+        """
         ns = _load(
             self.rec,
             lambda u, b, n: FakeTimeoutException("read timeout"),
@@ -231,34 +224,29 @@ class TimeoutLoggingTests(unittest.TestCase):
         )
         with self.assertRaises(RuntimeError):
             asyncio.run(ns[_FUNCTION]("a " * 200))
+        self.assertTrue(
+            self.rec.errors, "a chat timeout wrote no ERROR line at all — this is the defect"
+        )
         blob = " ".join(self.rec.errors)
         self.assertIn("qwen3.5:2b", blob)
         self.assertIn("prompt_chars", blob)
         self.assertIn("300", blob)
+        self.assertIn("MEM_LLM_TIMEOUT", blob)
 
-    def test_the_timeout_log_points_at_the_knob(self):
-        ns = self._timed_out()
-        with self.assertRaises(RuntimeError):
-            asyncio.run(ns[_FUNCTION]("x"))
-        self.assertIn("MEM_LLM_TIMEOUT", " ".join(self.rec.errors))
-
-    def test_the_raised_error_names_the_model_and_the_knob(self):
-        ns = _load(self.rec, lambda u, b, n: FakeTimeoutException("read timeout"))
-        with self.assertRaises(RuntimeError) as ctx:
-            asyncio.run(ns[_FUNCTION]("x"))
-        detail = str(ctx.exception)
-        self.assertIn("qwen3.5:0.8b", detail)
-        self.assertIn("MEM_LLM_TIMEOUT", detail)
-
-    def test_a_timeout_is_raised_as_a_runtime_error_not_a_bare_httpx_one(self):
+    def test_the_raised_error_is_a_runtime_error_naming_the_model_and_the_knob(self):
         """RuntimeError is what the API layer turns into a 503 with the detail.
 
         A bare httpx.ReadTimeout escaped every handler, so the user saw a 500
-        with no explanation and the operator saw a log with a hole in it.
+        with no explanation and the operator saw a log with a hole in it — so the
+        exception *type* is part of what this asserts, not incidental.
         """
-        ns = self._timed_out()
-        with self.assertRaises(RuntimeError):
+        ns = _load(self.rec, lambda u, b, n: FakeTimeoutException("read timeout"))
+        with self.assertRaises(RuntimeError) as ctx:
             asyncio.run(ns[_FUNCTION]("x"))
+        self.assertNotIsInstance(ctx.exception, FakeTimeoutException)
+        detail = str(ctx.exception)
+        self.assertIn("qwen3.5:0.8b", detail)
+        self.assertIn("MEM_LLM_TIMEOUT", detail)
 
 
 # ---------------------------------------------------------------------------
@@ -273,20 +261,26 @@ class TimeoutBudgetTests(unittest.TestCase):
         asyncio.run(ns[_FUNCTION]("x"))
         return self.rec.client_timeouts[0]
 
-    def test_the_read_budget_is_the_configured_default_not_sixty_seconds(self):
-        """The literal that caused this was `timeout=60.0` in the source."""
-        budget = self._budget()
-        self.assertEqual(budget.read, 300.0)
+    def test_the_read_budget_is_the_configured_or_per_call_value(self):
+        """The literal that caused this was `timeout=60.0` in the source.
 
-    def test_the_configured_default_is_actually_honoured(self):
-        budget = self._budget(LLM_TIMEOUT=45.0)
-        self.assertEqual(budget.read, 45.0)
-
-    def test_a_per_call_timeout_overrides_the_default(self):
-        """The search rewrite must not inherit the background budget."""
-        ns = _load(self.rec, _ok(), LLM_TIMEOUT=300.0)
-        asyncio.run(ns[_FUNCTION]("x", timeout=45.0))
-        self.assertEqual(self.rec.client_timeouts[0].read, 45.0)
+        One test covers the group because all three cases assert the single
+        property "the read budget handed to AsyncClient", and each case carries
+        its own exact expected value.
+        """
+        cases = (
+            ("shipping default", {}, {}, 300.0),
+            ("MEM_LLM_TIMEOUT override", {"LLM_TIMEOUT": 45.0}, {}, 45.0),
+            # The search rewrite must not inherit the background budget.
+            ("per-call timeout beats the default",
+             {"LLM_TIMEOUT": 300.0}, {"timeout": 45.0}, 45.0),
+        )
+        for label, overrides, kwargs, expected in cases:
+            with self.subTest(case=label):
+                rec = Recorder()
+                ns = _load(rec, _ok(), **overrides)
+                asyncio.run(ns[_FUNCTION]("x", **kwargs))
+                self.assertEqual(rec.client_timeouts[0].read, expected)
 
     def test_the_connect_budget_is_short_and_independent(self):
         """A dead Ollama must fail fast rather than burn the full read budget."""
@@ -316,26 +310,36 @@ class OtherFailureTests(unittest.TestCase):
     def setUp(self):
         self.rec = Recorder()
 
-    def test_a_transport_error_is_logged_and_names_the_pull_fix(self):
-        ns = _load(self.rec, lambda u, b, n: FakeHTTPError("connection refused"))
-        with self.assertRaises(RuntimeError) as ctx:
-            asyncio.run(ns[_FUNCTION]("x"))
-        self.assertIn("ollama pull", str(ctx.exception))
-        self.assertTrue(self.rec.errors)
-
-    def test_an_http_error_status_reports_the_body(self):
+    def test_a_transport_or_status_failure_is_logged_and_names_the_reason(self):
+        """One test covers the group because both are the single property "a
+        failure reaching the caller also leaves an ERROR record with its
+        reason". Each case keeps its own needles: what the raised message must
+        carry, and which string must be in the log — Ollama's own body is the
+        whole diagnostic and dropping it is what used to happen.
+        """
         body = "model requires more system memory"
-        ns = _load(
-            self.rec,
-            lambda u, b, n: FakeResponse(500, text=body, is_error=True),
+        cases = (
+            ("transport error",
+             lambda u, b, n: FakeHTTPError("connection refused"),
+             ("ollama pull",), ()),
+            ("http 500 with a body",
+             lambda u, b, n: FakeResponse(500, text=body, is_error=True),
+             ("500",), (body,)),
         )
-        with self.assertRaises(RuntimeError) as ctx:
-            asyncio.run(ns[_FUNCTION]("x"))
-        self.assertIn("500", str(ctx.exception))
-        self.assertTrue(
-            any(body in e for e in self.rec.errors),
-            msg="Ollama's own reason is the whole diagnostic and it was dropped",
-        )
+        for label, responder, raised, logged in cases:
+            with self.subTest(case=label):
+                rec = Recorder()
+                ns = _load(rec, responder)
+                with self.assertRaises(RuntimeError) as ctx:
+                    asyncio.run(ns[_FUNCTION]("x"))
+                self.assertTrue(rec.errors)
+                for needle in raised:
+                    self.assertIn(needle, str(ctx.exception))
+                for needle in logged:
+                    self.assertTrue(
+                        any(needle in e for e in rec.errors),
+                        msg=f"{needle!r} is not in the ERROR lines: {rec.errors}",
+                    )
 
     def test_a_body_that_is_not_a_chat_message_does_not_raise_keyerror(self):
         ns = _load(self.rec, lambda u, b, n: FakeResponse(200, text="not json"))
@@ -365,9 +369,19 @@ class HappyPathTests(unittest.TestCase):
     def setUp(self):
         self.rec = Recorder()
 
-    def test_a_normal_call_returns_the_content(self):
-        ns = _load(self.rec, _ok("Deutsche Bank (DB)"))
-        self.assertEqual(asyncio.run(ns[_FUNCTION]("x")), "Deutsche Bank (DB)")
+    def test_the_returned_answer_is_the_content_with_thinking_stripped(self):
+        """One test covers the group because both cases are the single property
+        "the returned string is the model's content, minus any think block",
+        and each case carries its own exact expected string.
+        """
+        for label, content, expected in (
+            ("plain content", "Deutsche Bank (DB)", "Deutsche Bank (DB)"),
+            ("think block", "<think>hmm</think>  Paris  ", "Paris"),
+        ):
+            with self.subTest(case=label):
+                rec = Recorder()
+                ns = _load(rec, _ok(content))
+                self.assertEqual(asyncio.run(ns[_FUNCTION]("x")), expected)
 
     def test_the_model_override_is_used(self):
         ns = _load(self.rec, _ok("x"))
@@ -380,10 +394,6 @@ class HappyPathTests(unittest.TestCase):
         asyncio.run(ns[_FUNCTION]("p", num_predict=80))
         _, body = self.rec.posts[0]
         self.assertEqual(body["options"]["num_predict"], 80)
-
-    def test_think_blocks_are_stripped(self):
-        ns = _load(self.rec, _ok("<think>hmm</think>  Paris  "))
-        self.assertEqual(asyncio.run(ns[_FUNCTION]("x")), "Paris")
 
     def test_the_request_line_reports_the_budget(self):
         """So a log reader can tell a 300s wait from a 45s one."""
@@ -415,24 +425,34 @@ class ContentLoggingTests(unittest.TestCase):
         return ns["_llm_excerpt"]
 
     # --- the excerpt helper -------------------------------------------------
-    def test_short_text_is_untouched(self):
+    def test_text_within_the_budget_is_returned_untouched(self):
+        """One test covers the group because both cases are the single property
+        "text that fits is passed through byte for byte", and each case asserts
+        its own exact output — so "no truncation marker" is a consequence of the
+        equality rather than a weaker separate check.
+        """
         ex = self._excerpt()
-        self.assertEqual(ex("hello"), "hello")
+        for label, text in (("short", "hello"), ("at the default budget", "a" * 1000)):
+            with self.subTest(case=label):
+                self.assertEqual(ex(text), text)
 
-    def test_a_prompt_that_fits_is_not_marked_as_truncated(self):
-        ex = self._excerpt()
-        self.assertNotIn("more chars", ex("a" * 1000))
+    def test_text_over_the_budget_keeps_the_head_and_reports_the_remainder(self):
+        """The first question is always 'how much is there that I can't see'.
 
-    def test_long_text_is_capped_at_the_budget(self):
+        One test covers the group because both cases are the single property
+        "over the limit, keep the head and say what was dropped", and each case
+        carries its own expected head length and marker.
+        """
         ex = self._excerpt()
-        out = ex("a" * 5000)
-        self.assertTrue(out.startswith("a" * 1000))
-        self.assertIn("+4000 more chars", out)
-
-    def test_the_elision_marker_reports_the_total_length(self):
-        """The first question is always 'how much is there that I can't see'."""
-        ex = self._excerpt()
-        self.assertIn("+4000 more chars", ex("a" * 5000))
+        cases = (
+            ("default budget", "a" * 5000, None, "a" * 1000, "+4000 more chars"),
+            ("explicit limit", "a" * 100, 10, "a" * 10, "+90 more chars"),
+        )
+        for label, text, limit, head, marker in cases:
+            with self.subTest(case=label):
+                out = ex(text) if limit is None else ex(text, limit)
+                self.assertTrue(out.startswith(head), msg=repr(out[:40]))
+                self.assertIn(marker, out)
 
     def test_newlines_are_escaped_so_one_event_stays_one_line(self):
         ex = self._excerpt()
@@ -450,31 +470,37 @@ class ContentLoggingTests(unittest.TestCase):
         ex = self._excerpt(LLM_LOG_CHARS=0)
         self.assertEqual(ex("secret content"), "")
 
-    def test_an_explicit_limit_overrides_the_default(self):
-        ex = self._excerpt()
-        self.assertTrue(ex("a" * 100, 10).startswith("a" * 10))
-        self.assertIn("+90 more chars", ex("a" * 100, 10))
 
     # --- the content actually reaches the log line -------------------------
-    def test_the_prompt_reaches_the_log(self):
-        ns = _load(self.rec, _ok("x"))
-        asyncio.run(ns[_FUNCTION]("Find the client named Deutsche Bank."))
-        joined = " ".join(self.rec.warnings)
-        self.assertIn("Find the client named Deutsche Bank.", joined)
-
-    def test_the_system_prompt_reaches_the_log(self):
-        ns = _load(self.rec, _ok("x"))
-        asyncio.run(ns[_FUNCTION]("q", system="You are a scope classifier."))
-        joined = " ".join(self.rec.warnings)
-        self.assertIn("You are a scope classifier.", joined)
-
-    def test_the_answer_reaches_the_log(self):
-        ns = _load(self.rec, _ok('{"client": "Deutsche Bank (DB)"}'))
-        asyncio.run(ns[_FUNCTION]("q"))
-        self.assertTrue(
-            any("Deutsche Bank (DB)" in w for w in self.rec.warnings),
-            msg="the model's answer is not in the log, only its length",
+    def test_every_content_field_reaches_the_log(self):
+        """One test covers the group because all three are the single property
+        "each field the caller passed is recoverable from a log line", and each
+        case asserts its own exact substring *within one record* — so a dropped
+        field cannot hide behind another field being logged. The record is
+        pinned by its own prefix too: the answer is required in the *result*
+        line specifically, because the raw response body is echoed on the
+        request/response pair and would otherwise satisfy the check on its own.
+        """
+        cases = (
+            ("prompt",
+             {"prompt": "Find the client named Deutsche Bank."}, "x",
+             "Find the client named Deutsche Bank.", "Ollama request"),
+            ("system prompt",
+             {"prompt": "q", "system": "You are a scope classifier."}, "x",
+             "You are a scope classifier.", "Ollama request"),
+            ("the model's answer",
+             {"prompt": "q"}, '{"client": "Deutsche Bank (DB)"}',
+             'Deutsche Bank (DB)', "Ollama result: chat"),
         )
+        for label, kwargs, content, expected, record in cases:
+            with self.subTest(case=label):
+                rec = Recorder()
+                ns = _load(rec, _ok(content))
+                asyncio.run(ns[_FUNCTION](**kwargs))
+                self.assertTrue(
+                    any(record in w and expected in w for w in rec.warnings),
+                    msg=f"{expected!r} is not in the {record!r} line: {rec.warnings}",
+                )
 
     def test_a_huge_prompt_does_not_land_in_the_log_unbounded(self):
         """A 40k-char entry must not put 40k chars on every reclassify line."""
@@ -520,16 +546,18 @@ class ServiceUnavailableLoggingTests(unittest.TestCase):
         with open(GUI_PY, "r", encoding="utf-8") as handle:
             return handle.read()
 
-    def test_no_bare_503_without_logging_survives(self):
+    def test_every_503_goes_through_the_helper_and_no_bare_one_survives(self):
+        """One test covers the group because the two halves are one rule: every
+        503 routes through the logging helper, and no unlogged bare form is
+        left behind. Presence is asserted first, so the absence cannot be
+        satisfied by deleting the routes.
+        """
         source = self._gui_source()
+        self.assertGreater(
+            source.count("raise _service_unavailable(e)"), 0,
+            msg="no 503 routes through the logging helper at all")
         self.assertNotIn(
             "raise HTTPException(status_code=503, detail=str(e))", source
-        )
-
-    def test_every_503_goes_through_the_helper(self):
-        count = self._gui_source().count("raise _service_unavailable(e)")
-        self.assertGreater(
-            count, 0, msg="no 503 routes through the logging helper at all"
         )
 
     def test_the_helper_logs_before_it_builds_the_response(self):
@@ -580,13 +608,16 @@ class ConflictLoggingTests(unittest.TestCase):
         with open(self.TEMPLATE, "r", encoding="utf-8") as handle:
             return handle.read()
 
-    def test_no_bare_409_without_logging_survives(self):
+    def test_every_409_goes_through_the_helper_and_no_bare_one_survives(self):
+        """One test covers the group because the two halves are one rule: every
+        409 routes through the logging helper and no unlogged bare form is left.
+        Presence first, so the absence cannot be satisfied by deleting the
+        routes.
+        """
         source = self._gui_source()
-        self.assertNotIn("raise HTTPException(status_code=409, detail=str(e))", source)
-
-    def test_every_409_goes_through_the_helper(self):
-        self.assertGreater(self._gui_source().count("raise _conflict(e)"), 0,
+        self.assertGreater(source.count("raise _conflict(e)"), 0,
                            msg="no 409 routes through the logging helper at all")
+        self.assertNotIn("raise HTTPException(status_code=409, detail=str(e))", source)
 
     def test_the_helper_logs_and_returns_rather_than_raising(self):
         source = self._gui_source()
@@ -602,7 +633,11 @@ class ConflictLoggingTests(unittest.TestCase):
         """A refusal is the guard working. ERROR would bury it in real failures."""
         source = self._gui_source()
         segment = _def_segment(source, "_conflict")
-        self.assertNotIn(".error(", segment,
+        # Presence first: an absent info( line must not make the .error( check
+        # pass.
+        self.assertIn("info(", segment)
+        self.assertNotIn(".error(",
+                         segment,
                          "a 409 is an expected refusal, not a failure")
 
     def test_a_rejected_call_carries_the_servers_detail(self):

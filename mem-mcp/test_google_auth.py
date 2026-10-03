@@ -89,19 +89,22 @@ class ConfigTests(EnvCase):
         self.assertEqual(google_auth.client_id(), self.CID)
         self.assertEqual(google_auth.client_secret(), self.SECRET)
 
-    def test_a_present_but_empty_variable_reads_as_absent(self):
+    def test_a_present_but_blank_variable_reads_as_absent(self):
         # A compose line with no value passes an empty string, and
         # `os.getenv(name, "fallback")` would return that empty string rather
         # than the fallback -- so a half-configured deployment would look
         # configured. This is the `or ""` form's whole reason for existing.
-        os.environ["GOOGLE_CLIENT_ID"] = ""
-        self.assertEqual(google_auth.client_id(), "")
-        self.assertFalse(google_auth.configured())
-
-    def test_whitespace_around_a_value_is_not_a_value(self):
-        os.environ["GOOGLE_CLIENT_SECRET"] = "   "
-        self.assertEqual(google_auth.client_secret(), "")
-        self.assertFalse(google_auth.configured())
+        # One test covers the group because the reader, the exact read-back and
+        # the `configured()` verdict are the same three assertions for either
+        # variable; only the input differs, so each case keeps its own value.
+        for name, blank, reader, expected in (
+            ("GOOGLE_CLIENT_ID", "", google_auth.client_id, ""),
+            ("GOOGLE_CLIENT_SECRET", "   ", google_auth.client_secret, ""),
+        ):
+            with self.subTest(variable=name, value=repr(blank)):
+                os.environ[name] = blank
+                self.assertEqual(reader(), expected)
+                self.assertFalse(google_auth.configured())
 
     def test_both_halves_are_required(self):
         # The secret is what makes the code redemption confidential. With only a
@@ -117,14 +120,19 @@ class ConfigTests(EnvCase):
     def test_the_callback_url_is_derived_from_base_url(self):
         # Not configured separately: a redirect URI that disagrees with the URL
         # the app is served on fails at Google with an error page naming neither.
-        self.assertEqual(google_auth.callback_url("https://hass.example/mem-mcp"),
-                         "https://hass.example/mem-mcp/api/auth/google/callback")
-        self.assertEqual(google_auth.callback_url("https://hass.example/mem-mcp/"),
-                         "https://hass.example/mem-mcp/api/auth/google/callback")
-
-    def test_an_empty_base_url_still_yields_a_relative_callback(self):
-        self.assertEqual(google_auth.callback_url(""),
-                         "/api/auth/google/callback")
+        # One test covers the group because the property is the single rule
+        # "strip the trailing slash, append the path", and each case carries its
+        # own exact expected string -- so the degenerate empty BASE_URL stays as
+        # specific as it was as a test of its own.
+        for base, expected in (
+            ("https://hass.example/mem-mcp",
+             "https://hass.example/mem-mcp/api/auth/google/callback"),
+            ("https://hass.example/mem-mcp/",
+             "https://hass.example/mem-mcp/api/auth/google/callback"),
+            ("", "/api/auth/google/callback"),
+        ):
+            with self.subTest(base_url=repr(base)):
+                self.assertEqual(google_auth.callback_url(base), expected)
 
 
 class AuthorizationUrlTests(EnvCase):
@@ -214,36 +222,44 @@ class ExchangeCodeTests(EnvCase):
     def test_the_secret_is_only_ever_in_the_body_never_the_url(self):
         opener = RecordingOpener({"access_token": "t"})
         google_auth.exchange_code("c", self.REDIRECT, opener=opener)
+        # Presence first, so this cannot pass by the secret going missing
+        # altogether.
+        self.assertEqual(opener.form["client_secret"], self.SECRET)
         self.assertNotIn(self.SECRET, opener.calls[0]["url"])
 
-    def test_a_200_with_no_access_token_is_refused(self):
-        # Not a thing Google's server does; a thing a proxy or captive portal
-        # does. Refusing is the only answer that does not sign someone in as
-        # nobody.
-        opener = RecordingOpener({"error": "nope"})
-        with self.assertRaises(google_auth.GoogleOAuthError) as ctx:
-            google_auth.exchange_code("c", self.REDIRECT, opener=opener)
-        self.assertIn("no access token", str(ctx.exception))
-
-    def test_an_implausibly_long_token_is_refused(self):
-        opener = RecordingOpener({"access_token": "t" * (google_auth.MAX_TOKEN_CHARS + 1)})
-        with self.assertRaises(google_auth.GoogleOAuthError):
-            google_auth.exchange_code("c", self.REDIRECT, opener=opener)
-
-    def test_an_empty_code_is_refused_before_any_request(self):
-        opener = RecordingOpener({})
-        for bad in ("", "   ", None):
-            with self.assertRaises(google_auth.GoogleOAuthError):
-                google_auth.exchange_code(bad, self.REDIRECT, opener=opener)
-        self.assertEqual(opener.calls, [])
-
-    def test_an_oversized_code_is_refused_before_any_request(self):
-        opener = RecordingOpener({})
-        with self.assertRaises(google_auth.GoogleOAuthError) as ctx:
-            google_auth.exchange_code("c" * (google_auth.MAX_CODE_CHARS + 1),
-                                      self.REDIRECT, opener=opener)
-        self.assertIn("plausible", str(ctx.exception))
-        self.assertEqual(opener.calls, [])
+    def test_a_bad_input_is_refused_before_any_request_is_issued(self):
+        # One test covers the group because all six cases are the same property
+        # -- exchange_code judges the call on its own parameters and never opens
+        # a socket -- and each case keeps the exact `no calls made` claim plus
+        # its own expected message wherever the original pinned one.
+        saved = {name: os.environ.get(name) for name in self.ENV}
+        cases = (
+            ("empty code", (), "", self.REDIRECT, None),
+            ("blank code", (), "   ", self.REDIRECT, None),
+            ("absent code", (), None, self.REDIRECT, None),
+            ("oversized code", (),
+             "c" * (google_auth.MAX_CODE_CHARS + 1), self.REDIRECT, "plausible"),
+            ("missing secret", ("GOOGLE_CLIENT_SECRET",), "c", self.REDIRECT, None),
+            ("missing redirect_uri", (), "c", "", None),
+        )
+        for label, unset, code, redirect, expected in cases:
+            with self.subTest(case=label):
+                for name in self.ENV:
+                    os.environ[name] = dict(zip(self.ENV, (self.CID, self.SECRET)))[name]
+                for name in unset:
+                    os.environ.pop(name, None)
+                opener = RecordingOpener({})
+                with self.assertRaises(google_auth.GoogleOAuthError) as ctx:
+                    google_auth.exchange_code(code, redirect, opener=opener)
+                self.assertEqual(opener.calls, [],
+                                 "a refusal must not have issued a request")
+                if expected is not None:
+                    self.assertIn(expected, str(ctx.exception))
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
     def test_the_bound_is_a_ceiling_not_off_by_one(self):
         opener = RecordingOpener({"access_token": "t"})
@@ -251,21 +267,39 @@ class ExchangeCodeTests(EnvCase):
                                   self.REDIRECT, opener=opener)
         self.assertEqual(len(opener.calls), 1)
 
-    def test_a_missing_secret_is_refused_before_any_request(self):
-        # This is the exchange, which is where the secret is actually needed, so
-        # this is the check that matters even though building a URL does not
-        # need one.
-        os.environ.pop("GOOGLE_CLIENT_SECRET")
-        opener = RecordingOpener({"access_token": "t"})
-        with self.assertRaises(google_auth.GoogleOAuthError):
-            google_auth.exchange_code("c", self.REDIRECT, opener=opener)
-        self.assertEqual(opener.calls, [])
+    def test_a_token_response_that_is_missing_or_oversized_is_refused(self):
+        # Not a thing Google's server does; a thing a proxy or captive portal
+        # does. Refusing is the only answer that does not sign someone in as
+        # nobody. One test covers the group because both cases are the single
+        # property "the value handed back must be a plausible token", and each
+        # keeps its own expected message -- the oversized case pinned none.
+        for label, body, expected in (
+            ("no access_token", {"error": "nope"}, "no access token"),
+            ("implausibly long access_token",
+             {"access_token": "t" * (google_auth.MAX_TOKEN_CHARS + 1)}, None),
+        ):
+            with self.subTest(case=label):
+                with self.assertRaises(google_auth.GoogleOAuthError) as ctx:
+                    google_auth.exchange_code("c", self.REDIRECT,
+                                              opener=RecordingOpener(body))
+                if expected is not None:
+                    self.assertIn(expected, str(ctx.exception))
 
-    def test_a_missing_redirect_uri_is_refused(self):
-        opener = RecordingOpener({})
-        with self.assertRaises(google_auth.GoogleOAuthError):
-            google_auth.exchange_code("c", "", opener=opener)
-        self.assertEqual(opener.calls, [])
+    def test_a_body_that_is_not_a_json_object_is_refused(self):
+        # A captive portal or intercepting proxy. Parsing it leniently is how an
+        # HTML error page becomes a username. One test covers the group because
+        # both are the same property -- a 200 that is not a dict is refused --
+        # and each case keeps its own expected message.
+        for label, body, expected in (
+            ("html error page", b"<html>hi</html>", "could not be read"),
+            ("json array", b"[1, 2, 3]", None),
+        ):
+            with self.subTest(case=label):
+                with self.assertRaises(google_auth.GoogleOAuthError) as ctx:
+                    google_auth.exchange_code("c", self.REDIRECT,
+                                              opener=RecordingOpener(body))
+                if expected is not None:
+                    self.assertIn(expected, str(ctx.exception))
 
     def test_google_refusal_is_reported_in_its_own_words(self):
         # invalid_grant is the single most common failure here — the code was
@@ -305,10 +339,7 @@ class ExchangeCodeTests(EnvCase):
             google_auth.exchange_code("c", self.REDIRECT, opener=opener)
         self.assertIn("could not be read", str(ctx.exception))
 
-    def test_json_that_is_not_an_object_is_refused(self):
-        opener = RecordingOpener(b"[1, 2, 3]")
-        with self.assertRaises(google_auth.GoogleOAuthError):
-            google_auth.exchange_code("c", self.REDIRECT, opener=opener)
+
 
     def test_overrides_beat_the_environment(self):
         opener = RecordingOpener({"access_token": "t"})
@@ -381,19 +412,19 @@ class FetchUserinfoTests(EnvCase):
         self.assertLessEqual(len(info["email"]), google_auth.MAX_EMAIL_CHARS)
         self.assertLessEqual(len(info["name"]), google_auth.MAX_NAME_CHARS)
 
-    def test_an_empty_token_is_refused_before_any_request(self):
-        opener = RecordingOpener(self.BODY)
-        for bad in ("", "   ", None):
-            with self.assertRaises(google_auth.GoogleOAuthError):
-                google_auth.fetch_userinfo(bad, opener=opener)
-        self.assertEqual(opener.calls, [])
-
-    def test_an_oversized_token_is_refused_before_any_request(self):
-        opener = RecordingOpener(self.BODY)
-        with self.assertRaises(google_auth.GoogleOAuthError):
-            google_auth.fetch_userinfo("t" * (google_auth.MAX_TOKEN_CHARS + 1),
-                                       opener=opener)
-        self.assertEqual(opener.calls, [])
+    def test_an_implausible_token_is_refused_before_any_request(self):
+        # One test covers the group: blank, absent and oversized are the same
+        # property — the token is rejected on its own shape with no request
+        # made — so each case only supplies its own input.
+        for label, token in (
+            ("empty", ""), ("blank", "   "), ("absent", None),
+            ("oversized", "t" * (google_auth.MAX_TOKEN_CHARS + 1)),
+        ):
+            with self.subTest(case=label):
+                opener = RecordingOpener(self.BODY)
+                with self.assertRaises(google_auth.GoogleOAuthError):
+                    google_auth.fetch_userinfo(token, opener=opener)
+                self.assertEqual(opener.calls, [])
 
 
 class SecrecyTests(EnvCase):
@@ -447,27 +478,28 @@ class FailureReportingTests(EnvCase):
             with self.assertRaises(google_auth.GoogleOAuthError):
                 call()
 
-    def test_a_network_failure_is_logged_with_its_reason(self):
+    def test_every_failure_is_logged_with_its_own_reason(self):
         # The defect this repo has been bitten by before was a missing log line,
-        # and only a call that genuinely raises can assert one.
-        with self.assertLogs("memory-vault", level="WARNING") as captured:
-            with self.assertRaises(google_auth.GoogleOAuthError):
-                google_auth.exchange_code(
-                    "c", "https://x/cb",
-                    opener=RecordingOpener(urllib.error.URLError("dns is down")))
-        joined = "\n".join(captured.output)
-        self.assertIn("could not reach Google", joined)
-        self.assertIn("dns is down", joined)
-
-    def test_a_refusal_is_logged_with_the_google_detail(self):
+        # and only a call that genuinely raises can assert one. One test covers
+        # the group because the property is the same — a WARNING record exists
+        # carrying the reason — and each case asserts its own substrings, so a
+        # dropped line for one kind cannot hide behind the other.
         err = urllib.error.HTTPError(google_auth.GOOGLE_TOKEN_URL, 400, "Bad", {}, None)
         err.read = lambda: b'{"error_description":"Bad Request"}'
-        with self.assertLogs("memory-vault", level="WARNING") as captured:
-            with self.assertRaises(google_auth.GoogleOAuthError):
-                google_auth.exchange_code("c", "https://x/cb", opener=RecordingOpener(err))
-        joined = "\n".join(captured.output)
-        self.assertIn("400", joined)
-        self.assertIn("Bad Request", joined)
+        cases = (
+            ("network failure",
+             RecordingOpener(urllib.error.URLError("dns is down")),
+             ("could not reach Google", "dns is down")),
+            ("google refusal", RecordingOpener(err), ("400", "Bad Request")),
+        )
+        for label, opener, expected in cases:
+            with self.subTest(case=label):
+                with self.assertLogs("memory-vault", level="WARNING") as captured:
+                    with self.assertRaises(google_auth.GoogleOAuthError):
+                        google_auth.exchange_code("c", "https://x/cb", opener=opener)
+                joined = "\n".join(captured.output)
+                for needle in expected:
+                    self.assertIn(needle, joined)
 
     def test_nothing_is_logged_on_a_successful_exchange(self):
         with self.assertNoLogs("memory-vault", level="WARNING"):

@@ -241,17 +241,46 @@ class EmbeddingCallTests(unittest.TestCase):
                 self.assertEqual(vector, VEC)
 
     # -- transient failures ------------------------------------------------
-    def test_transient_500_is_retried_and_then_succeeds(self):
+    # One property -- a recoverable failure is retried on the same route and
+    # then succeeds -- over the two ways Ollama reports one, so one test covers
+    # the group. Each responder is a *factory*, so a case's call counter starts
+    # at zero whatever ran before it, and the exact route sequence a case must
+    # produce is its own expected value.
+    @staticmethod
+    def _http_500_then_ok():
         calls = {"n": 0}
 
         def responder(url, body, n):
             calls["n"] += 1
             return FakeResponse(500, {"error": "model loading"}) if calls["n"] == 1 else _ok_for(url)
 
-        recorder, vector, err = self._run(responder, retries=2)
-        self.assertIsNone(err, err)
-        self.assertEqual(vector, VEC)
-        self.assertEqual(_paths(recorder), [LEGACY, LEGACY], "must retry the same route first")
+        return responder
+
+    @staticmethod
+    def _transport_error_then_ok():
+        calls = {"n": 0}
+
+        def responder(url, body, n):
+            calls["n"] += 1
+            return FakeHTTPError("connection reset") if calls["n"] <= 2 else _ok_for(url)
+
+        return responder
+
+    def test_a_transient_failure_is_retried_on_the_same_route(self):
+        cases = (
+            ("http 500 then success", self._http_500_then_ok(), 2, [LEGACY, LEGACY]),
+            ("transport error then success", self._transport_error_then_ok(), 2,
+             [LEGACY, LEGACY, LEGACY]),
+        )
+        for label, responder, retries, expected_paths in cases:
+            with self.subTest(failure=label, expected_paths=expected_paths):
+                recorder, vector, err = self._run(responder, retries=retries)
+                self.assertIsNone(err, err)
+                self.assertEqual(vector, VEC)
+                self.assertEqual(
+                    _paths(recorder), expected_paths,
+                    "must retry the same route before falling back",
+                )
 
     def test_ollama_error_body_reaches_the_debug_log(self):
         """A recovered failure still explains itself, at DEBUG not WARNING."""
@@ -288,20 +317,6 @@ class EmbeddingCallTests(unittest.TestCase):
         self.assertIsNone(err, err)
         self.assertEqual(vector, VEC)
         self.assertEqual(recorder.warnings, [], f"embedding warned: {recorder.warnings}")
-
-    def test_transport_error_is_retried(self):
-        calls = {"n": 0}
-
-        def responder(url, body, n):
-            calls["n"] += 1
-            if calls["n"] <= 2:
-                return FakeHTTPError("connection reset")
-            return _ok_for(url)
-
-        recorder, vector, err = self._run(responder, retries=2)
-        self.assertIsNone(err, err)
-        self.assertEqual(vector, VEC)
-        self.assertEqual(len(recorder.posts), 3)
 
     # -- fallback across routes -------------------------------------------
     def test_persistent_failure_falls_back_to_the_modern_route(self):
@@ -367,29 +382,25 @@ class EmbeddingCallTests(unittest.TestCase):
         self.assertIn("ollama pull", recorder.errors[0])
         self.assertEqual(recorder.warnings, [], f"a failure must not warn: {recorder.warnings}")
 
-    def test_malformed_success_body_does_not_raise_keyerror(self):
-        _, _, err = self._run(
-            lambda url, body, n: FakeResponse(200, {"data": "nope"}),
-            retries=0,
-        )
-        self.assertIsInstance(err, RuntimeError)
-        self.assertIn("no embedding in response", str(err))
+    # One property -- a body the embedder cannot use becomes a RuntimeError
+    # that names *which* body it was, never a bare status -- over three body
+    # shapes. Three separate methods could each be satisfied by the other's
+    # substring, so the diagnosis each shape owes is its own expected value.
+    _UNUSABLE_BODIES = (
+        ("200 with no embedding key", lambda *_: FakeResponse(200, {"data": "nope"}),
+         "no embedding in response"),
+        ("200 with a non-JSON body", lambda *_: FakeResponse(200, None, text="<html>gateway</html>"),
+         "non-JSON"),
+        ("500 with an empty error body", lambda *_: FakeResponse(500, None, text=""),
+         "empty response body"),
+    )
 
-    def test_non_json_body_is_reported_clearly(self):
-        _, _, err = self._run(
-            lambda url, body, n: FakeResponse(200, None, text="<html>gateway</html>"),
-            retries=0,
-        )
-        self.assertIsInstance(err, RuntimeError)
-        self.assertIn("non-JSON", str(err))
-
-    def test_empty_ollama_error_body_does_not_produce_a_bare_500(self):
-        _, _, err = self._run(
-            lambda url, body, n: FakeResponse(500, None, text=""),
-            retries=0,
-        )
-        self.assertIsInstance(err, RuntimeError)
-        self.assertIn("empty response body", str(err))
+    def test_an_unusable_body_is_named_in_the_failure(self):
+        for label, build, expected in self._UNUSABLE_BODIES:
+            with self.subTest(body=label, expected=expected):
+                _, _, err = self._run(build, retries=0)
+                self.assertIsInstance(err, RuntimeError, msg="must not surface a raw httpx error")
+                self.assertIn(expected, str(err))
 
 
 class EmbedDetailTests(unittest.TestCase):
@@ -407,20 +418,20 @@ class EmbedDetailTests(unittest.TestCase):
         exec(segment, scope)  # noqa: S102
         return scope["_ollama_detail"](response)
 
-    def test_json_error_field_is_preferred(self):
-        self.assertEqual(
-            self._detail(FakeResponse(500, {"error": "model not found"})),
-            "model not found",
-        )
+    # One property -- which source of the failure reason wins -- over four body
+    # shapes, so one test carries the precedence order end to end: the exact
+    # string each shape must produce is the case's expected value.
+    CASES = (
+        ("json error field", FakeResponse(500, {"error": "model not found"}), "model not found"),
+        ("json without an error field", FakeResponse(500, {"foo": "bar"}), "{'foo': 'bar'}"),
+        ("plain text body", FakeResponse(502, None, text="upstream down"), "upstream down"),
+        ("blank body", FakeResponse(500, None, text="  "), "(empty response body)"),
+    )
 
-    def test_json_without_error_falls_back_to_raw_text(self):
-        self.assertEqual(self._detail(FakeResponse(500, {"foo": "bar"})), "{'foo': 'bar'}")
-
-    def test_plain_text_body_is_returned(self):
-        self.assertEqual(self._detail(FakeResponse(502, None, text="upstream down")), "upstream down")
-
-    def test_empty_body_is_labelled(self):
-        self.assertEqual(self._detail(FakeResponse(500, None, text="  ")), "(empty response body)")
+    def test_the_reason_comes_from_the_first_source_that_has_one(self):
+        for label, response, expected in self.CASES:
+            with self.subTest(body=label, expected=expected):
+                self.assertEqual(self._detail(response), expected)
 
 
 class OversizedInputTests(unittest.TestCase):
@@ -442,30 +453,43 @@ class OversizedInputTests(unittest.TestCase):
         except Exception as exc:  # noqa: BLE001
             return recorder, ns, None, exc
 
-    def test_text_over_the_budget_is_truncated_before_sending(self):
-        recorder, _, _, err = self._run_text("x" * 20000, _ok_for, max_chars=1000)
-        self.assertIsNone(err, err)
-        sent = recorder.posts[0][1]["prompt"]
-        self.assertLessEqual(len(sent), 1000)
-        self.assertTrue(
-            any("truncating" in w for w in recorder.warnings),
-            f"an over-budget embed must warn: {recorder.warnings}",
-        )
-
-    def test_truncation_keeps_head_and_tail(self):
+    # One property -- what text reaches Ollama for a given input against a given
+    # budget -- over the three length relationships, so one test covers the
+    # group. Each case names its own expected content and whether truncation must
+    # have been announced, which is what keeps the "sent verbatim" case from
+    # being satisfied by the truncating one.
+    _SHAPING_CASES = (
+        # label, text, truncation announced?, expected content of the prompt
+        ("over the budget", "x" * 20000, True, {"max_len": 1000}),
         # A transcription puts the subject first and the conclusions last, and a
         # search query is far more likely to match the tail.
-        text = "HEADMARKER" + ("-" * 5000) + "TAILMARKER"
-        recorder, _, _, err = self._run_text(text, _ok_for, max_chars=1000)
-        self.assertIsNone(err, err)
-        sent = recorder.posts[0][1]["prompt"]
-        self.assertIn("HEADMARKER", sent)
-        self.assertIn("TAILMARKER", sent)
+        ("head and tail survive", "HEADMARKER" + ("-" * 5000) + "TAILMARKER", True,
+         {"contains": ("HEADMARKER", "TAILMARKER")}),
+        ("short text", "a short note", False, {"verbatim": "a short note"}),
+    )
 
-    def test_short_text_is_sent_verbatim(self):
-        recorder, _, _, err = self._run_text("a short note", _ok_for, max_chars=1000)
-        self.assertIsNone(err, err)
-        self.assertEqual(recorder.posts[0][1]["prompt"], "a short note")
+    def test_the_sent_text_is_the_input_shaped_to_the_budget(self):
+        for label, text, expect_truncated, expected in self._SHAPING_CASES:
+            with self.subTest(input=label, expected=expected):
+                recorder, _, _, err = self._run_text(text, _ok_for, max_chars=1000)
+                self.assertIsNone(err, err)
+                sent = recorder.posts[0][1]["prompt"]
+                if "max_len" in expected:
+                    self.assertLessEqual(
+                        len(sent), expected["max_len"],
+                        "an over-budget input must be cut to the budget before sending",
+                    )
+                for marker in expected.get("contains", ()):
+                    self.assertIn(marker, sent, f"{label}: {marker} did not survive truncation")
+                if "verbatim" in expected:
+                    self.assertEqual(
+                        sent, expected["verbatim"],
+                        "text under the budget must be sent byte-identical",
+                    )
+                self.assertEqual(
+                    any("truncating" in w for w in recorder.warnings), expect_truncated,
+                    f"truncation must be announced exactly when it happens: {recorder.warnings}",
+                )
 
     def test_too_long_response_shrinks_the_input_and_succeeds(self):
         """The budget is a guess at the real window, so the reply can disagree."""
@@ -579,7 +603,21 @@ class WriteOrderingGuardTests(unittest.TestCase):
                     if _MUTATES.search(body[m.start():body.find(")", m.start()) + 400])
                 ]
                 if not writes:
-                    self.skipTest(f"{func} writes to Neo4j through a helper, not an inline query")
+                    # A path whose Neo4j write moved into a helper has no inline
+                    # mutating query to order against, and the invariant then
+                    # lives in that helper. Skipping here reported the case as
+                    # green, which is how a refactor silently disarms the guard
+                    # (verified by moving db_save_diary's session behind a
+                    # helper). Require the write to be *present* in some
+                    # recognisable form instead: a path that stopped persisting
+                    # now fails rather than passing unasserted.
+                    self.assertRegex(
+                        body, r"(s\.run\(|await\s+db_[a-z_]+\()",
+                        f"{func} no longer writes to Neo4j at all — either the "
+                        f"path stopped persisting, or its write moved somewhere "
+                        f"this guard cannot order against the embed",
+                    )
+                    continue
                 self.assertLess(
                     embed, writes[0],
                     f"{func} writes to Neo4j before it embeds — a failed embed would "
@@ -591,6 +629,15 @@ class WriteOrderingGuardTests(unittest.TestCase):
         for module, func in WRITE_PATHS:
             with self.subTest(f"{module}::{func}"):
                 body = _function_source(func, self._read(module))
+                # An absence check alone passes on a function that no longer
+                # embeds anything, so the upsert it *must* go through is asserted
+                # present first — otherwise deleting the embed disarms both
+                # guards in this class rather than failing one.
+                self.assertTrue(
+                    "_upsert_fact_points(" in body or "_upsert_diary_points(" in body,
+                    f"{func} embeds through neither _upsert_* helper, so this "
+                    f"absence check would pass without testing anything",
+                )
                 self.assertNotIn(
                     "await get_embedding(", body,
                     f"{func} embeds directly; route it through the _upsert_* helper so "
@@ -613,52 +660,52 @@ class OllamaModelMatchTests(unittest.TestCase):
     def setUp(self):
         self._matches = _load(Recorder(), _ok_for)["_ollama_model_matches"]
 
-    def test_a_tagless_config_name_matches_the_latest_tag(self):
+    # One property -- which (installed, wanted) pairs are the same model -- over
+    # every input the production log and the tag rules produced, so one test
+    # covers the group. The per-case verdict is the expected value, so a pair
+    # that must not match can never be satisfied by a pair that must.
+    _INSTALLED_FROM_LOG = frozenset({
+        "nomic-embed-text:latest", "qwen3.5:2b", "qwen3.5:0.8b",
+        "nomic-ea:latest", "gemma4:e2b",
+    })
+    CASES = (
         # The exact case from the log: nomic-embed-text vs nomic-embed-text:latest
-        self.assertTrue(self._matches({"nomic-embed-text:latest"}, "nomic-embed-text"))
-
-    def test_a_tagless_config_name_matches_the_any_tag(self):
-        self.assertTrue(self._matches({"llama3:any"}, "llama3"))
-
-    def test_an_exact_tagged_name_still_matches(self):
-        self.assertTrue(self._matches({"qwen3.5:2b"}, "qwen3.5:2b"))
-        self.assertTrue(self._matches({"gemma4:e2b"}, "gemma4:e2b"))
-
-    def test_a_different_tag_is_not_the_same_model(self):
+        ({"nomic-embed-text:latest"}, "nomic-embed-text", True),
+        ({"llama3:any"}, "llama3", True),
+        ({"qwen3.5:2b"}, "qwen3.5:2b", True),
+        ({"gemma4:e2b"}, "gemma4:e2b", True),
+        # Defensive: a proxy in front of Ollama could report a bare name.
+        ({"nomic-embed-text"}, "nomic-embed-text", True),
         # 0.8b and 2b are genuinely different models; matching them would leave
         # the vault embedded with the wrong one.
-        self.assertFalse(self._matches({"qwen3.5:2b"}, "qwen3.5:0.8b"))
-        self.assertFalse(self._matches({"gemma4:e2b"}, "gemma4:4b"))
+        ({"qwen3.5:2b"}, "qwen3.5:0.8b", False),
+        ({"gemma4:e2b"}, "gemma4:4b", False),
+        ({"nomic-embed-text:latest"}, "qwen3.5:2b", False),
+        (set(), "nomic-embed-text", False),
+        ({"nomic-embed-text:latest"}, "", False),
+        ({"nomic-embed-text:latest"}, "   ", False),
+        ({"nomic-embed-text:latest"}, None, False),
+        (_INSTALLED_FROM_LOG, "nomic-embed-text", True),
+        (_INSTALLED_FROM_LOG, "qwen3.5:2b", True),
+        (_INSTALLED_FROM_LOG, "qwen3.5:0.8b", True),
+        (_INSTALLED_FROM_LOG, "gemma4:e2b", True),
+        (_INSTALLED_FROM_LOG, "gemma4:e4b", False),
+    )
 
-    def test_a_different_model_is_not_a_match(self):
-        self.assertFalse(self._matches({"nomic-embed-text:latest"}, "qwen3.5:2b"))
-
-    def test_a_missing_model_is_not_a_match(self):
-        self.assertFalse(self._matches(set(), "nomic-embed-text"))
-
-    def test_an_empty_name_never_matches(self):
-        self.assertFalse(self._matches({"nomic-embed-text:latest"}, ""))
-        self.assertFalse(self._matches({"nomic-embed-text:latest"}, "   "))
-        self.assertFalse(self._matches({"nomic-embed-text:latest"}, None))
-
-    def test_a_colonless_installed_name_matches_a_tagless_wanted(self):
-        # Defensive: a proxy in front of Ollama could report a bare name.
-        self.assertTrue(self._matches({"nomic-embed-text"}, "nomic-embed-text"))
-
-    def test_the_real_installed_set_from_the_production_log(self):
-        installed = {
-            "nomic-embed-text:latest", "qwen3.5:2b", "qwen3.5:0.8b",
-            "nomic-ea:latest", "gemma4:e2b",
-        }
-        for wanted in ("nomic-embed-text", "qwen3.5:2b", "qwen3.5:0.8b", "gemma4:e2b"):
-            self.assertTrue(self._matches(installed, wanted), wanted)
-        self.assertFalse(self._matches(installed, "gemma4:e4b"))
+    def test_only_the_pairs_carrying_the_same_tag_are_the_same_model(self):
+        for installed, wanted, expected in self.CASES:
+            with self.subTest(installed=sorted(installed), wanted=wanted, expected=expected):
+                self.assertEqual(
+                    self._matches(installed, wanted), expected,
+                    f"{sorted(installed)} is {'not ' if not expected else ''}a "
+                    f"match for {wanted!r}",
+                )
 
     def test_ensure_ollama_models_actually_calls_the_helper(self):
         """Pin the call site.
 
-        The tests above exercise the helper directly, so re-injecting the old
-        ``if model in installed`` at the call site leaves all nine green --
+        The cases above exercise the helper directly, so re-injecting the old
+        ``if model in installed`` at the call site leaves them green --
         verified by doing exactly that. The download bug lives in the call
         site, so the call site is what has to be asserted.
         """

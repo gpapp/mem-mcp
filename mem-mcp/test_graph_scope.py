@@ -163,13 +163,25 @@ class GraphCapTests(unittest.TestCase):
                 self.assertEqual(result["total"], kept)
 
     def test_the_cap_keeps_the_most_connected_records(self):
-        """A graph of leaves explains nothing, so degree is what we rank on."""
+        """A graph of leaves explains nothing, so degree is what we rank on.
+
+        Two hubs on purpose, and they are not the two lowest ids. A star with one
+        hub selects the same two nodes whether the sort key is degree or id, so
+        the ranking was never actually under test -- replacing it with
+        `(n["id"],)` left this green.
+        """
         nodes = {f"f{i}": fact(f"f{i}") for i in range(5)}
-        edges = [edge("f0", "f1"), edge("f0", "f2"), edge("f0", "f3"), edge("f0", "f4")]
+        # f0 degree 4, f3 degree 3, f1/f2/f4 degree 2 -- no tie among the two
+        # the limit keeps, so the id tie-break cannot stand in for the ranking.
+        edges = [edge("f0", "f1"), edge("f0", "f2"), edge("f0", "f3"),
+                 edge("f0", "f4"), edge("f3", "f1"), edge("f3", "f2"),
+                 edge("f3", "f4")]
         result = _scope_and_cap_graph(nodes, edges, {}, {}, {}, "", "", 2)
         self.assertTrue(result["truncated"])
-        self.assertIn("f0", ids(result))
-        self.assertLessEqual(len(result["nodes"]), 2)
+        self.assertEqual(ids(result), {"f0", "f3"},
+                         "the two most connected records survive; f1 has degree "
+                         "one and must not be chosen just for having the lowest id")
+        self.assertNotIn("f1", ids(result))
 
     def test_the_cap_reports_the_uncapped_total(self):
         nodes = {f"f{i}": fact(f"f{i}") for i in range(9)}

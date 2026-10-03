@@ -205,12 +205,14 @@ class ListParameterInPropertyMapTests(unittest.TestCase):
 
     def test_the_batch_clear_tests_its_ids_with_in(self):
         """Pin the one query whose whole job is to delete by a list of ids."""
+        checked = 0
         for path in _python_sources():
             with open(path, "r", encoding="utf-8") as handle:
                 source = handle.read()
             for lineno, query, _list_names in _run_calls(source):
                 if "count(DISTINCT n) AS cleared" not in query:
                     continue
+                checked += 1
                 self.assertRegex(
                     query, r"WHERE\s+n\.id\s+IN\s+\$ids",
                     f"{os.path.basename(path)}:{lineno} — the scope clear must test "
@@ -219,6 +221,11 @@ class ListParameterInPropertyMapTests(unittest.TestCase):
                     query, r"\{\s*id\s*:\s*\$ids",
                     f"{os.path.basename(path)}:{lineno} — a list in a property map "
                     f"matches nothing and fails silently")
+        # Without this the whole test passes on a batch clear that no longer
+        # exists: the loop body is the only place either assertion can run, so a
+        # renamed alias or a deleted query leaves it vacuously green. The broken
+        # form this pins was exactly a query that returned `cleared = 0`.
+        self.assertGreaterEqual(checked, 1, "the batch scope clear was not found at all")
 
 
 class DanglingConjunctionTests(unittest.TestCase):
@@ -234,8 +241,10 @@ class DanglingConjunctionTests(unittest.TestCase):
 
     def test_no_query_starts_a_line_with_and_without_a_where(self):
         offenders = []
+        examined = 0
         for path in _python_sources():
             for lineno, query in _cypher_strings(path):
+                examined += 1
                 seen_where = False
                 for line in query.splitlines():
                     text = line.strip()
@@ -259,6 +268,10 @@ class DanglingConjunctionTests(unittest.TestCase):
             "a line-leading AND with no WHERE since the last clause needs fixing: "
             + "; ".join(offenders),
         )
+        # This lint asserts absence over every query in the tree, so it passes
+        # vacuously if the extractor stops finding any — which is what a
+        # docstring- or f-string-handling regression would look like.
+        self.assertGreater(examined, 0, "no Cypher strings were examined; it is not running")
 
     def test_conditional_fragments_render_a_complete_clause(self):
         """Pin the two _backfill_qdrant filters to a full WHERE, not a bare AND."""
@@ -302,6 +315,21 @@ class ClearScopeQueryTests(unittest.TestCase):
         self.assertRegex(query, r"OPTIONAL MATCH \(n\)-\[r:FOR_CLIENT\|IN_CONTEXT\]->\(\)")
         self.assertRegex(query, r"ELSE \[r\] END")
         self.assertNotRegex(query, r"ELSE \[x\] END")
+
+    def test_batch_clear_also_drops_the_boot_stamp(self):
+        """`REMOVE n.scopeCheckedSig` has to be in the same statement.
+
+        It is the mark that says "the classifier has already ruled on this item,
+        do not ask again". Leaving it on the record means the *next* boot skips
+        an item a reclassify just re-decided — which is exactly how a run that
+        appeared to do nothing looked while it was overwriting links. It was
+        silent in production for the same reason the id test was: the query
+        returned `cleared = 0`, indistinguishable from nothing to clear.
+        """
+        _, query = self.find("migrate_client_context.py", "count(DISTINCT n) AS cleared")
+        self.assertIn("REMOVE n.scopeCheckedSig", query,
+                      "the batch clear must retire the stamp, or the next "
+                      "boot treats a re-decided item as already decided")
 
     def test_batch_clear_does_not_count_a_node_twice(self):
         """A node with both FOR_CLIENT and IN_CONTEXT yields two rows.
@@ -560,14 +588,64 @@ class ManualScopeGuardTests(unittest.TestCase):
         contextId from the vector store. The graph filter still showed the
         entry — the links were untouched — while client-filtered search
         silently stopped returning it, and nothing errored in between.
+
+        Asserting the four key *names* over the whole function is what this used
+        to do, and it does not bite: the same names appear in the query's RETURN
+        aliases and in the scope-clearing assignments, so deleting the key from
+        the payload dict it was written for, or replacing the alias with a
+        literal `null`, both left it green (both verified by re-injection). So
+        the two halves are located rather than searched for: the dict literal
+        that carries the keys, and the pattern the aliases are derived from.
         """
-        segment = self.segment("db_update_diary")
-        for key in ("clientId", "clientName", "contextId", "contextName"):
-            self.assertIn(key, segment, f"db_update_diary no longer carries {key} into the payload")
-        self.assertIn("payload.update", segment)
-        # And the source of that scope has to be the link, not a stale payload.
-        self.assertIn("FOR_CLIENT", segment)
-        self.assertIn("IN_CONTEXT", segment)
+        _source, node = self.functions["db_update_diary"]
+        scope_keys = {"clientId", "clientName", "contextId", "contextName"}
+        dicts = [
+            (ast.unparse(n.targets[0]), n.value)
+            for n in ast.walk(node)
+            if isinstance(n, ast.Assign) and isinstance(n.value, ast.Dict)
+        ]
+        carrying = [
+            (name, value) for name, value in dicts
+            if scope_keys <= {k.value for k in value.keys if isinstance(k, ast.Constant)}
+        ]
+        self.assertEqual(
+            len(carrying), 1,
+            msg="expected exactly one dict literal carrying all four scope keys; "
+                f"found {[n for n, _ in carrying]}",
+        )
+        scope_name, _value = carrying[0]
+        # ...and it has to reach the payload, or the keys are built and dropped.
+        updates = [
+            n for n in ast.walk(node)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "update" and isinstance(n.func.value, ast.Name)
+            and n.func.value.id == "payload"
+        ]
+        self.assertTrue(updates, msg="the rebuilt payload is never merged with the scope")
+        self.assertTrue(
+            any(scope_name in ast.unparse(call) for call in updates),
+            msg=f"payload.update does not read {scope_name}, so the four scope "
+                f"keys never reach the vector store: "
+                f"{[ast.unparse(c) for c in updates]}",
+        )
+        # ...and the values have to come off the links, not off a stale payload.
+        queries = "\n".join(
+            _function_queries(os.path.join(HERE, "diary_manager.py"), "db_update_diary")
+        )
+        for rel, keys in (("FOR_CLIENT", ("clientId", "clientName")),
+                          ("IN_CONTEXT", ("contextId", "contextName"))):
+            match = re.search(rf"\(d\)-\[:{rel}\]->\(\s*(\w+)\s*:", queries)
+            self.assertIsNotNone(
+                match, msg=f"db_update_diary no longer reads the {rel} edge")
+            sources = _alias_closure(queries, match.group(1))
+            for key in keys:
+                self.assertTrue(
+                    any(re.search(rf"\b{re.escape(src)}\.\w+\s+as\s+{key}\b", queries)
+                        for src in sources),
+                    msg=f"the {key} alias is not derived from the {rel} edge "
+                        f"(bound as {sorted(sources)}); a literal or a stale-payload "
+                        f"value silently strips the scope from every edited entry",
+                )
 
     def test_the_edit_endpoint_actually_forwards_the_scope(self):
         """The field was on the request body and nothing read it.
@@ -916,33 +994,35 @@ class MergeDraftEndpointTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(result["factIds"], ["f0", "f1"])
 
-    def test_an_oversized_selection_is_a_400_naming_the_remedy(self):
+    # One property -- a selection the endpoint cannot serve is refused with a
+    # 400 *before* the request goes out -- over the three ways a selection is
+    # unservable, so one test covers the group. Each case carries its own record
+    # count, text size and the wording its refusal owes, and every case asserts
+    # that no LLM call was made, so an over-budget case can never be satisfied by
+    # the count cap's message or the other way round.
+    _REFUSALS = (
+        # label, record count, text chars per record, substrings the detail owes
+        ("over-budget text", 12, 40_000, ("12 records", "characters")),
+        ("thirteen records, text that would fit", 13, 10, ("at most 12",)),
+        ("a single record", 1, 400, ()),
+    )
+
+    def _refusal(self, label, count, text_chars, expected):
+        endpoint, calls = self._runner(text_chars)
+        body = type("B", (), {"factIds": ["f%d" % i for i in range(count)]})()
+        with self.subTest(selection=label, records=count, chars=text_chars,
+                          expected_detail=expected):
+            with self.assertRaises(self._HTTPException) as caught:
+                asyncio.run(endpoint(object(), body))
+            self.assertEqual(caught.exception.status_code, 400)
+            self.assertEqual(calls, [], msg="an unservable selection was sent anyway")
+            for phrase in expected:
+                self.assertIn(phrase, caught.exception.detail)
+
+    def test_an_unservable_selection_is_a_400_before_the_request_goes_out(self):
         """Not a 502: the request is never issued, and the message says why."""
-        endpoint, calls = self._runner(40_000)
-        body = type("B", (), {"factIds": ["f%d" % i for i in range(12)]})()
-        with self.assertRaises(self._HTTPException) as caught:
-            asyncio.run(endpoint(object(), body))
-        self.assertEqual(caught.exception.status_code, 400)
-        self.assertEqual(calls, [], msg="an over-budget selection was sent anyway")
-        for expected in ("12 records", "characters"):
-            self.assertIn(expected, caught.exception.detail)
-
-    def test_thirteen_records_is_refused_even_though_the_text_would_fit(self):
-        """The count cap is its own guard, not a side effect of the char budget."""
-        endpoint, calls = self._runner(10)
-        body = type("B", (), {"factIds": ["f%d" % i for i in range(13)]})()
-        with self.assertRaises(self._HTTPException) as caught:
-            asyncio.run(endpoint(object(), body))
-        self.assertEqual(caught.exception.status_code, 400)
-        self.assertIn("at most 12", caught.exception.detail)
-        self.assertEqual(calls, [])
-
-    def test_one_record_is_refused(self):
-        endpoint, calls = self._runner(400)
-        with self.assertRaises(self._HTTPException) as caught:
-            asyncio.run(endpoint(object(), type("B", (), {"factIds": ["f0"]})()))
-        self.assertEqual(caught.exception.status_code, 400)
-        self.assertEqual(calls, [])
+        for label, count, text_chars, expected in self._REFUSALS:
+            self._refusal(label, count, text_chars, expected)
 
     def test_a_people_draft_is_formatted_through_the_schema(self):
         result, calls = self._draft(2, 400, category="People")
@@ -1051,6 +1131,33 @@ def _function_queries(path, function_name):
         if (isinstance(node, ast.Constant) and isinstance(node.value, str)
                 and id(node) not in docstrings and _CYPHER_RE.search(node.value)):
             yield node.value
+
+
+def _alias_closure(queries, bound):
+    """Names whose value is derived from ``bound``, following ``AS`` aliases.
+
+    A RETURN alias rarely reads the pattern variable directly: this query reads
+    ``(d)-[:FOR_CLIENT]->(c:Client)``, folds it with
+    ``head(collect({id: c.id, ...})) AS cl``, and only then projects
+    ``cl.id as clientId``. Pinning ``c.id as clientId`` would be pinning one
+    rewrite of that; what matters is that the alias chain reaches the edge at
+    all, so an alias is admitted when its defining projection mentions a name
+    already in the set. Fixed-point over a short chain, not a single hop.
+    """
+    known = {bound}
+    for _ in range(4):
+        grew = False
+        for match in re.finditer(r"\bAS\s+(\w+)", queries, re.I):
+            alias = match.group(1)
+            if alias in known:
+                continue
+            window = queries[max(0, match.start() - 160):match.start()]
+            if any(re.search(rf"\b{re.escape(name)}\b", window) for name in known):
+                known.add(alias)
+                grew = True
+        if not grew:
+            break
+    return known
 
 
 def _row_reads(func):
@@ -1330,6 +1437,34 @@ class OneRowPerRecordTests(unittest.TestCase):
         how the `FOREACH` bug in this file's docstring happened in the first
         place. When one of those does become a record list, add it here.
         """
+        # The analyzer is the guard, so the guard is only as good as the
+        # analyzer. It is driven here on the shape this whole class exists for
+        # — two expansions with a projecting `WITH` between them, then a RETURN
+        # projecting the record — because a derivation that stopped flagging
+        # anything would otherwise leave this loop passing on every query.
+        self.assertNotEqual(
+            self._unaggregated_expansions(
+                "MATCH (d:DiaryEntry {userId: $userId}) "
+                "OPTIONAL MATCH (d)-[:MENTIONS]->(p:People) WITH d, p "
+                "OPTIONAL MATCH (d)-[:RELEVANT_TO]->(c:Client) "
+                "RETURN d, collect(p) AS mentions"
+            ),
+            [],
+            msg="the analyzer no longer flags the fan-out it was written for, so "
+                "the check below is passing on everything",
+        )
+        self.assertEqual(
+            self._unaggregated_expansions(
+                "MATCH (d:DiaryEntry {userId: $userId}) "
+                "OPTIONAL MATCH (d)-[:MENTIONS]->(p:People) WITH d, collect(p) AS mentions "
+                "OPTIONAL MATCH (d)-[:RELEVANT_TO]->(c:Client) "
+                "WITH d, mentions, collect(c) AS relevant "
+                "RETURN d, mentions, relevant"
+            ),
+            [],
+            msg="the analyzer now flags the collapsed form, so it would demand "
+                "churn on the correct queries this lint exists to protect",
+        )
         for module, function in _RENDERED_LIST_QUERIES:
             with self.subTest(function=function):
                 for query in _function_queries(os.path.join(HERE, module), function):
@@ -1350,8 +1485,11 @@ class OneRowPerRecordTests(unittest.TestCase):
         """
         for module, function in _RENDERED_LIST_QUERIES:
             with self.subTest(function=function):
+                withs = 0
                 for query in _function_queries(os.path.join(HERE, module), function):
-                    for keyword, body in self._clauses(query):
+                    clauses = self._clauses(query)
+                    withs += sum(1 for keyword, _body in clauses if keyword == "WITH")
+                    for keyword, body in clauses:
                         if keyword != "WITH":
                             continue
                         with self.subTest(with_body=" ".join(body.split())[:60]):
@@ -1361,6 +1499,11 @@ class OneRowPerRecordTests(unittest.TestCase):
                                 "the rows the previous pattern fanned out are "
                                 "still fanned out",
                             )
+                # Every assertion above lives inside the loop, so a query with no
+                # WITH at all — or a clause splitter that stopped recognising one
+                # — would leave this case green without having looked at
+                # anything.
+                self.assertGreater(withs, 0, f"{function}: no WITH clause found to check")
 
     def test_no_aggregation_happens_in_the_return(self):
         """The trailing `OPTIONAL MATCH` needs a `WITH` too.
@@ -1374,16 +1517,21 @@ class OneRowPerRecordTests(unittest.TestCase):
         """
         for module, function in _RENDERED_LIST_QUERIES:
             with self.subTest(function=function):
+                returns = 0
                 for query in _function_queries(os.path.join(HERE, module), function):
                     for keyword, body in self._clauses(query):
                         if keyword != "RETURN":
                             continue
+                        returns += 1
                         with self.subTest(return_body=" ".join(body.split())[:60]):
                             self.assertNotRegex(
                                 body, r"\bcollect\s*\(",
                                 "aggregating in the RETURN cannot collapse the "
                                 "rows; the last pattern needs its own WITH",
                             )
+                # Same shape as the WITH check: without a RETURN there is
+                # nothing to assert on, and this would pass without looking.
+                self.assertGreater(returns, 0, f"{function}: no RETURN clause found to check")
 
     def test_every_field_the_python_reads_is_still_returned(self):
         """A `WITH` chain renames things on the way to the RETURN.
@@ -1415,6 +1563,14 @@ class OneRowPerRecordTests(unittest.TestCase):
                             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
                             and n.name == function)
                 reads = _row_reads(func)
+                # An empty read set makes the loop below vacuous, and the
+                # derivation is exactly the sort of thing that rots silently: a
+                # loop variable that stops being a bare Name, or a `row["x"]`
+                # rewritten as `row.get("x")` on a different receiver, empties it
+                # without failing anywhere.
+                self.assertGreater(len(reads), 0,
+                                   f"{function}: no row reads were derived, so there "
+                                   f"is nothing to check the RETURN against")
                 query = "\n".join(_function_queries(os.path.join(HERE, module), function))
                 analyzer = OneRowPerRecordTests()
                 returned = " ".join(body for keyword, body in analyzer._clauses(query)
@@ -1529,12 +1685,18 @@ class ScopeIsRankedNotFilteredTests(unittest.TestCase):
         return a whole record rather than a ranking map. The batched read is
         identified by the id-list predicate and the `AS relevant` alias, which is
         why the selector is a shape and not the relationship name.
+
+        The relationship name used to be part of the selector as well, which made
+        ``assertIn("RELEVANT_TO", query)`` in the test above unsatisfiable — the
+        query cannot fail an assertion about a string it was selected by. The
+        alias and the id list are still unique to this read (checked: one match
+        across every module), so the assertion now has something to say: a read
+        that stopped reading RELEVANT_TO at all would be found here and fail.
         """
         queries = []
         for path in _python_sources():
             for lineno, query in _cypher_strings(path):
-                if "n.id IN $ids" in query and "RELEVANT_TO]->(rc)" in query \
-                        and "AS relevant" in query:
+                if "n.id IN $ids" in query and "AS relevant" in query:
                     queries.append((os.path.basename(path), query))
         self.assertEqual(
             len(queries), 1,
