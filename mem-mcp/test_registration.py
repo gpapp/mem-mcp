@@ -172,16 +172,40 @@ class PasswordHashingTests(unittest.TestCase):
             with self.subTest(stored=stored):
                 self.assertFalse(sessions.verify_password("anything at all", stored))
 
-    def test_a_truncated_digest_does_not_verify(self):
+    def test_a_digest_that_disagrees_with_its_claimed_length_does_not_verify(self):
         # The first implementation derived dklen from the stored digest, so it
         # computed a digest of that same length and compared equal: anyone able
         # to shorten the stored hash had made it verify against anything.
+        #
+        # The damage is done to the *dklen field*, not to the digest. That is the
+        # construction that separates the two implementations: the digest bytes
+        # still decode cleanly, so the parse and the comparison both succeed, and
+        # the only thing that can refuse is the check that the stored digest
+        # agrees with the length it claims. An earlier version of this test
+        # replaced the digest with 43 base64 characters instead, which is not a
+        # valid `b64decode(validate=True)` length -- so it returned False from the
+        # blanket `except` and never reached the guard it was written to pin,
+        # passing on the mutant for the wrong reason.
         stored = sessions.hash_password("a long enough password")
-        head, _, _ = stored.rpartition("$")
-        shortened = head + "$" + "A" * (len(stored.split("$")[-1]) - 1)
-        self.assertFalse(sessions.verify_password("a long enough password", shortened))
-        self.assertNotEqual(len(shortened.split("$")[-1]),
-                            int(stored.split("$")[4]))
+        parts = stored.split("$")
+        real_len = int(parts[4])
+        understated = "$".join(parts[:4] + [str(real_len - 1)] + parts[5:])
+        self.assertEqual(len(base64.b64decode(parts[6], validate=True)), real_len,
+                         "precondition: the digest is intact and decodable")
+        self.assertNotEqual(int(understated.split("$")[4]), real_len)
+        self.assertFalse(sessions.verify_password("a long enough password",
+                                                  understated))
+
+    def test_a_digest_that_will_not_decode_is_refused_rather_than_raising(self):
+        # A different hazard from the one above, and it was the one the old test
+        # actually exercised: a corrupt row must read as "cannot log in", not as a
+        # 500. Kept separate so neither test can pass for the other's reason.
+        for label, encoded in (("not base64", "scrypt$16384$8$1$32$c2FsdA$!!!!"),
+                               ("too short", "scrypt$16384$8$1$32$c2FsdA$"),
+                               ("not scrypt", "pbkdf2$16384$8$1$32$c2FsdA$c2FsdA")):
+            with self.subTest(hash=label):
+                self.assertFalse(sessions.verify_password("a long enough password",
+                                                          encoded))
 
     def test_passwords_outside_the_bounds_are_refused(self):
         for value in ("", "   ", "x" * (sessions.MAX_PASSWORD_CHARS + 1), None, 12345):

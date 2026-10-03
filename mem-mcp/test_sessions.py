@@ -640,7 +640,11 @@ class AsgiCase(StoreCase):
             for key, value in message.get("headers", []):
                 if key == b"set-cookie":
                     return value.decode("latin-1")
-        return None
+        # "" rather than None. Returning None makes every `assertIn(x, cookie)`
+        # raise TypeError on the *harness*, so a real regression — the middleware
+        # emitting no cookie at all — reports as "argument of type 'NoneType' is
+        # not a container" instead of naming the property that broke.
+        return ""
 
     @staticmethod
     def session_id_of(set_cookie):
@@ -681,8 +685,12 @@ class SessionMiddlewareTests(AsgiCase):
         for label, kwargs in cases.items():
             with self.subTest(case=label):
                 messages = asyncio.run(self._drive(inert, **kwargs))
-                self.assertIsNone(self.set_cookie(messages),
-                                  "A request that persists nothing must not be "
+                # assertFalse on the *absence* of a cookie, not assertIsNone on
+                # the helper's sentinel: the property is "no Set-Cookie header
+                # was sent", and pinning the sentinel would make the helper's
+                # return value the thing under test.
+                self.assertFalse(self.set_cookie(messages),
+                                 "A request that persists nothing must not be "
                                   "issued a session")
 
     def test_logging_in_issues_a_cookie_and_stores_the_user(self):
