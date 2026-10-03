@@ -2,7 +2,6 @@
 client_manager.py – Client and Context management for multi-client memory separation.
 """
 
-import uuid
 import hashlib
 import time
 from datetime import datetime, timezone
@@ -10,6 +9,7 @@ from typing import Optional
 
 from common import get_neo4j, get_qdrant, logger, COLLECTION_NAME, DIARY_COLLECTION
 from matching_utils import plan_search_scope
+from scoped_ids import client_id_for, context_id_for
 
 # ---------------------------------------------------------------------------
 # Scope ranking tunables (shared by fact_manager and diary_manager)
@@ -79,7 +79,7 @@ async def db_create_client(name: str, user_id: str) -> str:
     if not neo4j_driver:
         raise RuntimeError("Neo4j not connected.")
 
-    client_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"client_{user_id}_{name.strip().lower()}"))
+    client_id = client_id_for(user_id, name)
 
     with neo4j_driver.session() as s:
         s.run(
@@ -100,7 +100,7 @@ async def db_create_context(name: str, client_id: str, user_id: str) -> str:
     if not neo4j_driver:
         raise RuntimeError("Neo4j not connected.")
 
-    context_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"context_{user_id}_{client_id}_{name.strip().lower()}"))
+    context_id = context_id_for(user_id, client_id, name)
 
     with neo4j_driver.session() as s:
         s.run(

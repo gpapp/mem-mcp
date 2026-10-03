@@ -53,14 +53,35 @@ six classes will render the wrong one. `assertLogs` there is not decoration: a
 network failure that raises without logging is the absence-of-a-log-line bug this
 repo has already been bitten by once.
 
+`test_vault_migration.py` is the sixteenth suite, and it **imports
+`scoped_ids.py` directly** — that module is standard-library-only (`uuid`) for the
+same reason `sessions.py` and `matching_utils.py` are: the id derivation is the
+one part of a vault move that has to agree with `db_create_client`, and a helper
+that cannot be imported on a plain box cannot be compared against it here.
+`migrate_vault_user.py` cannot be imported (no `qdrant_client`, no `common`), so
+its Qdrant and graph functions are lifted with `ast.get_source_segment` and
+**called** against fakes — the properties worth guarding are behavioural, since
+the whole module is about an order of operations that is invisible in the shape
+of the code. `PerformMoveOrderTests` is the call-site guard for the defect that
+shaped the planner: `IdRemap.contexts` and `IdRemap.context_parents` have the
+same shape and the same key type, so passing one where the other belongs is
+silent, and `MoveGraphTests` cannot see it because it calls `move_graph` directly
+with its own dict. `PaginationTests` models Qdrant's `offset` as a cursor over
+the collection's own order rather than an index into the filtered result, because
+`move_qdrant_user` mutates the filter it is paginating over and the other model
+would make it drop points. `VerifyTests` and `RunTests` likewise **call** the
+verification pass and the entry point against fakes — a `_StubCommon` is
+installed in `sys.modules` because `run()` does `from common import …` inside its
+own body and a namespace entry cannot reach that.
+
 `test_registration.py` is the fifteenth suite, and it is deliberately its own file rather than more classes in `test_sessions.py`: registration is a **third** credential surface, and the only one that is *unauthenticated by design* — the signup routes live under the `/api/auth` allow-list, which is what makes an account creatable at all — so burying it in a suite about the two properly-protected gates would hide the one fact that matters about it. It **calls** `sessions.py` directly for the credential store, the scrypt hashing and the throttle, and lifts `_verify_account`, `_require_registration`, `registration_config` and both signup routes out of `gui.py` with `ast.get_source_segment` (gui.py is not importable on a machine with no fastapi). The lifted routes are async, and the harness drives them through `asyncio.run` for a reason that is worth stating because it is not visible in the code: an un-awaited coroutine enters no function at all, so every guard in the class would have reported green against routes that were never called. That was a real harness bug while the suite was being written, and it is invisible from the outside — the tests pass either way, they just test nothing. `CallSiteTests` pins what no source test above can otherwise see: both login paths going through `_verify_account` rather than each picking a store for itself (an address can be in `credentials` *and* htpasswd, and the two stores have different rotation rules); the throttle textually *before* the flag check, so turning registration **off** removes the rate limit from a route that is still mounted and the counter only ever sees successful attempts; and `McpAuthGuard` containing no `register` at all, which is the `/mcp` half of the rule stated above. `LandingPageTests` pins the template's `minlength` against `sessions.MIN_PASSWORD_CHARS` — a cross-file contract between two modules nothing else would notice drifting, and one that fails silently as a signup form that rejects passwords the backend would have accepted. After the rewrite to username + verified email it also pins each half of the form to **its own** flag, and asserts the page contains no pasted-token field at all; `VerificationMailTests` covers the confirmation mail, and `GoogleSignInTests` / `GoogleSignupTests` drive the redirect endpoints end to end with a fake opener. One harness lesson from that rewrite is worth keeping: **the routes `return` a `RedirectResponse`, they do not raise**, so `assertRaises(_Redirect)` against a route that forgets to return one passes on a route that was never correct — the helper asserts the return value is a redirect, which fails loudly instead.
 
 ```bash
 cd mem-mcp
-python3 -m unittest -v test_matching_regressions.py test_embedding_reliability.py test_chunking.py test_cypher_safety.py test_backup_compression.py test_people_extraction.py test_graph_scope.py test_mobile_layout.py test_llm_reliability.py test_env_wiring.py test_status_monitor.py test_sessions.py test_auth_guard.py test_google_auth.py test_registration.py
+python3 -m unittest -v test_matching_regressions.py test_embedding_reliability.py test_chunking.py test_cypher_safety.py test_backup_compression.py test_people_extraction.py test_graph_scope.py test_mobile_layout.py test_llm_reliability.py test_env_wiring.py test_status_monitor.py test_sessions.py test_auth_guard.py test_google_auth.py test_registration.py test_vault_migration.py
 ```
 
-This was a Windows path (`C:/tools/miniconda3/python.exe`) with PowerShell `Push-Location`/`Pop-Location`, and it does not exist on the Linux host these files are edited from — every suite "failed" on an interpreter that is not there. Any `python`/`python3` on `PATH` runs all ten; none of them import a DB driver.
+This was a Windows path (`C:/tools/miniconda3/python.exe`) with PowerShell `Push-Location`/`Pop-Location`, and it does not exist on the Linux host these files are edited from — every suite "failed" on an interpreter that is not there. Any `python`/`python3` on `PATH` runs all sixteen; none of them import a DB driver.
 
 Run `git -c core.whitespace=cr-at-eol diff --check` after documentation or code edits (the `cr-at-eol` avoids false positives on the CRLF files). The suites use pure helpers and fake callbacks so they do not require Neo4j, Qdrant, or Ollama.
 
@@ -497,11 +518,235 @@ Do not reintroduce byte-exact name matching, per-item synchronous clears, a stam
 - **`renderBackupStatus()` must stay a pure renderer.** Completion side effects live in `applyBackupCompletion()`, reached only from `backupTick()` and guarded by `backupSettled`. A `render*` function that re-fetches its own input is a loop: `renderBackupStatus('done')` → `loadSavepoints()` → `renderBackupStatus('done')` … was measured issuing 500+ requests for a single finished backup.
 - `prune_savepoints()` keeps the newest `MEM_BACKUP_KEEP` **complete** savepoints only, so a failed attempt is never promoted into the retention window.
 
+### Maintenance lock and the vault move
+
+`migrate_vault_user.py` is the one rewrite that takes **no** maintenance lock.
+Every other job that rewrites the graph in bulk does — see the section below —
+and the reason does not apply here: a vault move is operator-initiated and is
+expected to be the only thing happening, and it takes a per-user lock for a user
+whose lock the running server is not holding. What that costs is precise and
+documented rather than fixed: the migration's completeness check compares exact
+counts taken before the first write, so a `rechunk_unindexed_records()` or
+`sync_orphans()` running against either vault mid-migration makes a healthy move
+report dirty. Do not run the migration and those background passes at the same
+time.
+
 ### Maintenance lock
 
 `claim_maintenance()` / `release_maintenance()` in `common.py` are a per-user in-process mutex. Reclassification and backup/restore both rewrite large parts of the graph; running them together interleaves the writes. Every maintenance job takes the lock when it starts and releases it in a `finally` block, and the API answers `409` with a human-readable reason when it cannot.
 
 The scheduled backup is the one exception: it is vault-wide, so there is no single user whose lock it could take. `scheduled_backup_loop()` calls `active_maintenance()` first and defers by `_RETRY_SECONDS` if any user holds the lock. Keep it that way — calling `run_backup()` directly from the scheduler would snapshot a graph mid-reclassify.
+
+## Moving a Vault Between Users
+
+`mem-mcp/migrate_vault_user.py` hands everything belonging to one vault user to
+another. Both usernames are arguments, so neither is ever written into the
+repository, and the run **is a dry run unless `--apply` is passed** — the
+opposite of `reindex_chunks.py`, because this moves the only copy of somebody's
+data and there is no undo.
+
+```bash
+python mem-mcp/migrate_vault_user.py --from OLD_USER --to NEW_USER            # report only
+python mem-mcp/migrate_vault_user.py --from OLD_USER --to NEW_USER --apply
+```
+
+**Take a savepoint first** (Setup → Backup, or `POST /api/backup/run`). The two
+stores are not transactional together, so a failure between them leaves a vault
+mid-move. Re-running converges **once the destination is empty again** — and
+after a partial move it may not be, because the Qdrant half can land first. Clear
+the destination's leftovers (or restore the savepoint) and re-run; a savepoint is
+cheaper than working out which half got there.
+
+### A user is four stores, not a profile row
+
+The username is the partition key of all four. Touching three leaves a vault
+that looks empty in one place and full in another:
+
+| store | what carries the user |
+|---|---|
+| Neo4j | `:Fact`, `:DiaryEntry`, `:Client`, `:Context` (`userId`), plus a `:User {id}` hub |
+| Qdrant | `userId` in the `ea_memories` and `ea_diary` payloads |
+| SQLite (`sessions.db`) | `psks.user_id` — the access keys |
+| htpasswd / `credentials` | **deliberately not touched** |
+
+`:Category` is **global** — it carries no `userId` — and is never rewritten.
+
+### The ids are derived from the username, and that is the whole trap
+
+`client_id_for` / `context_id_for` in **`scoped_ids.py`** are the only place that
+formula lives:
+
+```
+client_id  = uuid5(NAMESPACE_DNS, f"client_{user_id}_{name.strip().lower()}")
+context_id = uuid5(NAMESPACE_DNS,
+                   f"context_{user_id}_{client_id}_{name.strip().lower()}")
+```
+
+`db_create_client` and `db_create_context` call them. **Do not re-inline the
+`uuid5` in either place.** A migration that rewrites `userId` alone moves the
+data and leaves those ids stale, and the damage is invisible in the vault you
+just moved: the next create with an existing name derives a *different* uuid, so
+the vault ends up with two `Client` nodes of the same name — which reads as the
+scope filter being broken. A `Context` also stores its parent's id in a property,
+so it is re-derived against the parent's **new** id, and `IdRemap.context_parents`
+carries that separately from `IdRemap.contexts`. The two maps have the same shape
+and the same key type, so passing one where the other belongs points every
+Context at a sibling that does not exist.
+
+`plan_id_remap()` builds both maps and the refusal conditions as a **pure
+function over plain dicts**, so the whole plan is testable with no database. It
+returns `duplicate_names` as well: two same-named Clients, or two same-named
+Contexts under one parent, derive one id — and `destination_occupied` only
+inspects the destination, so without that the move would leave two nodes sharing
+an id. The Context key is `(parent, name)` rather than the name alone, because
+two contexts of one name under *different* clients are two different nodes with
+two different ids and must not be refused.
+
+### Qdrant is written first, and within it the scope retarget goes before the re-own
+
+`perform_move()` is a function rather than a run of statements in `run()` for the
+same reason the rest of this repo pins call sites: asserted from source text it
+only proves two `await`s are on the right lines, and it stays green through the
+refactor that hoists them into a helper and reverses them there. It is driven
+with fakes in `PerformMoveOrderTests`.
+
+Both facts come from one place: **every read is a scroll filtered by the old
+`userId`**, so once a point has been re-owned it is invisible to the step that
+still has work to do on it. The wrong order is not an error — it is a silent
+success that patches nothing. A `Context` id in a payload is retargeted the same
+way; `clientName`/`contextName` are not, because a name is not derived from the
+username.
+
+Note that `move_qdrant_user` **mutates the filter it is paginating over**. That is
+only safe because Qdrant's `offset` is a cursor over the collection's own point
+order with the filter applied per point — not an index into the filtered result.
+`PaginationTests` models it that way deliberately; modelling it as a filtered
+index would demand a "fix" for correct code.
+
+### What it refuses, and what it leaves behind
+
+Refused, with a reason: source and destination the same user; an empty source
+(facts, diary, scope nodes or points — a scope-node-only source is not empty);
+a **non-empty destination** — merging two populated vaults has to reconcile ids,
+duplicates and scope across both, and is a different operation this does not
+attempt; a destination already holding any record, client, context **or Qdrant point**
+(the preflight reads all four — a destination whose Neo4j was emptied while its
+vector points survived is what a stopped `sync_orphans` leaves behind, and
+comparing the source's point count against a destination total that already
+included those reported a healthy move as dirty); a destination already holding
+one of the names; **duplicate names in the source** (two same-named Clients, or two same-named Contexts under one client —
+they derive one id, and `destination_occupied` cannot see it because it only
+inspects the target); and a destination that gained a record between the
+preflight and the write, which is re-checked **inside** the transaction. That re-check sees the
+graph only — it cannot see Qdrant, so a destination-only vector write landing
+between the preflight and the transaction is unguarded, exactly as the preflight
+is for the other direction.
+
+That abort is a **dedicated exception type**, not a bare `ValueError`, and the
+distinction is load-bearing: the handler in `run` turns it into a clean refusal,
+so a bare `except ValueError` around the whole of `perform_move` would also
+swallow a failure from the credential half — *after* Qdrant and Neo4j are fully
+rewritten, with no `FAILED:` line. That is the exact failure the abort message
+exists to prevent, reached by a different route. For the same reason **its
+message must not claim nothing was written**: the Qdrant half is already
+rewritten by the time it fires.
+
+Left behind on purpose:
+
+- **`DiaryEntry.id` is user-derived but is not rewritten.** Chunk 0 of a Qdrant
+  family *is* the record id, so re-deriving it means re-embedding every chunk of
+  every entry — a large, lossy-risk operation bought to avoid a collision that
+  needs the same timestamp to the stored resolution. `Fact.id` is a `uuid4` and
+  was never affected.
+- **Live sessions are revoked, not re-pointed** (`delete_sessions_for_user`). A
+  session open across the move would otherwise keep writing under whichever vault
+  it started with. `transfer_psks` hands the access keys over in one scoped
+  `UPDATE`, so an MCP client holding a key keeps working and starts seeing the new
+  vault — which is the point.
+- **The old account itself is untouched**: htpasswd entry, `credentials` row and
+  `google_identities` row all stay, so it can still sign in and finds an empty
+  vault. The leftover `:User` hub node is reported as `source_user_node_left`.
+
+### It ends with a verification pass, and exits non-zero if it is not clean
+
+`verify()` re-counts both stores and looks for Qdrant payloads whose scope id
+matches no node. **The Client and Context id sets are kept apart**: merged into
+one set, a Context whose `clientId` wrongly holds a *context* id tests as present,
+so the one corruption the check exists to catch would report as clean.
+
+Anything left behind or dangling prints `FAILED:` and returns 1 — a migration
+that reports a dirty result and exits 0 is the failure mode worth precluding,
+because the operator reads "Done" and stops looking. Seven conditions feed it, in five rows:
+
+| condition | why it is not obvious |
+|---|---|
+| records still in the source | **including clients and contexts**, not just facts and diary — a scope node left behind is a whole client the user cannot see |
+| Qdrant points still carrying the source's `userId` | invisible to any graph count |
+| dangling `clientId` / `contextId` payloads | counted separately per kind |
+| facts, diary or points **missing at the destination** (three comparisons) | "nothing was left behind" and "everything arrived" are different claims, and only the first was being made — the pre-move counts are recorded and compared |
+| access keys that did not move | SQLite is the one store verification cannot see: run with a `MEM_SESSION_DIR` different from the app's, `transfer_psks` opens a *different* database, moves nothing, and everything else reports clean |
+
+**The completeness comparison is exact, so run it with nothing else writing.**
+It compares the destination against a snapshot taken before the first write, and
+two documented background passes can move those numbers underneath it:
+`rechunk_unindexed_records()` **adds** points for large records and
+`sync_orphans()` deletes Qdrant-only ones. Either running against either vault
+mid-migration makes a healthy move report dirty. This script takes **no
+maintenance lock** — see "Maintenance lock" below — because a vault move is
+operator-initiated and expected to be the only thing happening; do not run it
+alongside a reclassify, a backup or a boot-time reconcile.
+
+`_count_keys` reads SQLite and is called **only on the `--apply` path**,
+because `sessions.db_path()` creates its directory: counting keys during a dry
+run would write a database and then print "Nothing was written", which would be
+false. `CountKeysTests` asserts that — by collecting the calls and checking the
+list is empty, since checking only the exit code passes on the defect it names. It returns `None` rather than raising when the store is unreadable, so an
+unavailable SQLite reports a skipped check instead of aborting a migration that
+has not started.
+
+`RunTests` **drives `run()` end to end** for every one of those, because every
+other assertion about it reads the source and flipping `return 1` to `return 0`
+is invisible to that.
+
+`move_graph` returns `RETURN count(...)` rather than `len(rows)`, so a row whose
+`MATCH` matched nothing shows as 0 instead of hiding.
+
+There is deliberately **no "every id would come out unchanged" refusal**. Its only
+reachable case was a same-user move, which is refused above, so in practice it
+caught exactly one thing: a vault holding records but no `Client`/`Context` nodes
+at all. Clients are created on demand, so that is an ordinary vault and the move
+does real work — re-owning every fact, diary entry and Qdrant point.
+
+It is handed `remap.client_rows()` rather than `remap.clients`, and the two differ
+in exactly one case: a row whose stored id is **already the id the destination
+would derive**. A hand-written id is not that case — it is *changed* to a derived
+id and lands in `clients` normally. The row that is already derived is a
+pre-existing inconsistency (an id minted for another username, or one migrated by
+hand), and it still needs its `userId` rewritten or it stays behind in the source
+vault while everything around it moves.
+
+`IdRemap` has **three** row accessors, not two. `context_rows()` is the Context
+counterpart of `client_rows()`; `context_parent_rows()` is a third thing and
+exists because `context_parents` is populated for **every** row rather than only
+the changed ones — a `Context` whose own id comes out unchanged can still have a
+stale `clientId` property, and defaulting a missing entry to the context's own id
+writes a node pointing at itself. That was a real bug here, and `verify()` reads
+Qdrant payloads only, so nothing downstream reported it.
+
+### No vault names belong in this repository
+
+`NoVaultNamesCommittedTests` in `test_vault_migration.py` asserts that neither
+username argument has a default, that the two new modules bind no string literal
+with the shape of an account name (three shapes: lowercase-with-separators,
+CamelCase, and spaced capitalised words — nothing forces the stored spelling to be
+lowercase), and that the usage block uses placeholders. Two things about that
+guard are deliberate. It judges literals by **value**, not by the name they are
+bound to: a version keyed on the constant's name passes on a real vault name
+assigned to something innocuously named, and on any `AnnAssign` or in-function
+binding. And it is **scoped to the two new modules** on purpose: over `sessions.py`
+and `client_manager.py` it needs ~90 legitimate column names in the allowlist
+and would rot on the next schema change, and a guard that needs updating whenever
+unrelated code moves is a guard that gets deleted.
 
 ## Long Records & Chunking
 

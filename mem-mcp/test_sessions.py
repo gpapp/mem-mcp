@@ -474,6 +474,75 @@ class PskOwnershipTests(StoreCase):
         self.assertEqual(sessions.resolve_psk(self.bobs["key"])["user_id"], "bob")
 
 
+class PskTransferTests(StoreCase):
+    """Handing a vault to a different username has to hand the keys with it.
+
+    A key is already scoped to a vault by its `user_id`, so a client presenting
+    an existing key against the moved vault starts seeing the new owner's data
+    the moment the graph moves. That is the point; the transfer is what stops it
+    being a surprise.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.moving = sessions.create_psk("alice", label="work")
+        self.staying = sessions.create_psk("bob", label="personal")
+        self.second = sessions.create_psk("alice", label="spare")
+
+    def _alice_ids(self):
+        return {row["id"] for row in sessions.list_psks("alice")}
+
+    def test_a_moved_key_still_resolves(self):
+        # The digest is untouched, so the plaintext an MCP client already holds
+        # keeps working — which is the whole reason this is a row update and not
+        # a re-mint.
+        sessions.transfer_psks("alice", "carol")
+        resolved = sessions.resolve_psk(self.moving["key"])
+        self.assertIsNotNone(resolved)
+        self.assertEqual(resolved["user_id"], "carol")
+
+    def test_a_moved_key_leaves_the_old_vaults_list(self):
+        before = self._alice_ids()
+        sessions.transfer_psks("alice", "carol")
+        self.assertEqual(sessions.list_psks("alice"), [])
+        self.assertEqual({row["id"] for row in sessions.list_psks("carol")}, before)
+
+    def test_another_users_keys_are_untouched(self):
+        sessions.transfer_psks("alice", "carol")
+        self.assertEqual([row["id"] for row in sessions.list_psks("bob")],
+                         [self.staying["id"]])
+
+    def test_the_returned_count_is_the_number_moved(self):
+        self.assertEqual(len(self._alice_ids()), 2)
+        self.assertEqual(sessions.transfer_psks("alice", "carol"), 2)
+        self.assertEqual(sessions.transfer_psks("nobody", "carol"), 0)
+
+    def test_a_revoked_key_moves_in_its_revoked_state(self):
+        revoked = sessions.list_psks("alice")[0]
+        sessions.revoke_psk(revoked["id"], "alice")
+        sessions.transfer_psks("alice", "carol")
+        moved = {row["id"]: row["status"] for row in sessions.list_psks("carol")}
+        self.assertEqual(moved[revoked["id"]], "revoked")
+
+    def test_a_transfer_to_the_same_user_is_refused(self):
+        # "Moved 0 keys" and "there were no keys" are the same number, and a
+        # migration that prints one of them has told the operator nothing.
+        with self.assertRaises(ValueError):
+            sessions.transfer_psks("alice", "alice")
+        self.assertEqual(len(sessions.list_psks("alice")), 2)
+
+    def test_an_empty_name_is_refused_rather_than_matching_nothing(self):
+        for old, new in (("", "carol"), ("alice", ""), ("  ", "carol")):
+            with self.assertRaises(ValueError):
+                sessions.transfer_psks(old, new)
+        self.assertEqual(len(sessions.list_psks("alice")), 2)
+
+    def test_a_transfer_never_writes_the_plaintext(self):
+        sessions.transfer_psks("alice", "carol")
+        blob = self.db_bytes().lower()
+        self.assertNotIn(self.moving["key"].lower().encode(), blob)
+
+
 class PskListingTests(StoreCase):
 
     def test_status_reflects_revocation_and_expiry(self):

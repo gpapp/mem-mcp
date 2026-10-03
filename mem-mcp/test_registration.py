@@ -95,8 +95,21 @@ class StoreCase(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix="reg-test-")
         self.addCleanup(shutil.rmtree, self.dir, True)
+        # Restored, not popped. An unconditional pop discards whatever value the
+        # runner exported, and `db_path()` then falls back to <repo>/sessions/ and
+        # mkdir's it — so a later test in the same process that touches the real
+        # sessions module writes a live sessions.db into the working tree. It is
+        # gitignored, which is exactly why it went unnoticed: `git status` stays
+        # clean while the file appears.
+        previous = os.environ.get("MEM_SESSION_DIR")
         os.environ["MEM_SESSION_DIR"] = self.dir
-        self.addCleanup(os.environ.pop, "MEM_SESSION_DIR", None)
+        self.addCleanup(self._restore_dir, previous)
+
+    def _restore_dir(self, previous):
+        if previous is None:
+            os.environ.pop("MEM_SESSION_DIR", None)
+        else:
+            os.environ["MEM_SESSION_DIR"] = previous
 
     def db_bytes(self) -> bytes:
         with open(os.path.join(self.dir, "sessions.db"), "rb") as handle:

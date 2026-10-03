@@ -654,6 +654,37 @@ def revoke_psk(psk_id: str, user_id: str, now=None) -> bool:
         conn.close()
 
 
+def transfer_psks(old_user: str, new_user: str) -> int:
+    """Re-own every one of `old_user`'s access keys under `new_user`.
+
+    For a vault migration: the keys are already scoped to a vault by their
+    `user_id`, so handing the vault to a different username has to hand the keys
+    with it. A client presenting an existing key stops working and starts seeing
+    the new owner's data otherwise, which is the opposite of what a rename means.
+
+    Returns the number of keys moved. Raises rather than reporting 0 for a
+    no-op argument, because "moved 0 keys" and "there were no keys" are the same
+    number and a migration that prints one of them has told the operator nothing.
+    """
+    old_user = (old_user or "").strip()
+    new_user = (new_user or "").strip()
+    if not old_user or not new_user:
+        raise ValueError("Both usernames are required to transfer access keys")
+    if old_user == new_user:
+        raise ValueError("Source and destination are the same user")
+    init_db()
+    conn = _connect()
+    try:
+        # One statement, scoped by owner, so no row is read-then-written and
+        # there is no window in which a key belongs to neither user.
+        cursor = conn.execute(
+            "UPDATE psks SET user_id = ? WHERE user_id = ?", (new_user, old_user))
+        conn.commit()
+        return cursor.rowcount
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # External identities (Google)
 # ---------------------------------------------------------------------------
