@@ -347,9 +347,9 @@
                         border-radius: 6px; border: 1px solid var(--border); }
 
     /* ── Diary Layout ──
-       Three columns, right-anchored: the entry being read takes all the
-       leftover width, the filtered entry list sits beside it, and the
-       calendar + search rail is pinned to the top-right. `min-width: 0` on
+       Three columns, left-anchored: the calendar + search rail comes first,
+       then the filtered entry list, and the entry being read takes all the
+       leftover width on the right. `min-width: 0` on
        .diary-main is load-bearing -- a flex item's default `min-width: auto`
        refuses to shrink below its content, so one long transcription would
        widen the detail pane and squeeze the two rails instead of wrapping. */
@@ -640,11 +640,14 @@
         flex: 0 0 auto; overflow-y: visible; min-height: auto;
       }
 
-      /* Stacked, the diary reads in DOM order -- detail pane, entry list,
-         calendar rail -- so a phone opens on an empty card with the pickers
-         below it. `order` puts the pickers first and the entry they select
-         last, which is the order the desktop row reads left-to-right once it
-         is mirrored. */
+      /* Stacked, the diary would read in DOM order, so `order` states the
+         same reading order as the desktop row rather than leaving it implicit:
+         pickers first, the entry they select last. The two currently agree --
+         the rail is the first column in the DOM too -- so these rules are a
+         no-op on the markup as it stands today. They are kept anyway, because
+         a reordering of the columns on desktop would otherwise silently
+         reorder the phone with it, and the only reason anyone would read this
+         block is to find out why the stacked layout is usable. */
       .diary-sidebar { order: 1; }
       .diary-list-col { order: 2; }
       .diary-main { order: 3; }

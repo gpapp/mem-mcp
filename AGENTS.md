@@ -984,17 +984,18 @@ Modify or delete links between memories directly from the UI.
 
 ### Diary Screen Layout
 
-Three columns, **right-anchored**. `.diary-layout` is a flex *row*, so the DOM order is
+Three columns, **left-anchored**. `.diary-layout` is a flex *row*, so the DOM order is
 the visual order and it is the design:
 
 | column | width | holds |
 |---|---|---|
-| `.diary-main` | `flex: 1`, `min-width: 0` | the selected entry (viewer or editor) |
-| `.diary-list-col` | 340px | the filtered entry list — `＋ New`, a count, `#diary-dates-list` |
 | `.diary-sidebar` | 250px | search box, then the month pager and the month grid |
+| `.diary-list-col` | 340px | the filtered entry list — `＋ New`, a count, `#diary-dates-list` |
+| `.diary-main` | `flex: 1`, `min-width: 0` | the selected entry (viewer or editor) |
 
-The calendar and search rail is last, so it lands top-right. Three properties are
-load-bearing, and each is pinned by `test_mobile_layout.py::DiaryColumnOrderTests`:
+The calendar and search rail is first, so it lands top-left, and the entry being
+read takes the remaining width on the right. Three properties are load-bearing,
+and each is pinned by `test_mobile_layout.py::DiaryColumnOrderTests`:
 
 - **`min-width: 0` on `.diary-main`.** A flex item's default `min-width: auto` refuses
   to shrink below its content, so one long transcription would widen the detail pane and
@@ -1003,8 +1004,24 @@ load-bearing, and each is pinned by `test_mobile_layout.py::DiaryColumnOrderTest
   (`flex: 1 1 0` + `min-height: 0`) that the mobile block releases, and it is also the
   `IntersectionObserver` root for the lazy batches. Leaving it inside a bounded rail
   would nest two scroll regions, and the count would then be bounded twice.
-- **`.diary-date-item.active` marks its *left* edge.** The list is no longer the leftmost
-  column, so the old `border-right` pointed at the detail pane instead of away from it.
+**`DiaryColumnOrderTests` asserted the opposite order for several commits, and nobody
+decided who was wrong.** The columns had been swapped by hand in the template — that was
+the intent — and the test and this section still described detail-first. A failing test
+that everybody reads as a stale artefact is worse than no test: it is a permanently red
+suite that every later run has to re-classify, and the one thing it could have caught
+(the columns being swapped back by a careless edit) is the thing it had stopped being
+able to say anything about. **When a layout test and the shipped layout disagree, ask
+which one was changed on purpose before "fixing" either.** The rail-first test also had
+a second, independent bug: `layout.split('class="diary-sidebar"')[1]` is a *tail* slice,
+so with the rail first it ran to the end of the layout and then complained that the
+list's scroller was "in the rail" — the assertion was reading a region three times larger
+than the rail. It now cuts each column at the next column's opening tag.
+
+- **`.diary-date-item.active` marks its *left* edge.** The detail pane is to the list's
+  right, so the old `border-right` pointed *at* it instead of away from it. This is the
+  edge that is correct for rail → list → main; it was right by accident for a while,
+  because the columns had been swapped by hand and a `border-right` was equally wrong
+  there for the mirror-image reason.
 
 **Filling the page is two separate rules, and the second one is derived from the first.**
 `.page` is `max-width: 1100px; margin: 0 auto`, which is right for a form page and wrong
@@ -1026,14 +1043,17 @@ itself cannot show: what the current month or search narrowed away.
 
 On a phone the columns stack, and DOM order is visual order, so the mobile block
 re-ranks them with `order`: rail first, then the entry list, then the entry they select.
-Without it the tab opens on an empty detail card with both pickers below the fold. Both
+That happens to match the desktop DOM order today, so the rules are currently a no-op —
+they are kept because the stacked layout is a flex *column* whose children are otherwise
+ordered by DOM, and re-ordering the desktop columns is exactly the edit that would
+otherwise move the pickers below the fold. Both
 diary columns are bounded (`max-height` + `overflow-y: auto`) below 900px, which is why
 `StackedPaneVisibilityTests` carries two diary selectors rather than one.
 
 ### Diary Search
 Search diary entries from the calendar rail.
 
-- Type in the **Search entries…** box at the top of the diary rail (right-hand column)
+- Type in the **Search entries…** box at the top of the diary rail (left-hand column)
 - Instant client-side substring filter runs as you type
 - After 400 ms a server-side **vector similarity search** (`GET /api/diary/search?q=`) fires and updates results
 - Clicking a result navigates to that date's entries

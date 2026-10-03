@@ -689,18 +689,27 @@ class DiaryColumnOrderTests(unittest.TestCase):
     """The diary tab is three columns, and only one order of them is the design.
 
     `.diary-layout` is a flex *row*, so the DOM order is the visual order:
-    the entry being read, then the filtered entry list, then the calendar and
-    search rail on the right. Nothing errors if the rails are swapped or the
-    detail pane is pinned narrow -- the tab still renders, and still selects an
-    entry -- it is simply not the screen that was asked for, and there is no
-    browser here to see the difference.
+    the calendar and search rail on the left, then the filtered entry list, then
+    the entry being read taking all the remaining width. Nothing errors if the
+    columns are swapped or the detail pane is pinned narrow -- the tab still
+    renders, and still selects an entry -- it is simply not the screen that was
+    asked for, and there is no browser here to see the difference.
 
     So these pin the three things a reorder would silently undo: which element
     each column is, what order they sit in, and that the detail pane is the
     flexible one rather than one of the fixed rails.
+
+    The order below is **left to right**. This test asserted the opposite once
+    (detail, list, rail) and failed on the shipped template for a long time
+    before anyone asked whether the template or the test was right: the answer
+    was that the template had been swapped by hand on purpose. A test that
+    disagrees with the shipped layout is not a failing regression detector, it
+    is a green suite covering a screen nobody ships.
     """
 
-    COLUMNS = ('class="diary-main"', 'class="diary-list-col"', 'class="diary-sidebar"')
+    # Left to right, and deliberately not `sorted()`-ed anywhere: the whole point
+    # is the order, so it is spelled out and compared against itself.
+    COLUMNS = ('class="diary-sidebar"', 'class="diary-list-col"', 'class="diary-main"')
 
     @classmethod
     def setUpClass(cls):
@@ -716,17 +725,17 @@ class DiaryColumnOrderTests(unittest.TestCase):
             positions.append(idx)
         self.assertEqual(
             positions, sorted(positions),
-            "the diary layout must read detail, then entry list, then the "
-            "calendar rail -- a flex row renders DOM order left to right",
+            "the diary layout must read calendar rail, then entry list, then "
+            "the entry being read -- a flex row renders DOM order left to right",
         )
 
-    def test_the_calendar_rail_is_last_so_it_lands_top_right(self):
+    def test_the_rail_holds_search_above_the_calendar(self):
         self.assertIn(
             'id="diary-month-dates"', self.layout,
-            "the month grid has to be in the rail that is last in the row",
+            "the month grid has to be in the left-hand rail",
         )
         # Search is a filter on the list, so it goes above the calendar: the
-        # rail is the top-right of the screen and the field should be the
+        # rail is the top-left of the screen and the field should be the
         # thing already under the cursor there.
         self.assertLess(
             self.layout.find('id="diary-search-input"'),
@@ -756,12 +765,14 @@ class DiaryColumnOrderTests(unittest.TestCase):
         self.assertIn("min-width: 0", merged, merged)
 
     def test_the_pickers_come_before_the_entry_on_a_phone(self):
-        """Stacked, DOM order is visual order -- and the detail pane is first.
+        """Stacked, DOM order is visual order, so `order` has to state it.
 
-        On a phone that means opening the tab on an empty card with the
-        calendar and the entry list below the fold. `order` re-ranks them so
-        the pickers come first, which is what makes the stacked column usable
-        rather than merely correct.
+        The stacked column reads rail, entry list, then the entry being read,
+        which is also how the desktop row reads. The two currently agree -- the
+        rail is the first column in the DOM too -- so these rules are a no-op
+        on the markup as it stands. They are pinned anyway, because the only
+        failure that would make a phone unusable is someone reordering the
+        columns on desktop and taking the stacked layout with them.
         """
         tablet = _declarations(_media_block(900))
         for selector in (".diary-sidebar", ".diary-list-col", ".diary-main"):
@@ -770,7 +781,8 @@ class DiaryColumnOrderTests(unittest.TestCase):
                 self.assertTrue(
                     "order:" in merged,
                     f"{selector} is not re-ranked on a phone, so the stacked "
-                    f"column opens on the detail pane; got: {merged.strip()!r}",
+                    f"column stops reading in the order the desktop row does; "
+                    f"got: {merged.strip()!r}",
                 )
 
     def test_the_list_column_holds_the_scroller_not_the_rail(self):
@@ -781,10 +793,35 @@ class DiaryColumnOrderTests(unittest.TestCase):
         the list's own released scroller would nest, and the entry list would
         be bounded twice.
         """
-        list_col = self.layout.split('class="diary-list-col"')[1].split('class="diary-sidebar"')[0]
-        self.assertIn('id="diary-dates-list"', list_col)
-        rail = self.layout.split('class="diary-sidebar"')[1]
-        self.assertNotIn('id="diary-dates-list"', rail)
+        # Both regions have to be *bounded*, and the order matters: the rail is
+        # the first column, so a tail slice from `class="diary-sidebar"` to the
+        # end of the layout swallows the list column -- and `#diary-dates-list`
+        # is legitimately in there. That is why this test failed on a template
+        # that was already correct: the assertion was reading a region three
+        # times larger than the rail and calling it the rail. `_column` cuts at
+        # whichever of the other two columns comes next.
+        # Sorted by position, then each column is the slice between its own
+        # opening tag and the next column's. Only the *following* boundaries may
+        # be consulted -- a column that happens to be first has no earlier
+        # sibling to stop at, which is exactly what made the old tail slice
+        # reach past the rail into the list.
+        # COLUMNS carries the opening tags verbatim because the order test
+        # compares against them; strip the wrapper to get the class names back.
+        names = [column.split('"')[1] for column in self.COLUMNS]
+        boundaries = sorted(
+            (self.layout.index(f'class="{name}"'), name) for name in names
+        )
+
+        def _column(name):
+            at = next(i for i, n in boundaries if n == name)
+            end = next((i for i, _ in boundaries if i > at), len(self.layout))
+            return self.layout[at:end]
+
+        list_col = _column("diary-list-col")
+        self.assertIn('id="diary-dates-list"', list_col,
+                      "the entry list column is where the scroller lives")
+        self.assertNotIn('id="diary-dates-list"', _column("diary-sidebar"),
+                         "the rail must not hold the list's scroller as well")
 
 
 class DiaryFillsThePageTests(unittest.TestCase):
