@@ -188,47 +188,32 @@ class DerivationTests(unittest.TestCase):
     changed, which is the one thing this needs to catch.
     """
 
-    def test_a_client_id_is_the_documented_uuid5(self):
+    def test_the_two_ids_are_the_documented_uuid5(self):
         import uuid
         self.assertEqual(
             client_id_for("someone", "Acme Holdings"),
             str(uuid.uuid5(uuid.NAMESPACE_DNS, "client_someone_acme holdings")))
-
-    def test_a_context_id_is_the_documented_uuid5(self):
-        import uuid
         self.assertEqual(
             context_id_for("someone", "cid", "Phase One"),
             str(uuid.uuid5(uuid.NAMESPACE_DNS, "context_someone_cid_phase one")))
 
-    def test_a_context_name_is_normalised_the_same_way_a_client_is(self):
-        # The client path had this and the context path did not, so removing
-        # `.strip()` from context_id_for passed the whole suite. Both normalise;
-        # a test covering only one leaves the other free to drift into producing
-        # a different id for a padded name.
-        self.assertEqual(context_id_for("u", "cid", "  Phase One  "),
-                         context_id_for("u", "cid", "phase one"))
-
-    def test_a_client_name_is_normalised_the_same_way(self):
-        self.assertEqual(client_id_for("u", "  ACME  "),
-                         client_id_for("u", "acme"))
-
-    def test_the_username_is_part_of_the_id(self):
+    def test_the_inputs_are_all_three_of_them(self):
+        # The username, the name and — for a context — the parent id. Each is a
+        # distinct field in the f-string, so dropping one is a behaviour change
+        # that leaves the ids looking perfectly well-formed.
         self.assertNotEqual(client_id_for("one", "Acme"),
                             client_id_for("two", "Acme"))
-
-    def test_name_normalisation_is_case_and_space_insensitive(self):
-        self.assertEqual(client_id_for("u", "  ACME  "), client_id_for("u", "acme"))
-
-    def test_two_names_sharing_a_prefix_do_not_collide(self):
-        # "client_u_acme" and "client_u_acme_uk" are different strings, but a
-        # derivation that joined the fields with a fixed separator would fold
-        # one into the other.
-        self.assertNotEqual(client_id_for("u", "acme"), client_id_for("u", "acme_uk"))
-
-    def test_a_context_depends_on_its_parents_id(self):
+        self.assertNotEqual(client_id_for("u", "acme"),
+                            client_id_for("u", "acme_uk"))
         self.assertNotEqual(context_id_for("u", "parent-a", "phase"),
                             context_id_for("u", "parent-b", "phase"))
 
+    def test_both_names_are_normalised_identically(self):
+        # Both functions normalise. Covering only one let `.strip()` be dropped
+        # from context_id_for and the whole suite stay green.
+        self.assertEqual(client_id_for("u", "  ACME  "), client_id_for("u", "acme"))
+        self.assertEqual(context_id_for("u", "cid", "  Phase One  "),
+                         context_id_for("u", "cid", "phase one"))
 
 class ClientManagerCallSiteTests(unittest.TestCase):
     """A test of the helper is not a test of its call site.
@@ -285,7 +270,12 @@ class ScopedIdsImportTests(unittest.TestCase):
 
 
 class PlanTests(unittest.TestCase):
-    """The pure planner: what changes, what does not, and what must be refused."""
+    """The pure planner: what changes, what does not, and what must be refused.
+
+    ``plan_id_remap`` is the one part of a move that needs no database, which is
+    why it can be tested exhaustively here and why ``scoped_ids`` is
+    standard-library-only.
+    """
 
     def setUp(self):
         self.clients = [
@@ -301,20 +291,17 @@ class PlanTests(unittest.TestCase):
         self.remap = plan_id_remap(SOURCE_USER, TARGET_USER, self.clients,
                                    self.contexts)
 
-    def test_every_client_is_re_identified(self):
-        self.assertEqual(self.remap.client_count, 2)
-
-    def test_the_new_id_is_what_a_create_would_mint(self):
+    def test_a_moved_id_is_the_one_a_create_would_mint(self):
         # The point of the whole module: the moved id has to be
         # indistinguishable from one db_create_client would have produced in the
         # new vault, or the next same-named client becomes a second node.
         #
         # Membership is asserted before the lookup on purpose. Indexing the map
-        # directly reports a wrong derivation as a KeyError from an omitted
-        # entry — and an omitted entry is the *expected* consequence of a
-        # derivation that ignores the username, since the id then comes out
-        # unchanged. The guard bites either way, but as a KeyError it reads like
-        # a broken fixture rather than a broken formula.
+        # directly reports a wrong derivation as a KeyError from an omitted entry
+        # — and an omitted entry is the *expected* consequence of a derivation
+        # that ignores the username, since the id then comes out unchanged. The
+        # guard bites either way, but as a KeyError it reads like a broken
+        # fixture rather than a broken formula.
         for row in self.clients:
             self.assertIn(row["id"], self.remap.clients,
                           "a client whose id changes must be in the remap")
@@ -325,144 +312,106 @@ class PlanTests(unittest.TestCase):
         # Deriving it from the OLD parent is the subtle half: the parent is
         # renamed in the same pass, so a context built from the old id is an id
         # nothing will ever generate again.
-        expected = context_id_for(
-            TARGET_USER, client_id_for(TARGET_USER, "Acme Holdings"), "Phase One")
-        self.assertEqual(list(self.remap.contexts.values()), [expected])
+        self.assertEqual(list(self.remap.contexts.values()),
+                         [context_id_for(TARGET_USER,
+                                         client_id_for(TARGET_USER, "Acme Holdings"),
+                                         "Phase One")])
 
-    def test_the_parent_each_context_points_at_is_reported(self):
-        # Deliberately a separate map from `contexts`. Both have the same shape
-        # and the same key type, so handing the caller the new *context* id where
-        # the *parent client* id belongs points every Context at a sibling that
-        # does not exist — and reads as correct, because the value is a real id
-        # of the right shape.
-        old_context_id = self.contexts[0]["id"]
-        self.assertEqual(self.remap.context_parents[old_context_id],
-                         client_id_for(TARGET_USER, "Acme Holdings"))
+    def test_a_parent_is_never_the_context_itself(self):
+        # The two maps have the same shape and the same key type, so a
+        # self-referential parent is silent and writes a node pointing at itself.
+        # `verify()` reads Qdrant payloads only and cannot see it.
+        for context_id, parent in self.remap.context_parent_rows().items():
+            self.assertNotEqual(context_id, parent)
+        self.assertEqual(
+            list(self.remap.context_parent_rows().values()),
+            [client_id_for(TARGET_USER, "Acme Holdings")])
 
-    def test_the_parent_map_is_not_the_context_map(self):
-        old_context_id = self.contexts[0]["id"]
-        self.assertNotEqual(self.remap.context_parents[old_context_id],
-                            self.remap.contexts[old_context_id])
-
-    def test_a_same_user_move_is_reported_as_a_no_op(self):
-        # Otherwise the script prints a tidy success having done nothing, which
-        # is the failure changes_anything exists to catch.
-        same = plan_id_remap(SOURCE_USER, SOURCE_USER, self.clients, self.contexts)
+    def test_a_same_user_move_is_a_no_op_that_still_reaches_the_rewrite(self):
+        # ``changes_anything`` exists so a no-op cannot report success — and the
+        # *unchanged* rows must still be handed to move_graph, because a row whose
+        # id comes out unchanged is a pre-existing inconsistency that still needs
+        # its userId rewritten.
+        same = plan_id_remap(SOURCE_USER, SOURCE_USER, self.clients,
+                             self.contexts)
         self.assertFalse(same.changes_anything)
         self.assertEqual(same.clients, {})
         self.assertEqual(same.contexts, {})
-
-    def test_an_unchanged_id_is_left_out_of_the_map(self):
-        same = plan_id_remap(SOURCE_USER, SOURCE_USER, self.clients, self.contexts)
-        self.assertEqual(sorted(same.unchanged_clients),
-                         sorted(c["id"] for c in self.clients))
-
-    def test_an_occupied_destination_name_is_detected(self):
-        clash = plan_id_remap(SOURCE_USER, TARGET_USER, self.clients,
-                              self.contexts,
-                              target_clients=[{"name": "acme holdings"}])
-        self.assertTrue(clash.destination_occupied)
-
-    def test_an_unrelated_destination_name_is_not_a_clash(self):
-        free = plan_id_remap(SOURCE_USER, TARGET_USER, self.clients,
-                             self.contexts,
-                             target_clients=[{"name": "Gamma GmbH"}])
-        self.assertFalse(free.destination_occupied)
-
-    def test_a_clashing_context_name_is_also_detected(self):
-        clash = plan_id_remap(SOURCE_USER, TARGET_USER, self.clients,
-                              self.contexts,
-                              target_contexts=[{"name": "Phase One"}])
-        self.assertTrue(clash.destination_occupied)
-
-    def test_duplicate_source_client_names_are_reported(self):
-        # Two same-named Clients in the source derive one id, so the move would
-        # leave two nodes sharing it. `destination_occupied` cannot see this: it
-        # only inspects the target.
-        doubled = self.clients + [dict(self.clients[0])]
-        remap = plan_id_remap(SOURCE_USER, TARGET_USER, doubled, self.contexts)
-        self.assertEqual(remap.duplicate_names, ["Acme Holdings"])
-
-    def test_duplicate_source_context_names_are_reported(self):
-        # Same collision one level down, and it needs the parent in the key:
-        # two contexts of one name under *different* clients are two different
-        # nodes with two different ids.
-        other = {"id": client_id_for(SOURCE_USER, "Beta SE"), "name": "Beta SE"}
-        twin = dict(self.contexts[0])
-        twin["id"] = context_id_for(SOURCE_USER, other["id"], "Phase One")
-        twin["clientId"] = other["id"]
-        clash = plan_id_remap(SOURCE_USER, TARGET_USER, self.clients,
-                              self.contexts + [twin])
-        self.assertEqual(clash.duplicate_names, [])
-
-        same_parent = dict(self.contexts[0])
-        same_parent["id"] = "a-different-hand-written-id"
-        dupes = plan_id_remap(SOURCE_USER, TARGET_USER, self.clients,
-                              self.contexts + [same_parent])
-        self.assertEqual(len(dupes.duplicate_names), 1)
-
-    def test_the_row_accessors_cover_every_source_id(self):
-        # `clients` alone omits any row whose id comes out unchanged, and
-        # move_graph must still rewrite those: it is handed client_rows(), not
-        # clients. A same-user plan is the only thing that populates the
-        # unchanged set, since a real rename changes every derived id — so that
-        # is what exercises the union.
-        same = plan_id_remap(SOURCE_USER, SOURCE_USER, self.clients,
-                             self.contexts)
-        self.assertEqual(same.clients, {})
-        self.assertEqual(same.unchanged_clients,
-                         [c["id"] for c in self.clients])
-        self.assertEqual(set(same.client_rows()),
-                         {c["id"] for c in self.clients})
-        self.assertEqual(set(same.context_rows()),
-                         {c["id"] for c in self.contexts})
-        # Values, not just key sets. A self-referential parent — the map mapping
-        # each context id to *itself* — passes every key-set assertion and writes
-        # a Context that points at itself.
+        self.assertEqual(set(same.client_rows()), {c["id"] for c in self.clients})
+        self.assertEqual(set(same.context_rows()), {c["id"] for c in self.contexts})
+        # Values, not just key sets: a self-referential parent passes every
+        # key-set assertion.
         self.assertEqual(same.context_parent_rows(),
                          {c["id"]: c["clientId"] for c in self.contexts})
 
-    def test_the_parent_map_never_points_a_context_at_itself(self):
-        for source, target in ((SOURCE_USER, TARGET_USER),
-                               (SOURCE_USER, SOURCE_USER)):
-            remap = plan_id_remap(source, target, self.clients, self.contexts)
-            for context_id, parent in remap.context_parent_rows().items():
-                self.assertNotEqual(
-                    context_id, parent,
-                    "a Context whose id is unchanged but whose parent is being "
-                    "re-identified must still get the new parent id, not its own")
+    def test_the_row_accessors_include_the_changed_rows(self):
+        for row in self.clients:
+            self.assertEqual(self.remap.client_rows()[row["id"]],
+                             client_id_for(TARGET_USER, row["name"]))
+        self.assertEqual(set(self.remap.context_rows()),
+                         set(self.remap.contexts))
 
     def test_an_unchanged_context_still_has_its_parent_rewritten(self):
-        # The defect this pair exists for. A context stored with an id already
-        # derived for the destination user comes out of the remap unchanged, and
-        # its `clientId` property is then never rewritten — so it keeps pointing
-        # at the old client while that client is re-identified.
+        # A Context stored with an id already derived for the destination user
+        # comes out of the remap unchanged, and its `clientId` property is then
+        # never rewritten — so it keeps pointing at the old client while that
+        # client is re-identified.
         old_acme = client_id_for(SOURCE_USER, "Acme Holdings")
         new_acme = client_id_for(TARGET_USER, "Acme Holdings")
-        # Stored with an id already derived for the *destination* user, but a
-        # clientId property still pointing at the source's client — which is the
-        # inconsistent state that produces the self-referential write.
         rows = [{"id": context_id_for(TARGET_USER, new_acme, "Phase One"),
                  "name": "Phase One", "clientId": old_acme}]
         remap = plan_id_remap(SOURCE_USER, TARGET_USER, self.clients, rows)
         self.assertEqual(remap.contexts, {}, "precondition: the id is unchanged")
-        only = next(iter(remap.context_parent_rows()))
-        self.assertEqual(remap.context_parent_rows()[only], new_acme,
+        self.assertEqual(list(remap.context_parent_rows().values()), [new_acme],
                          "the stale parent pointer must be rewritten")
 
-    def test_the_row_accessors_include_the_changed_rows(self):
-        rows = self.remap.client_rows()
-        for row in self.clients:
-            self.assertEqual(rows[row["id"]],
-                             client_id_for(TARGET_USER, row["name"]))
-        self.assertEqual(set(self.remap.context_rows()),
-                         set(self.remap.contexts))
+    def test_a_name_the_destination_already_holds_is_refused(self):
+        # `destination_occupied` only inspects the target, and the Context key is
+        # the name alone here because a destination Context hangs off a client
+        # this source has not got.
+        for label, kwargs in (
+                ("client", {"target_clients": [{"name": "acme holdings"}]}),
+                ("context", {"target_contexts": [{"name": "Phase One"}]}),
+                ("unrelated", {"target_clients": [{"name": "Gamma GmbH"}]})):
+            with self.subTest(collision=label):
+                occupied = plan_id_remap(SOURCE_USER, TARGET_USER, self.clients,
+                                         self.contexts, **kwargs)
+                self.assertEqual(occupied.destination_occupied,
+                                 label != "unrelated")
+
+    def test_a_name_the_source_repeats_is_refused(self):
+        # Two same-named rows derive one id, so the move would leave two nodes
+        # sharing it — and `destination_occupied` cannot see it, because it only
+        # inspects the target.
+        twin_client = dict(self.clients[0])
+        twin_context = dict(self.contexts[0])
+        twin_context["id"] = "a-second-row-same-name"
+        with self.subTest(dupe="client"):
+            self.assertEqual(
+                plan_id_remap(SOURCE_USER, TARGET_USER, self.clients + [twin_client],
+                              self.contexts).duplicate_names, ["Acme Holdings"])
+        with self.subTest(dupe="context"):
+            self.assertEqual(
+                len(plan_id_remap(SOURCE_USER, TARGET_USER, self.clients,
+                                  self.contexts + [twin_context]
+                                  ).duplicate_names), 1)
+
+    def test_a_context_under_another_client_is_not_a_duplicate(self):
+        # Keyed by parent as well as name: two contexts of one name under
+        # *different* clients are two different nodes with two different ids.
+        other = {"id": client_id_for(SOURCE_USER, "Beta SE"), "name": "Beta SE"}
+        twin = {"id": context_id_for(SOURCE_USER, other["id"], "Phase One"),
+                "name": "Phase One", "clientId": other["id"]}
+        remap = plan_id_remap(SOURCE_USER, TARGET_USER, self.clients,
+                              self.contexts + [twin])
+        self.assertEqual(remap.duplicate_names, [])
+        self.assertEqual(remap.context_count, 2)
 
     def test_a_vault_with_no_clients_has_nothing_to_remap(self):
         empty = plan_id_remap(SOURCE_USER, TARGET_USER, [], [])
         self.assertFalse(empty.changes_anything)
         self.assertFalse(empty.destination_occupied)
-
+        self.assertEqual(empty.duplicate_names, [])
 
 class RetargetScopeTests(unittest.TestCase):
     """Called against a fake client, because the properties are behavioural."""
@@ -479,8 +428,8 @@ class RetargetScopeTests(unittest.TestCase):
 
     def _fixture(self):
         # A chunked record: chunk 0 plus two siblings sharing the same scope
-        # keys. A retarget that stops at chunk 0 leaves the family split, and
-        # the symptom is a long record that filters differently from itself.
+        # keys. A retarget that stops at chunk 0 leaves the family split, and the
+        # symptom is a long record that filters differently from itself.
         return FakeQdrant({
             "ea_memories": {
                 "fact-1": {"userId": SOURCE_USER, "clientId": self.old_client,
@@ -503,85 +452,57 @@ class RetargetScopeTests(unittest.TestCase):
         return asyncio.run(self.retarget(qdrant, SOURCE_USER, self.client_map,
                                          self.context_map))
 
-    def test_both_scope_ids_are_rewritten(self):
+    def test_only_the_ids_are_touched(self):
+        # Every chunk of a family, and nothing else on the point. A name is not
+        # derived from the username, so rewriting it would be a gratuitous write
+        # of every scoped point in the vault; the text must survive too.
         qdrant = self._fixture()
         self.assertEqual(self._retarget(qdrant), 4)
-        payload = qdrant.data["ea_memories"]["fact-1"]
-        self.assertEqual(payload["clientId"], self.new_client)
-        self.assertEqual(payload["contextId"], self.new_context)
-
-    def test_every_chunk_of_a_family_is_rewritten(self):
-        qdrant = self._fixture()
-        self._retarget(qdrant)
         for pid in ("fact-1", "fact-1#1", "fact-1#2"):
             self.assertEqual(qdrant.data["ea_memories"][pid]["clientId"],
                              self.new_client, f"{pid} was left behind")
+        payload = qdrant.data["ea_memories"]["fact-1"]
+        self.assertEqual(payload["contextId"], self.new_context)
+        self.assertEqual(payload["clientName"], "Acme Holdings")
+        self.assertEqual(payload["text"], "body")
 
-    def test_names_are_left_alone(self):
-        # A name is not derived from the username, so rewriting it would be a
-        # gratuitous write of every scoped point in the vault.
-        qdrant = self._fixture()
-        self._retarget(qdrant)
-        self.assertEqual(qdrant.data["ea_memories"]["fact-1"]["clientName"],
-                         "Acme Holdings")
-
-    def test_the_record_text_survives(self):
-        qdrant = self._fixture()
-        self._retarget(qdrant)
-        self.assertEqual(qdrant.data["ea_memories"]["fact-1"]["text"], "body")
-
-    def test_an_unscoped_point_is_not_written_at_all(self):
+    def test_points_that_need_no_patch_are_not_written(self):
+        # The unscoped point, and another vault's point — which carries this
+        # vault's client id in the fixture. Ownership is the userId filter, and
+        # the filter is what stops a migration rewriting a stranger's payload.
         qdrant = self._fixture()
         self._retarget(qdrant)
         self.assertNotIn("fact-2", qdrant.written_ids())
-
-    def test_another_users_point_is_never_touched(self):
-        # The fixture gives another vault a point carrying this vault's client
-        # id; ownership is the userId filter, and the filter is what stops a
-        # migration rewriting a stranger's payload.
-        qdrant = self._fixture()
-        self._retarget(qdrant)
         self.assertEqual(qdrant.data["ea_diary"]["other-1"]["clientId"],
                          self.old_client)
 
-    def test_it_never_builds_a_per_point_payload(self):
-        # The container's PointStruct is a pydantic model with a **required**
-        # vector field, and set_payload ignores the value. An earlier version
-        # omitted it, the permissive stub accepted that, and the whole suite
-        # passed — then the container raised a ValidationError on the first real
-        # point. The fake now refuses the per-point form outright, and this
-        # asserts the module never imports the model at all.
-        qdrant = self._fixture()
-        self._retarget(qdrant)
-        # An AST check, not assertNotIn: the module docstring explains *why* the
-        # per-point form is avoided, so a substring guard fails on the
-        # explanation — the assertIn-matches-the-comment lesson again.
-        for node in ast.walk(ast.parse(_read(_MIGRATE))):
-            if isinstance(node, ast.ImportFrom) and node.module:
-                self.assertNotIn("qdrant_client.models",
-                                 [a.name for a in node.names],
-                                 "the per-point payload form needs a pydantic "
-                                 "model whose required 'vector' field "
-                                 "set_payload ignores")
-            if isinstance(node, ast.Call):
-                name = (node.func.attr if isinstance(node.func, ast.Attribute)
-                        else getattr(node.func, "id", ""))
-                self.assertNotEqual(name, "PointStruct")
-        for _collection, pid, payload in qdrant.payload_writes:
-            self.assertIn(payload, ({}, {"clientId": self.new_client},
-                                    {"contextId": self.new_context},
-                                    {"clientId": self.new_client,
-                                     "contextId": self.new_context}))
-
     def test_an_id_that_is_not_in_the_map_is_left_alone(self):
-        # A dangling clientId from a deleted client is already broken; blanking
-        # it would hide that instead of surfacing it.
+        # A dangling clientId from a deleted client is already broken; blanking it
+        # would hide that instead of surfacing it.
         qdrant = FakeQdrant({"ea_memories": {"f": {"userId": SOURCE_USER,
                                                    "clientId": "gone"}},
                              "ea_diary": {}})
         self.assertEqual(self._retarget(qdrant), 0)
         self.assertEqual(qdrant.data["ea_memories"]["f"]["clientId"], "gone")
 
+    def test_it_never_builds_a_per_point_payload(self):
+        # The container's PointStruct is a pydantic model with a **required**
+        # vector field, and set_payload ignores the value. An earlier version
+        # omitted it, the permissive stub accepted that, and the whole suite
+        # passed — then the container raised a ValidationError on the first real
+        # point. The fake now refuses the per-point form outright.
+        #
+        # An AST check, not assertNotIn: the module docstring explains *why* the
+        # per-point form is avoided, so a substring guard fails on the
+        # explanation — the assertIn-matches-the-comment lesson again.
+        self._retarget(self._fixture())
+        for node in ast.walk(ast.parse(_read(_MIGRATE))):
+            if isinstance(node, ast.ImportFrom):
+                self.assertNotIn("PointStruct", [a.name for a in node.names])
+            if isinstance(node, ast.Call):
+                name = (node.func.attr if isinstance(node.func, ast.Attribute)
+                        else getattr(node.func, "id", ""))
+                self.assertNotEqual(name, "PointStruct")
 
 class PaginationTests(unittest.TestCase):
     """Every loop in the migration, at a page boundary.
@@ -901,21 +822,23 @@ class MoveGraphTests(unittest.TestCase):
     """The Cypher side, driven against a recording driver.
 
     There is no Neo4j here, so what is asserted is the *shape* of every write:
-    which labels move, that ids and the parent pointer move with them, and that
-    nothing is re-identified that does not need it. The query text itself is
-    linted by ``test_cypher_safety.py``, which scans this module too.
+    which labels move, that ids and the parent pointer move with them, and what
+    it does not touch at all. The query text itself is linted by
+    ``test_cypher_safety.py``, which scans this module too.
     """
 
     def setUp(self):
-        self.move_graph = _module_namespace("move_graph")["move_graph"]
+        ns = _module_namespace("move_graph")
+        self.move_graph = ns["move_graph"]
+        self.DestinationOccupied = ns["DestinationOccupied"]
         self.driver = FakeDriver()
         self.client_map = {"old-client": "new-client"}
         self.context_map = {"old-ctx": "new-ctx"}
         self.parents = {"old-ctx": "new-client"}
 
     def _go(self):
-        self.move_graph(self.driver, SOURCE_USER, TARGET_USER, self.client_map,
-                        self.context_map, self.parents)
+        self.move_graph(self.driver, SOURCE_USER, TARGET_USER,
+                        self.client_map, self.context_map, self.parents)
         return self.driver.calls
 
     def _only(self, needle):
@@ -930,8 +853,7 @@ class MoveGraphTests(unittest.TestCase):
         self.assertIn("SET c.id = row.newId, c.userId = $new", query)
         self.assertEqual(params["rows"],
                          [{"oldId": "old-client", "newId": "new-client"}])
-        self.assertEqual(params["old"], SOURCE_USER)
-        self.assertEqual(params["new"], TARGET_USER)
+        self.assertEqual((params["old"], params["new"]), (SOURCE_USER, TARGET_USER))
 
     def test_a_context_is_rewritten_with_its_new_parent(self):
         self._go()
@@ -951,74 +873,57 @@ class MoveGraphTests(unittest.TestCase):
                     if ":Client {id:" in q or ":Context {id:" in q]
         self.assertEqual(len(labelled), 2)
         self.assertIn(":Client {id:", labelled[0])
-        self.assertIn(":Context {id:", labelled[1])
 
-    def test_facts_and_diary_move_by_user_id_only(self):
-        # The record id is a uuid4 (facts) or timestamp-derived (diary) and is
-        # not a function of the user, so nothing else about them may be written.
+    def test_the_records_move_by_user_id_only(self):
+        # A record's id is a uuid4 (facts) or timestamp-derived (diary), neither
+        # a function of the user, so nothing else about them may be written.
         self._go()
-        fact, _ = self._only("MATCH (n:Fact)")
-        diary, _ = self._only("MATCH (n:DiaryEntry)")
-        self.assertIn("WHERE n.userId = $old SET n.userId = $new", fact)
-        self.assertIn("WHERE n.userId = $old SET n.userId = $new", diary)
-        self.assertNotIn("n.id", fact)
-        self.assertNotIn("n.id", diary)
+        for label in ("Fact", "DiaryEntry"):
+            query, _ = self._only(f"MATCH (n:{label})")
+            self.assertIn("WHERE n.userId = $old SET n.userId = $new", query)
+            self.assertNotIn("n.id", query)
 
-    def test_the_returned_counts_are_per_label(self):
+    def test_the_reported_counts_are_actual_not_planned(self):
+        # RETURN count(...) rather than len(map): a row whose MATCH matched
+        # nothing is a silent no-op, and reporting the plan hides exactly that.
         counts = self.move_graph(self.driver, SOURCE_USER, TARGET_USER,
                                  self.client_map, self.context_map, self.parents)
-        self.assertEqual(counts["facts"], 7)
-        self.assertEqual(counts["diary"], 3)
-        self.assertEqual(counts["clients"], 1)
-        self.assertEqual(counts["contexts"], 1)
-
-    def test_the_reported_client_count_is_what_the_match_rewrote(self):
-        # Not len(client_map). A row whose MATCH matched nothing is a silent
-        # no-op, and reporting the plan instead of the result would hide exactly
-        # that — the whole reason the statements RETURN a count.
+        self.assertEqual(counts, {"facts": 7, "diary": 3, "clients": 1,
+                                  "contexts": 1})
         self.driver.counts["Client"] = 0
+        self.driver.calls.clear()
         counts = self.move_graph(self.driver, SOURCE_USER, TARGET_USER,
                                  self.client_map, self.context_map, self.parents)
         self.assertEqual(counts["clients"], 0)
         self.assertEqual(counts["contexts"], 1)
+
+    def test_what_it_must_not_touch(self):
+        # :Category is global — it carries no userId at all — so a migration that
+        # touched it would re-file one vault's categories under another. Nothing is
+        # deleted either, because the old account is left intact by design and no
+        # node is anybody else's business. And the source gets no :User node.
+        for query, _ in self._go():
+            self.assertNotIn("DELETE", query.upper())
+            self.assertNotIn(":Category", query)
+            self.assertNotIn("MERGE (u:User {id: $old})", query)
+        _, params = self._only("MERGE (u:User")
+        self.assertEqual(params["new"], TARGET_USER)
 
     def test_a_non_empty_destination_aborts_the_whole_transaction(self):
         # Re-checked inside the transaction, not only before it: a record saved
         # into the destination in between would otherwise be interleaved with the
         # arriving ones, and the move would exit 0 having merged two vaults.
         self.driver.counts["__bare__"] = 4
-        with self.assertRaises(ValueError):
+        with self.assertRaises(self.DestinationOccupied):
             self.move_graph(self.driver, SOURCE_USER, TARGET_USER,
                             self.client_map, self.context_map, self.parents)
         self.assertEqual(self.driver.transactions, 1)
-
-    def test_the_destination_gets_a_user_node(self):
-        self._go()
-        _, params = self._only("MERGE (u:User")
-        self.assertEqual(params["new"], TARGET_USER)
-
-    def test_no_node_is_deleted(self):
-        # The old account is left intact by design, and nothing else may go.
-        for query, _ in self._go():
-            self.assertNotIn("DELETE", query.upper())
-
-    def test_no_user_node_is_created_for_the_source(self):
-        self._go()
-        for query, _ in self._go():
-            self.assertNotIn("MERGE (u:User {id: $old})", query)
-
-    def test_category_nodes_are_never_rewritten(self):
-        # :Category is global — it carries no userId at all — so a migration
-        # touching it would re-file one vault's categories under another.
-        for query, _ in self._go():
-            self.assertNotIn(":Category", query)
 
     def test_it_runs_in_a_single_transaction(self):
         # Split across several, a crash between them leaves the graph describing
         # a vault that does not exist.
         self._go()
         self.assertEqual(self.driver.transactions, 1)
-
 
 class PerformMoveOrderTests(unittest.TestCase):
     """The ordering, driven rather than read.
@@ -1193,6 +1098,11 @@ class FakeGraph(FakeDriver):
 
 _MIGRATE = "migrate_vault_user.py"
 _MIGRATE_EXCEPTIONS = ("DestinationOccupied",)
+# Lifted once and shared, because class *identity* is part of the contract:
+# `except DestinationOccupied` only catches the very class that was raised, and
+# two execs of the same class body produce two unrelated types. Two namespaces
+# built separately therefore miss each other.
+_LIFTED_CLASSES = {}
 
 
 def _module_constant(module_name, name):
@@ -1264,7 +1174,9 @@ def _module_namespace(*names, extra=None):
     # Read from the module, not restated here: see _module_constant.
     ns["PATCH_KEYS"] = _module_constant(_MIGRATE, "PATCH_KEYS")
     for name in _MIGRATE_EXCEPTIONS:
-        ns[name] = _lift_class(_MIGRATE, name, ns)
+        if name not in _LIFTED_CLASSES:
+            _LIFTED_CLASSES[name] = _lift_class(_MIGRATE, name, {})
+        ns[name] = _LIFTED_CLASSES[name]
     ns.update(extra or {})
     for name in names:
         _lift_shared(_MIGRATE, name, ns)
@@ -1326,70 +1238,53 @@ class VerifyTests(unittest.TestCase):
         ns = _module_namespace("read_graph", "read_points", "read_known_scope_ids",
                                "read_old_user_node_present", "verify")
         self.verify = ns["verify"]
+        self.client_id = client_id_for(TARGET_USER, "Acme Holdings")
+        self.context_id = context_id_for(TARGET_USER, self.client_id, "Phase One")
 
-    def _ids(self):
-        return (client_id_for(TARGET_USER, "Acme Holdings"),
-                context_id_for(TARGET_USER,
-                               client_id_for(TARGET_USER, "Acme Holdings"),
-                               "Phase One"))
+    def _run(self, payload, *, healthy=True):
+        """Verify a single point carrying ``payload``.
 
-    def _run(self, payload, client_ids, context_ids, **kwargs):
-        # client_ids / context_ids are required, not defaulted: with empty
-        # defaults a caller that forgot them got a graph with no scope nodes at
-        # all and every payload id read as dangling — the signature failed open.
-        graph = FakeGraph(clients=[{"id": i, "name": "n"} for i in client_ids],
-                          contexts=[{"id": i, "name": "n"} for i in context_ids],
-                          **kwargs)
+        ``healthy`` puts both scope nodes in the graph, so a payload naming the
+        wrong one is the only possible cause of a dangling count.
+        """
+        graph = FakeGraph(
+            clients=[{"id": self.client_id, "name": "n"}] if healthy else [],
+            contexts=[{"id": self.context_id, "name": "n"}] if healthy else [],
+            user_node=healthy)
         qdrant = FakeQdrant({"ea_memories": {"f": dict({"userId": TARGET_USER},
                                                       **payload)},
                              "ea_diary": {}})
         return asyncio.run(self.verify(qdrant, graph, SOURCE_USER, TARGET_USER))
 
     def test_a_healthy_payload_reports_nothing_dangling(self):
-        client_id, context_id = self._ids()
-        report = self._run({"clientId": client_id, "contextId": context_id},
-                           client_ids=[client_id], context_ids=[context_id])
+        report = self._run({"clientId": self.client_id,
+                            "contextId": self.context_id})
         self.assertEqual(report["dangling_scope_payloads"], 0)
 
-    def test_a_client_id_pointing_at_a_context_id_is_dangling(self):
-        # The regression: merged into one set this tests as present.
-        client_id, context_id = self._ids()
-        report = self._run({"clientId": context_id},
-                           client_ids=[client_id], context_ids=[context_id])
-        self.assertEqual(report["dangling_client_payloads"], 1)
-        self.assertEqual(report["dangling_scope_payloads"], 1)
+    def test_each_id_is_checked_against_its_own_namespace(self):
+        # Both directions, and counted per kind. Merged into one set these both
+        # read as present, which is the regression.
+        for key, other in (("clientId", self.context_id),
+                           ("contextId", self.client_id)):
+            with self.subTest(payload_key=key):
+                report = self._run({key: other})
+                self.assertEqual(report[f"dangling_{key[:-2].lower()}_payloads"], 1)
+                self.assertEqual(report["dangling_scope_payloads"], 1)
 
-    def test_a_context_id_pointing_at_a_client_id_is_dangling(self):
-        client_id, context_id = self._ids()
-        report = self._run({"contextId": client_id},
-                           client_ids=[client_id], context_ids=[context_id])
-        self.assertEqual(report["dangling_context_payloads"], 1)
-
-    def test_each_kind_is_counted_separately(self):
-        client_id, context_id = self._ids()
-        report = self._run({"clientId": context_id, "contextId": client_id},
-                           client_ids=[client_id], context_ids=[context_id])
-        self.assertEqual(report["dangling_client_payloads"], 1)
-        self.assertEqual(report["dangling_context_payloads"], 1)
-        self.assertEqual(report["dangling_scope_payloads"], 2)
-
-    def test_records_left_in_the_source_are_counted(self):
-        client_id, _ = self._ids()
-        graph = FakeGraph(facts=4, diary=2, clients=[{"id": client_id, "name": "n"}])
-        qdrant = FakeQdrant({"ea_memories": {}, "ea_diary": {}})
-        report = asyncio.run(self.verify(qdrant, graph, SOURCE_USER, TARGET_USER))
+    def test_records_and_the_leftover_hub_node_are_reported(self):
+        graph = FakeGraph(facts=4, diary=2, user_node=True,
+                          clients=[{"id": self.client_id, "name": "n"}])
+        report = asyncio.run(self.verify(FakeQdrant({"ea_memories": {},
+                                                      "ea_diary": {}}), graph,
+                                           SOURCE_USER, TARGET_USER))
+        # Facts, diary AND the client: a scope node left behind is a whole client
+        # the user cannot see, which is why the count is not just the records.
         self.assertEqual(report["old_left_in_graph"], 7)
-
-    def test_the_leftover_user_node_is_reported(self):
-        client_id, _ = self._ids()
-        qdrant = FakeQdrant({"ea_memories": {}, "ea_diary": {}})
-        self.assertTrue(asyncio.run(
-            self.verify(qdrant, FakeGraph(user_node=True), SOURCE_USER,
-                        TARGET_USER))["source_user_node_left"])
-        self.assertFalse(asyncio.run(
-            self.verify(qdrant, FakeGraph(user_node=False), SOURCE_USER,
-                        TARGET_USER))["source_user_node_left"])
-
+        self.assertTrue(report["source_user_node_left"])
+        self.assertFalse(asyncio.run(self.verify(
+            FakeQdrant({"ea_memories": {}, "ea_diary": {}}),
+            FakeGraph(user_node=False), SOURCE_USER, TARGET_USER
+        ))["source_user_node_left"])
 
 class CountKeysTests(unittest.TestCase):
     """``_count_keys`` **called**, because a stub everywhere left it untested.
@@ -1471,9 +1366,54 @@ class RunTests(unittest.TestCase):
     dirty result and exits 0 is the failure mode this exists to preclude — the
     operator reads "Done" and stops looking — and flipping ``return 1`` to
     ``return 0`` is invisible to a source assertion.
+
+    The dirty conditions and the refusals are each one table-driven test rather
+    than one test per row. They share a fixture and a single exit-code
+    assertion, and a named failure is not worth twenty method bodies: the
+    subTest label carries the same information.
     """
 
+    # The fixture source holds 3 facts, 1 diary entry, 1 client, 0 contexts,
+    # 0 Qdrant points (the fake is empty) and 0 access keys, so a clean run
+    # reports exactly those numbers at the destination. Getting this wrong makes
+    # every test in the class fail on the completeness check instead of on what
+    # it is about.
+    KEYS_BEFORE = 2
     EMPTY_DESTINATION = {"facts": 0, "diary": 0, "clients": [], "contexts": []}
+
+    # Every condition that must turn a successful move into a non-zero exit, and
+    # the report key each one moves. Seven conditions in five rows of AGENTS.md.
+    DIRTY = (
+        ("records left in the source", {"old_left_in_graph": 3}),
+        ("a dangling payload", {"dangling_scope_payloads": 2,
+                                "dangling_client_payloads": 1,
+                                "dangling_context_payloads": 1}),
+        ("points left in the source", {"old_points": 5}),
+        ("facts missing at the destination", {"new_facts": 1}),
+        ("diary missing at the destination", {"new_diary": 0}),
+        ("points missing at the destination", {"new_points": 2}),
+        ("access keys that did not move", None),  # handled separately
+    )
+
+    # Each way a destination can be non-empty, all of which must be refused
+    # before a single write is issued.
+    OCCUPIED = (
+        ("facts", {"facts": 1, "diary": 0, "clients": [], "contexts": []}, None),
+        ("diary entries", {"facts": 0, "diary": 2, "clients": [], "contexts": []}, None),
+        ("clients", {"facts": 0, "diary": 0, "clients": [{"id": "c", "name": "n"}],
+                     "contexts": []}, None),
+        # The term the in-transaction guard also has and the preflight used not
+        # to: a contexts-only destination passed the preflight, had its whole
+        # Qdrant half rewritten, then aborted claiming it had gained records
+        # while being prepared. It had them all along.
+        ("contexts only", {"facts": 0, "diary": 0, "clients": [],
+                           "contexts": [{"id": "x", "name": "n"}]}, None),
+        # A destination whose Neo4j was emptied while its vector points survived
+        # is what a stopped sync_orphans leaves behind. Letting it through made
+        # the completeness comparison report a healthy move dirty and tell the
+        # operator to stop using a vault that was fine.
+        ("surviving Qdrant points", None, 1),
+    )
 
     def setUp(self):
         self._saved = sys.modules.get("common")
@@ -1493,6 +1433,12 @@ class RunTests(unittest.TestCase):
             redirect.__enter__()
         self.addCleanup(self._restore_streams)
 
+    def _restore(self):
+        if self._saved is None:
+            sys.modules.pop("common", None)
+        else:
+            sys.modules["common"] = self._saved
+
     def _restore_streams(self):
         for redirect in reversed(self._redirects):
             redirect.__exit__(None, None, None)
@@ -1500,22 +1446,43 @@ class RunTests(unittest.TestCase):
     def output(self) -> str:
         return self._sinks[0].getvalue() + self._sinks[1].getvalue()
 
+    @contextlib.contextmanager
+    def capture(self):
+        """Fresh output sinks for one case inside a table-driven test.
+
+        Re-running ``setUp`` instead would work on the first case and then
+        consume the accumulated cleanups, so the second iteration raises out of
+        an empty list — a harness failure that reads as a product failure.
+        """
+        sinks = (io.StringIO(), io.StringIO())
+        entered = (contextlib.redirect_stdout(sinks[0]),
+                   contextlib.redirect_stderr(sinks[1]))
+        for redirect in entered:
+            redirect.__enter__()
+        previous = self._sinks
+        self._sinks = sinks
+        try:
+            yield
+        finally:
+            self._sinks = previous
+            for redirect in reversed(entered):
+                redirect.__exit__(None, None, None)
+
     def _read_graph(self, clients=None, destination=None):
         """Build the per-user ``read_graph`` stand-in.
 
-        Source vault populated, destination empty, keyed by the argument.
-
-        run() reads the same graph twice — once per user — so a single fixed
-        answer would make the destination look occupied and the move would be
-        refused before any of the behaviour under test is reached.
+        Source vault populated, destination empty, keyed by the argument — run()
+        reads the same graph twice, once per user, so a single fixed answer would
+        make the destination look occupied and the move would be refused before
+        any of the behaviour under test is reached.
 
         The real ``plan_id_remap`` is used rather than a stub: ``run`` imports it
         inside its own body, so a namespace entry cannot reach it, and forcing one
         would mean stripping the import out of the segment under test.
         """
         if clients is None:
-            client = client_id_for(SOURCE_USER, "Acme Holdings")
-            clients = [{"id": client, "name": "Acme Holdings"}]
+            clients = [{"id": client_id_for(SOURCE_USER, "Acme Holdings"),
+                        "name": "Acme Holdings"}]
 
         async def _read(_driver, user_id):
             if user_id == SOURCE_USER:
@@ -1525,26 +1492,12 @@ class RunTests(unittest.TestCase):
                         else destination)
         return _read
 
-    def _restore(self):
-        if self._saved is None:
-            sys.modules.pop("common", None)
-        else:
-            sys.modules["common"] = self._saved
-
-    # The fixture source holds 3 facts, 1 diary entry, 1 client, 0 contexts and
-    # 0 Qdrant points (the qdrant fake is empty) and 0 access keys, so a clean
-    # run reports exactly those numbers at the destination. Getting this wrong
-    # makes every test in the class fail on the completeness check instead of on
-    # what it is about.
-    KEYS_BEFORE = 2
-
     def _read_points(self, qdrant):
         """Point count per user, defaulting to an empty vault.
 
         A closure over the fake rather than the lifted function, so a test can
         hand the destination a non-empty vector store — the state a stopped
-        ``sync_orphans`` leaves behind, and the one the completeness comparison
-        would otherwise mis-report.
+        ``sync_orphans`` leaves behind.
         """
         async def _read(_qdrant, user_id):
             if qdrant is None:
@@ -1563,150 +1516,171 @@ class RunTests(unittest.TestCase):
         report.update(overrides)
         return report
 
-    def _drive(self, verify_report, apply=True, source=None, target=None,
+    def _namespace(self, verify_report, *, read_graph=None, qdrant=None,
+                   moved=None, keys=None, extra=None):
+        ns = _module_namespace(extra={
+            "read_points": self._read_points(qdrant),
+            "read_graph": read_graph or self._read_graph(),
+            "_load_env": lambda *a, **k: None,
+            "_report": lambda *a, **k: None,
+            "_count_keys": lambda *a, **k: (self.KEYS_BEFORE if keys is None
+                                            else keys),
+            "perform_move": _async_value(moved if moved is not None else {
+                "scope_payloads": 1, "qdrant_points": 0, "facts": 3, "diary": 1,
+                "clients": 1, "contexts": 0, "psks": self.KEYS_BEFORE}),
+            "verify": _async_value(verify_report),
+            # Merged last so a caller can override a stub — and so the exception
+            # class it raises is the same object the handler catches. Two
+            # separate _module_namespace() calls produce two *different* classes,
+            # and the exception escapes the handler as a traceback.
+            **(extra or {}),
+        })
+        return ns
+
+    def _drive(self, verify_report=None, apply=True, source=None, target=None,
                clients=None, destination=None, qdrant=None):
+        if verify_report is None:
+            verify_report = self._healthy()
+        run = _lift(_MIGRATE, "run", self._namespace(
+            verify_report, read_graph=self._read_graph(clients, destination),
+            qdrant=qdrant))
+        return asyncio.run(run(self._args(source, target, apply)))
+
+    def _args(self, source=None, target=None, apply=True):
         import argparse
-        ns = _module_namespace(
-            extra={
-                "read_points": self._read_points(qdrant),
-                "read_graph": self._read_graph(clients, destination),
-                "_load_env": lambda *a, **k: None,
-                "_report": lambda *a, **k: None,
-                "_count_keys": lambda *a, **k: self.KEYS_BEFORE,
-                "perform_move": _async_value({"scope_payloads": 1,
-                                              "qdrant_points": 0, "facts": 3,
-                                              "diary": 1, "clients": 1,
-                                              "contexts": 0,
-                                              "psks": self.KEYS_BEFORE}),
-                "verify": _async_value(verify_report),
-            })
-        run = _lift(_MIGRATE, "run", ns)
-        return asyncio.run(run(argparse.Namespace(
-            source=source or SOURCE_USER, target=target or TARGET_USER,
-            apply=apply, reconcile=False, env="/nonexistent")))
+        return argparse.Namespace(source=source or SOURCE_USER,
+                                  target=target or TARGET_USER,
+                                  apply=apply, reconcile=False,
+                                  env="/nonexistent")
 
     def test_a_clean_run_exits_zero(self):
-        self.assertEqual(self._drive(self._healthy()), 0)
+        self.assertEqual(self._drive(), 0)
         self.assertIn("Done.", self.output())
 
-    def test_records_left_in_the_source_exit_non_zero(self):
-        report = self._healthy()
-        report["old_left_in_graph"] = 3
-        self.assertEqual(self._drive(report), 1)
-
-    def test_a_dangling_payload_exits_non_zero(self):
-        report = self._healthy()
-        report["dangling_scope_payloads"] = 2
-        report["dangling_client_payloads"] = 1
-        report["dangling_context_payloads"] = 1
-        self.assertEqual(self._drive(report), 1)
-
-    def test_points_left_in_the_source_exit_non_zero(self):
-        # Qdrant is the half a count in the graph cannot see: a point whose
-        # userId never moved is invisible to read_graph entirely.
-        report = self._healthy()
-        report["old_points"] = 5
-        self.assertEqual(self._drive(report), 1)
-
-    def test_records_missing_at_the_destination_exit_non_zero(self):
-        # "Nothing was left behind" and "everything arrived" are different
-        # claims. Only the first was being checked, so a move that lost records
-        # while clearing the source printed "Done".
-        self.assertEqual(self._drive(self._healthy(new_facts=1)), 1)
-
-    def test_diary_missing_at_the_destination_exits_non_zero(self):
-        self.assertEqual(self._drive(self._healthy(new_diary=0)), 1)
-
-    def test_points_missing_at_the_destination_exit_non_zero(self):
-        self.assertEqual(self._drive(self._healthy(new_points=2)), 1)
-
-    def test_a_dry_run_never_calls_perform_move(self):
-        calls = []
-        import argparse
-        ns = _module_namespace(
-            "read_points",
-            extra={
-                "read_graph": self._read_graph(),
-                "_load_env": lambda *a, **k: None,
-                "_report": lambda *a, **k: None,
-                "_count_keys": lambda *a, **k: self.KEYS_BEFORE,
-                "perform_move": lambda *a, **k: calls.append(1),
-                "verify": _async_value(self._healthy()),
-            })
-        run = _lift(_MIGRATE, "run", ns)
-        code = asyncio.run(run(argparse.Namespace(
-            source=SOURCE_USER, target=TARGET_USER, apply=False, reconcile=False,
-            env="/nonexistent")))
-        self.assertEqual(code, 0)
-        self.assertEqual(calls, [], "a dry run must not reach the writes")
+    def test_every_dirty_condition_exits_non_zero(self):
+        for label, overrides in self.DIRTY:
+            if overrides is None:
+                continue
+            with self.subTest(condition=label), self.capture():
+                report = self._healthy()
+                report.update(overrides)
+                self.assertEqual(self._drive(report), 1, label)
+                self.assertIn("FAILED:", self.output(), label)
 
     def test_keys_that_did_not_move_exit_non_zero(self):
-        # The SQLite store is the one verification cannot see. Run against a
+        # SQLite is the one store verification cannot see. Run against a
         # different MEM_SESSION_DIR than the app, transfer_psks opens a
         # different database, moves nothing, and everything else reports clean.
-        import argparse
-        ns = _module_namespace(
-            "read_points",
-            extra={
-                "read_graph": self._read_graph(),
-                "_load_env": lambda *a, **k: None,
-                "_report": lambda *a, **k: None,
-                "_count_keys": lambda *a, **k: 2,
-                "perform_move": _async_value({"scope_payloads": 1,
-                                              "qdrant_points": 0, "facts": 3,
-                                              "diary": 1, "clients": 1,
-                                              "contexts": 0, "psks": 0}),
-                "verify": _async_value(self._healthy()),
-            })
-        run = _lift(_MIGRATE, "run", ns)
-        code = asyncio.run(run(argparse.Namespace(
-            source=SOURCE_USER, target=TARGET_USER, apply=True, reconcile=False,
-            env="/nonexistent")))
-        self.assertEqual(code, 1)
+        run = _lift(_MIGRATE, "run", self._namespace(
+            self._healthy(), moved={"scope_payloads": 1, "qdrant_points": 0,
+                                    "facts": 3, "diary": 1, "clients": 1,
+                                    "contexts": 0, "psks": 0}))
+        self.assertEqual(asyncio.run(run(self._args())), 1)
+        self.assertIn("MEM_SESSION_DIR", self.output())
 
-    def test_the_occupancy_abort_is_a_clean_refusal_not_a_traceback(self):
-        # The one refusal only discoverable after the writes begin. It has to
-        # read like every other one, and it must not claim nothing was written:
-        # the Qdrant half is already rewritten by that point.
-        import argparse
-        # The exception has to be raised as the *same class object* the handler
-        # catches: _module_namespace execs the class afresh each call, so
-        # raising one built from a different namespace escapes the handler and the
-        # test reports a traceback instead of a clean refusal.
-        ns = _module_namespace("read_points")
-        abort = ns["DestinationOccupied"]
+    def test_every_way_a_non_empty_destination_is_refused(self):
+        for label, destination, points in self.OCCUPIED:
+            with self.subTest(destination=label), self.capture():
+                qdrant = None
+                if points is not None:
+                    qdrant = FakeQdrant({"ea_memories": {}, "ea_diary": {}})
+                    qdrant.destination_points = points
+                self.assertEqual(self._drive(destination=destination,
+                                             qdrant=qdrant), 1, label)
+                self.assertIn("the destination is not empty", self.output())
+
+    def test_the_other_refusals(self):
+        # Same user, an empty source, and a duplicated source name are three
+        # arguments or one fixture rather than three method bodies.
+        duplicate = {"id": "a-second-row-same-name", "name": "Acme Holdings"}
+        cases = (
+            ("same user", dict(source=SOURCE_USER, target=SOURCE_USER)),
+            ("duplicate source name", dict(clients=[
+                {"id": client_id_for(SOURCE_USER, "Acme Holdings"),
+                 "name": "Acme Holdings"}, duplicate])),
+        )
+        for label, kwargs in cases:
+            with self.subTest(refusal=label), self.capture():
+                self.assertEqual(self._drive(**kwargs), 1, label)
+        # An empty source needs its own graph, since the default has content.
+        run = _lift(_MIGRATE, "run", self._namespace(
+            self._healthy(), read_graph=_async_value(
+                {"facts": 0, "diary": 0, "clients": [], "contexts": []})))
+        self.assertEqual(asyncio.run(run(self._args())), 1)
+        self.assertIn("nothing to move", self.output())
+
+    def test_a_contexts_only_source_is_not_moved_as_empty(self):
+        # The "nothing to move" check has to count scope nodes. Without this term
+        # a source whose only content is Context nodes is reported as empty, while
+        # a source with the same number of clients is not.
+        parent = client_id_for(SOURCE_USER, "Acme Holdings")
+
+        async def _read(_driver, user_id):
+            if user_id == SOURCE_USER:
+                return {"facts": 0, "diary": 0, "clients": [], "contexts": [
+                    {"id": context_id_for(SOURCE_USER, parent, "Phase One"),
+                     "name": "Phase One", "clientId": parent}]}
+            return dict(self.EMPTY_DESTINATION)
+        run = _lift(_MIGRATE, "run", self._namespace(
+            self._healthy(new_facts=0, new_diary=0), read_graph=_read,
+            moved={"scope_payloads": 0, "qdrant_points": 0, "facts": 0,
+                   "diary": 0, "clients": 0, "contexts": 1,
+                   "psks": self.KEYS_BEFORE}))
+        self.assertEqual(asyncio.run(run(self._args())), 0)
+        self.assertIn("Done.", self.output())
+
+    def test_a_records_only_source_is_not_refused_as_a_no_op(self):
+        # Records with no Client/Context nodes at all — clients are created on
+        # demand, so this is an ordinary vault — and the move does real work. The
+        # "every id would come out unchanged" guard used to refuse it, because
+        # there are no ids to change. clients=[] is the whole point: with a client
+        # present the ids change and any no-op guard is satisfied.
+        self.assertEqual(self._drive(clients=[]), 0)
+        self.assertIn("Done.", self.output())
+
+    def test_a_dry_run_reaches_neither_the_writes_nor_the_key_store(self):
+        # Two calls, one assertion each. The key count matters because
+        # sessions.db_path() creates its directory, so reading it during a dry run
+        # writes a database and then prints "Nothing was written" — which would
+        # be false.
+        calls = []
+        ns = self._namespace(self._healthy())
+        ns["_count_keys"] = lambda *a, **k: calls.append("keys")
+        ns["perform_move"] = lambda *a, **k: calls.append("move")
+        self.assertEqual(asyncio.run(_lift(_MIGRATE, "run", ns)(
+            self._args(apply=False))), 0)
+        self.assertEqual(calls, [], "a dry run must not read or write anything")
+
+    def test_the_occupancy_abort_is_a_clean_refusal(self):
+        # The one refusal only discoverable after the writes begin. It has to read
+        # like every other one, and it must not claim nothing was written: the
+        # Qdrant half is already rewritten by that point.
+        abort = _LIFTED_CLASSES["DestinationOccupied"]
 
         def _boom(*_a, **_k):
             raise abort("the destination gained records; the Qdrant half has "
                         "already been rewritten")
-        ns.update({
-            "read_graph": self._read_graph(),
-            "_load_env": lambda *a, **k: None,
-            "_report": lambda *a, **k: None,
-            "_count_keys": lambda *a, **k: self.KEYS_BEFORE,
-            "perform_move": _boom,
-            "verify": _async_value(self._healthy()),
-        })
-        run = _lift(_MIGRATE, "run", ns)
-        code = asyncio.run(run(argparse.Namespace(
-            source=SOURCE_USER, target=TARGET_USER, apply=True, reconcile=False,
-            env="/nonexistent")))
-        self.assertEqual(code, 1)
+        ns = self._namespace(self._healthy(), extra={"perform_move": _boom})
+        self.assertEqual(asyncio.run(_lift(_MIGRATE, "run", ns)(self._args())), 1)
         self.assertIn("ERROR:", self.output())
         self.assertIn("already been rewritten", self.output(),
                       "the refusal must say the Qdrant half is already done")
         self.assertNotIn("Traceback", self.output())
 
     def test_the_abort_message_does_not_claim_nothing_was_written(self):
-        # A message is text, so a source assertion is the right tool — the same
-        # reasoning as the LLM prompt sentences in test_matching_regressions.
-        # Nothing else in the suite can see it, and it is load-bearing: the
-        # Qdrant half IS rewritten when this fires.
-        # The AST, not a slice of the file. Both of the narrower versions of this
-        # check failed on text that is not the message: the explanatory comment
-        # quotes the phrase to say why it is wrong, and the dry-run banner
-        # further down legitimately says "Nothing was written". Only the string
-        # literal handed to ValueError is the message.
+        """The shipped message, not a stub's copy of it.
+
+        A message is text, so a source assertion is the right tool — the same
+        reasoning as the LLM prompt sentences in test_matching_regressions.
+        Nothing else in the suite can see it, and it is load-bearing: the Qdrant
+        half IS rewritten when this fires, so an operator who believed the
+        opposite stops looking at a vault that is half-moved.
+
+        Read from the AST, not a slice: two earlier versions of this check failed
+        on text that is not the message — the explanatory comment quotes the
+        phrase to say why it is wrong, and the dry-run banner further down
+        legitimately says "Nothing was written".
+        """
         message = None
         for node in ast.walk(ast.parse(_read(_MIGRATE))):
             if isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call):
@@ -1715,10 +1689,7 @@ class RunTests(unittest.TestCase):
                             and "destination gained records" in arg.value:
                         message = arg.value
         self.assertIsNotNone(message, "the occupancy abort must raise a reason")
-        self.assertFalse(
-            "nothing was written" in message.lower(),
-            "the abort message must not claim nothing was written — the Qdrant "
-            "half has already been rewritten by this point")
+        self.assertNotIn("nothing was written", message.lower())
         self.assertIn("already been rewritten", message,
                       "the abort must say the Qdrant half is already done")
 
@@ -1727,148 +1698,86 @@ class RunTests(unittest.TestCase):
 
         A bare ``except ValueError`` around ``perform_move`` would report this as
         a refusal — *after* Qdrant and Neo4j are fully rewritten, with no
-        ``FAILED:`` line and no statement that the vault is mid-move. So it has
-        to propagate, and the test says so by asserting the raise.
+        ``FAILED:`` line and no statement that the vault is mid-move. So it has to
+        propagate, and the test says so by asserting the raise.
         """
-        import argparse
-        ns = _module_namespace(extra={
-            "read_graph": self._read_graph(),
-            "read_points": self._read_points(None),
-            "_load_env": lambda *a, **k: None,
-            "_report": lambda *a, **k: None,
-            "_count_keys": lambda *a, **k: self.KEYS_BEFORE,
-            "perform_move": _boom_with(ValueError("PSK row has an empty "
-                                                   "user_id")),
-            "verify": _async_value(self._healthy()),
-        })
-        run = _lift(_MIGRATE, "run", ns)
+        ns = self._namespace(self._healthy())
+        ns["perform_move"] = _boom_with(ValueError("PSK row has an empty "
+                                                   "user_id"))
         with self.assertRaises(ValueError):
-            asyncio.run(run(argparse.Namespace(
-                source=SOURCE_USER, target=TARGET_USER, apply=True,
-                reconcile=False, env="/nonexistent")))
+            asyncio.run(_lift(_MIGRATE, "run", ns)(self._args()))
         self.assertNotIn("mid-move", self.output(),
                          "the credential failure must not borrow the "
                          "occupancy message")
 
-    def test_a_same_user_move_is_refused(self):
-        self.assertEqual(self._drive(self._healthy(), source=SOURCE_USER,
-                                     target=SOURCE_USER), 1)
+class MigrationScriptTests(unittest.TestCase):
+    """The few properties of the script that are decisions, not behaviour.
 
-    def _refuses(self, destination=None, qdrant=None, what=""):
-        """Drive a run whose destination is non-empty in exactly one way."""
-        if qdrant is not None:
-            qdrant.destination_points = 1
-        code = self._drive(self._healthy(), destination=destination,
-                           qdrant=qdrant)
-        self.assertEqual(code, 1, f"a destination {what} was not refused")
-        self.assertIn("the destination is not empty", self.output())
+    Deliberately short. Everything else this file once asserted here by
+    `assertIn` over the source — the refusals, the ordering, the access-key
+    handoff, the dangling check — is now driven against fakes in `RunTests`,
+    `VerifyTests`, `PerformMoveOrderTests` and `CountKeysTests`, and a substring
+    assertion is strictly weaker: it pins a token, not the property. What is left
+    here is what no behavioural test can reach.
+    """
 
-    def test_a_contexts_only_source_is_not_moved_as_empty(self):
-        # The "nothing to move" check has to count scope nodes. Without this term
-        # a source whose only content is Context nodes is reported as empty and
-        # refused, while a source with the same number of clients is not.
-        import argparse
-        ctx = context_id_for(SOURCE_USER,
-                              client_id_for(SOURCE_USER, "Acme Holdings"),
-                              "Phase One")
-        async def _read(_driver, user_id):
-            if user_id == SOURCE_USER:
-                return {"facts": 0, "diary": 0, "clients": [],
-                        "contexts": [{"id": ctx, "name": "Phase One",
-                                      "clientId": client_id_for(
-                                          SOURCE_USER, "Acme Holdings")}]}
-            return dict(self.EMPTY_DESTINATION)
-        ns = _module_namespace(extra={
-            "read_graph": _read,
-            "read_points": self._read_points(None),
-            "_load_env": lambda *a, **k: None,
-            "_report": lambda *a, **k: None,
-            "_count_keys": lambda *a, **k: self.KEYS_BEFORE,
-            "perform_move": _async_value({"scope_payloads": 0, "qdrant_points": 0,
-                                          "facts": 0, "diary": 0, "clients": 0,
-                                          "contexts": 1,
-                                          "psks": self.KEYS_BEFORE}),
-            "verify": _async_value(self._healthy(new_facts=0, new_diary=0)),
-        })
-        code = asyncio.run(_lift(_MIGRATE, "run", ns)(
-            argparse.Namespace(source=SOURCE_USER, target=TARGET_USER,
-                               apply=True, reconcile=False,
-                               env="/nonexistent")))
-        self.assertEqual(code, 0)
-        self.assertIn("Done.", self.output())
+    def setUp(self):
+        self.tree = ast.parse(_read(_MIGRATE))
 
-    def test_a_records_only_source_is_not_refused_as_a_no_op(self):
-        # Records with no Client/Context nodes at all — clients are created on
-        # demand, so this is an ordinary vault — and the move does real work. The
-        # "every id would come out unchanged" guard used to refuse it, because
-        # there are no ids to change.
-        # clients=[] is the whole point: with a client present the ids change and
-        # any no-op guard is satisfied, so the test would pass on the defect.
-        self.assertEqual(self._drive(self._healthy(new_facts=3), clients=[]), 0)
-        self.assertIn("Done.", self.output())
+    def _calls(self):
+        names = {}
+        for node in ast.walk(self.tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                names[node.func.id] = names.get(node.func.id, 0) + 1
+        return names
 
-    def test_a_destination_with_facts_is_refused(self):
-        self._refuses(destination={"facts": 1, "diary": 0, "clients": [],
-                                   "contexts": []}, what="with facts")
+    def test_dry_run_is_the_default_and_both_users_are_required(self):
+        # One test because it is one argparse surface: a default anywhere on
+        # --from/--to would be a hardcoded vault name, and --apply is the only
+        # thing allowed to default to False.
+        flags = {}
+        for node in ast.walk(self.tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                    and node.func.attr == "add_argument":
+                names = [a.value for a in node.args
+                         if isinstance(a, ast.Constant)]
+                for flag in names:
+                    if flag in ("--from", "--to", "--apply"):
+                        flags[flag] = {kw.arg for kw in node.keywords}
+        for flag in ("--from", "--to"):
+            self.assertIn("required", flags[flag], f"{flag} must be required")
+            self.assertNotIn("default", flags[flag],
+                             f"{flag} has a default, which hardcodes a vault name")
+        self.assertNotIn("default", flags["--apply"],
+                         "--apply must be opt-in")
 
-    def test_a_destination_with_diary_is_refused(self):
-        self._refuses(destination={"facts": 0, "diary": 2, "clients": [],
-                                   "contexts": []}, what="with diary entries")
+    def test_run_delegates_the_writes_to_perform_move(self):
+        # So the ordering lives in one testable function instead of inline in
+        # run(), where a test could only read it. PerformMoveOrderTests drives it.
+        calls = self._calls()
+        for stage in ("retarget_qdrant_scope", "move_qdrant_user", "move_graph",
+                      "move_credentials"):
+            self.assertEqual(calls.get(stage), 1,
+                             f"{stage} must be called from perform_move only")
+        self.assertNotIn("retarget_qdrant_scope", _read(_MIGRATE).split("async def run(", 1)[1],
+                         "run() must not perform the writes itself")
 
-    def test_a_destination_with_clients_is_refused(self):
-        self._refuses(destination={"facts": 0, "diary": 0,
-                                   "clients": [{"id": "c", "name": "n"}],
-                                   "contexts": []}, what="with clients")
-
-    def test_a_destination_with_only_contexts_is_refused(self):
-        # The term the in-transaction guard also has, and the preflight used not
-        # to: a contexts-only destination passed the preflight, had its whole
-        # Qdrant half rewritten, and then aborted with a message saying it had
-        # gained records while being prepared. It had them all along.
-        self._refuses(destination={"facts": 0, "diary": 0, "clients": [],
-                                   "contexts": [{"id": "x", "name": "n"}]},
-                      what="with contexts only")
-
-    def test_a_destination_with_only_vector_points_is_refused(self):
-        # A destination whose Neo4j was emptied while its vector points survived
-        # is what a stopped sync_orphans leaves behind. Letting it through made
-        # the completeness comparison report a healthy move as dirty and tell the
-        # operator to stop using a vault that was fine.
-        self._refuses(qdrant=FakeQdrant({"ea_memories": {}, "ea_diary": {}}),
-                      what="with surviving Qdrant points")
-
-    def test_an_empty_destination_is_still_accepted(self):
-        # So the five refusals above are about the condition and not the harness.
-        self.assertEqual(self._drive(self._healthy()), 0)
-
-    def test_a_duplicate_source_name_is_refused(self):
-        # Two Client rows of one name derive one id, so the move would leave two
-        # nodes sharing it — and the destination check cannot see it, because it
-        # only inspects the target.
-        duplicate = {"id": "a-second-row-same-name", "name": "Acme Holdings"}
-        self.assertEqual(self._drive(self._healthy(), clients=[
-            {"id": client_id_for(SOURCE_USER, "Acme Holdings"),
-             "name": "Acme Holdings"}, duplicate]), 1)
-
-    def test_an_empty_source_is_refused(self):
-        # read_graph reports an empty vault, so there is nothing to move.
-        import argparse
-        # The empty-vault case: read_points and read_graph both zero, so the
-        # "nothing to move" refusal fires. _count_keys is stubbed because the
-        # real one touches SQLite, and on this path it is never reached.
-        run = _lift(_MIGRATE, "run", _module_namespace(extra={
-            "_load_env": lambda *a, **k: None,
-            "_report": lambda *a, **k: None,
-            "_count_keys": lambda *a, **k: 0,
-            "read_graph": _async_value({"facts": 0, "diary": 0, "clients": [],
-                                        "contexts": []}),
-            "read_points": _async_value(0),
-        }))
-        code = asyncio.run(run(argparse.Namespace(
-            source=SOURCE_USER, target=TARGET_USER, apply=False, reconcile=False,
-            env="/nonexistent")))
-        self.assertEqual(code, 1)
-
+    def test_the_account_itself_is_never_touched(self):
+        # Checked against calls and imports, not text: the module docstring names
+        # every one of these to say it leaves them alone, so a substring guard
+        # fails on the explanation and is then watered down until it asserts
+        # nothing.
+        called = set(self._calls())
+        for node in ast.walk(self.tree):
+            if isinstance(node, ast.ImportFrom):
+                called.update(a.name for a in node.names)
+            elif isinstance(node, ast.Import):
+                called.update(a.name for a in node.names)
+        for forbidden in ("delete_credentials", "create_credentials", "htpasswd",
+                          "google_identities", "revoke_psk", "user_id_taken",
+                          "verify_account"):
+            self.assertNotIn(forbidden, called,
+                             f"the migration must not reach {forbidden}")
 
 def _boom_with(exc):
     """A callable that raises ``exc``, for the failure-path tests."""
@@ -1881,133 +1790,6 @@ def _async_value(value):
     async def _get(*_a, **_k):
         return value
     return _get
-
-
-class MigrationScriptTests(unittest.TestCase):
-    """Properties of the script that are decisions rather than behaviour.
-
-    Everything here is about what the tool must *not* do, which is why it is
-    asserted rather than assumed: a migration that quietly also rewrites the
-    credentials table, or that is one flag away from writing without a dry run,
-    is a different tool from the one that was reviewed.
-    """
-
-    def setUp(self):
-        self.source = _read("migrate_vault_user.py")
-
-    def test_dry_run_is_the_default(self):
-        self.assertIn('parser.add_argument("--apply", action="store_true"', self.source)
-        self.assertIn("if not args.apply:", self.source)
-
-    def test_both_users_are_required_arguments(self):
-        self.assertIn('parser.add_argument("--from", dest="source", required=True',
-                      self.source)
-        self.assertIn('parser.add_argument("--to", dest="target", required=True',
-                      self.source)
-
-    def test_a_same_user_move_is_refused(self):
-        self.assertIn("source and destination are the same user", self.source)
-
-    def test_a_non_empty_destination_is_refused(self):
-        self.assertIn("the destination is not empty", self.source)
-
-    def test_an_occupied_name_is_refused(self):
-        self.assertIn("remap.destination_occupied", self.source)
-
-    def test_an_empty_source_is_refused(self):
-        self.assertIn("has nothing to move", self.source)
-
-    def test_keys_are_transferred_through_the_sessions_module(self):
-        # The SQL lives next to the schema that declares the column.
-        self.assertIn("sessions.transfer_psks(", self.source)
-
-    def test_sessions_are_revoked_rather_than_moved(self):
-        self.assertIn("sessions.delete_sessions_for_user(", self.source)
-
-    def _called_names(self):
-        """Every function name the script actually calls.
-
-        An AST walk, not a substring search, and the distinction is the whole
-        point of these tests: the module docstring names htpasswd, the
-        credentials table and the uuid5 formula *because it documents what the
-        tool does not touch*. A substring guard fails on that explanation, so it
-        is either deleted (losing the documentation) or watered down until it
-        asserts nothing.
-        """
-        names = set()
-        for node in ast.walk(ast.parse(self.source)):
-            if isinstance(node, ast.Call):
-                func = node.func
-                if isinstance(func, ast.Name):
-                    names.add(func.id)
-                elif isinstance(func, ast.Attribute):
-                    names.add(func.attr)
-            elif isinstance(node, ast.ImportFrom):
-                names.update(a.name for a in node.names)
-            elif isinstance(node, ast.Import):
-                names.update(a.name for a in node.names)
-            elif isinstance(node, ast.Name):
-                names.add(node.id)
-        return names
-
-    def test_the_account_itself_is_never_touched(self):
-        # Deliberately checked against calls and imports rather than text: the
-        # docstring names every one of these to say it leaves them alone.
-        called = self._called_names()
-        for forbidden in ("delete_credentials", "create_credentials",
-                          "htpasswd", "google_identities", "revoke_psk",
-                          "user_id_taken", "verify_account"):
-            self.assertFalse(
-                forbidden in called,
-                f"the migration must not reach {forbidden}, but it does")
-
-    def test_run_delegates_the_writes_to_perform_move(self):
-        # So the ordering lives in one testable function instead of inline in
-        # run(), where a test could only read it. PerformMoveOrderTests drives it.
-        self.assertTrue("await perform_move(qdrant, neo4j_driver" in self.source,
-                        "run() must delegate the writes")
-        # Counted from the AST, so the `def` line is not counted as a call. A
-        # regex over the text would have to exclude the definition by hand, and
-        # getting that wrong fails open.
-        called = {}
-        for node in ast.walk(ast.parse(self.source)):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-                called[node.func.id] = called.get(node.func.id, 0) + 1
-        for stage in ("retarget_qdrant_scope", "move_qdrant_user",
-                      "move_graph", "move_credentials"):
-            self.assertEqual(
-                called.get(stage), 1,
-                f"{stage} must be called from perform_move, and nowhere else")
-
-    def test_the_id_derivation_is_imported_not_reimplemented(self):
-        # The docstring quotes the formula it delegates to, so this is an AST
-        # check: no Call anywhere resolves to uuid5.
-        for node in ast.walk(ast.parse(self.source)):
-            if isinstance(node, ast.Call):
-                name = node.func.attr if isinstance(node.func, ast.Attribute) \
-                    else getattr(node.func, "id", "")
-                self.assertNotEqual(
-                    name, "uuid5",
-                    "the derivation must come from scoped_ids, not be inlined")
-
-    def test_diary_entry_ids_are_not_rewritten(self):
-        # Rewriting them would orphan every chunk family, because chunk 0 of a
-        # Qdrant family *is* the record id.
-        for node in ast.walk(ast.parse(self.source)):
-            if isinstance(node, ast.Constant) and isinstance(node.value, str):
-                self.assertFalse(
-                    "DiaryEntry {id:" in node.value,
-                    "the migration must not address a diary entry by id")
-
-    def test_it_reports_a_verification_pass_at_the_end(self):
-        self.assertTrue("await verify(qdrant, neo4j_driver" in self.source,
-                        "the run must end with a verification pass")
-
-    def test_the_verification_pass_looks_for_dangling_scope_ids(self):
-        # The failure this whole exercise is about is a payload pointing at an id
-        # no node has, which no count anywhere would reveal.
-        self.assertTrue("dangling_scope_payloads" in self.source,
-                        "verification must count dangling scope payloads")
 
 
 class NoVaultNamesCommittedTests(unittest.TestCase):

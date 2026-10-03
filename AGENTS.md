@@ -725,7 +725,18 @@ has not started.
 
 `RunTests` **drives `run()` end to end** for every one of those, because every
 other assertion about it reads the source and flipping `return 1` to `return 0`
-is invisible to that.
+is invisible to that. The dirty conditions, the ways a destination can be
+non-empty, and the remaining refusals are each one table-driven test rather than
+one test per row: they share a fixture and a single exit-code assertion, and the
+subTest label carries the same information a method name would.
+
+`MigrationScriptTests` is deliberately short for the same reason. Everything it
+once asserted by `assertIn` over the source — the refusals, the ordering, the
+access-key handoff, the dangling check — is now driven against fakes elsewhere in
+the file, and a substring assertion is strictly weaker: it pins a token, not the
+property. What is left is the three things no behavioural test can reach: the
+argparse surface, the fact that `run()` delegates its writes to a single
+testable function, and the set of credential functions the tool must never call.
 
 `move_graph` returns `RETURN count(...)` rather than `len(rows)`, so a row whose
 `MATCH` matched nothing shows as 0 instead of hiding.
