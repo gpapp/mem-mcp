@@ -1425,7 +1425,7 @@ description says so rather than implying missing data.
 
 `resolve_write_scope(client, context, user_id)` in `client_manager.py` is the
 only way `diary_save_entry` turns a caller's names into node ids. The ladder is
-**exact (case-insensitive) → declared abbreviation → evidence ladder → one LLM
+**declared abbreviation → case-insensitive exact → evidence ladder → one LLM
 approximation → `ValueError`**. Nothing creates a node.
 
 - **Creating on a near-miss was worse than no scope at all.** The old path did

@@ -820,8 +820,9 @@ async def resolve_write_scope(client: Optional[str], context: Optional[str],
     ``ValueError`` when a name was asked for and cannot be matched to something
     that already exists.
 
-    The ladder is exact, then ``plan_search_scope`` (declared abbreviation, then
-    the token/containment/fuzzy evidence ladder), then one LLM approximation.
+    The ladder is ``plan_search_scope`` (declared abbreviation first, then
+    case-insensitive exact, then the token/containment/fuzzy evidence ladder),
+    then one LLM approximation.
     **Nothing here creates a node.** A caller that handed over a near-miss name
     used to get a second ``Client`` spelled slightly differently, which is worse
     than no scope at all: both nodes then match a client filter, the counts
