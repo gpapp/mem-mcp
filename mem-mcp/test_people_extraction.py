@@ -17,10 +17,12 @@ missing MENTIONS edge that nobody was looking for.
 
 import ast
 import asyncio
+import datetime
 import json
 import os
 import re
 import sys
+import typing
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -28,6 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from chunking import normalize_text
 from matching_utils import parse_people_name_array, text_windows
 
+MCP_TOOLS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_tools.py")
 DIARY_MANAGER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "diary_manager.py")
 
 
@@ -776,6 +779,618 @@ class ReclassifyIsScopeOnlyTests(unittest.TestCase):
                          msg="the scope clear must not delete MENTIONS -- that "
                              "would destroy the evidence the fast path reads")
 
+
+
+
+def _lift_tool(node_name, namespace):
+    """Lift a tool out of mcp_tools.py.
+
+    mcp_tools cannot be imported here (no fastmcp, no httpx), so the routing
+    decision is exec'd from the real source rather than transcribed. A copied
+    version would keep passing after the shipping tool was broken, which is the
+    whole reason for lifting rather than rewriting.
+    """
+    with open(MCP_TOOLS, "r", encoding="utf-8") as handle:
+        source = handle.read()
+    tree = ast.parse(source)
+    target = next(
+        node for node in tree.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == node_name
+    )
+    exec(compile(ast.get_source_segment(source, target),
+                 "mcp_tools.py:" + node_name, "exec"), namespace)
+    return namespace[node_name]
+
+
+class _Row(dict):
+    """A Neo4j record: attribute access, because the query aliases camelCase."""
+
+    def __getattr__(self, key):
+        try:
+            return self[key]
+        except KeyError as exc:
+            raise AttributeError(key) from exc
+
+
+class _FakeCypherSession:
+    """Records the query and returns the rows the test chose.
+
+    Cypher cannot be executed here, so these tests pin the query's *shape*
+    separately from the mapping of a result row onto the returned dict. The
+    shape is where both of the documented diary bugs live.
+    """
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.queries = []
+
+    def run(self, query, **params):
+        self.queries.append((query, params))
+        return self.rows
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _FakeCypherDriver:
+    def __init__(self, rows):
+        self._session = _FakeCypherSession(rows)
+
+    def session(self):
+        return self._session
+
+
+def _list_entries_runner(rows):
+    driver = _FakeCypherDriver(rows)
+    # diary_manager does `from datetime import datetime, timezone, timedelta`,
+    # so the lifted code needs the *class*, not the module.
+    fn = _lift("db_list_diary_entries",
+               get_neo4j=lambda: driver,
+               json=json,
+               datetime=datetime.datetime,
+               timezone=datetime.timezone,
+               timedelta=datetime.timedelta,
+               Optional=typing.Optional)
+
+    def run(from_ts=None, to_ts=None):
+        return fn("alice", from_ts, to_ts)
+
+    run.driver = driver
+    run.session = driver._session
+    return run
+
+
+class ListDiaryEntriesTests(unittest.TestCase):
+    """list_diary_entries must report scope, and must report it once.
+
+    Two documented defects shaped this. Diary scope lives on the FOR_CLIENT /
+    IN_CONTEXT *edges* -- no DiaryEntry node carries a clientId property at
+    all, that key is Qdrant-only -- so a property read answers None for every
+    entry and the whole vault looks unclassified. And a chain of OPTIONAL
+    MATCHes returns the product of the rows each produces, so an entry with one
+    client and one project comes back twice unless every pattern is closed by
+    an aggregating WITH, the trailing one included.
+    """
+
+    SCOPED = [_Row({
+        "id": "e1", "timestamp": "2026-05-15T14:30:00", "name": "Handover",
+        "metadata": '{"original_file": "handover.md"}',
+        "clientName": "Deutsche Bank (DB)",
+        "contextName": "DB AI Adoption",
+    })]
+
+    def test_it_returns_one_dict_per_entry_with_the_documented_keys(self):
+        entries = _list_entries_runner(self.SCOPED)()
+        self.assertEqual(len(entries), 1)
+        entry = entries[0]
+        for key in ("id", "timestamp", "name", "original_file", "client",
+                    "context"):
+            self.assertIn(key, entry, f"{key} is documented in the tool "
+                                      "description and must be present")
+        # Names only. The ids are deliberately absent: diary_save_entry takes
+        # client/context by name, so an id here would not round-trip, and
+        # returning both invites a caller to pick the wrong one.
+        self.assertNotIn("clientId", entry)
+        self.assertNotIn("contextId", entry)
+        self.assertIsInstance(entry, dict,
+                              "the tool description documents named fields; a "
+                              "tuple makes that description unreadable")
+
+    def test_scope_comes_back_as_the_stored_spelling(self):
+        entry = _list_entries_runner(self.SCOPED)()[0]
+        self.assertEqual(entry["client"], "Deutsche Bank (DB)")
+        self.assertEqual(entry["context"], "DB AI Adoption")
+
+    def test_the_original_file_is_reported(self):
+        self.assertEqual(_list_entries_runner(self.SCOPED)()[0]["original_file"],
+                         "handover.md")
+
+    def test_the_longer_metadata_spelling_is_read_too(self):
+        row = _Row(dict(self.SCOPED[0],
+                        metadata='{"original_filename": "long-form.md"}'))
+        self.assertEqual(_list_entries_runner([row])()[0]["original_file"],
+                         "long-form.md")
+
+    def test_an_unscoped_entry_reports_null_rather_than_a_guess(self):
+        row = _Row({"id": "e2", "timestamp": "2026-05-15T10:00:00",
+                    "name": "Standup", "metadata": None,
+                    "clientName": None, "contextName": None})
+        entry = _list_entries_runner([row])()[0]
+        self.assertIsNone(entry["client"])
+        self.assertIsNone(entry["context"])
+        self.assertEqual(entry["original_file"], "")
+
+    def test_a_nameless_entry_is_labelled_rather_than_null(self):
+        row = _Row({"id": "e3", "timestamp": None, "name": None,
+                    "metadata": None, "clientName": None, "contextName": None})
+        entry = _list_entries_runner([row])()[0]
+        self.assertEqual(entry["name"], "Unnamed")
+        self.assertIsNone(entry["timestamp"])
+
+    def test_metadata_stored_as_a_map_is_not_raised_on(self):
+        row = _Row(dict(self.SCOPED[0], metadata={"original_file": "map.md"}))
+        self.assertEqual(_list_entries_runner([row])()[0]["original_file"],
+                         "map.md")
+
+    def test_the_query_reads_scope_from_the_edges_not_from_properties(self):
+        run = _list_entries_runner(self.SCOPED)
+        run()
+        query = run.session.queries[0][0]
+        self.assertIn("FOR_CLIENT", query)
+        self.assertIn("IN_CONTEXT", query)
+        # The trap this guards: a DiaryEntry has no clientId property to read,
+        # so a property read is silently None for every entry in the vault.
+        self.assertNotRegex(query, r"\bd\.clientId\b")
+        self.assertNotRegex(query, r"\bd\.contextId\b")
+
+    def test_every_optional_match_is_closed_by_an_aggregating_with(self):
+        run = _list_entries_runner(self.SCOPED)
+        run()
+        query = run.session.queries[0][0]
+
+        # Split the query at each OPTIONAL MATCH. Every segment from one match
+        # to the next (or to RETURN) must contain a `collect(` -- that is the
+        # aggregation that collapses the pattern's rows back to the entry's own.
+        # The trailing segment is the one that gets forgotten: collapsing every
+        # pattern *except* the last turns a mentions x relevant product into a
+        # single relevant multiplier, which is a bug this repo shipped once.
+        segments = re.split(r"OPTIONAL\s+MATCH", query)
+        self.assertEqual(len(segments) - 1, 2,
+                         "precondition: both scope edges are read")
+        for index, segment in enumerate(segments[1:], start=1):
+            # Only the *next* pattern or the RETURN ends the span. A WITH is
+            # what is supposed to close it, so cutting on it would skip the
+            # very collect() being looked for.
+            tail = re.split(r"\b(?:OPTIONAL\s+MATCH|RETURN)\b", segment, 1)[0]
+            self.assertIn("collect(", tail,
+                          f"OPTIONAL MATCH #{index} is not closed by an "
+                          "aggregating WITH before the next clause, so the "
+                          "rows each pattern produces multiply together")
+
+    def test_the_defaults_are_the_last_thirty_days(self):
+        run = _list_entries_runner(self.SCOPED)
+        run()
+        params = run.session.queries[0][1]
+        self.assertEqual(params["userId"], "alice")
+        self.assertTrue(params["fromTs"] < params["toTs"])
+        span = (datetime.datetime.fromisoformat(params["toTs"])
+                - datetime.datetime.fromisoformat(params["fromTs"]))
+        self.assertEqual(span.days, 30)
+
+    def test_an_explicit_range_is_passed_through(self):
+        run = _list_entries_runner(self.SCOPED)
+        run("2026-01-01T00:00:00", "2026-02-01T00:00:00")
+        params = run.session.queries[0][1]
+        self.assertEqual(params["fromTs"], "2026-01-01T00:00:00")
+        self.assertEqual(params["toTs"], "2026-02-01T00:00:00")
+
+
+class _Result(list):
+    def single(self):
+        return self[0] if self else None
+
+
+class _WriteSession:
+    """Records every statement; returns `rows` from the read."""
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.statements = []
+
+    def run(self, query, **params):
+        self.statements.append((query, params))
+        return _Result(self.rows)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _WriteDriver:
+    def __init__(self, rows):
+        self._session = _WriteSession(rows)
+
+    def session(self):
+        return self._session
+
+
+class _FakeQdrant:
+    def __init__(self, fail=False):
+        self.patches = []
+        self._fail = fail
+
+    async def set_payload(self, collection_name=None, payload=None, points=None):
+        if self._fail:
+            raise RuntimeError("qdrant is down")
+        self.patches.append({"collection": collection_name, "payload": payload,
+                             "points": list(points or [])})
+
+
+class _MetaRecorder:
+    def __init__(self):
+        self.warnings = []
+        self.debugs = []
+
+    def warning(self, message, *a, **k):
+        self.warnings.append(str(message))
+
+    def debug(self, message, *a, **k):
+        self.debugs.append(str(message))
+
+    def __getattr__(self, _name):
+        return lambda *a, **k: None
+
+
+class _Result(list):
+    def single(self):
+        return self[0] if self else None
+
+
+class _WriteSession:
+    """Records every statement; returns `rows` from the read."""
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.statements = []
+
+    def run(self, query, **params):
+        self.statements.append((query, params))
+        return _Result(self.rows)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _WriteDriver:
+    def __init__(self, rows):
+        self._session = _WriteSession(rows)
+
+    def session(self):
+        return self._session
+
+
+class _FakeQdrant:
+    def __init__(self, fail=False):
+        self.patches = []
+        self._fail = fail
+
+    async def set_payload(self, collection_name=None, payload=None, points=None):
+        if self._fail:
+            raise RuntimeError("qdrant is down")
+        self.patches.append({"collection": collection_name, "payload": payload,
+                             "points": list(points or [])})
+
+
+class _MetaRecorder:
+    def __init__(self):
+        self.warnings = []
+        self.debugs = []
+
+    def warning(self, message, *a, **k):
+        self.warnings.append(str(message))
+
+    def debug(self, message, *a, **k):
+        self.debugs.append(str(message))
+
+    def __getattr__(self, _name):
+        return lambda *a, **k: None
+
+
+class DiaryMetadataUpdateTests(unittest.TestCase):
+    """Metadata has to be changeable without resending the body.
+
+    ``db_save_diary`` writes ``SET d.content = $content`` unconditionally, so
+    there is no way to attach a filename to an entry whose body the caller
+    cannot afford to read back, embed and re-keyword. Sending an empty body is
+    not a no-op there; it is the loss. This is that other path, and the
+    properties worth pinning are the ones a caller cannot see: the merge, the
+    absence of an embed, and the chunk family.
+    """
+
+    EXISTING = {"metadata": '{"original_file": "old.md", "keywords": "epam, sap"}',
+                "timestamp": "2026-05-15T14:30:00"}
+
+    def _run(self, rows=None, qdrant=None, fail_qdrant=False):
+        rows = self.EXISTING if rows is None else rows
+        driver = _WriteDriver([rows] if rows is not False else [])
+        qdrant = qdrant if qdrant is not None else _FakeQdrant(fail=fail_qdrant)
+        published = []
+        recorder = _MetaRecorder()
+
+        async def get_qdrant():
+            return qdrant
+
+        async def publish(user_id, kind, payload):
+            published.append((user_id, kind, payload))
+
+        async def fake_targets(qdrant_arg, record_id, collection):
+            return ["e1", "e1-chunk1", "e1-chunk2"]
+
+        stub = type(sys)("client_manager")
+        stub._scope_targets = fake_targets
+        saved = sys.modules.get("client_manager")
+        sys.modules["client_manager"] = stub
+        self.addCleanup(lambda: sys.modules.__setitem__("client_manager", saved)
+                        if saved is not None
+                        else sys.modules.pop("client_manager", None))
+
+        fn = _lift("db_update_diary_metadata",
+                   get_neo4j=lambda: driver,
+                   get_qdrant=get_qdrant,
+                   publish_db_event=publish,
+                   DIARY_COLLECTION="ea_diary",
+                   json=json,
+                   logger=recorder,
+                   Optional=typing.Optional)
+        result = asyncio.run(fn("e1", "alice", {"original_file": "new.md"}))
+        return result, driver._session, qdrant, recorder, published
+
+    def test_the_new_value_wins_and_the_other_keys_survive(self):
+        result, _, _, _, _ = self._run()
+        self.assertEqual(result["original_file"], "new.md")
+        self.assertEqual(result["keywords"], "epam, sap",
+                         "sending one field must add it, not replace the rest — "
+                         "a caller that cannot see the current metadata could "
+                         "only assume a replace")
+
+    def test_the_body_is_never_written(self):
+        _, session, _, _, _ = self._run()
+        writes = [q for q, _ in session.statements if " SET " in q.upper()]
+        self.assertEqual(len(writes), 1, "precondition: one write was issued")
+        for query in writes:
+            self.assertNotIn("d.content", query,
+                             "this path exists precisely so the body is left "
+                             "alone; a SET on it would be the bug it replaces")
+            self.assertNotIn("d.name", query)
+            self.assertNotIn("d.timestamp", query)
+
+    def test_no_embedding_and_no_llm_call_are_reachable(self):
+        # The reason to have this path at all. Both are awaited inside
+        # db_save_diary/db_update_diary; a re-embed of a 40k entry is the cost
+        # this avoids, and a keyword regeneration is an LLM call to arrive at
+        # the same string.
+        _source, _tree, node, segment = _segment("db_update_diary_metadata")
+        for name in ("get_embedding", "extract_diary_keywords", "get_llm_response",
+                     "_upsert_diary_points", "_auto_link_people", "replace=True"):
+            self.assertNotIn(name, segment,
+                             f"{name} must not appear on the metadata-only "
+                             "path; the entry's text is not changing")
+
+    def test_the_whole_chunk_family_is_patched_not_one_point(self):
+        _, _, qdrant, _, _ = self._run()
+        self.assertEqual(len(qdrant.patches), 1)
+        patch = qdrant.patches[0]
+        self.assertEqual(patch["collection"], "ea_diary")
+        # Chunk 0 keeps the record id, so addressing one point by it looks right
+        # until the entry is long enough to chunk — then the other chunks keep
+        # the previous metadata.
+        self.assertEqual(patch["points"], ["e1", "e1-chunk1", "e1-chunk2"])
+        self.assertEqual(patch["payload"]["metadata"]["original_file"], "new.md")
+
+    def test_a_missing_entry_is_reported_rather_than_created(self):
+        result, session, _, _, _ = self._run(rows=False)
+        self.assertIsNone(result)
+        self.assertEqual(len(session.statements), 1,
+                         "no write may be issued for an entry that is not there")
+
+    def test_a_patch_failure_does_not_fail_the_write(self):
+        # Neo4j holds the canonical value and a stale payload is recoverable by
+        # any later reconcile pass; the reverse order would lose the edit.
+        result, session, _, recorder, _ = self._run(fail_qdrant=True)
+        self.assertEqual(result["original_file"], "new.md")
+        self.assertEqual(len(session.statements), 2, "the Neo4j write still ran")
+        self.assertTrue(recorder.warnings, "the failure must be logged, not silent")
+
+    def test_the_change_is_published(self):
+        _, _, _, _, published = self._run()
+        self.assertEqual(len(published), 1)
+        user_id, kind, payload = published[0]
+        self.assertEqual((user_id, kind), ("alice", "diary_changed"))
+        self.assertEqual(payload["id"], "e1")
+        self.assertEqual(payload["date"], "2026-05-15")
+
+    def test_metadata_stored_as_a_map_is_merged_too(self):
+        result, _, _, _, _ = self._run(
+            rows={"metadata": {"original_file": "old.md", "tags": "x"},
+                  "timestamp": "2026-05-15T14:30:00"})
+        self.assertEqual(result["original_file"], "new.md")
+        self.assertEqual(result["tags"], "x")
+
+    def test_a_non_dict_is_refused(self):
+        with self.assertRaises(ValueError):
+            asyncio.run(self._lifted()("e1", "alice", "not-a-dict"))
+
+    def _lifted(self):
+        driver = _WriteDriver([self.EXISTING])
+
+        async def get_qdrant():
+            return None
+
+        async def publish(*a, **k):
+            return None
+
+        return _lift("db_update_diary_metadata",
+                     get_neo4j=lambda: driver,
+                     get_qdrant=get_qdrant,
+                     publish_db_event=publish,
+                     DIARY_COLLECTION="ea_diary",
+                     json=json,
+                     logger=_MetaRecorder(),
+                     Optional=typing.Optional)
+
+
+class DiarySaveEntryRoutingTests(unittest.TestCase):
+    """An empty body must not become an empty entry.
+
+    `diary_save_entry` routes on one condition — an `entryId` with a blank
+    `content` means "metadata only" — and both mistakes available there are
+    destructive. Routing that condition the other way runs `db_save_diary`,
+    whose `SET d.content = $content` replaces the body: the caller asked to
+    attach a filename and destroyed a 40k transcription, with nothing in the
+    return value to say so. And an empty body with no `entryId` must be
+    refused rather than stored, since it is indistinguishable from a mistake.
+    """
+
+    def _lift(self, **stubs):
+        recorded = {"saved": [], "metadata": [], "deleted": []}
+
+        async def db_update_diary_metadata(entry_id, user, metadata):
+            recorded["metadata"].append((entry_id, user, metadata))
+            return {**metadata, "keywords": "epam"}
+
+        async def db_delete_diary(entry_id, user):
+            recorded["deleted"].append((entry_id, user))
+
+        async def db_save_diary(content, user, timestamp, name, **kw):
+            recorded["saved"].append({"content": content, "user": user,
+                                      "timestamp": timestamp, "name": name, **kw})
+            return timestamp
+
+        async def db_resolve_client(name, user):
+            return {"id": "c1"}
+
+        async def db_resolve_context(name, client_id, user):
+            return {"id": "x1"}
+
+        async def db_create_client(name, user):
+            return "c-new"
+
+        async def db_create_context(name, client_id, user):
+            return "x-new"
+
+        mem = type(sys)("mem")
+        mem._current_user_value = "alice"
+        mem._diary_id = lambda user, ts: f"id-{ts}"
+        mem.db_update_diary_metadata = db_update_diary_metadata
+        mem.db_delete_diary = db_delete_diary
+        mem.db_save_diary = db_save_diary
+        mem.db_resolve_client = db_resolve_client
+        mem.db_resolve_context = db_resolve_context
+        mem.db_create_client = db_create_client
+        mem.db_create_context = db_create_context
+        for name, value in stubs.items():
+            setattr(mem, name, value)
+
+        fn = _lift_tool("diary_save_entry", {
+            "mem": mem,
+            "_current_user": lambda: "alice",
+            "Optional": typing.Optional,
+        })
+        return fn, recorded
+
+    def test_an_empty_body_with_an_id_updates_metadata_alone(self):
+        fn, recorded = self._lift()
+        result = asyncio.run(fn(content="", entryId="e1",
+                                metadata={"original_file": "meeting.md"}))
+        self.assertEqual(recorded["metadata"], [("e1", "alice",
+                                                 {"original_file": "meeting.md"})])
+        self.assertEqual(recorded["saved"], [],
+                         "db_save_diary SETs d.content unconditionally; taking "
+                         "that path here would wipe the entry's body")
+        self.assertEqual(recorded["deleted"], [],
+                         "the old entry must not be deleted either — this is "
+                         "an update, not a move")
+        self.assertTrue(result["metadataOnly"])
+        self.assertEqual(result["id"], "e1")
+
+    def test_the_merged_metadata_comes_back_so_the_caller_can_see_it(self):
+        fn, _ = self._lift()
+        result = asyncio.run(fn(content="", entryId="e1",
+                                metadata={"original_file": "meeting.md"}))
+        self.assertEqual(result["metadata"]["keywords"], "epam",
+                         "the merged value is returned; without it the caller "
+                         "cannot tell what the entry now carries")
+
+    def test_whitespace_counts_as_empty(self):
+        fn, recorded = self._lift()
+        asyncio.run(fn(content="   \n\t ", entryId="e1", metadata={"a": 1}))
+        self.assertEqual(len(recorded["metadata"]), 1)
+        self.assertEqual(recorded["saved"], [])
+
+    def test_an_empty_body_with_no_id_is_refused(self):
+        fn, recorded = self._lift()
+        with self.assertRaises(ValueError) as ctx:
+            asyncio.run(fn(content="", name="X", timestamp="2026-05-15T14:30:00",
+                          metadata={"a": 1}))
+        self.assertIn("entryId", str(ctx.exception),
+                      "the message has to name the way out, not just the refusal")
+        self.assertEqual(recorded["saved"], [])
+
+    def test_an_empty_body_and_an_id_but_no_metadata_is_refused(self):
+        # Otherwise the condition silently means "do nothing" and returns
+        # success, which reads as an update that happened.
+        fn, recorded = self._lift()
+        with self.assertRaises(ValueError):
+            asyncio.run(fn(content="", entryId="e1"))
+        self.assertEqual(recorded["metadata"], [])
+        self.assertEqual(recorded["saved"], [])
+
+    def test_an_unknown_id_is_reported_rather_than_created(self):
+        async def missing(entry_id, user, metadata):
+            return None
+
+        fn, recorded = self._lift(db_update_diary_metadata=missing)
+        with self.assertRaises(ValueError):
+            asyncio.run(fn(content="", entryId="nope", metadata={"a": 1}))
+        self.assertEqual(recorded["saved"], [])
+
+    def test_a_real_body_still_takes_the_save_path(self):
+        fn, recorded = self._lift()
+        result = asyncio.run(fn(content="the body", name="Handover",
+                                timestamp="2026-05-15T14:30:00"))
+        self.assertEqual(len(recorded["saved"]), 1)
+        self.assertEqual(recorded["saved"][0]["content"], "the body")
+        self.assertEqual(recorded["metadata"], [])
+        self.assertFalse(result.get("metadataOnly"))
+        self.assertEqual(result["timestamp"], "2026-05-15T14:30:00")
+
+    def test_a_new_entry_still_requires_a_name_and_a_timestamp(self):
+        fn, recorded = self._lift()
+        for label, kwargs in (("no name", {"timestamp": "2026-05-15T14:30:00"}),
+                              ("no timestamp", {"name": "X"}),
+                              ("neither", {})):
+            with self.subTest(label):
+                with self.assertRaises(ValueError):
+                    asyncio.run(fn(content="body", **kwargs))
+        self.assertEqual(recorded["saved"], [])
+
+    def test_metadata_alongside_a_real_body_is_still_written(self):
+        fn, recorded = self._lift()
+        asyncio.run(fn(content="body", name="X", timestamp="2026-05-15T14:30:00",
+                       metadata={"original_file": "a.md"}))
+        self.assertEqual(recorded["saved"][0]["metadata"],
+                         {"original_file": "a.md"})
+        self.assertEqual(recorded["metadata"], [],
+                         "a non-empty body is a save; db_save_diary writes the "
+                         "metadata itself")
 
 if __name__ == "__main__":
     unittest.main()

@@ -264,7 +264,10 @@ class ClientManagerCallSiteTests(unittest.TestCase):
             self.assertIn("points", keywords,
                           "the id-list form names its points")
             payload = keywords.get("payload")
-            self.assertFalse(isinstance(payload, (ast.List, ast.comprehension)),
+            # ast.ListComp, not ast.comprehension: the latter is the loop
+            # clause *inside* a comprehension, so naming it here let the one
+            # form this guard exists to catch sail through.
+            self.assertFalse(isinstance(payload, (ast.List, ast.ListComp)),
                              "a list payload is the per-point form: a list of "
                              "PointStruct, each needing a vector this call "
                              "would have to invent")
@@ -1822,8 +1825,10 @@ class MoveCredentialsTests(unittest.TestCase):
     def test_the_credential_store_is_open_before_it_is_touched(self):
         self.move_credentials(SOURCE_USER, TARGET_USER)
         self.assertEqual([c[0] for c in self.calls][0], "init_db",
-                         "init_db must come first: transfer_psks would "
-                         "otherwise write to a database that does not exist")
+                         "move_credentials opens the store itself rather than "
+                         "relying on its callees to do it -- either call also "
+                         "calls init_db(), so order is a convention here, not "
+                         "a correctness requirement")
 
     def test_perform_move_hands_it_the_source_and_the_destination(self):
         # The other half of the same seam: the arguments. Revoking the

@@ -325,24 +325,73 @@ async def find_patterns():
 
 @mcp.tool()
 @monitor_mcp_tool("diary_save_entry", context_provider=_current_user)
-async def diary_save_entry(content: str, name: str, timestamp: str, entryId: Optional[str] = None, metadata: Optional[dict] = None, linked_facts: Optional[list[str]] = None, client: Optional[str] = None, context: Optional[str] = None):
-    """Save or update a diary entry.
+async def diary_save_entry(content: str, name: Optional[str] = None, timestamp: Optional[str] = None, entryId: Optional[str] = None, metadata: Optional[dict] = None, linked_facts: Optional[list[str]] = None, client: Optional[str] = None, context: Optional[str] = None):
+    """Save a new diary entry, or update an existing one.
 
-    - name: Concise name for the entry.
+    - content: The entry body. **Pass an empty string with `entryId` to change
+      metadata only** — see "Updating an entry you cannot resend" below.
+    - name: Concise name for the entry. Required for a new entry.
     - timestamp: ISO-8601 datetime string including time (e.g. '2026-05-15T14:30:00').
-      **Must be aligned to 15-minute boundaries** (:00, :15, :30, :45) — round the original time to the nearest 15 minutes.
+      Required for a new entry. **Must be aligned to 15-minute boundaries**
+      (:00, :15, :30, :45) — round the original time to the nearest 15 minutes.
       Passing the same timestamp a second time **replaces** the existing entry.
-    - entryId: Optional ID of an existing entry. Use this if you are changing the 
+    - entryId: Optional ID of an existing entry. Use this if you are changing the
       timestamp of an existing entry to ensure the old one is moved/deleted.
-    - metadata: Optional dict with extra fields (e.g. {"original_file": "path/to/file.txt"}).
+      Together with an empty `content` it selects the metadata-only path.
+    - metadata: Optional dict of extra fields, e.g. {"original_file": "path/to/file.txt"}.
+      Keys are **merged** into whatever the entry already carries, so sending one
+      field does not drop the others. Send `metadata` alone to update an entry
+      you cannot resend.
     - linked_facts: Optional list of fact IDs to link via MENTIONS. Pass [] to clear existing links.
       When omitted, existing MENTIONS relationships are preserved.
     - client: Optional client name to scope the entry (creates Client node if new).
     - context: Optional context name within the client (creates Context node if new).
-    - Returns a dict with 'id' (use this to update or delete the entry later) and 
-      'timestamp' (the ISO string that keys the entry).
+    - Returns a dict with 'id' (use this to update or delete the entry later),
+      'timestamp' (the ISO string that keys the entry), and 'metadataOnly': True
+      when nothing but metadata was written.
+
+    ## Updating an entry you cannot resend
+
+    A long transcription is expensive to re-send: it has to be read back, split,
+    embedded and re-keyworded. To attach or correct metadata on an entry you do
+    not have the body of, pass the existing entry's `id` as `entryId` with
+    `content` empty:
+
+        diary_save_entry(content="", entryId="...", metadata={"original_file": "meeting.md"})
+
+    The body, name, timestamp and keywords are left exactly as they are, and no
+    embedding or LLM call is made. **Do not do this for a new entry** — an empty
+    body with no `entryId` is rejected rather than stored as a blank entry.
     """
     user = _current_user()
+    metadata_only = entryId is not None and not (content or "").strip()
+    if metadata_only:
+        if not metadata:
+            raise ValueError(
+                "An empty content with an entryId only updates metadata, so "
+                "metadata is required — pass the fields to change, or pass the "
+                "full content to rewrite the entry."
+            )
+        merged = await mem.db_update_diary_metadata(entryId, user, metadata)
+        if merged is None:
+            raise ValueError(f"No diary entry with id {entryId!r}.")
+        return {"id": entryId, "timestamp": None, "metadataOnly": True,
+                "metadata": merged}
+
+    if not name or not timestamp:
+        raise ValueError(
+            "name and timestamp are required for a new entry; to change "
+            "metadata on an existing one pass its id as entryId with an empty "
+            "content instead."
+        )
+    if not (content or "").strip():
+        # The blank-body case only means "metadata only" when there is an entry
+        # to apply it to. Without one it is a mistake, and storing it would
+        # create an empty entry that looks like a real one in every list.
+        raise ValueError(
+            "content is required for a new entry. To change metadata on an "
+            "existing entry, pass its id as entryId with an empty content."
+        )
     if entryId:
         new_id = mem._diary_id(user, timestamp)
         if entryId != new_id:
@@ -391,10 +440,30 @@ async def diary_search_entries(query: str, limit: int = 3, top_p: float = 0.4, c
 @monitor_mcp_tool("list_diary_entries", context_provider=_current_user)
 async def list_diary_entries(fromTs: Optional[str] = None, toTs: Optional[str] = None):
     """
-    List diary entry names with timestamps within a time range, also provides original file information.
+    List diary entries within a time range, newest first, with their client and
+    project assignment and the file they were imported from.
+
     - fromTs: Start timestamp (ISO-8601). Defaults to 30 days ago.
     - toTs: End timestamp (ISO-8601). Defaults to now.
-    Returns a list of (id, timestamp, name, original_file) tuples.
+
+    Returns a list of objects, one per entry:
+
+      id            entry id — pass this to diary_save_entry or diary_delete_entry
+      timestamp     ISO-8601 string that keys the entry
+      name          entry name, or "Unnamed"
+      original_file the metadata field recording where the entry came from
+                    (e.g. "meeting.md"); "" when the entry has none
+      client        name of the client this entry is filed under, or null
+      context       name of the project within the client, or null
+
+    `client` and `context` are the stored spellings, so they can be handed
+    straight back to diary_save_entry to re-file an entry. Both are null for an
+    entry that was never classified or that was classified as generic — which
+    is a real outcome, not missing data.
+
+    Use it to see what is already there before saving: an entry created from the
+    same file twice will not collide, because entries are keyed by timestamp
+    rather than by name or filename.
     """
     return mem.db_list_diary_entries(_current_user(), fromTs, toTs)
 

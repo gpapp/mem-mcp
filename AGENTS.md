@@ -1366,6 +1366,61 @@ otherwise move the pickers below the fold. Both
 diary columns are bounded (`max-height` + `overflow-y: auto`) below 900px, which is why
 `StackedPaneVisibilityTests` carries two diary selectors rather than one.
 
+### Diary Metadata Without the Body
+
+`diary_save_entry` takes `entryId` with an **empty `content`** as "change
+metadata only", and `list_diary_entries` now reports each entry's client,
+project and `original_file` so a caller can see what is already there first.
+
+**The empty-body case exists because the alternative destroys data.**
+`db_save_diary` writes `SET d.content = $content` unconditionally, so a caller
+wanting to attach a filename to a 40k transcription it cannot afford to
+resend had no way to do it — and sending an empty body was not a no-op, it was
+the loss. `db_update_diary_metadata` is that other path: it merges the keys,
+writes `d.metadata`, and patches the Qdrant payload across the chunk family.
+**No embed, no chunk rebuild, no keyword regeneration** — keywords derive from
+the name and the body, and neither is changing, so the extractor would spend an
+LLM call to arrive at the same string.
+
+- **Keys are merged, not replaced.** `original_file` arriving on an entry that
+  also carries `keywords` must add a field, not silently drop the other. A
+  replace is what a caller who cannot see the current metadata would have to
+  assume. The Qdrant payload is patched with `set_payload` over
+  `_scope_targets()`, not re-upserted — the same reasoning as
+  `db_set_diary_scope`: chunk 0 keeps the record id, so addressing one point by
+  it looks right until the entry is long enough to chunk.
+- **A Qdrant patch failure is logged and swallowed, not fatal.** Neo4j holds the
+  canonical value and a stale payload is recoverable by any reconcile pass; the
+  reverse order loses the edit.
+- **Both refusals matter and both are destructive if dropped.** An empty body
+  with no `entryId` is refused rather than stored — it is indistinguishable
+  from a mistake, and storing it creates an empty entry that looks real in
+  every list. An `entryId` with empty content and **no** `metadata` is refused
+  too, because otherwise the condition silently means "do nothing" and returns
+  success, which reads as an update that happened.
+- **The routing is one condition and both of its mistakes are data loss.** It
+  turns the wrong way and `db_save_diary` runs and wipes the body; it always
+  turns and a real save never happens. `DiarySaveEntryRoutingTests` drives it
+  with fakes and pins both directions, plus that the old entry is *not* deleted
+  (this is an update, not a move).
+
+**`list_diary_entries` reads scope from the edges, and every `OPTIONAL MATCH`
+is closed by an aggregating `WITH`.** Both are the documented diary bugs, and
+both fail in the same direction — silently. No `DiaryEntry` node carries a
+`clientId` property at all (that key is Qdrant-only), so a property read
+answers `None` for every entry and the whole vault looks unclassified. And a
+chain of `OPTIONAL MATCH`es returns the *product* of the rows each produces, so
+an entry with one client and one project comes back twice unless each pattern
+is aggregated — **including the trailing one**, which is the one that gets
+forgotten: collapsing every pattern except the last turns a mentions × relevant
+product into a single relevant multiplier.
+
+Names are returned, not ids. `diary_save_entry` takes `client`/`context` by
+name, so an id here would not round-trip, and returning both invites a caller to
+pick the wrong one. `null` means unclassified **or classified as generic**,
+which is a real outcome — the classifier's nulls are permanent, so the tool
+description says so rather than implying missing data.
+
 ### Diary Search
 Search diary entries from the calendar rail.
 

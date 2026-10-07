@@ -903,6 +903,82 @@ async def db_update_diary(entry_id: str, user_id: str, content: Optional[str] = 
     return True
 
 
+async def db_update_diary_metadata(entry_id: str, user_id: str,
+                                   metadata: dict, *, merge: bool = True) -> Optional[dict]:
+    """Change a diary entry's metadata without touching its body.
+
+    Returns the entry's metadata after the change, or None if no such entry.
+
+    **This exists because the alternative destroys data.** ``db_save_diary``
+    writes ``SET d.content = $content`` unconditionally, so a caller who wants
+    to attach a filename to an entry it cannot resend — a 40k transcription it
+    would have to read back, embed and pay for again — has no way to do it
+    without either sending the whole body or wiping it. Sending an empty body
+    is not a no-op here; it is the loss.
+
+    So the metadata write is its own path: no embed, no chunk rebuild, no
+    keyword regeneration. Keywords are derived from the name and the body, and
+    neither is changing, so re-running the extractor would spend an LLM call to
+    arrive at the same string.
+
+    **Keys are merged, not replaced** (unless ``merge=False``). ``original_file``
+    arriving on an entry that also carries ``keywords`` should add a field, not
+    silently drop the other one — and a replace is exactly what a caller who
+    cannot see the current metadata would have to assume.
+
+    The Qdrant payload is patched in place across the whole chunk family rather
+    than re-upserted, for the same reason ``db_set_diary_scope`` patches: a long
+    entry is several points, and addressing one by its record id updates chunk 0
+    and leaves the rest describing the previous state. A patch failure is logged
+    and swallowed rather than failing the write — Neo4j holds the canonical
+    value, and a stale payload is recoverable by any later reconcile pass.
+    """
+    neo4j_driver = get_neo4j()
+    if not neo4j_driver:
+        raise RuntimeError("Neo4j not connected.")
+    if not isinstance(metadata, dict):
+        raise ValueError("metadata must be a dict of field names to values")
+
+    with neo4j_driver.session() as s:
+        row = s.run(
+            """
+            MATCH (d:DiaryEntry {id: $id, userId: $userId})
+            RETURN d.metadata AS metadata, d.timestamp AS timestamp
+            """,
+            id=entry_id, userId=user_id,
+        ).single()
+        if not row:
+            return None
+        raw_meta = row.get("metadata")
+        existing = json.loads(raw_meta) if isinstance(raw_meta, str) else (raw_meta or {})
+        merged = {**existing, **metadata} if merge else dict(metadata)
+        s.run(
+            "MATCH (d:DiaryEntry {id: $id, userId: $userId}) SET d.metadata = $metadata",
+            id=entry_id, userId=user_id, metadata=json.dumps(merged),
+        )
+
+    try:
+        qdrant = await get_qdrant()
+        if qdrant:
+            from client_manager import _scope_targets
+            family = await _scope_targets(qdrant, entry_id, DIARY_COLLECTION)
+            if family:
+                await qdrant.set_payload(
+                    collection_name=DIARY_COLLECTION,
+                    payload={"metadata": merged},
+                    points=family,
+                )
+    except Exception as exc:  # noqa: BLE001 - a payload patch must not fail the write
+        logger.warning(f"db_update_diary_metadata: Qdrant payload patch failed for {entry_id}: {exc}")
+
+    await publish_db_event(
+        user_id, "diary_changed",
+        {"action": "update", "id": entry_id,
+         "date": str(row["timestamp"])[:10] if row.get("timestamp") else None},
+    )
+    return merged
+
+
 async def db_link_diary_mention(entry_id: str, fact_id: str, user_id: str):
     """Create a MENTIONS relationship from a diary entry to a fact."""
     neo4j_driver = get_neo4j()
@@ -1008,8 +1084,25 @@ async def db_delete_diary(entry_id: str, user_id: str) -> bool:
 
 
 def db_list_diary_entries(user_id: str, from_ts: Optional[str] = None, to_ts: Optional[str] = None) -> list:
-    """Return diary entries as (id, timestamp, name) tuples within optional time range.
-    Defaults to last month if timestamps not provided."""
+    """Return diary entries within an optional time range, newest first.
+
+    One dict per entry — ``id``, ``timestamp``, ``name``, ``original_file``,
+    ``client`` and ``context``. Defaults to the last 30 days when no range is
+    given.
+
+    **Scope is read from the ``FOR_CLIENT`` / ``IN_CONTEXT`` edges, never from
+    properties.** No ``DiaryEntry`` node carries a ``clientId`` property at all;
+    that key exists only in the Qdrant payload, so a property read here would
+    answer None for every entry and scope would look unassigned across the
+    whole vault.
+
+    **Each ``OPTIONAL MATCH`` is closed by an aggregating ``WITH``, the trailing
+    one included.** A pattern on a relationship multiplies the rows it
+    produces, so two of them return their product, and ``collect`` inside
+    ``RETURN`` deduplicates values within a row without ever merging rows. An
+    entry with one client and one project still comes back twice; five
+    auto-linked participants made it five times.
+    """
     neo4j_driver = get_neo4j()
     if not neo4j_driver:
         raise RuntimeError("Neo4j not connected.")
@@ -1025,19 +1118,37 @@ def db_list_diary_entries(user_id: str, from_ts: Optional[str] = None, to_ts: Op
             """
             MATCH (d:DiaryEntry {userId: $userId})
             WHERE d.timestamp >= $fromTs AND d.timestamp <= $toTs
-            RETURN d.id as id, d.timestamp as timestamp, d.name as name, d.metadata as metadata
+            OPTIONAL MATCH (d)-[:FOR_CLIENT]->(c:Client)
+            WITH d, head(collect(c.name)) AS clientName
+            OPTIONAL MATCH (d)-[:IN_CONTEXT]->(cx:Context)
+            WITH d, clientName, head(collect(cx.name)) AS contextName
+            RETURN d.id as id, d.timestamp as timestamp, d.name as name,
+                   d.metadata as metadata, clientName, contextName
             ORDER BY d.timestamp DESC
             """,
             userId=user_id,
             fromTs=from_clause,
             toTs=to_clause,
         )
-        return [(
-            r["id"],
-            str(r["timestamp"]) if r["timestamp"] else None,
-            r.get("name") or "Unnamed",
-            json.loads(r.get("metadata") or "{}").get("original_file", ""),
-        ) for r in result]
+        entries = []
+        for r in result:
+            raw_meta = r.get("metadata")
+            # Stored as a JSON string, but a node written by hand or by another
+            # tool may hold a map; both are accepted rather than raising on the
+            # second.
+            meta = json.loads(raw_meta) if isinstance(raw_meta, str) else (raw_meta or {})
+            entries.append({
+                "id": r["id"],
+                "timestamp": str(r["timestamp"]) if r["timestamp"] else None,
+                "name": r.get("name") or "Unnamed",
+                # Both spellings are read: `original_file` is what
+                # diary_save_entry documents, and a caller that wrote the longer
+                # form should still see its own value back.
+                "original_file": meta.get("original_file") or meta.get("original_filename") or "",
+                "client": r.get("clientName") or None,
+                "context": r.get("contextName") or None,
+            })
+        return entries
 
 
 def db_list_diary(user_id: str) -> list:
