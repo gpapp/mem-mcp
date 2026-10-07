@@ -2,12 +2,15 @@
 client_manager.py – Client and Context management for multi-client memory separation.
 """
 
+import asyncio
 import hashlib
+import json
+import re
 import time
 from datetime import datetime, timezone
 from typing import Optional
 
-from common import get_neo4j, get_qdrant, logger, COLLECTION_NAME, DIARY_COLLECTION
+from common import get_neo4j, get_qdrant, get_llm_response, logger, COLLECTION_NAME, DIARY_COLLECTION
 from matching_utils import plan_search_scope
 from scoped_ids import client_id_for, context_id_for
 
@@ -741,6 +744,161 @@ def db_resolve_context(name: str, client_id: str, user_id: str) -> Optional[dict
             ctx = record["ctx"]
             return {"id": ctx["id"], "name": ctx["name"]}
     return None
+
+
+_SCOPE_MATCH_SYSTEM = (
+    "You map a caller's client and project onto names that already exist in "
+    "their vault. Answer with a single JSON object.\n"
+    "- Pick a client ONLY from the given list, spelled exactly as stored.\n"
+    "- Pick a project ONLY from that client's own project list, spelled "
+    "exactly as stored. A project listed under another client is not this "
+    "client's project, so never return it.\n"
+    "- Use null when nothing in the list is what the caller meant. A null is a "
+    "real, correct answer; a wrong guess is not recoverable, so never fill the "
+    "field to avoid leaving it empty.\n"
+    "Reply with only the JSON object, no commentary."
+)
+
+
+def _scope_match_payload(requested: str, candidates: list) -> str:
+    return json.dumps({
+        "requested": requested,
+        "candidates": candidates,
+    })
+
+
+async def _llm_pick_scope_name(requested: str, candidates: list, label: str) -> Optional[str]:
+    """Ask the LLM which existing name `requested` means, or nothing.
+
+    The model may only echo a name from `candidates`. An answer outside that
+    set is discarded rather than written, because the whole point of routing
+    through the model here is to pick among names that already exist — a name it
+    invents is a new reference, which is what this path exists to avoid.
+    """
+    if not requested or not candidates:
+        return None
+    lowered = {name.lower(): name for name in candidates if name}
+    if requested.strip().lower() in lowered:
+        return lowered[requested.strip().lower()]
+    try:
+        raw = await get_llm_response(
+            _scope_match_payload(requested, candidates),
+            system=_SCOPE_MATCH_SYSTEM,
+        )
+    except Exception as exc:  # noqa: BLE001 - a failed guess must not become a new node
+        logger.warning(f"scope match for {label} {requested!r} failed: {exc}")
+        return None
+    if not raw:
+        logger.warning(f"scope match for {label} {requested!r} returned nothing")
+        return None
+    match = re.search(r"\{.*\}", raw, re.S)
+    if not match:
+        logger.warning(f"scope match for {label} {requested!r} was not JSON: {raw[:200]!r}")
+        return None
+    try:
+        answer = json.loads(match.group(0)).get("match")
+    except ValueError:
+        logger.warning(f"scope match for {label} {requested!r} was unparseable JSON")
+        return None
+    if not answer:
+        return None
+    picked = lowered.get(str(answer).strip().lower())
+    if not picked:
+        logger.warning(
+            f"scope match for {label} {requested!r} returned {answer!r}, which "
+            f"is not an existing name — treating it as no match"
+        )
+    return picked
+
+
+async def resolve_write_scope(client: Optional[str], context: Optional[str],
+                              user_id: str) -> dict:
+    """Resolve the client/project a write was asked for onto existing nodes.
+
+    Returns ``{"clientId", "clientName", "contextId", "contextName"}`` — the
+    stored spellings and ids, with ``None`` for anything not asked for. Raises
+    ``ValueError`` when a name was asked for and cannot be matched to something
+    that already exists.
+
+    The ladder is exact, then ``plan_search_scope`` (declared abbreviation, then
+    the token/containment/fuzzy evidence ladder), then one LLM approximation.
+    **Nothing here creates a node.** A caller that handed over a near-miss name
+    used to get a second ``Client`` spelled slightly differently, which is worse
+    than no scope at all: both nodes then match a client filter, the counts
+    disagree, and neither is the node the other queries resolve to. A duplicate
+    is also unrecoverable by the reclassify — the classifier only ever picks
+    from existing names, so the near-miss copy is never the one it links to and
+    never gets a second look.
+
+    The context is resolved **only against the resolved client's own projects**,
+    and the LLM is given only that list. A project belonging to a different
+    client is not this client's project, and pairing the two is the cross-client
+    guess the classifier is already documented as making.
+
+    A Context that matches nothing is an **error, not a new project**, which is
+    the deliberate half of the rule: the vault's clients and projects are curated
+    (they are created from the UI), so an unmatched name means the caller
+    mistyped or named something that is not in this vault, and inventing a node
+    for it would put the entry somewhere no later query will ever look.
+    """
+    client = (client or "").strip() or None
+    context = (context or "").strip() or None
+    resolved = {"clientId": None, "clientName": None,
+                "contextId": None, "contextName": None}
+    if not client and not context:
+        return resolved
+
+    clients = await asyncio.to_thread(db_list_clients, user_id)
+    client_name, context_name, _c_ev, _x_ev = plan_search_scope(client, context, clients)
+
+    if client and not client_name:
+        client_name = await _llm_pick_scope_name(
+            client, [c["name"] for c in clients if c.get("name")], "client")
+    if context and not context_name and client_name:
+        own = next((c for c in clients if c.get("name") == client_name), None)
+        context_name = await _llm_pick_scope_name(
+            context, [x["name"] for x in (own or {}).get("contexts", []) if x.get("name")],
+            "context")
+
+    if client and not client_name:
+        known = ", ".join(sorted(c["name"] for c in clients if c.get("name"))) or "none"
+        raise ValueError(
+            f"client {client!r} does not match any existing client ({known}). "
+            f"Clients are not created by this tool — create the client first, "
+            f"then file the entry under it."
+        )
+    if context and not context_name:
+        if not client_name:
+            raise ValueError(
+                f"context {context!r} was given with no client to match it "
+                f"against. Pass client as well, so the project can be resolved."
+            )
+        known = ", ".join(sorted(
+            x["name"] for c in clients if c.get("name") == client_name
+            for x in (c.get("contexts") or []) if x.get("name"))) or "none"
+        raise ValueError(
+            f"context {context!r} is not a project of client {client_name!r} "
+            f"({known}). Projects are not created by this tool — use an "
+            f"existing project, or file the entry without a project."
+        )
+
+    if client_name:
+        row = next(c for c in clients if c.get("name") == client_name)
+        resolved["clientId"], resolved["clientName"] = row.get("id"), client_name
+    if context_name:
+        # The owning client is found by the project's presence, not by
+        # `client_name`: a context given on its own resolves against *every*
+        # project's list, so there may be no client to name. Knowing which
+        # client owns it is what lets the entry be found by a client filter.
+        owner = next(
+            (c for c in clients
+             if any(x.get("name") == context_name for x in (c.get("contexts") or []))),
+            None)
+        row = next(x for x in (owner.get("contexts") or []) if x.get("name") == context_name)
+        resolved["contextId"], resolved["contextName"] = row.get("id"), context_name
+        if not resolved["clientId"]:
+            resolved["clientId"], resolved["clientName"] = owner.get("id"), owner.get("name")
+    return resolved
 
 
 async def link_fact_to_client(fact_id: str, client_id: str, user_id: str):

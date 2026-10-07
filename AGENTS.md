@@ -1421,6 +1421,42 @@ pick the wrong one. `null` means unclassified **or classified as generic**,
 which is a real outcome — the classifier's nulls are permanent, so the tool
 description says so rather than implying missing data.
 
+### Write-Scope Matching
+
+`resolve_write_scope(client, context, user_id)` in `client_manager.py` is the
+only way `diary_save_entry` turns a caller's names into node ids. The ladder is
+**exact (case-insensitive) → declared abbreviation → evidence ladder → one LLM
+approximation → `ValueError`**. Nothing creates a node.
+
+- **Creating on a near-miss was worse than no scope at all.** The old path did
+  `db_resolve_client(...) or await db_create_client(...)`, so `"EPAM Systems"`
+  minted a second `Client`. Both nodes then match a client filter, the counts
+  disagree, and neither is the node other queries resolve to — and the
+  duplicate is *permanent*: the classifier only ever picks from existing
+  names, so the near-miss copy never gets linked and never gets a second look.
+- **The context is resolved only against the resolved client's own projects.**
+  The LLM is handed just that list, so `PPC` (EPAM's project) can never be
+  paired with `SAP SE` — the cross-client guess the classifier is already
+  documented as making. A context given *without* a client resolves against
+  every project's list and reports the owning client back, because an entry
+  filed under a project no client filter can find is not scoped.
+- **An LLM answer outside the candidate list is discarded**, not written. The
+  model's whole job here is to pick among names that already exist; an invented
+  name is a new reference, which is what this path exists to avoid. A failed or
+  empty model answer is a `ValueError`, never a silent fallback to creation.
+- **A match failure is an error naming the candidates**, so the caller learns
+  what it could have meant rather than discovering an unscoped entry later.
+  The tool response returns the **stored** spellings in `client`/`context`, so
+  a caller can see which node the entry actually landed under.
+- **The tool source must not reference `db_create_client` / `db_create_context`
+  / `db_resolve_client` / `db_resolve_context` at all.** `DiarySaveScopeRoutingTests`
+  pins both halves: `WriteScopeResolutionTests` proves the resolver behaves
+  (lifted with `ast.get_source_segment` — `client_manager.py` imports `common`,
+  so it cannot be imported here), and the routing tests prove the *tool calls
+  it*, because a helper tested in isolation is not a test of its call site —
+  the create-on-miss path lived one line away from a perfectly green resolver
+  test.
+
 ### Diary Search
 Search diary entries from the calendar rail.
 

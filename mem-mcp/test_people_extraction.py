@@ -24,11 +24,12 @@ import re
 import sys
 import typing
 import unittest
+from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from chunking import normalize_text
-from matching_utils import parse_people_name_array, text_windows
+from matching_utils import parse_people_name_array, plan_search_scope, text_windows
 
 MCP_TOOLS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_tools.py")
 DIARY_MANAGER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "diary_manager.py")
@@ -1391,6 +1392,309 @@ class DiarySaveEntryRoutingTests(unittest.TestCase):
         self.assertEqual(recorded["metadata"], [],
                          "a non-empty body is a save; db_save_diary writes the "
                          "metadata itself")
+
+
+def _lift_scope_resolver(**stubs):
+    """Lift the write-scope resolver out of client_manager.py.
+
+    client_manager cannot be imported here (it pulls in ``common``, which needs
+    the DB drivers), so the resolver is exec'd from the real source. A copied
+    version would keep passing after the shipping function was broken, which is
+    the whole reason for lifting rather than transcribing.
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "client_manager.py")
+    with open(path, "r", encoding="utf-8") as handle:
+        source = handle.read()
+    tree = ast.parse(source)
+    namespace = {
+        "asyncio": asyncio, "json": json, "re": re, "Optional": Optional,
+        "plan_search_scope": plan_search_scope,
+        "get_llm_response": stubs.pop("get_llm_response", None),
+        "logger": stubs.pop("logger", None),
+        "db_list_clients": stubs.pop("db_list_clients", None),
+    }
+    for name, value in stubs.items():
+        namespace[name] = value
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "_SCOPE_MATCH_SYSTEM"
+                for t in node.targets):
+            exec(compile(ast.get_source_segment(source, node),
+                         "client_manager.py:_SCOPE_MATCH_SYSTEM", "exec"), namespace)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in (
+                "_scope_match_payload", "_llm_pick_scope_name", "resolve_write_scope"):
+            exec(compile(ast.get_source_segment(source, node),
+                         "client_manager.py:" + node.name, "exec"), namespace)
+    return namespace
+
+
+class _ScopeClients:
+    """The ``db_list_clients`` shape, with a call counter."""
+
+    def __init__(self, clients):
+        self.clients = clients
+        self.calls = 0
+
+    def __call__(self, user_id):
+        self.calls += 1
+        return self.clients
+
+
+class _FakeLLM:
+    """Answers the scope-match prompt with a canned ``{"match": ...}``."""
+
+    def __init__(self, answer, fail=False):
+        self.answer = answer
+        self.fail = fail
+        self.prompts = []
+
+    async def __call__(self, prompt, system="", model="", **kw):
+        self.prompts.append((prompt, system))
+        if self.fail:
+            raise RuntimeError("ollama is down")
+        return json.dumps({"match": self.answer})
+
+
+class WriteScopeResolutionTests(unittest.TestCase):
+    """A write must land on a node that already exists.
+
+    The old path resolved a near-miss by *creating* it, which is worse than no
+    scope at all: the vault then holds two clients that both match a client
+    filter, the counts disagree, and neither is the node the other queries
+    resolve to. A duplicate is also unrecoverable by the reclassify, because the
+    classifier only ever picks from existing names — so the near-miss copy is
+    never the one it links to and never gets a second look.
+    """
+
+    CLIENTS = [
+        {"id": "c-epam", "name": "EPAM", "contexts": [
+            {"id": "x-ppc", "name": "PPC"}, {"id": "x-mbag", "name": "MBAG"}]},
+        {"id": "c-db", "name": "Deutsche Bank (DB)", "contexts": [
+            {"id": "x-ai", "name": "DB AI Adoption"}]},
+        {"id": "c-sap", "name": "SAP SE", "contexts": []},
+    ]
+
+    def _resolver(self, clients=None, llm=None):
+        clients = _ScopeClients(clients if clients is not None else self.CLIENTS)
+        llm = llm or _FakeLLM(None)
+        ns = _lift_scope_resolver(db_list_clients=clients, get_llm_response=llm,
+                                   logger=_NullLogger())
+        return ns["resolve_write_scope"], clients, llm
+
+    def test_an_exact_match_needs_no_llm(self):
+        resolve, clients, llm = self._resolver()
+        out = asyncio.run(resolve("EPAM", "PPC", "alice"))
+        self.assertEqual(out["clientId"], "c-epam")
+        self.assertEqual(out["clientName"], "EPAM")
+        self.assertEqual(out["contextId"], "x-ppc")
+        self.assertEqual(out["contextName"], "PPC")
+        self.assertEqual(llm.prompts, [], "an exact match must not cost an LLM call")
+
+    def test_case_and_whitespace_do_not_matter(self):
+        resolve, _, llm = self._resolver()
+        out = asyncio.run(resolve("  epam ", "ppc", "alice"))
+        self.assertEqual(out["clientId"], "c-epam")
+        self.assertEqual(out["contextId"], "x-ppc")
+        self.assertEqual(llm.prompts, [])
+
+    def test_a_declared_abbreviation_resolves_without_the_llm(self):
+        resolve, _, llm = self._resolver()
+        out = asyncio.run(resolve("DB", "DB AI Adoption", "alice"))
+        self.assertEqual(out["clientName"], "Deutsche Bank (DB)")
+        self.assertEqual(out["contextName"], "DB AI Adoption")
+        self.assertEqual(llm.prompts, [])
+
+    def test_a_near_miss_is_approximated_to_an_existing_name(self):
+        llm = _FakeLLM("EPAM")
+        resolve, _, _ = self._resolver(llm=llm)
+        out = asyncio.run(resolve("EPAM Systems", None, "alice"))
+        self.assertEqual(out["clientName"], "EPAM")
+        self.assertEqual(out["clientId"], "c-epam")
+
+    def test_the_llm_may_only_echo_a_name_that_already_exists(self):
+        # The whole point of routing through the model is to pick among existing
+        # names. An answer outside the set is a new reference, so it is
+        # discarded rather than written.
+        llm = _FakeLLM("EPAM Systems")
+        resolve, _, _ = self._resolver(llm=llm)
+        with self.assertRaises(ValueError) as ctx:
+            asyncio.run(resolve("EPAM Systems", None, "alice"))
+        self.assertIn("EPAM", str(ctx.exception))
+
+    def test_an_unmatched_name_is_an_error_naming_the_candidates(self):
+        llm = _FakeLLM(None)
+        resolve, _, _ = self._resolver(llm=llm)
+        with self.assertRaises(ValueError) as ctx:
+            asyncio.run(resolve("Acme Corp", None, "alice"))
+        message = str(ctx.exception)
+        self.assertIn("Acme Corp", message)
+        self.assertIn("EPAM", message, "the error must say what the caller could have meant")
+
+    def test_a_failing_llm_is_an_error_not_a_new_node(self):
+        llm = _FakeLLM(None, fail=True)
+        resolve, _, _ = self._resolver(llm=llm)
+        with self.assertRaises(ValueError):
+            asyncio.run(resolve("EPAM Systems", None, "alice"))
+
+    def test_a_project_of_another_client_is_not_this_clients_project(self):
+        # SAP SE has no projects, so "PPC" is not offered to the LLM at all —
+        # it is EPAM's project, and pairing it with SAP is the cross-client
+        # guess the classifier is already documented as making.
+        resolve, _, llm = self._resolver()
+        with self.assertRaises(ValueError) as ctx:
+            asyncio.run(resolve("SAP SE", "PPC", "alice"))
+        self.assertIn("SAP SE", str(ctx.exception))
+        self.assertEqual(llm.prompts, [],
+                         "an empty candidate list must not reach the model")
+
+    def test_the_llm_is_only_offered_that_clients_own_projects(self):
+        llm = _FakeLLM("PPC")
+        resolve, _, _ = self._resolver(llm=llm)
+        out = asyncio.run(resolve("EPAM", "DB AI Adoption", "alice"))
+        self.assertEqual(out["contextName"], "PPC")
+        prompt = llm.prompts[0][0]
+        payload = json.loads(prompt)
+        self.assertEqual(payload["candidates"], ["PPC", "MBAG"],
+                         "a project of another client must not be offered as a candidate")
+
+    def test_a_context_given_alone_reports_the_client_it_belongs_to(self):
+        # plan_search_scope falls back to every project when no client was asked
+        # for, so the owning client has to be recovered from the project's
+        # presence — otherwise the entry is filed under a project no client
+        # filter will ever find.
+        resolve, _, llm = self._resolver()
+        out = asyncio.run(resolve(None, "PPC", "alice"))
+        self.assertEqual(out["contextId"], "x-ppc")
+        self.assertEqual(out["contextName"], "PPC")
+        self.assertEqual(out["clientId"], "c-epam")
+        self.assertEqual(out["clientName"], "EPAM")
+        self.assertEqual(llm.prompts, [])
+
+    def test_a_context_given_alone_and_unmatched_is_an_error(self):
+        llm = _FakeLLM(None)
+        resolve, _, _ = self._resolver(llm=llm)
+        with self.assertRaises(ValueError) as ctx:
+            asyncio.run(resolve(None, "GRC", "alice"))
+        self.assertIn("client", str(ctx.exception).lower())
+
+    def test_nothing_asked_for_costs_nothing(self):
+        resolve, clients, llm = self._resolver()
+        out = asyncio.run(resolve(None, None, "alice"))
+        self.assertEqual(out, {"clientId": None, "clientName": None,
+                               "contextId": None, "contextName": None})
+        self.assertEqual(clients.calls, 0)
+        self.assertEqual(llm.prompts, [])
+
+    def test_no_create_is_reachable_from_the_resolver(self):
+        # The property that matters is not "the happy path works" but "there is
+        # no path at all to a new node". Asserted on the lifted source, because
+        # a call to db_create_client would be invisible in the return value.
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "client_manager.py")
+        with open(path, "r", encoding="utf-8") as handle:
+            source = handle.read()
+        tree = ast.parse(source)
+        node = next(n for n in tree.body
+                    if isinstance(n, ast.AsyncFunctionDef) and n.name == "resolve_write_scope")
+        segment = ast.get_source_segment(source, node)
+        self.assertNotIn("db_create_client", segment)
+        self.assertNotIn("db_create_context", segment)
+        self.assertNotIn("db_resolve_client", segment,
+                         "the resolver reads the client list once and picks from it")
+
+
+class _NullLogger:
+    def __getattr__(self, _name):
+        return lambda *a, **kw: None
+
+
+class DiarySaveScopeRoutingTests(unittest.TestCase):
+    """The tool must go through the resolver, and only the resolver.
+
+    `WriteScopeResolutionTests` proves the resolver behaves; this class proves
+    the *tool calls it*. A helper tested in isolation is not a test of its call
+    site — the old create-on-miss path lived one line away from a perfectly
+    green resolver test.
+    """
+
+    def _lift(self, scope_result=None, scope_error=None, creates=None):
+        recorded = {"saved": [], "scope": [], "creates": creates if creates is not None else []}
+
+        async def resolve_write_scope(client, context, user):
+            recorded["scope"].append((client, context, user))
+            if scope_error is not None:
+                raise ValueError(scope_error)
+            return scope_result or {"clientId": None, "clientName": None,
+                                    "contextId": None, "contextName": None}
+
+        async def db_save_diary(content, user, timestamp, name, **kw):
+            recorded["saved"].append({"client_id": kw.get("client_id"),
+                                      "context_id": kw.get("context_id")})
+            return timestamp
+
+        mem = type(sys)("mem")
+        mem._current_user_value = "alice"
+        mem._diary_id = lambda user, ts: f"id-{ts}"
+        mem.resolve_write_scope = resolve_write_scope
+        mem.db_save_diary = db_save_diary
+        for name in ("db_create_client", "db_create_context",
+                     "db_resolve_client", "db_resolve_context"):
+            async def never(*a, _n=name, **k):
+                recorded["creates"].append(_n)
+                return "should-not-run"
+            setattr(mem, name, never)
+
+        fn = _lift_tool("diary_save_entry", {"mem": mem, "_current_user": lambda: "alice",
+                                             "Optional": typing.Optional})
+        return fn, recorded
+
+    def test_the_tool_resolves_through_the_resolver_not_by_creating(self):
+        fn, recorded = self._lift(
+            scope_result={"clientId": "c-epam", "clientName": "EPAM",
+                          "contextId": "x-ppc", "contextName": "PPC"})
+        result = asyncio.run(fn(content="body", name="X",
+                                timestamp="2026-05-15T14:30:00",
+                                client="EPAM", context="PPC"))
+        self.assertEqual(recorded["scope"], [("EPAM", "PPC", "alice")])
+        self.assertEqual(recorded["saved"][0]["client_id"], "c-epam")
+        self.assertEqual(recorded["saved"][0]["context_id"], "x-ppc")
+        self.assertEqual(recorded["creates"], [],
+                         "no create-on-miss function may be reachable from the tool")
+        self.assertEqual(result["client"], "EPAM",
+                         "the response reports the stored spelling so the caller "
+                         "can see what the entry was filed under")
+        self.assertEqual(result["context"], "PPC")
+
+    def test_a_match_failure_aborts_before_anything_is_written(self):
+        fn, recorded = self._lift(scope_error="client 'Acme' does not match")
+        with self.assertRaises(ValueError) as ctx:
+            asyncio.run(fn(content="body", name="X",
+                           timestamp="2026-05-15T14:30:00", client="Acme"))
+        self.assertIn("Acme", str(ctx.exception))
+        self.assertEqual(recorded["saved"], [],
+                         "the entry must not be written when scope matching failed")
+        self.assertEqual(recorded["creates"], [])
+
+    def test_no_scope_asked_for_skips_the_resolver_entirely(self):
+        fn, recorded = self._lift()
+        result = asyncio.run(fn(content="body", name="X",
+                                timestamp="2026-05-15T14:30:00"))
+        self.assertEqual(recorded["scope"], [])
+        self.assertEqual(recorded["saved"][0]["client_id"], None)
+        self.assertIsNone(result["client"])
+        self.assertIsNone(result["context"])
+
+    def test_the_tool_source_no_longer_creates_scope_nodes(self):
+        with open(MCP_TOOLS, "r", encoding="utf-8") as handle:
+            source = handle.read()
+        tree = ast.parse(source)
+        node = next(n for n in tree.body
+                    if isinstance(n, ast.AsyncFunctionDef) and n.name == "diary_save_entry")
+        segment = ast.get_source_segment(source, node)
+        for call in ("db_create_client", "db_create_context",
+                     "db_resolve_client", "db_resolve_context"):
+            self.assertNotIn(call, segment,
+                             f"{call} is the create/lookup path replaced by resolve_write_scope")
+        self.assertIn("resolve_write_scope", segment)
 
 if __name__ == "__main__":
     unittest.main()

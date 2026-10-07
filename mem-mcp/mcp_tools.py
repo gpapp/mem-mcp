@@ -344,11 +344,28 @@ async def diary_save_entry(content: str, name: Optional[str] = None, timestamp: 
       you cannot resend.
     - linked_facts: Optional list of fact IDs to link via MENTIONS. Pass [] to clear existing links.
       When omitted, existing MENTIONS relationships are preserved.
-    - client: Optional client name to scope the entry (creates Client node if new).
-    - context: Optional context name within the client (creates Context node if new).
+    - client: Optional client name to scope the entry. Must match an existing
+      client; see "Matching a client or project" below.
+    - context: Optional project name within the client. Must be a project of
+      *that* client; a project belonging to a different client is rejected.
     - Returns a dict with 'id' (use this to update or delete the entry later),
-      'timestamp' (the ISO string that keys the entry), and 'metadataOnly': True
-      when nothing but metadata was written.
+      'timestamp' (the ISO string that keys the entry), the resolved 'client'
+      and 'context' as the **stored** spellings (null when not asked for or not
+      matched), and 'metadataOnly': True when nothing but metadata was written.
+
+    ## Matching a client or project
+
+    `client` and `context` are matched against what already exists — an exact
+    match first, then the stored names' own abbreviations, then an LLM asked to
+    pick the closest existing name. **Nothing is created.** If a name matches
+    nothing, the call fails with an error naming the candidates instead of
+    quietly adding a near-duplicate node that no later query resolves to.
+
+    So `"DB"` finds `Deutsche Bank (DB)` through its declared abbreviation, and
+    a near-miss is approximated rather than duplicated — but `"Acme Corp"` in a
+    vault with no such client is an error, not a new client. The `client` and
+    `context` returned in the response are the spellings actually used, so
+    check them if the entry landed somewhere you did not expect.
 
     ## Updating an entry you cannot resend
 
@@ -398,15 +415,15 @@ async def diary_save_entry(content: str, name: Optional[str] = None, timestamp: 
             await mem.db_delete_diary(entryId, user)
     client_id = None
     context_id = None
-    if client:
-        c = mem.db_resolve_client(client, user)
-        client_id = c["id"] if c else await mem.db_create_client(client, user)
-    if context and client_id:
-        cx = mem.db_resolve_context(context, client_id, user)
-        context_id = cx["id"] if cx else await mem.db_create_context(context, client_id, user)
+    if client or context:
+        scope = await mem.resolve_write_scope(client, context, user)
+        client_id = scope["clientId"]
+        context_id = scope["contextId"]
     entry_ts = await mem.db_save_diary(content, user, timestamp, name, metadata=metadata, linked_facts=linked_facts, client_id=client_id, context_id=context_id)
     entry_id = mem._diary_id(user, entry_ts)
-    return {"id": entry_id, "timestamp": entry_ts}
+    return {"id": entry_id, "timestamp": entry_ts,
+            "client": scope["clientName"] if client or context else None,
+            "context": scope["contextName"] if client or context else None}
 
 @mcp.tool()
 @monitor_mcp_tool("diary_search_entries", context_provider=_current_user)
