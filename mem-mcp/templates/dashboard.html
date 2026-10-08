@@ -542,8 +542,14 @@
        so whatever this says is exactly what the user has to pan around in. */
     .graph-sidebar { width: 200px; flex-shrink: 0; border-right: 1px solid var(--border); padding-right: 1rem; }
     .graph-main { flex: 1; display: flex; flex-direction: column; gap: .5rem; min-width: 0; }
-    #graph-container { flex: 1; height: 70vh; min-height: 500px;
-      border: 1px solid var(--border); border-radius: 8px; background: #fff; }
+    /* `flex: 0 0 auto`, not `flex: 1`: the height has to be definite. With a
+       zero flex basis in an auto-height column the container's height comes
+       from its content -- the vis canvas -- and vis's own autoResize
+       observer then writes `Math.round(clientHeight * devicePixelRatio)`
+       back into that height every pass, which grows the page without bound
+       on a HiDPI display. `overflow: hidden` is the belt to that braces. */
+    #graph-container { flex: 0 0 auto; height: 70vh; min-height: 500px;
+      overflow: hidden; border: 1px solid var(--border); border-radius: 8px; background: #fff; }
 
     /* ── Mobile ──────────────────────────────────────────────────────────
        Three page layouts are built as fixed-width columns: memories is
@@ -5311,17 +5317,32 @@ function nodeInCategory(n) {
       showContextMenu(nativeEvent, params.nodes[0]);
     });
 
-    // vis.js sizes its canvas once, at construction. Below 900px the layout
-    // stacks, so the canvas keeps the width it was built at and gets clipped
-    // instead of reflowing -- the graph is present but half off-screen.
+    // Refit on a width change, and nothing else.
     //
-    // Width only, and at most once per distinct width. Reacting to height here
-    // is what grew the canvas without bound: `.graph-main` is a flex item in a
-    // row whose height is `auto`, so `#graph-container`'s height is derived from
-    // the canvas inside it. redraw()/fit() resize that canvas, the container
-    // changes, this observer fires again, and each pass was a little larger than
-    // the last. The stacking case that motivates the observer changes the
-    // *width* as well, so gating on width keeps the fix and drops the loop.
+    // vis sizes its own canvas: `autoResize` defaults to true, so vis installs
+    // its own ResizeObserver on its frame and calls `setSize()` for us. What it
+    // does not do is re-frame the graph, so after the layout stacks below 900px
+    // -- where the canvas changes width and the graph ends up off the visible
+    // area -- this is what brings it back.
+    //
+    // `network.redraw()` used to sit here and it is NOT a repaint. vis's
+    // `redraw()` is `emit("setSize")` followed by a draw: `setSize()` rewrites
+    // the canvas backing store from `clientWidth`/`clientHeight`, and sets the
+    // frame's height to `100%` -- a percentage, which resolves to `auto` when
+    // the container's height is content-derived. It is: `.graph-main` is a flex
+    // item in a row with no height of its own, so `#graph-container` takes its
+    // height from the canvas inside it. So each pass read `clientHeight`, wrote it
+    // back as `Math.round(clientHeight * devicePixelRatio)`, and fed the result
+    // straight into the next pass. On a 1x display that is a fixed point and
+    // nothing is visible; on a HiDPI one it is a ~1.25x growth per pass, so the
+    // canvas -- and the page holding it -- grew without bound, which is the
+    // 'the page is resized constantly' report. Calling a resize-observing
+    // handler that resizes is the loop, whichever axis it resizes.
+    //
+    // Width only, and at most once per distinct width, for the same reason:
+    // `ResizeObserver` delivers an entry for the change the handler itself
+    // caused. The stacking case that motivates the observer changes the
+    // *width*, so the width gate keeps the feature and drops the loop.
     if (typeof ResizeObserver !== 'undefined') {
       let lastWidth = container.clientWidth;
       graphResizeObserver = new ResizeObserver(function () {
@@ -5329,7 +5350,6 @@ function nodeInCategory(n) {
         const width = container.clientWidth;
         if (width === lastWidth) return;
         lastWidth = width;
-        network.redraw();
         network.fit({ animation: false });
       });
       graphResizeObserver.observe(container);
@@ -5340,7 +5360,6 @@ function nodeInCategory(n) {
         const width = container.clientWidth;
         if (width === lastWidth) return;
         lastWidth = width;
-        network.redraw();
         network.fit({ animation: false });
       });
     }

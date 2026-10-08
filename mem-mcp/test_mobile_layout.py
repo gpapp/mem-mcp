@@ -50,6 +50,32 @@ def _media_block(width):
     return CSS[start:i - 1]
 
 
+def _base_css():
+    """The stylesheet with every @media block removed.
+
+    `_declarations(CSS)` includes the media blocks, so a declaration that
+    appears in both the desktop rule and a media query is indistinguishable
+    from one that is desktop-only. A test that re-injects a defect into the
+    desktop rule needs the desktop rules alone, or the mobile copy satisfies
+    the assertion and the guard reports green on the bug.
+    """
+    out = CSS
+    while True:
+        m = re.search(r"@media[^{]*\{", out)
+        if not m:
+            return out
+        start = m.end()
+        depth = 1
+        i = start
+        while depth:
+            if out[i] == "{":
+                depth += 1
+            elif out[i] == "}":
+                depth -= 1
+            i += 1
+        out = out[:m.start()] + out[i:]
+
+
 def _declarations(block):
     """selector -> concatenated declarations, for every rule in a block.
 
@@ -921,6 +947,50 @@ class DiaryFillsThePageTests(unittest.TestCase):
         )
 
 
+
+class GraphHeightIsDefiniteTests(unittest.TestCase):
+    """The graph container's height must not be derived from its content.
+
+    "The page is resized constantly" was a feedback loop with three edges, and
+    this is the one that remains once the JS is right. vis-network's
+    `autoResize` defaults to true, so vis installs its own ResizeObserver on
+    its frame and calls `Canvas.setSize()` on every size change. `setSize()`
+    writes the canvas backing store from `clientWidth`/`clientHeight` and sets
+    the frame's height to `100%` -- a percentage, which resolves to `auto`
+    when the container's height is content-derived. It is, when the container
+    is a zero-basis flex item in an auto-height column: `flex: 1` is
+    `flex-basis: 0%`, so the container's height comes from the canvas inside
+    it, and each pass reads `clientHeight` and writes it back as
+    `Math.round(clientHeight * devicePixelRatio)`. At 1x that is a fixed point
+    and the bug is invisible; on a HiDPI display it is a ~1.25x growth per
+    pass, forever.
+
+    The mobile rule already states the height (`flex: 0 0 auto; height: 62vh`)
+    and does not loop. The desktop rule is the one that did.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.base = _declarations(_base_css())
+
+    def test_the_desktop_container_is_not_a_zero_flex_basis(self):
+        _assert_declares(
+            self, self.base, "#graph-container", "flex: 0 0 auto",
+            "flex:1 is a zero basis in an auto-height column, which makes the "
+            "container's height content-derived -- and the content is the vis "
+            "canvas, which is what grows without bound")
+
+    def test_the_desktop_container_states_its_height(self):
+        _assert_declares(
+            self, self.base, "#graph-container", "height: 70vh",
+            "a definite height is what lets the frame's `height: 100%` resolve "
+            "to a real pixel value instead of falling back to the canvas")
+
+    def test_the_desktop_container_cannot_spill(self):
+        _assert_declares(
+            self, self.base, "#graph-container", "overflow: hidden",
+            "the belt to the braces: even if a future change makes the height "
+            "content-derived again, the canvas clips instead of growing the page")
 class GraphRenderLoopTests(unittest.TestCase):
     """A resize handler that resizes what it observes is a loop, not a handler.
 
@@ -938,6 +1008,13 @@ class GraphRenderLoopTests(unittest.TestCase):
       exists is the mobile block stacking the layout, which changes the *width*
       of a canvas vis sized once at construction. Gating on width keeps that
       case and removes the feedback edge.
+    - **The observer called `network.redraw()`, which is not a repaint.**
+      In vis-network `redraw()` is `emit("setSize")` plus a draw, and
+      `setSize()` rewrites the canvas backing store from the box's own
+      `clientWidth`/`clientHeight` -- so the handler read the container and
+      wrote back into it, which is the same loop on the axis the width gate
+      does not cover. It grew the page by `devicePixelRatio` per pass, so it
+      was invisible at 1x and unbounded on a HiDPI display.
     - **Each load left its observer and its network behind.** Six call sites
       reach `loadGraph()`, it never destroyed what was there, and the observer
       reads the *global* `network` — so an observer from load 1 was refitting
@@ -1003,6 +1080,47 @@ class GraphRenderLoopTests(unittest.TestCase):
                       msg="the no-ResizeObserver fallback refits on every event "
                           "with no dedupe, which is the same loop")
 
+    def _fallback_body(self):
+        """The `window.resize` branch, sliced the same way as the observer.
+
+        Same shape, same loop -- and the first version of this file let a fix in
+        one branch satisfy a check on the other, which is why the existing
+        dedupe test re-slices it inline. Reuse the slice rather than duplicating
+        it, so a third resize path is one edit away from being covered.
+        """
+        start = SOURCE.index("window.addEventListener('resize'")
+        return SOURCE[start:SOURCE.index("\n  function ", start)]
+
+    def test_the_handler_never_asks_vis_to_resize_the_canvas(self):
+        """`network.redraw()` inside a resize observer *is* the loop.
+
+        In vis-network `Network.redraw()` is `emit("setSize")` followed by a
+        draw, and `Canvas.setSize()` rewrites the canvas backing store from
+        `clientWidth`/`clientHeight` and sets the frame's height to `100%` -- a
+        percentage, which resolves to `auto` when the container's height is
+        content-derived. It is (see the class docstring), so each pass read
+        `clientHeight`, wrote it back as `Math.round(clientHeight *
+        devicePixelRatio)`, and handed the result to the next pass. At 1x that
+        is a fixed point and the bug is invisible; on a HiDPI display it is a
+        ~1.25x growth per pass, which is the "the page is resized constantly"
+        report.
+
+        The width gate cannot catch this -- the loop is not gated on width, it is
+        gated on *the callback running at all*. `autoResize` defaults to true,
+        so vis already resizes the canvas with an observer of its own; all this
+        handler owes is the refit.
+        """
+        for body, where in ((self.observer, "ResizeObserver callback"),
+                            (self._fallback_body(), "window resize fallback")):
+            self.assertNotIn("redraw", body,
+                             msg=f"the {where} calls network.redraw(), which in "
+                                 f"vis-network re-derives the canvas size from the "
+                                 f"very box this handler observes -- that is the "
+                                 f"feedback edge, not a repaint")
+            self.assertIn("network.fit(", body,
+                          msg=f"the {where} must still refit: autoResize defaults "
+                              f"to true and vis sizes its own canvas, so the refit "
+                              f"is the only thing left that needs doing here")
     def test_every_load_tears_down_the_previous_graph_first(self):
         """`loadGraph` is not the only entry point that builds a network."""
         self.assertIn("destroyNetwork()", self.load,
