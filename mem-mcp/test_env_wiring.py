@@ -58,11 +58,11 @@ def _reachable():
 
 
 TEMPLATES = os.path.join(_HERE, "templates")
-# Every key get_gui() builds: _get_auth_context()'s four, plus the two it adds.
+# Every key get_gui() builds: _get_auth_context()'s four, plus the three it adds.
 DASHBOARD_CTX = {
     "AUTH_USER": "u", "AUTH_PASS": "p", "AUTH_BASE64": "dTpw",
     "MCP_URL": "/mem-mcp/mcp", "BASE_URL": "/mem-mcp",
-    "MERGE_MAX_CLUSTER": 12,
+    "MERGE_MAX_CLUSTER": 12, "SESSION_MAX_AGE_DAYS": 30, "IS_ADMIN": True,
 }
 # `{{ NAME }}` where NAME is a bare identifier. Anything else between the
 # doubled braces is an EXPRESSION, and Jinja parses those in comments too.
@@ -111,6 +111,25 @@ class DashboardRenderTests(unittest.TestCase):
         self.assertNotIn("{{MERGE_MAX_CLUSTER}}", out,
                          msg="MERGE_MAX_CLUSTER reached the page unsubstituted")
 
+
+    def test_the_service_tab_is_rendered_only_for_admin(self):
+        """The tab and its page are omitted entirely for a non-admin.
+
+        Shown-and-refused would advertise the option to someone who cannot use
+        it; the API guard is the real boundary, but the UI must not render
+        controls that always 403.
+        """
+        try:
+            from jinja2 import Environment, FileSystemLoader
+        except ImportError:
+            self.skipTest("jinja2 not installed")
+        env = Environment(loader=FileSystemLoader(TEMPLATES))
+        admin = env.get_template("dashboard.html").render(**{**DASHBOARD_CTX, "IS_ADMIN": True})
+        non_admin = env.get_template("dashboard.html").render(**{**DASHBOARD_CTX, "IS_ADMIN": False})
+        self.assertIn('id="page-service"', admin)
+        self.assertIn('data-tab="service"', admin)
+        self.assertNotIn('id="page-service"', non_admin)
+        self.assertNotIn('data-tab="service"', non_admin)
     def test_no_doubled_braces_holding_an_expression(self):
         """Dependency-free guard, so it runs even without jinja2.
 

@@ -956,6 +956,7 @@ class MergeDraftEndpointTests(unittest.TestCase):
             "MERGE_DRAFT_MIN_NUM_PREDICT": self.MIN_NUM_PREDICT,
             "MERGE_PROMPT_CHARS_PER_TOKEN": self.CHARS_PER_TOKEN,
             "_require_user": lambda request: "test-user",
+            "_require_admin": lambda request: "test-user",
             "_service_unavailable": lambda exc: exc,
         }
         # The route decorator comes with the lifted source and refers to the
@@ -1029,8 +1030,8 @@ class MergeDraftEndpointTests(unittest.TestCase):
         self.assertEqual(result["mergedText"], "formatted")
 
 
-class DedupUnderSetupTests(unittest.TestCase):
-    """Deduplicate moved from the top-level tab rail into the Setup page.
+class DedupUnderServiceTests(unittest.TestCase):
+    """Deduplicate lives on the admin-only Service page.
 
     Two failure modes, both silent. A leftover `switchTab('deduplicate')`
     dereferences a page div that no longer exists, and because that runs
@@ -1051,21 +1052,21 @@ class DedupUnderSetupTests(unittest.TestCase):
         self.assertNotIn("switchTab('deduplicate')", self.html,
                          msg="a tab button or link still points at the removed page")
 
-    def test_the_dedup_controls_live_inside_the_setup_page(self):
-        """Containment, not adjacency — being near Setup is not being in it."""
-        start = self.html.index('<div id="page-setup"')
+    def test_the_dedup_controls_live_inside_the_service_page(self):
+        """Containment, not adjacency — being near Service is not being in it."""
+        start = self.html.index('<div id="page-service"')
         depth, end = 0, None
         for match in re.finditer(r"<div\b|</div>", self.html[start:]):
             depth += 1 if match.group(0) != "</div>" else -1
             if depth == 0:
                 end = start + match.end()
                 break
-        self.assertIsNotNone(end, msg="could not find the end of the setup page")
-        setup = self.html[start:end]
+        self.assertIsNotNone(end, msg="could not find the end of the service page")
+        service = self.html[start:end]
         for control in ("dedup-max-cluster", "dedup-threshold", "dedup-category",
                         "dedup-scan-btn", "dedup-status", "dedup-clusters"):
-            self.assertIn(control, setup,
-                          msg=f"{control} is not inside the Setup page")
+            self.assertIn(control, service,
+                          msg=f"{control} is not inside the Service page")
 
     def test_a_stale_persisted_tab_cannot_kill_init(self):
         """The tab name outlives the tab, in localStorage, across deploys.

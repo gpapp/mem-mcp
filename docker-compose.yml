@@ -135,6 +135,8 @@ services:
       # status probe must never be what makes anything else slow.
       - MEM_STATUS_POLL_SECONDS=${MEM_STATUS_POLL_SECONDS:-10}
       - MEM_STATUS_HTTP_TIMEOUT=${MEM_STATUS_HTTP_TIMEOUT:-8}
+      # Empty default: no Service tab until an operator names the admin account.
+      - MEM_ADMIN_USER=${MEM_ADMIN_USER:-}
 
       # Merge-draft budget. The only LLM call whose prompt is uncapped: it
       # json.dumps the full text of every selected record, so it is sized

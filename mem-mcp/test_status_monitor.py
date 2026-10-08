@@ -554,6 +554,7 @@ class UnloadEndpointTests(unittest.TestCase):
             "status_monitor": sm,
             "_status_snapshot": _status_snapshot,
             "_require_user": lambda request: "test-user",
+            "_require_admin": lambda request: "test-user",
             "_service_unavailable": lambda exc: self._HTTPException(503, str(exc)),
         }
         func.decorator_list = []

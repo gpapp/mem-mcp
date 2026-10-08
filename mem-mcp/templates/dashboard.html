@@ -705,6 +705,12 @@
   <button class="tab-btn" data-tab="clients" onclick="switchTab('clients')">🏢 Clients</button>
   <button class="tab-btn" data-tab="projects" onclick="switchTab('projects')">📁 Projects</button>
   <button class="tab-btn" data-tab="setup" onclick="switchTab('setup')">🔌 Setup</button>
+  {# Loaded models, backup/restore, reclassify and dedup act on the whole
+     vault or the whole server rather than on one account, so the tab is
+     omitted entirely for a non-admin rather than shown and refused. #}
+  {% if IS_ADMIN %}
+  <button class="tab-btn" data-tab="service" onclick="switchTab('service')">⚙️ Service</button>
+  {% endif %}
   <div class="cf-bar">
     <div class="cf-wrap" id="cf-wrap">
       <button class="cf-btn" id="cf-btn" onclick="_cfToggle(event)">All clients</button>
@@ -1082,6 +1088,17 @@ npm install @modelcontextprotocol/sdk</code></pre>
       </ol>
     </div>
 
+  </div>
+</div>
+{% if IS_ADMIN %}
+<div id="page-service" class="page">
+  <div class="card">
+    <h2 style="margin-top:0;">⚙️ Service</h2>
+    <p>Operations that affect the whole vault or the whole server rather
+       than your own records: the models resident on the GPU, backups and
+       restores, scope reclassification and deduplication. This tab exists
+       only for the account named in <code>MEM_ADMIN_USER</code>.</p>
+
     <div style="margin-top: 2.5rem; padding-top: 1.5rem; border-top: 1px solid var(--border);">
       <h3 style="margin-top:0;">🧠 Loaded models</h3>
       <p style="font-size: 0.9rem; color: var(--muted); margin-bottom: 1rem;">
@@ -1156,6 +1173,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     </div>
   </div>
 </div>
+{% endif %}
 
 <div id="toast"></div>
 
@@ -1353,7 +1371,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     loadDiary();
     loadWhoami();
     loadClients();   // populate clientListCache + clientActiveMap for the filter dropdown
-    loadSavepoints();  // once on initial load; deduped against switchTab('setup')
+    if (document.getElementById('page-service')) loadSavepoints();  // admin only; deduped against switchTab('service')
     loadPSKs();  // same deal as loadSavepoints
     initSSE();
     initStatusStream();
@@ -1717,7 +1735,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
 
   function switchTab(tab) {
     // A tab name persisted in localStorage can outlive the tab itself — the
-    // Deduplicate page moved under Setup, so anyone who left it open has
+    // Deduplicate page moved off the rail (now under Service), so anyone who left it open has
     // 'deduplicate' saved here. Dereferencing a page div that no longer exists
     // would throw and take init() down with it, so unknown tabs fall back.
     const page = document.getElementById('page-' + tab);
@@ -1738,12 +1756,17 @@ npm install @modelcontextprotocol/sdk</code></pre>
     if (tab === 'clients') loadClients();
     if (tab === 'projects') { loadClients(); loadProjects(); }
     if (tab === 'setup') {
-      loadReclassifyStatus();
-      loadSavepoints();
       loadPSKs();
-      if (!duplicateClusters.length) renderDuplicateEmptyState();
     }
+    if (tab === 'service') loadServiceData();
     saveSessionState();
+  }
+
+  async function loadServiceData() {
+    loadReclassifyStatus();
+    loadSavepoints();
+    if (!duplicateClusters.length) renderDuplicateEmptyState();
+    api.get('status').then(renderServerStatus).catch(() => {});
   }
 
   async function loadWhoami() {

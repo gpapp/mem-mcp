@@ -497,6 +497,28 @@ def _require_user(request: Request) -> str:
     return user
 
 
+def _require_admin(request: Request) -> str:
+    """The authenticated user, but only if they are the configured admin.
+
+    The Service tab's operations are not per-user. A restore overwrites the
+    whole vault, a reclassify rewrites every client assignment, a backup
+    snapshots both collections and the graph, and an unload evicts a model
+    from a GPU other users are paying a cold load for. Gating those on "whoever
+    is logged in" would make them reachable by any account, so they require the
+    one name in `MEM_ADMIN_USER` -- and when that is unset, by nobody.
+    """
+    user = _require_user(request)
+    if not mem.is_admin_user(user):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "That operation is limited to the administrator. "
+                "Set MEM_ADMIN_USER to the account that may run it."
+            ),
+        )
+    return user
+
+
 def _service_unavailable(exc: Exception) -> HTTPException:
     """Log a RuntimeError that is about to become a 503, and build the response.
 
@@ -591,7 +613,7 @@ async def api_find_duplicates(
         if not 0.0 <= threshold <= 1.0:
             raise HTTPException(status_code=400, detail="threshold must be between 0 and 1")
         return await mem.db_find_duplicates(
-            _require_user(request), category.strip() or "People", limit, threshold, max_cluster
+            _require_admin(request), category.strip() or "People", limit, threshold, max_cluster
         )
     except HTTPException:
         raise
@@ -603,7 +625,7 @@ async def api_find_duplicates(
 async def api_merge_duplicates(request: Request, body: MemoryMerge):
     """Merge a manually reviewed duplicate cluster."""
     try:
-        user_id = _require_user(request)
+        user_id = _require_admin(request)
         master_id, duplicate_ids = await execute_merge(
             body.masterId,
             body.duplicateIds,
@@ -624,7 +646,7 @@ async def api_merge_duplicates(request: Request, body: MemoryMerge):
 @web_app.post("/api/duplicates/draft", response_class=JSONResponse)
 async def api_generate_duplicate_draft(request: Request, body: MemoryMergeDraft):
     """Generate an editable merge draft from explicitly selected fact records."""
-    user_id = _require_user(request)
+    user_id = _require_admin(request)
     fact_ids = list(dict.fromkeys(str(fact_id).strip() for fact_id in body.factIds if str(fact_id).strip()))
     if len(fact_ids) < 2:
         raise HTTPException(status_code=400, detail="Select at least two records")
@@ -1230,7 +1252,7 @@ async def api_set_diary_scope(entry_id: str, request: Request, body: ScopeUpdate
 async def api_start_reclassify(request: Request):
     """Start a full Ollama scope reclassification as a background job (409 if running)."""
     try:
-        result = start_reclassify_scope(_require_user(request))
+        result = start_reclassify_scope(_require_admin(request))
         if not result["started"]:
             detail = ("A backup or restore is running — wait for it to finish."
                       if result.get("conflict") == "maintenance"
@@ -1247,7 +1269,7 @@ async def api_start_reclassify(request: Request):
 async def api_reclassify_status(request: Request):
     """Return the current (or last) reclassification job status."""
     try:
-        return get_reclassify_status(_require_user(request))
+        return get_reclassify_status(_require_admin(request))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -1262,12 +1284,12 @@ async def api_reclassify_status(request: Request):
 @web_app.get("/api/backup/savepoints", response_class=JSONResponse)
 async def api_list_savepoints(request: Request):
     """List available savepoints, newest first, plus the schedule in effect."""
-    _require_user(request)
+    _require_admin(request)
     from backup import backup_config, get_backup_status
     return {
         "savepoints": list_savepoints(),
         "config": backup_config(),
-        "status": get_backup_status(_require_user(request)),
+        "status": get_backup_status(_require_admin(request)),
     }
 
 
@@ -1275,7 +1297,7 @@ async def api_list_savepoints(request: Request):
 async def api_run_backup(request: Request):
     """Create a savepoint now (409 if a maintenance job is already running)."""
     try:
-        result = start_backup(_require_user(request))
+        result = start_backup(_require_admin(request))
         if not result["started"]:
             detail = ("A reclassification, backup or restore is already running."
                       if result.get("conflict") == "maintenance"
@@ -1292,7 +1314,7 @@ async def api_run_backup(request: Request):
 async def api_run_restore(savepoint_id: str, request: Request):
     """Overwrite the vault with a savepoint. Destructive — confirm in the UI."""
     try:
-        result = start_restore(_require_user(request), savepoint_id)
+        result = start_restore(_require_admin(request), savepoint_id)
         if not result["started"]:
             detail = ("A reclassification or backup is running — wait for it to finish."
                       if result.get("conflict") == "maintenance"
@@ -1311,7 +1333,7 @@ async def api_run_restore(savepoint_id: str, request: Request):
 async def api_backup_status(request: Request):
     """Current (or last) backup/restore job status."""
     try:
-        return get_backup_status(_require_user(request))
+        return get_backup_status(_require_admin(request))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -1914,7 +1936,7 @@ async def api_status_stream(request: Request):
 
 @web_app.post("/api/status/models/unload", response_class=JSONResponse)
 async def api_unload_model(request: Request, body: ModelUnload):
-    _require_user(request)
+    _require_admin(request)
     model = (body.model or "").strip()
     if not model:
         raise HTTPException(status_code=400, detail="A model name is required.")
@@ -2133,5 +2155,9 @@ async def get_gui(request: Request):
     # Shown next to the session count so the number the UI promises and the one
     # the store enforces come from the same place.
     ctx["SESSION_MAX_AGE_DAYS"] = SESSION_MAX_AGE // 86400
+    # Whether the Service tab is rendered at all. The tab and its page are
+    # omitted for a non-admin rather than shown and refused, so the option is
+    # not advertised to someone who cannot use it.
+    ctx["IS_ADMIN"] = mem.is_admin_user(creds)
     html = _render("dashboard", **ctx)
     return HTMLResponse(content=html)

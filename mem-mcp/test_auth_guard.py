@@ -944,6 +944,77 @@ class _Response:
         self.status_code = kwargs.get("status_code")
 
 
+
+class AdminGuardTests(unittest.TestCase):
+    """The Service tab's operations require the configured admin, not just a login.
+
+    Model unload, backup/restore, reclassify and dedup are vault-wide or
+    server-wide: a restore overwrites the whole vault, a reclassify rewrites
+    every client assignment, an unload evicts a model from a GPU other users
+    are paying a cold load for. Gating them on "whoever is logged in" would
+    make them reachable by any account, so they require the one name in
+    `MEM_ADMIN_USER` -- and when that is unset, by nobody.
+    """
+
+    class _HTTPException(Exception):
+        def __init__(self, status_code, detail):
+            super().__init__(detail)
+            self.status_code = status_code
+            self.detail = detail
+
+    def _guard(self, admin_user):
+        """Lift _require_admin with is_admin_user bound to `admin_user`."""
+        namespace = {
+            "HTTPException": self._HTTPException,
+            "mem": types.SimpleNamespace(is_admin_user=lambda u: bool(admin_user) and u == admin_user),
+            "_require_user": lambda request: request.session.get("user"),
+        }
+        return _lift("gui.py", "_require_admin", namespace)
+
+    def test_a_non_admin_is_refused_with_a_reason(self):
+        guard = self._guard("root")
+        with self.assertRaises(self._HTTPException) as ctx:
+            guard(types.SimpleNamespace(session={"user": "alice"}, state=types.SimpleNamespace()))
+        self.assertEqual(ctx.exception.status_code, 403)
+        self.assertIn("administrator", ctx.exception.detail)
+
+    def test_the_configured_admin_gets_through(self):
+        guard = self._guard("root")
+        request = types.SimpleNamespace(session={"user": "root"}, state=types.SimpleNamespace())
+        self.assertEqual(guard(request), "root")
+
+    def test_no_admin_configured_means_nobody_gets_through(self):
+        """Empty MEM_ADMIN_USER disables the Service tab entirely."""
+        guard = self._guard("")
+        with self.assertRaises(self._HTTPException) as ctx:
+            guard(types.SimpleNamespace(session={"user": "root"}, state=types.SimpleNamespace()))
+        self.assertEqual(ctx.exception.status_code, 403)
+
+    def test_the_service_endpoints_require_admin_not_just_a_login(self):
+        """Every moved endpoint must call _require_admin, not _require_user.
+
+        A source assertion rather than a behavioural one: the guard is the
+        whole feature, and a handler that quietly reverts to _require_user
+        would leave the tab visible to every account with no error anywhere.
+        """
+        with open(os.path.join(HERE, "gui.py"), encoding="utf-8") as handle:
+            source = handle.read()
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.AsyncFunctionDef):
+                continue
+            if node.name not in (
+                "api_start_reclassify", "api_reclassify_status",
+                "api_list_savepoints", "api_run_backup", "api_run_restore",
+                "api_backup_status", "api_find_duplicates", "api_merge_duplicates",
+                "api_generate_duplicate_draft", "api_unload_model",
+            ):
+                continue
+            segment = ast.get_source_segment(source, node)
+            self.assertIn("_require_admin", segment,
+                          msg=f"{node.name} must require the admin, not just a login")
+            self.assertNotIn("_require_user(request)", segment,
+                             msg=f"{node.name} still calls _require_user directly")
 class ApiAuthTests(unittest.TestCase):
     """The GUI/API gate, which is a *different* gate from McpAuthGuard.
 

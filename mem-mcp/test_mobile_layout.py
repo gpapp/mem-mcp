@@ -665,7 +665,7 @@ class ClientFilterOnMobileTests(unittest.TestCase):
     It is invisible on a phone for a reason no amount of restyling the
     control itself would fix: `.tabs` becomes a horizontal scroller below
     900px, and the filter is the *last* flex child of that rail, sitting
-    after all seven tab buttons off the right edge of the screen. The
+    after every tab button off the right edge of the screen. The
     scrollbar is hidden, so nothing advertises that it is there -- the
     markup is present and the control works, it is simply unreachable.
 

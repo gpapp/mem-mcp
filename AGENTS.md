@@ -409,6 +409,14 @@ Python.
 - Server status widget: `MEM_STATUS_POLL_SECONDS` (default 10) and `MEM_STATUS_HTTP_TIMEOUT` (default 8) — see "Server Status Widget"
 - User vault resolved from a session cookie, `Authorization: Basic`, an access key, or proxy headers — see Authentication
 - Sessions and access keys: `MEM_SESSION_DIR` (must be the bind mount, or a container rebuild logs everyone out) and `MEM_SESSION_SECURE` (adds `Secure` to the session cookie; only enable when the app is reached over HTTPS, since the process cannot detect the proxy's scheme and a `Secure` cookie on a plain-HTTP visit is silently dropped). `MEM_SESSION_SECRET` is no longer used to sign anything.
+- Admin surface: `MEM_ADMIN_USER` names the one account that may reach the **Service** tab
+  (model unload, backup/restore, reclassify, dedup) — every one of those is vault-wide or
+  server-wide rather than per-user, so they are gated on a single configured name rather than
+  on "whoever is logged in". Empty (the default) means nobody is admin and the tab is not
+  rendered at all. The UI hiding is UX: the endpoints enforce it with `_require_admin`, which
+  answers 403 with a reason. `GET /api/status` and `/api/status/stream` deliberately stay open
+  to every signed-in user — they are read-only monitoring feeding the sidebar status widget —
+  and only `POST /api/status/models/unload` needs the admin.
 - Registration: `MEM_REGISTRATION_ENABLED` (default 0, and it should stay 0 — a route that creates accounts is something an operator turns on). The two methods have their own further requirements: email/password needs `MEM_SMTP_*`, Google needs `GOOGLE_CLIENT_ID` **and** `GOOGLE_CLIENT_SECRET`. Each is checked separately, so turning the flag on is not the same as having a usable form.
 - Outbound mail: `MEM_SMTP_HOST`, `MEM_SMTP_PORT` (587), `MEM_SMTP_USER`, `MEM_SMTP_PASSWORD`, `MEM_SMTP_FROM`, `MEM_SMTP_STARTTLS` (default 1) and `MEM_SMTP_TIMEOUT` (20s). `smtp_configured()` needs only host and From, because those are what a signup attempt must have to be worth offering a form at all.
 - Google sign-in (OAuth 2.0 redirect): `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`, plus the callback `{BASE_URL}/api/auth/google/callback` registered in Google Cloud. **Both are required** — the secret is what makes the code redemption confidential. Note `test_env_wiring._DECL` had to grow a `GOOGLE_[A-Z0-9_]+` branch: without it a documented `GOOGLE_*` variable silently escapes the "every documented variable reaches the container" test, which is the same class of quiet as an unwired knob.
@@ -550,7 +558,7 @@ python mem-mcp/migrate_vault_user.py --from OLD_USER --to NEW_USER            # 
 python mem-mcp/migrate_vault_user.py --from OLD_USER --to NEW_USER --apply
 ```
 
-**Take a savepoint first** (Setup → Backup, or `POST /api/backup/run`). The two
+**Take a savepoint first** (Service → Backup, or `POST /api/backup/run`). The two
 stores are not transactional together, so a failure between them leaves a vault
 mid-move. Re-running converges **once the destination is empty again** — and
 after a partial move it may not be, because the Qdrant half can land first. Clear
@@ -845,7 +853,7 @@ Tests live in `mem-mcp/test_llm_reliability.py`, using the same `ast.get_source_
 
 ## Server Status Widget
 
-A status strip pinned to the bottom of the left rail of the **Memories** and **Diary** tabs, and a full model panel on **Setup**, both fed by one snapshot pushed over SSE from one poller. It answers the question the "must say `100% GPU`" rule in Critical Config keeps needing answered, and it puts an unload button where the model it evicts is named.
+A status strip pinned to the bottom of the left rail of the **Memories** and **Diary** tabs, and a full model panel on the admin-only **Service** tab, both fed by one snapshot pushed over SSE from one poller. It answers the question the "must say `100% GPU`" rule in Critical Config keeps needing answered, and it puts an unload button where the model it evicts is named.
 
 - **One poller for the process, not one per browser tab.** `status_monitor.broadcast_loop(mem.fetch_ollama_status, mem.STATUS_POLL_SECONDS)` is started in the `server.py` lifespan and cancelled with the other tasks. `GET /api/status/stream` subscribes; `GET /api/status` returns the stored snapshot (and probes once on the cold path). N tabs must not mean N polls of a GPU that is already contended.
 - **The change fingerprint excludes the wall clock, and that is the whole design.** `status_monitor.signature()` covers `ok`, `version`, `error`, `warnings`, `maintenance` and the per-model state — and deliberately *not* `checked` or `expiresAt`, both listed in `VOLATILE_SNAPSHOT_KEYS`. Fingerprint the snapshot wholesale and every poll looks like a change, so the widget is rewritten six times a minute to say nothing; fingerprint too narrowly and a model that loaded never appears. The keep-alive countdown is therefore a **client-side timer over an absolute timestamp** (`fmtEta` + `updateEtas`), not part of the pushed state. Do not move a timestamp into the signature.
@@ -1469,11 +1477,11 @@ Search diary entries from the calendar rail.
 - API endpoint: `GET /api/diary/search?q=<text>&limit=10&top_p=0.4`
 
 ### Dashboard Deduplication
-Setup → **🧹 Deduplicate memories** provides a review-first merge workflow. It is a section of the
-**Settings** page, not a top-level tab: the tab rail held eight tabs and this one is a maintenance
-task, not a daily view. The six controls (`#dedup-category`, `#dedup-threshold`,
+Service → **🧹 Deduplicate memories** provides a review-first merge workflow. It is on the
+admin-only **Service** tab, not a top-level tab: the tab rail held eight tabs and this one is a
+maintenance task, not a daily view. The six controls (`#dedup-category`, `#dedup-threshold`,
 `#dedup-max-cluster`, `#dedup-scan-btn`, `#dedup-status`, `#dedup-clusters`) live inside
-`#page-setup`'s single `.card`, between the Maintenance and Backup sections.
+`#page-service`'s single `.card`, between the Maintenance and Backup sections.
 
 - Scan a category with a configurable similarity threshold and maximum cluster size.
 - Select the records to merge, choose the master, and use the LLM to generate an editable merged title and text draft from only those records.
@@ -1556,11 +1564,11 @@ per caught name so "which one runs first" has one answer.
   thirteen records is refused by the count guard even though the text would fit. Re-injecting the
   old `num_predict = 4000` fails three of them, which is what makes this the test that would have
   caught the defect rather than one that describes it.
-- `DedupUnderSetupTests` in `test_cypher_safety.py` pins that the six dedup controls live inside
-  `#page-setup` and that no `switchTab('deduplicate')` survives.
+- `DedupUnderServiceTests` in `test_cypher_safety.py` pins that the six dedup controls live inside
+  `#page-service` and that no `switchTab('deduplicate')` survives.
 
 ### Backup & Restore
-Setup → Maintenance → **Backup & Restore** manages the savepoints.
+Service → **Backup & Restore** manages the savepoints.
 
 - **Back up now** takes an immediate savepoint; one is also written automatically at `MEM_BACKUP_HOUR:MEM_BACKUP_MINUTES` server time, keeping the newest `MEM_BACKUP_KEEP`.
 - Each savepoint lists its time, whether it was automatic, and the node/link counts and size.

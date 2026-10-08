@@ -266,6 +266,25 @@ DIARY_COLLECTION = "ea_diary"
 
 SESSION_MAX_AGE = 30 * 24 * 60 * 60  # 30 days in seconds
 
+# The one account allowed to reach the Service tab: model unload, backup and
+# restore, reclassification and deduplication. Every one of those is vault-wide
+# or server-wide rather than per-user -- a restore overwrites the whole vault,
+# a reclassify rewrites every client assignment -- so they are gated on a
+# single configured name rather than on "whoever is logged in". Empty means
+# nobody is admin and the tab is not rendered at all.
+ADMIN_USER = os.getenv("MEM_ADMIN_USER") or ""
+
+
+def is_admin_user(user: str) -> bool:
+    """Whether `user` is the configured admin.
+
+    A constant-time comparison would be the reflex for a password, but this
+    is a username checked against a deployment constant, not a secret: the
+    answer is not a credential and the timing signal is which of two
+    configured names it is, which the caller already knows.
+    """
+    return bool(ADMIN_USER) and user == ADMIN_USER
+
 # ---------------------------------------------------------------------------
 # Global DB client references (lazily populated)
 # ---------------------------------------------------------------------------

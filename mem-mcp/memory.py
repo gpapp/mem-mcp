@@ -12,7 +12,8 @@ from common import (
     SESSION_SECRET, SESSION_MAX_AGE, db_subscribers,
     publish_db_event, get_qdrant, get_neo4j, wait_for_service, ensure_ollama_models,
     get_embedding, get_llm_response, extract_user_from_headers, logger,
-    STATUS_POLL_SECONDS, configured_model_roles, fetch_ollama_status, unload_ollama_model
+    STATUS_POLL_SECONDS, configured_model_roles, fetch_ollama_status, unload_ollama_model,
+    is_admin_user, ADMIN_USER
 )
 
 import status_monitor
