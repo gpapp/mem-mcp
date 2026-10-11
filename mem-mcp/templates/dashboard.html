@@ -1910,16 +1910,21 @@ npm install @modelcontextprotocol/sdk</code></pre>
         ? '<span class="tag-badge">admin</span>'
         : (u.disabled ? '<span class="mtag srv-warn">disabled</span>' : '<span class="mtag">active</span>');
       const verified = u.verified ? '' : ' <span class="mtag srv-warn">unverified</span>';
-      // can_manage is false for anything with an htpasswd row, and the reason
-      // is on the row: that file is mounted read-only, so a Disable here would
-      // close the password path and leave the htpasswd one working. Saying
-      // "read-only" beats a button that half-works.
-      const actions = u.can_manage
+      // Three different half-worked operations, so three different affordances
+      // rather than one boolean. can_manage gates Disable/Enable (a Google-only
+      // vault has no credentials row, so it has no disabled_at to set and the
+      // route would 404), can_delete gates Delete, and manage_note says which
+      // of the two reasons applies -- an operator looking at a row with no
+      // buttons is owed the reason, not just the absence.
+      const suspend = u.can_manage
         ? (u.disabled
             ? `<button class="btn btn-sm" onclick="enableUser('${escHtml(u.user_id)}')">✅ Enable</button>`
             : `<button class="btn btn-sm" onclick="disableUser('${escHtml(u.user_id)}')">⏸️ Disable</button>`)
-          + ` <button class="btn btn-sm btn-danger" onclick="deleteUser('${escHtml(u.user_id)}')">🗑️ Delete</button>`
-        : '<span style="font-size:.78rem; color:var(--muted);">read-only — managed in htpasswd on the host</span>';
+        : `<span style="font-size:.78rem; color:var(--muted);">${escHtml(u.manage_note || 'not suspendable')}</span>`;
+      const remove = u.can_delete
+        ? ` <button class="btn btn-sm btn-danger" onclick="deleteUser('${escHtml(u.user_id)}')">🗑️ Delete</button>`
+        : '';
+      const actions = suspend + remove;
       return `<tr>
         <td style="font-weight:600;">${escHtml(u.user_id)} ${state}${verified}</td>
         <td>${tags}</td>

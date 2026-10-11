@@ -1025,6 +1025,121 @@ class AdminGuardTests(unittest.TestCase):
                              msg=f"{node.name} still calls _require_user directly")
 
 
+class UserTableTests(unittest.TestCase):
+    """`_user_table` — which rows the admin can actually act on, and why.
+
+    The table merges three stores into one row per vault, and the interesting
+    part is not the merge: it is that the three sources produce **three
+    different half-worked operations**, and a row that offers a button which
+    404s is worse than a row that offers nothing.
+
+      * a registered signup has a `credentials` row, so Disable writes
+        `disabled_at` and Enable clears it;
+      * a Google-only vault has *no* credentials row, so there is no
+        `disabled_at` to set and Disable answers 404 — but Delete still works,
+        because it removes the identity link as well;
+      * an htpasswd account cannot be suspended *or* deleted from here: the
+        file is mounted `:ro`, so the password path is not the only way in.
+
+    So `can_manage` and `can_delete` are two separate booleans, not one. The
+    version that shipped `can_manage` alone got the Google case wrong — it
+    offered a Disable button that the endpoint refused — and a single boolean
+    is what allowed that.
+    """
+
+    @staticmethod
+    def _runner(credentials=(), google=(), htpasswd=(), admins=()):
+        """Lift `_user_table` over three stub stores and return the rows."""
+        seen = []
+        namespace = {
+            "logging": _NullLogger(),
+            "mem": types.SimpleNamespace(
+                is_admin_user=lambda u: u in set(admins)),
+            "list_credentials": lambda: [dict(c) for c in credentials],
+            "list_all_google_identities": lambda: [dict(g) for g in google],
+            "list_htpasswd_users": lambda: list(htpasswd),
+            "seen": seen,
+        }
+        _lift("gui.py", "_user_table", namespace)
+        seen.append(namespace["_user_table"]())
+        return seen[-1]
+
+    @staticmethod
+    def _row(rows, name):
+        return next(r for r in rows if r["user_id"] == name)
+
+    def test_a_registered_account_can_be_suspended_and_deleted(self):
+        rows = self._runner(
+            credentials=[{"user_id": "alice", "email": "a@x", "email_verified_at": 1.0,
+                          "created_at": 10, "updated_at": 10, "disabled_at": None}])
+        row = self._row(rows, "alice")
+        self.assertEqual(row["sources"], ["password"])
+        self.assertTrue(row["can_manage"])
+        self.assertTrue(row["can_delete"])
+        self.assertEqual(row["manage_note"], "")
+
+    def test_a_google_only_vault_can_be_deleted_but_not_suspended(self):
+        """The case a single `can_manage` boolean gets wrong.
+
+        There is no credentials row to write `disabled_at` into, so Disable
+        answers 404. Delete still works — it removes the identity link — so
+        collapsing the two into one flag either offers a button that 404s or
+        hides the operation that does work.
+        """
+        rows = self._runner(
+            google=[{"provider": "google", "user_id": "bob@x", "email": "bob@x",
+                     "display_name": "Bob", "created_at": 20, "last_used_at": 20}])
+        row = self._row(rows, "bob@x")
+        self.assertEqual(row["sources"], ["google"])
+        self.assertFalse(row["can_manage"], "a vault with no password row cannot be suspended")
+        self.assertTrue(row["can_delete"], "delete removes the identity link, so it must stay available")
+        self.assertIn("delete only", row["manage_note"])
+
+    def test_an_htpasswd_account_is_read_only_and_says_which_reason(self):
+        rows = self._runner(htpasswd=["operator"])
+        row = self._row(rows, "operator")
+        self.assertEqual(row["sources"], ["htpasswd"])
+        self.assertFalse(row["can_manage"])
+        self.assertFalse(row["can_delete"])
+        self.assertIn("htpasswd", row["manage_note"])
+
+    def test_htpasswd_beats_a_registration_row_and_the_reason_says_so(self):
+        """One account in two stores: the read-only reason must win.
+
+        The htpasswd password path stays open whatever `disabled_at` says, so a
+        row offered as manageable here would be a half-working Disable — and
+        the operator needs the htpasswd reason, not the registration one.
+        """
+        rows = self._runner(
+            credentials=[{"user_id": "dupe", "email": "", "email_verified_at": None,
+                          "created_at": 1, "updated_at": 1, "disabled_at": None}],
+            htpasswd=["dupe"])
+        row = self._row(rows, "dupe")
+        self.assertEqual(sorted(row["sources"]), ["htpasswd", "password"])
+        self.assertFalse(row["can_manage"])
+        self.assertFalse(row["can_delete"])
+        self.assertIn("htpasswd", row["manage_note"])
+
+    def test_the_admin_row_is_flagged_and_never_editable_here(self):
+        rows = self._runner(
+            credentials=[{"user_id": "root", "email": "", "email_verified_at": None,
+                          "created_at": 1, "updated_at": 1, "disabled_at": None}],
+            admins=["root"])
+        row = self._row(rows, "root")
+        self.assertTrue(row["is_admin"])
+        # `can_manage` is about the store, not about the admin flag: the
+        # endpoint refuses self-delete and admin-delete separately, and the UI
+        # shows the buttons and reports the refusal. Collapsing it here would
+        # mean a row whose affordance and whose behaviour disagree.
+
+    def test_no_hash_or_verification_token_ever_reaches_a_row(self):
+        rows = self._runner(
+            credentials=[{"user_id": "alice", "email": "", "email_verified_at": None,
+                          "password_hash": "scrypt$secret", "verification_token": "tok",
+                          "created_at": 1, "updated_at": 1, "disabled_at": None}])
+        row = self._row(rows, "alice")
+        self.assertNotIn("password_hash", row)
+        self.assertNotIn("verification_token", row)
 class AdminUserEndpointTests(unittest.TestCase):
     """api_admin_delete_user — the refusals, driven rather than read.
 

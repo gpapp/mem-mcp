@@ -410,13 +410,53 @@ Python.
 - User vault resolved from a session cookie, `Authorization: Basic`, an access key, or proxy headers — see Authentication
 - Sessions and access keys: `MEM_SESSION_DIR` (must be the bind mount, or a container rebuild logs everyone out) and `MEM_SESSION_SECURE` (adds `Secure` to the session cookie; only enable when the app is reached over HTTPS, since the process cannot detect the proxy's scheme and a `Secure` cookie on a plain-HTTP visit is silently dropped). `MEM_SESSION_SECRET` is no longer used to sign anything.
 - Admin surface: `MEM_ADMIN_USER` names the one account that may reach the **Service** tab
-  (model unload, backup/restore, reclassify, dedup) — every one of those is vault-wide or
-  server-wide rather than per-user, so they are gated on a single configured name rather than
-  on "whoever is logged in". Empty (the default) means nobody is admin and the tab is not
-  rendered at all. The UI hiding is UX: the endpoints enforce it with `_require_admin`, which
-  answers 403 with a reason. `GET /api/status` and `/api/status/stream` deliberately stay open
-  to every signed-in user — they are read-only monitoring feeding the sidebar status widget —
-  and only `POST /api/status/models/unload` needs the admin.
+  (model unload, backup/restore, reclassify, dedup, user management, consistency repair) — every
+  one of those is vault-wide or server-wide rather than per-user, so they are gated on a single
+  configured name rather than on "whoever is logged in". Empty (the default) means nobody is
+  admin and the tab is not rendered at all. The UI hiding is UX: the endpoints enforce it with
+  `_require_admin`, which answers 403 with a reason. `GET /api/status` and `/api/status/stream`
+  deliberately stay open to every signed-in user — they are read-only monitoring feeding the
+  sidebar status widget — and only `POST /api/status/models/unload` needs the admin.
+- **The Service tab has three sub-tabs — Users, Models, Data — and they are a UX split only.** One
+  `{% if IS_ADMIN %}` wraps the tab button, the page and all three panels; the gate is
+  `_require_admin` on every handler. **Do not wrap a sub-tab in its own `{% if IS_ADMIN %}`**: it
+  would read as if the panels were separately protected, and a panel that renders for a
+  non-admin is a defect the endpoint guard makes obvious only after the fact.
+- **A user is three stores, and only one of them is editable.** `credentials` (registered
+  signups), `google_identities` (a vault created by a first Google sign-in) and the operator's
+  `htpasswd` file. They produce **three different half-worked operations**, which is why
+  `_user_table` returns `can_manage` and `can_delete` separately rather than one flag:
+  - registered signup — suspend **and** delete;
+  - Google-only — **no** credentials row, so there is no `disabled_at` to set and Disable
+    404s, while delete still works because it removes the identity link too;
+  - htpasswd — neither, and the reason is *not* "no password": the file is mounted `:ro`,
+    so a suspend would close the password path and leave the `htpasswd` path working. `manage_note`
+    names which of the two reasons applies, because a row with no button and no reason is the
+    one an operator cannot act on.
+  **A single `can_manage` boolean shipped this wrong** — it offered Disable on a Google-only
+  vault and the route answered 404. The review that caught it is why the flag is now split, and
+  `test_auth_guard.UserTableTests` pins each case.
+- **Deleting an account removes four things and keeps a fifth.** Credentials row, Google identity,
+  every access key, every session — **removed**; the vault records — **kept**, and the
+  response says so (`vault_records_kept`). All four are removed because they are independent
+  credentials: `/mcp` accepts *only* an access key, so dropping the password row alone would
+  leave a client reading a vault whose account no longer exists. Two deletions are refused
+  outright — the configured `MEM_ADMIN_USER` and the caller's own account — because either leaves the
+  deployment with no admin and the only way back is an env edit plus a restart.
+- **`enable_credentials` exists because `disable_credentials` had no inverse.** Its
+  `AND disabled_at IS NOT NULL` guard is load-bearing twice: without it a re-enable bumps
+  `updated_at` on an account that was never disabled, so "last changed" tracks how often
+  somebody looked at the table.
+- **The consistency checks and repairs return what they log.** `run_consistency_checks`,
+  `run_diary_consistency_checks`, `fix_diary_entries` and `sync_orphans` were boot-only and
+  log-only, so a graph/vector mismatch was discoverable only by reading `memory-vault.log` on
+  the host. Each now returns a report dict **collected alongside the existing log lines**, never
+  instead of them ” a version that replaced the logging would lose the boot-time trail for
+  no reason. `sync_orphans`'s return goes **after** its summary logging; putting it before left
+  three log lines dead.
+- **A skipped check is not a clean check.** All four report `{"ok": False, "skipped": ...}`
+  when the database is unavailable, and `renderConsistency` prints the skip rather than
+  "the stores agree" ” which would be the one thing it could say that is untrue.
 - Registration: `MEM_REGISTRATION_ENABLED` (default 0, and it should stay 0 — a route that creates accounts is something an operator turns on). The two methods have their own further requirements: email/password needs `MEM_SMTP_*`, Google needs `GOOGLE_CLIENT_ID` **and** `GOOGLE_CLIENT_SECRET`. Each is checked separately, so turning the flag on is not the same as having a usable form.
 - Outbound mail: `MEM_SMTP_HOST`, `MEM_SMTP_PORT` (587), `MEM_SMTP_USER`, `MEM_SMTP_PASSWORD`, `MEM_SMTP_FROM`, `MEM_SMTP_STARTTLS` (default 1) and `MEM_SMTP_TIMEOUT` (20s). `smtp_configured()` needs only host and From, because those are what a signup attempt must have to be worth offering a form at all.
 - Google sign-in (OAuth 2.0 redirect): `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`, plus the callback `{BASE_URL}/api/auth/google/callback` registered in Google Cloud. **Both are required** — the secret is what makes the code redemption confidential. Note `test_env_wiring._DECL` had to grow a `GOOGLE_[A-Z0-9_]+` branch: without it a documented `GOOGLE_*` variable silently escapes the "every documented variable reaches the container" test, which is the same class of quiet as an unwired knob.

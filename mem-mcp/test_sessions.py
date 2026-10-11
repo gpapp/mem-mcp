@@ -1196,5 +1196,420 @@ class GoogleIdentityStoreTests(StoreCase):
         self.assertEqual(len(row["display_name"]), sessions.MAX_NAME_CHARS)
 
 
+# ---------------------------------------------------------------------------
+# Admin-facing reads and writes
+#
+# The functions below are the admin surface added on top of the stores already
+# covered above: undo a suspension, kill every key a vault owns, unlink its
+# external identities, and list the operator's htpasswd. They are ordinary store
+# calls, so they are tested the same way -- by calling them.
+# ---------------------------------------------------------------------------
+
+class AccountEnableTests(StoreCase):
+    """`enable_credentials`, the inverse of `disable_credentials`.
+
+    The property worth testing is not "returns True", it is that an account
+    which was signing in, stopped signing in, and then signs in again. Every
+    assertion below therefore goes through `verify_account_password`, because a
+    return value is what the function reports about itself and a login is what
+    the operator is going to try.
+    """
+
+    PASSWORD = "correct horse battery staple"
+
+    def register(self, user_id="alice", email="alice@example.com"):
+        """A registered, address-verified account that can actually sign in."""
+        sessions.create_credentials(user_id, self.PASSWORD, email)
+        sessions.verify_email_token(sessions.issue_verification_token(user_id))
+
+    def test_enabling_restores_login_after_a_disable(self):
+        self.register()
+        self.assertTrue(sessions.verify_account_password("alice", self.PASSWORD))
+
+        self.assertTrue(sessions.disable_credentials("alice"))
+        self.assertFalse(
+            sessions.verify_account_password("alice", self.PASSWORD),
+            "a disabled account must stop signing in, or disable is not what it claims",
+        )
+
+        self.assertTrue(sessions.enable_credentials("alice"))
+        self.assertTrue(
+            sessions.verify_account_password("alice", self.PASSWORD),
+            "enable_credentials must actually restore the login, not just flip a column",
+        )
+
+    def test_enabling_an_account_that_is_not_disabled_reports_nothing_happened(self):
+        # The `AND disabled_at IS NOT NULL` guard, asserted on the return value
+        # *and* on the row. Asserting only the return value would pass against a
+        # bare `SET disabled_at = NULL` that also bumped updated_at, which is the
+        # defect the guard exists to prevent.
+        self.register()
+        before = sessions.get_credentials("alice")
+        self.assertIsNone(before["disabled_at"])
+
+        self.assertFalse(sessions.enable_credentials("alice", now=9999.0))
+
+        after = sessions.get_credentials("alice")
+        self.assertIsNone(after["disabled_at"])
+        self.assertEqual(
+            after["updated_at"], before["updated_at"],
+            "enabling an already-enabled account must not bump updated_at: that "
+            "would make 'last changed' track how often an admin looked at the table",
+        )
+
+    def test_a_blank_key_is_refused_rather_than_touching_a_row(self):
+        # The account is *disabled* going in, which is the half that matters.
+        # With a live (never-disabled) account the query's own
+        # `AND disabled_at IS NOT NULL` would match nothing, so the assertion
+        # would hold even against a predicate that a blank key could match --
+        # exactly the defect the `if not key` guard is there to stop.
+        self.register()
+        self.assertTrue(sessions.disable_credentials("alice", now=1000.0))
+        before = sessions.get_credentials("alice")
+        self.assertIsNotNone(before["disabled_at"])
+
+        for value in ("", "   ", None):
+            with self.subTest(value=repr(value)):
+                self.assertFalse(sessions.enable_credentials(value))
+
+        self.assertEqual(
+            sessions.get_credentials("alice"), before,
+            "a blank vault key must re-enable nothing at all, including an "
+            "account that is genuinely suspended",
+        )
+        self.assertFalse(
+            sessions.verify_account_password("alice", self.PASSWORD),
+            "the account must still be locked out after a refused enable",
+        )
+
+    def test_the_now_argument_is_the_timestamp_that_is_written(self):
+        # Explicit rather than defaulted: `time.time()` would make the assertion
+        # a range check, and a range check cannot tell an honoured argument from
+        # an ignored one that happened to be close to it.
+        self.register()
+        self.assertTrue(sessions.disable_credentials("alice", now=1000.0))
+        disabled = sessions.get_credentials("alice")
+        self.assertEqual(disabled["disabled_at"], 1000.0)
+
+        self.assertTrue(sessions.enable_credentials("alice", now=2000.0))
+        enabled = sessions.get_credentials("alice")
+        self.assertIsNone(enabled["disabled_at"])
+        self.assertEqual(
+            enabled["updated_at"], 2000.0,
+            "updated_at must be the moment passed in, not time.time()",
+        )
+
+    def test_enabling_leaves_the_password_and_the_verification_alone(self):
+        self.register()
+        sessions.disable_credentials("alice", now=1000.0)
+        sessions.enable_credentials("alice", now=2000.0)
+        row = sessions.get_credentials("alice")
+        self.assertIsNotNone(row["password_hash"])
+        self.assertIsNotNone(row["email_verified_at"])
+        self.assertTrue(sessions.verify_account_password("alice", self.PASSWORD))
+
+    def test_disabling_and_enabling_is_repeatable(self):
+        self.register()
+        for moment in (1000.0, 2000.0):
+            with self.subTest(moment=moment):
+                self.assertTrue(sessions.disable_credentials("alice", now=moment))
+                self.assertFalse(sessions.verify_account_password("alice", self.PASSWORD))
+                self.assertTrue(sessions.enable_credentials("alice", now=moment + 1))
+                self.assertTrue(sessions.verify_account_password("alice", self.PASSWORD))
+
+
+class RevokeAllPsksTests(StoreCase):
+    """`revoke_all_psks`, the "disable the account properly" operation.
+
+    Disabling a password login is not enough to disable a vault: `/mcp`
+    accepts an access key and nothing else, so an admin who disables an account
+    without revoking its keys leaves that account's MCP clients working. The
+    ownership filter is the load-bearing half of that, and it is asserted by
+    looking at the other user's keys afterwards rather than by reading the SQL.
+    """
+
+    def seed(self, user_id, count):
+        return [sessions.create_psk(user_id, label=f"{user_id}-{i}") for i in range(count)]
+
+    def statuses(self, user_id):
+        return {row["id"]: row["status"] for row in sessions.list_psks(user_id)}
+
+    def test_it_revokes_every_key_the_user_owns(self):
+        mine = self.seed("alice", 2)
+
+        self.assertEqual(sessions.revoke_all_psks("alice"), 2)
+
+        self.assertEqual(
+            {status for status in self.statuses("alice").values()}, {"revoked"},
+            "every key the user owns must end up revoked",
+        )
+        self.assertEqual(
+            set(self.statuses("alice")), {row["id"] for row in mine},
+            "the revoked rows are kept, not deleted: a key that vanishes from the "
+            "list is indistinguishable from one that was never minted",
+        )
+
+    def test_it_leaves_another_users_keys_alone(self):
+        # Separate from the test above on purpose. Asserting both halves in one
+        # method means the return-value assertion fires first on a dropped
+        # `WHERE user_id = ?` -- 3 instead of 2 -- and the ownership claim is
+        # never shown to be guarded at all. The failure that matters here is
+        # silent: the count is still a number an admin would believe.
+        self.seed("alice", 2)
+        theirs = self.seed("bob", 1)
+
+        sessions.revoke_all_psks("alice")
+
+        self.assertEqual(
+            self.statuses("bob"), {theirs[0]["id"]: "active"},
+            "another user's keys must survive: the WHERE clause is the ownership "
+            "check, and dropping it revokes every vault's credentials at once",
+        )
+        self.assertIsNotNone(sessions.resolve_psk(theirs[0]["key"]))
+
+    def test_the_returned_count_is_the_number_of_live_keys(self):
+        self.seed("alice", 3)
+        self.assertEqual(sessions.revoke_all_psks("alice"), 3)
+        # Second pass finds nothing live, so 0 -- not the number of rows the
+        # user has ever owned. The `AND revoked_at IS NULL` guard is what makes
+        # the count mean "keys killed by this call".
+        self.assertEqual(sessions.revoke_all_psks("alice"), 0)
+
+    def test_an_unknown_or_blank_user_revokes_nothing(self):
+        keep = self.seed("alice", 2)
+        self.assertEqual(sessions.revoke_all_psks("nobody"), 0)
+        for value in ("", "   ", None):
+            with self.subTest(value=repr(value)):
+                self.assertEqual(sessions.revoke_all_psks(value), 0)
+        self.assertEqual(
+            {status for status in self.statuses("alice").values()}, {"active"},
+            "a refused revoke must not have touched anyone's keys",
+        )
+        for row in sessions.list_psks("alice"):
+            self.assertIn(row["id"], {k["id"] for k in keep})
+
+    def test_the_now_argument_is_the_timestamp_that_is_written(self):
+        keys = self.seed("alice", 1)
+        self.assertEqual(sessions.revoke_all_psks("alice", now=4242.0), 1)
+        conn = sqlite3.connect(sessions.db_path())
+        try:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT revoked_at FROM psks WHERE id = ?", (keys[0]["id"],)
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(row["revoked_at"], 4242.0)
+
+
+class HtpasswdListingTests(unittest.TestCase):
+    """`list_htpasswd_users` -- the one store this app reads and never writes.
+
+    The file is mounted `:ro` and belongs to the operator, so this function's
+    whole contract is "parse it, lose nothing, invent nothing". Every case below
+    is a line shape that appears in real htpasswd files, and each one is a way
+    a naive parser puts a comment or a hash fragment into a username column in
+    an admin table.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="vault-htpasswd-")
+        self._saved = os.environ.get("HTPASSWD_PATH")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.addCleanup(self._restore_env)
+
+    def _restore_env(self):
+        if self._saved is None:
+            os.environ.pop("HTPASSWD_PATH", None)
+        else:
+            os.environ["HTPASSWD_PATH"] = self._saved
+
+    def write(self, text, name="htpasswd"):
+        path = os.path.join(self.tmp, name)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.environ["HTPASSWD_PATH"] = path
+        return path
+
+    def test_names_come_back_sorted(self):
+        self.write("zoe:$2y$05$abcdefghijklmnopqrstuv\nalice:$2y$05$qrstuvwxyz\n")
+        self.assertEqual(sessions.list_htpasswd_users(), ["alice", "zoe"])
+
+    def test_blank_lines_and_comments_are_skipped(self):
+        self.write(
+            "# a comment about alice\n"
+            "\n"
+            "alice:$2y$05$hash\n"
+            "   \n"
+            "#bob:$2y$05$notanaccount\n"
+        )
+        self.assertEqual(
+            sessions.list_htpasswd_users(), ["alice"],
+            "a comment line is prose, not an account: keeping it would show the "
+            "operator a user named '#a comment about alice'",
+        )
+
+    def test_a_line_with_no_colon_is_skipped(self):
+        self.write("alice:$2y$05$hash\norphan-with-no-colon\nbob:$2y$05$hash\n")
+        self.assertEqual(sessions.list_htpasswd_users(), ["alice", "bob"])
+
+    def test_a_bcrypt_hash_is_one_name_and_not_its_fragments(self):
+        # bcrypt is `$2y$05$<22-char salt><31-char digest>` and contains no
+        # colon, which is the common case. The line is stored verbatim here so
+        # that a parser splitting on every colon, or one that keeps the hash,
+        # fails visibly rather than by accident.
+        digest = "$2y$05$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN"
+        self.write("alice:%s\n" % digest)
+        self.assertEqual(sessions.list_htpasswd_users(), ["alice"])
+
+    def test_a_hash_containing_a_colon_is_not_split_into_the_name(self):
+        # Not a scheme htpasswd writes today, and the docstring says so -- the
+        # parse is deliberately "first colon, rest is opaque" because a future
+        # scheme might contain one. Splitting on the LAST colon instead would
+        # silently rename every such account, which is why this is a test rather
+        # than a comment.
+        self.write("alice:{SHA}abc:def\n")
+        self.assertEqual(sessions.list_htpasswd_users(), ["alice"])
+
+    def test_a_duplicate_name_appears_once(self):
+        self.write("alice:$2y$05$one\nalice:$2y$05$two\n")
+        self.assertEqual(sessions.list_htpasswd_users(), ["alice"])
+
+    def test_an_unset_path_is_an_empty_list(self):
+        os.environ.pop("HTPASSWD_PATH", None)
+        self.assertEqual(sessions.list_htpasswd_users(), [])
+
+    def test_a_missing_file_is_an_empty_list(self):
+        os.environ["HTPASSWD_PATH"] = os.path.join(self.tmp, "not-here")
+        self.assertEqual(sessions.list_htpasswd_users(), [])
+
+    def test_an_empty_path_is_an_empty_list(self):
+        os.environ["HTPASSWD_PATH"] = "   "
+        self.assertEqual(sessions.list_htpasswd_users(), [])
+
+    def test_an_unreadable_file_is_an_empty_list(self):
+        # A path that exists but cannot be opened -- a directory, or a bind
+        # mount the container cannot read. Raising here would take down the
+        # admin page for a reason that has nothing to do with the vault.
+        #
+        # The try/except is in the test so that the failure is an assertion
+        # rather than an escaped IsADirectoryError: "the function raised" and
+        # "the function returned the wrong thing" are the same defect here, and
+        # only one of them is a statement about what the function did.
+        os.environ["HTPASSWD_PATH"] = self.tmp
+        try:
+            found = sessions.list_htpasswd_users()
+        except OSError as exc:
+            self.fail("list_htpasswd_users raised %r on an unreadable path" % (exc,))
+        self.assertEqual(found, [])
+
+
+class AdminGoogleIdentityTests(StoreCase):
+    """`list_all_google_identities` and `delete_google_identities`.
+
+    The per-vault direction is already covered by `GoogleIdentityStoreTests`.
+    These are the admin direction: walk the whole table, and unlink one vault's
+    rows from it. `delete_google_identities` exists because deleting the
+    credentials row alone leaves the Google link behind, and a link pointing at
+    a vault with no account is a way back in -- `resolve_google_identity` would
+    still resolve the subject to a `user_id` that can no longer be disabled,
+    because there is nothing left to disable.
+    """
+
+    def link(self, subject, user_id, email="", name=""):
+        return sessions.link_google_identity(subject, user_id, email=email, name=name)
+
+    def test_it_lists_every_vaults_identities_at_once(self):
+        self.link("sub-alice-1", "alice", email="a1@example.com", name="Alice One")
+        self.link("sub-alice-2", "alice", email="a2@example.com", name="Alice Two")
+        self.link("sub-bob-1", "bob", email="bob@example.com", name="Bob One")
+
+        rows = sessions.list_all_google_identities()
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(
+            sorted(row["user_id"] for row in rows), ["alice", "alice", "bob"],
+            "every vault's links must appear -- a row is the only evidence that a "
+            "vault has a Google sign-in at all",
+        )
+        self.assertEqual(
+            sorted(row["email"] for row in rows),
+            ["a1@example.com", "a2@example.com", "bob@example.com"],
+        )
+
+    def test_the_subject_is_never_in_an_admin_row(self):
+        # Deliberately NOT a substring search over the function's source: the
+        # word appears in the docstring that explains why it is excluded, so
+        # that check would pass on the defect it exists to catch. This asserts
+        # on the returned dicts, where the key either is or is not.
+        self.link("secret-subject-1", "alice")
+        self.link("secret-subject-2", "bob")
+        rows = sessions.list_all_google_identities()
+        self.assertEqual(len(rows), 2)
+        for row in rows:
+            with self.subTest(user_id=row["user_id"]):
+                self.assertNotIn(
+                    "subject", row,
+                    "subject is the primary key of an identity and has no place "
+                    "in an admin listing",
+                )
+        self.assertNotIn("secret-subject-1", repr(rows))
+
+    def test_deleting_one_vaults_links_leaves_the_others(self):
+        self.link("sub-alice-1", "alice")
+        self.link("sub-alice-2", "alice")
+        self.link("sub-bob-1", "bob")
+
+        self.assertEqual(sessions.delete_google_identities("alice"), 2)
+
+        rows = sessions.list_all_google_identities()
+        self.assertEqual([row["user_id"] for row in rows], ["bob"])
+        self.assertEqual(
+            [r["user_id"] for r in sessions.list_google_identities("bob")], ["bob"]
+        )
+        self.assertEqual(sessions.list_google_identities("alice"), [])
+
+    def test_deleting_frees_the_vault_key_name(self):
+        # The reason the delete exists: an unlinked vault must be able to take
+        # the name again, and `user_id_taken` refuses a name held by any store.
+        self.link("sub-alice", "alice")
+        self.assertTrue(sessions.user_id_taken("alice"))
+        sessions.delete_google_identities("alice")
+        self.assertFalse(sessions.user_id_taken("alice"))
+
+    def test_an_unlinked_subject_stops_resolving(self):
+        self.link("sub-alice", "alice")
+        self.assertIsNotNone(sessions.resolve_google_identity("sub-alice"))
+        sessions.delete_google_identities("alice")
+        self.assertIsNone(
+            sessions.resolve_google_identity("sub-alice"),
+            "a deleted link must not still resolve: that is the way back into a "
+            "vault whose account no longer exists",
+        )
+
+    def test_a_blank_vault_deletes_nothing(self):
+        self.link("sub-alice", "alice")
+        for value in ("", "   ", None):
+            with self.subTest(value=repr(value)):
+                self.assertEqual(sessions.delete_google_identities(value), 0)
+        self.assertEqual(len(sessions.list_all_google_identities()), 1)
+
+    def test_deleting_twice_is_not_an_error(self):
+        self.link("sub-alice", "alice")
+        self.assertEqual(sessions.delete_google_identities("alice"), 1)
+        self.assertEqual(sessions.delete_google_identities("alice"), 0)
+
+    def test_deleting_one_vault_reports_only_its_own_rows(self):
+        self.link("sub-alice-1", "alice")
+        self.link("sub-alice-2", "alice")
+        self.link("sub-bob-1", "bob")
+        self.assertEqual(sessions.delete_google_identities("bob"), 1)
+        self.assertEqual(
+            sorted(row["user_id"] for row in sessions.list_all_google_identities()),
+            ["alice", "alice"],
+            "the WHERE clause is the ownership check; dropping it wipes every "
+            "vault's sign-in links at once",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

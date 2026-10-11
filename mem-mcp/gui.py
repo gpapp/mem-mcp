@@ -586,10 +586,23 @@ def _user_table() -> list:
             "disabled": bool(row.get("disabled_at")),
             "created_at": min(created) if created else None,
             "is_admin": mem.is_admin_user(name),
-            # An account with an htpasswd row is listed but not manageable:
-            # disabling it here closes the password path and leaves the
-            # htpasswd one open, which is worse than saying so plainly.
-            "can_manage": "htpasswd" not in sources,
+            # Three separate reasons a row is not fully manageable, and the
+            # client needs all of them, because they are three different
+            # half-worked operations rather than one "no":
+            #   htpasswd  -- disabling closes the password path and leaves the
+            #                 htpasswd one open (the file is mounted :ro);
+            #   google    -- a Google-only vault has no credentials row, so
+            #                 there is no disabled_at to set and Disable is a
+            #                 404, while Delete still works;
+            #   nothing   -- the row came from no store the app owns.
+            "can_manage": "htpasswd" not in sources and name in creds,
+            "can_delete": "htpasswd" not in sources,
+            "manage_note": (
+                "read-only — managed in htpasswd on the host" if name in htpasswd
+                else "delete only — this vault has no password to suspend"
+                if name not in creds
+                else ""
+            ),
         })
     return users
 

@@ -1,6 +1,6 @@
 # Memory MCP — Memory Vault
 
-A self-hosted MCP (Model Context Protocol) server that gives AI agents a **persistent memory layer** using vector embeddings and a Knowledge Graph. Includes an advanced editable web dashboard with insights and relationship tracking.
+A self-hosted MCP (Model Context Protocol) server that gives AI agents a **persistent memory layer** using vector embeddings and a Knowledge Graph. Includes an advanced editable web dashboard with relationship tracking, a client/project scoping model, and an admin surface for the operations that act on the whole vault rather than one account.
 
 ## Architecture
 
@@ -18,8 +18,18 @@ mem-mcp/
 ├── mcp_logging.py         # MCP tool call logging/monitoring
 ├── gui.py                 # FastAPI web app: REST API, Landing Page, and Dashboard
 ├── matching_utils.py      # Dependency-light matching, merge, and LLM candidate helpers
-├── test_matching_regressions.py  # Focused regression and fake-boundary tests
-├── reindex_diary_keywords.py  # CLI tool to backfill keyword extraction for existing diary entries
+├── chunking.py            # Splitting a long record into several vectors, and searching them
+├── scoped_ids.py          # The one place client/context ids are derived (uuid5)
+├── sessions.py            # Stdlib-only: sessions, access keys, credential store, registration
+├── backup.py              # Savepoints: Qdrant snapshot + graph export, and restore
+├── status_monitor.py      # Ollama status snapshot, change fingerprint, SSE subscribers
+├── google_auth.py         # OAuth 2.0 authorization-code client over stdlib urllib
+├── migrate_vault_user.py  # CLI: hand one user's whole vault to another
+├── reindex_chunks.py      # CLI: backfill chunking for existing long records
+├── reindex_diary_keywords.py  # CLI: backfill keyword extraction for existing diary entries
+├── test_*.py              # 16 dependency-light regression suites (see Testing)
+├── skills/                # Markdown skill workflows, loaded at request time
+├── templates/             # Landing page and dashboard
 ├── requirements.txt
 ├── Dockerfile
 └── .dockerignore
@@ -32,21 +42,28 @@ mem-mcp/
 - **Advanced Metadata** — Facts support rich JSON metadata (tags, source, confidence, etc.).
 - **Knowledge Patterns** — Automatically identifies recurring themes and associations via graph analysis.
 - **Diary** — Narrative entries with Markdown support, LLM-powered keyword extraction, and vector similarity search.
-- **Smart Search** — LLM query rewriting (see `LLM_QUERY_MODEL`) decomposes natural language into keyword phrases; multi-query expansion merges results from multiple vector searches.
+- **Smart Search** — LLM query rewriting (see `MEM_EXTRACT_MODEL`) decomposes natural language into keyword phrases; multi-query expansion merges results from multiple vector searches.
 - **Memory Deduplication** — Scope-aware multi-signal similarity clustering (vector, name, alias, email) with weighted fuzzy evidence, core-member filtering, and a guided merge workflow.
 - **LLM-Assisted Resolution** — LLMs review bounded People and duplicate candidates with diary, scope, metadata, and record context; returned IDs are validated before use.
 - **Recoverable Merges** — Neo4j/Qdrant merge cleanup records pending Qdrant deletions and retries them through startup orphan reconciliation when a store is temporarily unavailable.
-- **Dashboard Deduplication** — The Deduplicate tab scans scope-compatible clusters, lets you select the records to merge, generates an editable consolidated draft with the LLM, and requires confirmation before merging.
-- **Dedicated Merge Model** — Dashboard merge drafts use `MEM_MERGE_MODEL` (default `gemma4:e2b`), while search and scope classification run on `LLM_QUERY_MODEL` / `MEM_SCOPE_MODEL` (set both to the same model — the scope classifier is the slow path and defaults to the query model).
+- **Dashboard Deduplication** — The Service → Data sub-tab scans scope-compatible clusters, lets you select the records to merge, generates an editable consolidated draft with the LLM, and requires confirmation before merging.
+- **Split Chat Model Roles** — High-volume extraction — diary keywords, people names, search-query rewriting — runs on `MEM_EXTRACT_MODEL`; the judgement calls, scope classification and merge drafts, run on `MEM_SCOPE_MODEL` and `MEM_MERGE_MODEL`. See [Chat models](#chat-models) for why the split is not a preference.
 - **Skills System** — Pluggable skill workflows (e.g., `process-transcription`, `memory-deduplication`) loaded from Markdown files.
 - **Unified Web UI** — A modern, proxy-aware dashboard to manage memories, view diary history, and explore insights.
 - **Multi-user Isolation** — Secure per-user vaults, resolved from a verified dashboard session, a password-checked `Basic` credential, or an access key. Nothing else names a user.
-- **Client & Context Scoping** — Facts and diary entries can be scoped to a Client (e.g. "Deutsche Bank") and a Context within it (e.g. "SAP Implementation") via `FOR_CLIENT` / `IN_CONTEXT` graph links. Explicit `client`/`context` parameters hard-filter search; global search still finds everything.
-- **Scope Inference** — When no explicit client is passed, search infers the client from the query text (boost-only, never filters).
-- **Inactive Client Handling** — Clients untouched for 90 days are auto-deprioritized (−0.15 score, never hidden). Status can be manually pinned via `set_client_status`, `PUT /api/clients/{id}`, or the Setup-tab toggle; pinned clients are never auto-changed.
-- **Setup Tab** — Client list with active/inactive toggles, MCP connection details, and **Access Keys** (revocable `Bearer mvk_…` credentials for MCP clients).
+- **Client & Context Scoping** — Facts and diary entries can be scoped to a Client (e.g. "Deutsche Bank") and a Context within it (e.g. "SAP Implementation") via `FOR_CLIENT` / `IN_CONTEXT` graph links.
+- **Scope-Priority Search** — An explicit `client`/`context` **prioritises** results (sort key `(scopeStrength, score, confidence)`) but **never excludes** them. A record filed under another client, or under none, still comes back — ranked lower. That is what makes it work with two people called John at the same bank: asked for one project, the right one comes first and the other is still findable.
+- **Scope Inference** — When no explicit client is passed, search infers the client from the query text.
+- **Inactive Client Handling** — Clients untouched for 90 days are auto-deprioritized (−0.15 score, never hidden). Status can be manually pinned via `set_client_status`, `PUT /api/clients/{id}`, or the Clients-tab toggle; pinned clients are never auto-changed.
+- **Clients & Projects Tab** — The client list with activate/deactivate, rename, delete, and the projects nested under each client.
+- **Setup Tab** — MCP connection details and **Access Keys** (revocable `Bearer mvk_…` credentials for MCP clients), plus your live browser sessions.
+- **Admin-Only Service Tab** — Operations that act on the whole vault or the whole server rather than on one account live here, behind `MEM_ADMIN_USER`, in three sub-tabs:
+  - **Users** — every account from all three credential stores (registered signups, Google-linked vaults, and the operator's `htpasswd` file) with enable/disable and an irreversible delete. Also shows whether signup is currently on, read-only.
+  - **Models** — what Ollama holds in memory, and the controls to unload it. On a shared GPU card two resident chat models evict each other, so unloading the one you are not using is the cheapest way to stop paying the cold-load cost.
+  - **Data** — backups and restores, scope reclassification, deduplication, and a consistency check plus a repair pass over the graph and the vector index.
+- **Consistency Management** — The graph and the vector index are two stores holding the same records. A read-only check reports every place they disagree, and a repair fixes what has an automatic fix: filling in missing diary titles and timestamps, deleting vector points with no record behind them, re-embedding records with no vector, and pruning links that cross between vaults. Both used to run only at boot and only to the log.
 - **Persistent Sessions** — Login survives a server restart and a container rebuild; sessions live in SQLite on a bind-mounted volume rather than in the cookie, and the plaintext password is no longer stored.
-- **Daily Backups & Restore** — An in-process scheduler writes a vault-wide savepoint (graph + both vector collections) each night, keeps the last `MEM_BACKUP_KEEP`, and Setup → Maintenance → Backup & Restore can take one immediately or restore any of them.
+- **Daily Backups & Restore** — An in-process scheduler writes a vault-wide savepoint (graph + both vector collections) each night, keeps the last `MEM_BACKUP_KEEP`, and Service → Data → Backup & Restore can take one immediately or restore any of them.
 - **Long-Record Chunking** — A fact or diary entry that runs past the embedding budget is indexed as several vectors, so a query about a detail in the middle of a 40k-char transcription can still find the record. Search collapses a chunk family back to one result and returns the full text.
 - **Lazy-Loaded Lists** — Memories and diary sidebar render in batches of 50 with infinite scroll; calendar has a 📅 jump-to-today button.
 
@@ -56,7 +73,7 @@ The server is **unified** on port **8080** (mapped to **8086** in Docker).
 
 | Component | Path | Description |
 *   **Landing Page** | `/` | Onboarding, MCP setup instructions, and auto-detected credentials.
-*   **Web Dashboard** | `/gui` | The main interactive dashboard (Memories, Diary, Graph, Setup).
+*   **Web Dashboard** | `/gui` | The main interactive dashboard (Memories, Diary, Graph, Clients, Projects, Setup, and a Service tab only for the configured admin).
 *   **MCP Endpoint** | `/mcp` | The Model Context Protocol entry point for AI clients.
 *   **REST API** | `/api/*` | Backend endpoints used by the GUI.
 
@@ -66,8 +83,8 @@ Two gates check credentials, and they do not accept the same ones:
 
 | Credential | Where it is verified | Use it for |
 |---|---|---|
-| Dashboard session cookie | Issued by `POST /api/auth/login` against `htpasswd` | Browsing the dashboard and `/api/*` from a browser |
-| `Authorization: Basic <base64 user:pass>` | `auth_guard`, against the app's own `htpasswd` | Scripted calls to `/api/*` |
+| Dashboard session cookie | Issued by `POST /api/auth/login`, against the registered-account table then `htpasswd` | Browsing the dashboard and `/api/*` from a browser |
+| `Authorization: Basic <base64 user:pass>` | `auth_guard`, against the same store: `credentials` first, `htpasswd` only for accounts the app does not own | Scripted calls to `/api/*` |
 | `Authorization: Bearer mvk_…` | `McpAuthGuard`, against the access-key store | **All MCP clients** — the only thing `/mcp` accepts |
 | Google sign-in (OAuth redirect) | `GET /api/auth/google/start` → `…/callback` | Signing in from the browser; ends in the same session cookie |
 
@@ -159,6 +176,13 @@ session cookie. Signing up gives you a dashboard, not an MCP credential.
 dashboard session, a `Basic` password checked against the app's credential store
 or its `htpasswd`, or an access key. Nothing else names a user.
 
+The one exception is `/api/auth/*` — login, logout, signup, email confirmation
+and the two Google OAuth routes — which is unauthenticated *by design*, because
+it is where you exchange a credential for a session. That is also why those
+routes carry their own rate limiter rather than inheriting one: with the
+registration flag off, that limiter is the only thing between a script and the
+signup route.
+
 In particular, `Authorization: Basic` is *verified*. It used to be decoded and
 its username trusted without ever checking the password, which meant
 `base64(alice:anything)` authenticated as alice and reached every route,
@@ -212,31 +236,105 @@ identity itself as `X-Vault-User` after stripping any inbound copy.
 2. **Launch (CPU)**: `docker-compose up -d`
 3. **Launch (GPU)**: `docker-compose -f docker-compose.yml -f docker-compose.gpu.yml up -d` (requires NVIDIA driver + NVIDIA Container Toolkit). **Verify Ollama actually got the card**: `docker exec ollama ls /dev/nvidia0` must succeed and `docker exec ollama ollama ps` must say `100% GPU`. Without that the app silently runs every LLM call on the CPU, and the symptom is wild latency variance rather than an error.
 4. **Initialize Embedder**: `docker exec ollama ollama pull nomic-embed-text`
-5. **Initialize Query + Scope LLM**: `docker exec ollama ollama pull gemma3:4b-it-q4_K_M`
-   (a small 2b model completes fields rather than reasoning about them, which
-   misfiles diary entries; on a 4 GB card this one runs partly on the CPU and
-   pays a load per call, so allow a multi-minute full reclassify)
-6. **Initialize Merge LLM**: `docker exec ollama ollama pull gemma4:e2b`
-7. **After code changes**: rebuild the image with `docker-compose up -d --build mem-mcp` (dependency downloads are cached by BuildKit, so this is fast after the first build)
+5. **Initialize the chat models**: the four roles are split across two models, and
+   the split is deliberate — see the model table below.
+   ```bash
+   docker exec ollama ollama pull nemotron-3-nano:4b   # scope + merge
+   docker exec ollama ollama pull granite3.3:2b        # extraction
+   ```
+   `MEM_EXTRACT_MODEL` covers the high-volume extraction work (diary keywords,
+   people names, search rewriting) and `LLM_QUERY_MODEL` / `MEM_SCOPE_MODEL` /
+   `MEM_MERGE_MODEL` cover the judgement work. Do not collapse them onto one
+   model: a scope verdict is stamped and never revisited, so a **null** there is
+   recoverable and a **guess** is permanent, which is what decided the split. A
+   2b model also completes fields rather than reasoning about them — it will
+   confidently name a project the record never mentions. On a 4 GB card these
+   two cannot both stay resident, so expect a cold load when a search follows a
+   reclassify.
+6. **After code changes**: rebuild the image with `docker-compose up -d --build mem-mcp` (dependency downloads are cached by BuildKit, so this is fast after the first build)
 
 Visit **http://localhost:8086/** for the interactive setup guide.
 
+### Chat models
+
+Four roles, split across two models. The split is not a preference — it is the
+asymmetry between an error you can repeat and one you cannot.
+
+| Role | Variable | `.env.example` | Job |
+|---|---|---|---|
+| Extraction | `MEM_EXTRACT_MODEL` | `granite3.3:2b` | Diary keywords, people names, search-query rewriting |
+| Query | `LLM_QUERY_MODEL` | `nemotron-3-nano:4b` | Fallback when no model is given for a role |
+| Scope | `MEM_SCOPE_MODEL` | `nemotron-3-nano:4b` | Classifying a record's client and project |
+| Merge | `MEM_MERGE_MODEL` | `nemotron-3-nano:4b` | Dashboard merge-draft generation |
+
+The **code defaults** are narrower: `LLM_QUERY_MODEL` falls back to
+`qwen3.5:0.8b`, `MERGE_MODEL` to `gemma4:e2b`, and `EXTRACT_MODEL`/`SCOPE_MODEL`
+to `LLM_QUERY_MODEL`. So a bare install with an empty `.env` gets one small
+model for all four roles, and the split above is something `.env.example` opts
+you into rather than something the app does by default.
+
+That asymmetry is why the split exists. Extraction failures are recoverable —
+re-running the extractor is cheap and overwrites the bad result. **A scope null
+is not**: it is stamped with `scopeCheckedSig` and never revisited, so it is
+permanent scope loss. Recoverable-versus-permanent, not speed, is what decided
+it.
+
+Two of these cannot stay resident on a 4 GB card at once, so a role change
+evicts the other. That is the intended trade — the cheap high-volume role
+reloads fast, the expensive one stays warm across a reclassify — but it means a
+search immediately after a reclassify pays a load.
+
+**`MEM_EMBEDDER_MODEL` is not one of these.** It must stay an embedding model
+(`nomic-embed-text`). Pointing it at a chat model silently invalidates every
+vector already in Qdrant, and nothing errors.
+
+If your `.env` disagrees with `.env.example`, the `.env` is what is running —
+the example is the recommendation, not the enforced default. In particular,
+check that `MEM_SCOPE_MODEL` is the **reasoning** model. Putting it on
+`granite3.3:2b` is not a speed-up: that model answers quickly and confidently,
+and a scope verdict is stamped and never revisited, so every wrong one is
+permanent.
+
 ## Testing
 
-Run the focused dependency-light regression suite from the repository root:
+Run the focused dependency-light regression suite. Any `python` or `python3` on
+`PATH` runs all sixteen of them, and none of them needs Neo4j, Qdrant or Ollama:
 
-```powershell
-Push-Location mem-mcp
-C:/tools/miniconda3/python.exe -m unittest -v test_matching_regressions.py test_embedding_reliability.py test_chunking.py test_cypher_safety.py test_backup_compression.py test_people_extraction.py test_graph_scope.py test_mobile_layout.py test_llm_reliability.py test_env_wiring.py
-Pop-Location
+```bash
+cd mem-mcp
+MEM_SESSION_DIR=/tmp/mem-vault-test-sessions python3 -m unittest -v \
+  test_matching_regressions test_embedding_reliability test_chunking \
+  test_cypher_safety test_backup_compression test_people_extraction \
+  test_graph_scope test_mobile_layout test_llm_reliability test_env_wiring \
+  test_status_monitor test_sessions test_auth_guard test_google_auth \
+  test_registration test_vault_migration
 ```
 
-The suites cover scope-aware duplicate matching, weighted scoring, bridge-cluster rejection, merge target ownership, merge mutation ordering, People candidate resolution, scope-name and `Client:`-header resolution, LLM prompt contracts, the chunking split, embedding retry/fallback behaviour, the Cypher written in each module, snapshot compression, the diary people/keyword extraction windowing, graph scope and capping, the mobile stylesheet, LLM chat timeouts and log content, and that every documented variable actually reaches the container. They do not require the Docker services.
+`MEM_SESSION_DIR` matters: without it the session and PSK tests write a
+`sessions.db` into the source tree.
+
+The suites cover scope-aware duplicate matching, weighted scoring,
+bridge-cluster rejection, merge target ownership, merge mutation ordering,
+People candidate resolution, scope-name and `Client:`-header resolution, LLM
+prompt contracts, the chunking split, embedding retry/fallback behaviour, the
+Cypher written in each module, snapshot compression, the diary people/keyword
+extraction windowing, graph scope and capping, the mobile stylesheet, LLM chat
+timeouts and log content, that every documented variable actually reaches the
+container, the session and PSK stores, which credential each gate accepts, the
+OAuth redirect flow, the registration routes, and the vault-move planner.
+
+Most suites cannot import their subject — `gui.py`, `common.py` and
+`backup.py` need FastAPI, httpx and the database drivers. Those suites lift the
+real functions out of the source with `ast.get_source_segment` and run them
+against stubs, so they test the shipping code rather than a copy. A few modules
+(`sessions.py`, `matching_utils.py`, `google_auth.py`, `status_monitor.py`) are
+stdlib-only by design precisely so they *can* be imported and called directly.
 
 ## Backups
 
 The vault writes a **savepoint** every day and keeps the most recent
-`MEM_BACKUP_KEEP` of them. Manage them from **Setup → Maintenance → Backup & Restore**.
+`MEM_BACKUP_KEEP` of them. Manage them from **Service → Data → Backup & Restore**,
+which requires the admin account.
 
 - A savepoint holds the whole vault: the graph plus both vector collections. It
   lives in `mem-mcp-data/backup/` on the host (bind-mounted to `/app/backup`).
@@ -263,6 +361,97 @@ Schedule and retention are controlled in `.env`:
 Savepoints are copies, not a live mirror — if the host disk is lost, they are
 lost with it. Copy `mem-mcp-data/backup/` off the machine if you need a
 disaster-recovery copy.
+
+## Administration
+
+Operations that act on the **whole vault or the whole server** rather than on
+one account are not gated on "whoever is logged in". A restore overwrites every
+vault, a reclassify rewrites every client assignment, a backup snapshots both
+collections and the graph, and unloading a model evicts it from a GPU other
+people are paying a cold load for. So they require the one account named in:
+
+```bash
+MEM_ADMIN_USER=your-admin-username
+```
+
+Leave it **empty** and the Service tab is not rendered and no admin endpoint is
+reachable — which is the right default for a shared vault. With it set, the
+server decides (`ctx["IS_ADMIN"]` comes from the verified session, never from a
+request parameter), so the tab is **not rendered for other users at all**, not
+merely hidden: every handler behind it independently answers `403` to a
+non-admin. Hiding the UI is the friendly half; the guard is the boundary.
+
+### Service → Users
+
+Every account is a row, drawn from **all three credential stores**, because a
+user is three stores and the admin table is the only place they are seen
+together:
+
+| Store | How the account got there | Suspend | Delete |
+|---|---|---|---|
+| Registered signup | `POST /api/auth/register`, then the email link | ✅ | ✅ |
+| Google sign-in | First sign-in creates the vault, keyed on the verified address | ❌ no password row | ✅ |
+| Operator's `htpasswd` | Edited by hand on the host | ❌ | ❌ |
+
+The two ❌ cases are different failures, and the UI names which is which:
+
+- An **`htpasswd`** account is managed on the host. The file is mounted `:ro` on
+  purpose, so a Disable here would close the password path and leave the
+  `htpasswd` path still working — worse than saying plainly that nothing here
+  can change it.
+- A **Google-only** vault has no password to suspend. Delete still works, since
+  it removes the identity link as well.
+
+**Disable** suspends a *registered password* account: it cannot sign in, and its
+vault stays exactly where it is. Enable puts it back. This is the reversible
+option. A Google-only or `htpasswd` account has no `Disable` at all — there is
+no password to suspend — and the row says which of the two reasons applies
+rather than just showing no button.
+
+**Delete is irreversible** and removes the account together with *every*
+credential attached to it: the credentials row, the Google link, every access
+key, and every browser session. It does **not** delete the records — the facts,
+diary entries and clients stay in the graph and the vector store, because they
+are keyed by `userId` and nothing here deletes by it. The response says so
+(`vault_records_kept`), and the UI says so before it asks twice.
+
+Deleting every credential rather than just the password is deliberate: `/mcp`
+accepts **only** an access key, so removing the credentials row while leaving a
+key behind would leave a client able to read a vault whose account no longer
+exists. Two deletions are refused outright — the configured `MEM_ADMIN_USER` and
+the account you are signed in as — because either would leave the deployment
+with no admin at all.
+
+The signup flag is shown **read-only**. `MEM_REGISTRATION_ENABLED` is read once at
+startup, so a runtime toggle would be a second source disagreeing with the one
+the landing page actually renders from.
+
+### Service → Models
+
+What Ollama currently holds in memory, updated live, with the controls to
+unload it. Unloading is safe — the next request that needs the model reloads it, at a
+cost of 9-20s (measured on the 4 GB card this ships against, not a constant in
+the code). Unload validates the name against the live snapshot first,
+because unloading a model Ollama has not loaded answers `200` and does nothing,
+which would otherwise be an operation that reports success and changes nothing.
+
+Every signed-in user can already see the resident models in the sidebar status
+widget; this panel is the admin-only detail and the controls.
+
+### Service → Data
+
+Backups and restores (see above), scope reclassification, deduplication, and the
+consistency tools.
+
+The consistency check is **read-only** and reports every place the graph and the
+vector index disagree. Expect the count mismatches to be non-empty and expect
+them to be *fixed by a repair rather than by a check*: the boot order runs the
+checks before the reconcile step, so a mismatch means "the repair has this many
+to fix", not "data is lost". The repair fills in missing diary titles and
+timestamps, deletes vector points with no record behind them, re-embeds records
+with no vector, and prunes links that cross between vaults. It takes the
+maintenance lock, and it re-embeds records — so run the check first, and read it
+before you press the button.
 
 ## Embedding Reliability
 
@@ -362,5 +551,5 @@ naming the access-key header it needs.)*
 
 - **Frameworks**: FastAPI, FastMCP
 - **Databases**: Qdrant (Vector), Neo4j (Graph)
-- **AI/ML**: Ollama (nomic-embed-text for embeddings, `LLM_QUERY_MODEL` for query rewriting, keyword/people extraction and scope classification)
+- **AI/ML**: Ollama (`nomic-embed-text` for embeddings; `granite3.3:2b` for extraction, `nemotron-3-nano:4b` for scope/search/merge — see [Chat models](#chat-models))
 - **Frontend**: Vanilla JS, Modern CSS3
