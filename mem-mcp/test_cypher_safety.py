@@ -1085,19 +1085,46 @@ class DedupUnderServiceTests(unittest.TestCase):
         self.assertIn("saveSessionState()", self.script,
                       msg="the fallback must be persisted, or it returns every reload")
 
-    def test_entering_setup_still_primes_the_dedup_panel(self):
+    def test_entering_service_still_primes_the_dedup_panel(self):
         """Moving the panel means moving its lazy first-render with it.
 
         The empty state used to be primed by a `tab === 'deduplicate'` branch.
         Drop the branch while moving the markup and the panel renders as a
-        blank div until the user presses Scan — which looks like a broken
+        blank div until the user presses Scan - which looks like a broken
         button, because pressing it works.
+
+        The chain is asserted as three *call edges* rather than as one regex
+        over a window of characters. The window was how this test read before:
+        `tab === 'setup' ... within 400 chars ... renderDuplicateEmptyState`,
+        which said nothing about which function called what and happened to
+        survive a hop through an intermediate function only because the text
+        was still nearby. A call edge is the property; a window is a
+        coincidence that happens to be near it.
         """
-        self.assertIn("renderDuplicateEmptyState", self.script)
-        self.assertTrue(
-            re.search(r"tab\s*===\s*'setup'[\s\S]{0,400}renderDuplicateEmptyState", self.script),
-            msg="entering Setup no longer primes the dedup empty state",
-        )
+        def body(name):
+            """The source of one top-level `function name(...) { ... }`."""
+            m = re.search(r"\bfunction\s+%s\s*\(" % re.escape(name), self.script)
+            self.assertIsNotNone(m, msg="%s is not defined" % name)
+            start = self.script.index("{", m.end())
+            depth = 0
+            for i in range(start, len(self.script)):
+                if self.script[i] == "{":
+                    depth += 1
+                elif self.script[i] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return self.script[start:i + 1]
+            self.fail("%s has no closing brace" % name)
+
+        for caller, callee in (
+            ("switchTab", "switchServiceTab"),
+            ("switchServiceTab", "loadServiceData"),
+            ("loadServiceData", "loadDataPanel"),
+            ("loadDataPanel", "renderDuplicateEmptyState"),
+        ):
+            self.assertIn(callee, body(caller),
+                          msg="%s no longer calls %s, so entering the Service "
+                              "tab does not reach the dedup panel" % (caller, callee))
 
 
 # The queries whose rows are pushed one-per into a client array and rendered.

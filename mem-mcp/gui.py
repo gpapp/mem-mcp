@@ -45,8 +45,13 @@ from memory import SESSION_MAX_AGE # Import from memory.py
 import sessions as vault_sessions
 from sessions import (VaultSession, VaultSessionMiddleware, create_session,
                       get_credentials,
-                      delete_session, load_session, create_psk, list_psks,
-                      revoke_psk, resolve_psk, normalise_label, MAX_EXPIRY_DAYS,
+                      delete_session, load_session, delete_sessions_for_user,
+                      create_psk, list_psks,
+                      revoke_psk, revoke_all_psks, resolve_psk, normalise_label,
+                      MAX_EXPIRY_DAYS,
+                      disable_credentials, enable_credentials, list_credentials,
+                      list_all_google_identities, delete_google_identities,
+                      list_htpasswd_users,
                       link_google_identity, resolve_google_identity,
                       GOOGLE_PROVIDER, verify_account_password, user_id_taken,
                       create_credentials, delete_credentials, validate_email,
@@ -517,6 +522,246 @@ def _require_admin(request: Request) -> str:
             ),
         )
     return user
+
+
+# ---------------------------------------------------------------------------
+# Admin surface — the Service tab
+#
+# Everything below is behind `_require_admin`, and the whole Service page is
+# inside `{% if IS_ADMIN %}` in the template, so a non-admin is neither shown
+# the tab nor able to reach a handler behind it. Both halves matter and neither
+# substitutes for the other: the template gate is UX, the guard is the boundary.
+# ---------------------------------------------------------------------------
+
+
+def _user_table() -> list:
+    """Every account, from all three stores, merged into one row per vault.
+
+    A user is three stores, and the admin table is the only place they are
+    seen together: `credentials` (registered signups), `google_identities` (a
+    vault created by a first Google sign-in) and the operator's htpasswd file.
+    Listing only the first is what makes a suspended user invisible next to the
+    operator's own account, which is precisely the account an admin most often
+    needs to find.
+
+    The htpasswd half is read-only and says so on the row. That is not a
+    rendering choice: the file is mounted `:ro` on purpose (AGENTS.md,
+    "Registration"), so a Disable button over an htpasswd row would be a lie
+    even if it were wired -- the password path is refused, and the htpasswd path
+    still works. `can_manage` is therefore False for any account the app cannot
+    fully revoke, and the UI says why.
+
+    Never returns a password hash or a verification token. `list_credentials`
+    already selects neither, and the Google query leaves out `subject` for the
+    same reason: an admin table has no use for either, and a response body is
+    the easiest place in the app to leak one by accident.
+    """
+    creds = {row["user_id"]: row for row in list_credentials()}
+    google = {}
+    for row in list_all_google_identities():
+        google.setdefault(row["user_id"], []).append(row)
+    htpasswd = set(list_htpasswd_users())
+
+    users = []
+    for name in sorted(set(creds) | set(google) | htpasswd):
+        row = creds.get(name) or {}
+        links = google.get(name) or []
+        sources = []
+        if name in creds:
+            sources.append("password")
+        if links:
+            sources.append("google")
+        if name in htpasswd:
+            sources.append("htpasswd")
+        created = [t for t in (
+            row.get("created_at"),
+            min((l["created_at"] for l in links if l.get("created_at")), default=None),
+        ) if t]
+        users.append({
+            "user_id": name,
+            "sources": sources,
+            "email": row.get("email") or next(
+                (l.get("email") for l in links if l.get("email")), ""),
+            "verified": bool(row.get("email_verified_at")) or bool(links),
+            "disabled": bool(row.get("disabled_at")),
+            "created_at": min(created) if created else None,
+            "is_admin": mem.is_admin_user(name),
+            # An account with an htpasswd row is listed but not manageable:
+            # disabling it here closes the password path and leaves the
+            # htpasswd one open, which is worse than saying so plainly.
+            "can_manage": "htpasswd" not in sources,
+        })
+    return users
+
+
+@web_app.get("/api/admin/users", response_class=JSONResponse)
+async def api_admin_list_users(request: Request):
+    """Every account across all three credential stores, plus the signup state.
+
+    Read-only. `registration` is what the landing page is currently offering,
+    reported so an operator can answer "is signup even on?" from the same
+    screen as the accounts that came out of it. It is deliberately *not*
+    changeable here: `MEM_REGISTRATION_ENABLED` is read once at import, and a
+    runtime toggle would be a second, disagreeing source for the same question.
+    """
+    admin = _require_admin(request)
+    return {
+        "admin": admin,
+        "users": _user_table(),
+        "registration": registration_config(),
+        "htpasswd_path": HTPASSWD_PATH if os.path.exists(HTPASSWD_PATH) else "",
+    }
+
+
+@web_app.post("/api/admin/users/{user_id}/disable", response_class=JSONResponse)
+async def api_admin_disable_user(user_id: str, request: Request):
+    """Suspend an account. The vault is untouched; the key is not released.
+
+    A disabled account keeps its `userId`, so its records stay reachable and a
+    later Enable puts it back exactly as it was. That is the difference between
+    this and the delete below, and it is the reason both are offered.
+    """
+    _require_admin(request)
+    key = normalise_username(user_id)
+    if not key or not disable_credentials(key):
+        raise HTTPException(
+            status_code=404,
+            detail=f"No registrable account named '{key}'. htpasswd accounts "
+                   "and Google-only vaults cannot be disabled from here.",
+        )
+    logging.getLogger("memory-vault").info(f"admin: disabled account {key!r}")
+    return {"ok": True, "user_id": key, "disabled": True}
+
+
+@web_app.post("/api/admin/users/{user_id}/enable", response_class=JSONResponse)
+async def api_admin_enable_user(user_id: str, request: Request):
+    """Undo a suspension. The account can sign in again."""
+    _require_admin(request)
+    key = normalise_username(user_id)
+    if not key or not enable_credentials(key):
+        raise HTTPException(
+            status_code=404,
+            detail=f"No suspended account named '{key}'.",
+        )
+    logging.getLogger("memory-vault").info(f"admin: re-enabled account {key!r}")
+    return {"ok": True, "user_id": key, "disabled": False}
+
+
+@web_app.delete("/api/admin/users/{user_id}", response_class=JSONResponse)
+async def api_admin_delete_user(user_id: str, request: Request):
+    """Remove an account and every credential attached to it. Irreversible.
+
+    What this removes: the `credentials` row, every linked external identity,
+    every browser session and every access key. What it does NOT remove is the
+    vault -- the facts, diary entries, clients and projects stay in Neo4j and
+    Qdrant, because they are keyed by `userId` and nothing here deletes by it.
+    An operator who wants the data gone takes a savepoint first, or restores
+    over it.
+
+    Every credential is removed, not just the password, because the two halves
+    are independent: `/mcp` accepts *only* an access key, so deleting the
+    credentials row while leaving a key behind would produce an account that no
+    longer exists and a client that can still read the vault. `resolve_google_identity`
+    has the same shape -- a subject resolving to a vault nothing can disable.
+
+    Two refusals, and neither is negotiable:
+      * the configured admin cannot delete itself -- an app with
+        `MEM_ADMIN_USER` set to an account that no longer exists has no admin at
+        all, and the only way back is an env edit and a restart;
+      * nobody can delete the account they are signed in as, which is the same
+        lockout by a route one click away.
+    """
+    admin = _require_admin(request)
+    key = normalise_username(user_id)
+    if not key:
+        raise HTTPException(status_code=404, detail="No such account.")
+    if key == admin:
+        raise HTTPException(
+            status_code=400,
+            detail="This is the account you are signed in as. Sign in as another "
+                   "administrator first.",
+        )
+    if mem.is_admin_user(key):
+        raise HTTPException(
+            status_code=400,
+            detail="That is the configured MEM_ADMIN_USER account. Delete "
+                   "refused; disable it instead, or clear MEM_ADMIN_USER first.",
+        )
+    if key in set(list_htpasswd_users()) and not get_credentials(key):
+        raise HTTPException(
+            status_code=404,
+            detail=f"No registrable account named '{key}'.",
+        )
+
+    removed = {
+        "credentials": bool(delete_credentials(key)),
+        "google_identities": delete_google_identities(key),
+        "sessions": delete_sessions_for_user(key),
+        "access_keys": revoke_all_psks(key),
+    }
+    if not any(removed.values()):
+        raise HTTPException(status_code=404, detail=f"No such account '{key}'.")
+    logging.getLogger("memory-vault").warning(
+        f"admin: DELETED account {key!r} (vault records left in place) — {removed}"
+    )
+    return {"ok": True, "user_id": key, "removed": removed,
+            "vault_records_kept": True}
+
+
+@web_app.get("/api/admin/consistency", response_class=JSONResponse)
+async def api_admin_consistency(request: Request):
+    """Run both read-only consistency checks and return what they found.
+
+    These are boot steps. Nothing about them was reachable from the UI, so a
+    mismatch between the two stores was only ever discoverable by reading
+    `memory-vault.log` on the host.
+
+    Expect the count-mismatch rows to be non-empty after a normal period of
+    use, and expect them to be *fixed* by a repair rather than by a check:
+    the boot order runs these checks before `sync_orphans()`, so a mismatch
+    here means "the repair below has that many to fix", not "data is lost".
+    """
+    _require_admin(request)
+    try:
+        facts, diary = await asyncio.gather(
+            mem.run_consistency_checks(), mem.run_diary_consistency_checks()
+        )
+    except RuntimeError as e:
+        raise _service_unavailable(e)
+    return {"ok": bool(facts.get("ok")) and bool(diary.get("ok")),
+            "facts": facts, "diary": diary}
+
+
+@web_app.post("/api/admin/repair", response_class=JSONResponse)
+async def api_admin_repair(request: Request):
+    """Repair what the checks found: fill in diary metadata, reconcile the stores.
+
+    Takes the maintenance lock for the calling admin, because this writes in
+    bulk and interleaves with a backup or a reclassify the same way they would
+    with each other. It is the only place `sync_orphans()` is reachable by
+    hand; on boot it runs unattended after the checks.
+
+    Run the check first. The check is free and read-only; the repair re-embeds
+    records, and "deleted 40,000 orphans" is a much worse thing to discover
+    after the fact than to see before pressing the button.
+    """
+    admin = _require_admin(request)
+    if not mem.claim_maintenance(admin, "repair"):
+        raise HTTPException(
+            status_code=409,
+            detail="Another maintenance operation is running — wait for it to finish.",
+        )
+    try:
+        diary_fix = await mem.fix_diary_entries()
+        orphans = await mem.sync_orphans()
+    except RuntimeError as e:
+        raise _service_unavailable(e)
+    finally:
+        mem.release_maintenance(admin)
+    logging.getLogger("memory-vault").info(
+        f"admin: repair run by {admin!r} — diary={diary_fix} orphans={orphans}"
+    )
+    return {"ok": True, "diary": diary_fix, "orphans": orphans}
 
 
 def _service_unavailable(exc: Exception) -> HTTPException:

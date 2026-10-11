@@ -56,6 +56,15 @@
     #page-memories { max-width: none; padding: .75rem 1rem; }
     #page-diary { max-width: none; padding: .75rem 1rem; }
 
+    /* ── Service sub-tabs ──
+       Same show/hide contract as `.page`, for the panels inside the Service
+       tab. That is what lets switchServiceTab() reuse switchTab()'s
+       add-and-remove-an-`active`-class idiom instead of writing inline
+       `style.display` from JS: an inline style outranks the stylesheet, so the
+       panels would stop responding to the class the moment one was set. */
+    .service-panel { display: none; }
+    .service-panel.active { display: block; }
+
     /* ── Deduplication Page ── */
     .dedup-toolbar { display: flex; gap: .75rem; align-items: flex-end; flex-wrap: wrap; }
     .dedup-toolbar > div { flex: 1 1 150px; }
@@ -1095,11 +1104,31 @@ npm install @modelcontextprotocol/sdk</code></pre>
   <div class="card">
     <h2 style="margin-top:0;">⚙️ Service</h2>
     <p>Operations that affect the whole vault or the whole server rather
-       than your own records: the models resident on the GPU, backups and
-       restores, scope reclassification and deduplication. This tab exists
-       only for the account named in <code>MEM_ADMIN_USER</code>.</p>
+       than your own records. This tab exists only for the account named in
+       <code>MEM_ADMIN_USER</code>.</p>
 
-    <div style="margin-top: 2.5rem; padding-top: 1.5rem; border-top: 1px solid var(--border);">
+    <div class="mode-toggle" style="margin: 1.25rem 0;">
+      <button id="svc-tab-users" class="active" onclick="switchServiceTab('users')">👥 Users</button>
+      <button id="svc-tab-models" onclick="switchServiceTab('models')">🧠 Models</button>
+      <button id="svc-tab-data" onclick="switchServiceTab('data')">💾 Data</button>
+    </div>
+
+    <div id="service-users" class="service-panel active">
+      <h3 style="margin-top:0;">👥 Users</h3>
+      <p style="font-size: 0.9rem; color: var(--muted); margin-bottom: 1rem;">
+        Every account that can reach this server, from all three credential
+        stores: registered signups, vaults created by a first Google sign-in,
+        and the operator's own <code>htpasswd</code> file.
+        <strong>Disable</strong> suspends an account and leaves its vault
+        exactly where it is; <strong>Delete</strong> removes the account and
+        every credential attached to it, and
+        <strong>cannot be undone</strong>.
+      </p>
+      <div id="signup-state" style="font-size:.85rem; color:var(--muted); margin-bottom:1rem;"></div>
+      <div id="users-table"></div>
+    </div>
+    <div id="service-models" class="service-panel">
+<div style="margin-top: 2.5rem; padding-top: 1.5rem; border-top: 1px solid var(--border);">
       <h3 style="margin-top:0;">🧠 Loaded models</h3>
       <p style="font-size: 0.9rem; color: var(--muted); margin-bottom: 1rem;">
         What Ollama currently holds in memory, updated live. On a shared GPU card
@@ -1114,9 +1143,9 @@ npm install @modelcontextprotocol/sdk</code></pre>
         <button id="models-unload-all-btn" class="btn btn-sm" onclick="unloadAllModels()">♻️ Unload all resident models</button>
         <span id="models-note" style="font-size:.85rem; color:var(--muted);"></span>
       </div>
-    </div>
-
-    <div style="margin-top: 2.5rem; padding-top: 1.5rem; border-top: 1px solid var(--border);">
+    </div>    </div>
+    <div id="service-data" class="service-panel">
+<div style="margin-top: 2.5rem; padding-top: 1.5rem; border-top: 1px solid var(--border);">
       <h3 style="margin-top:0;">🛠️ Maintenance</h3>
       <p style="font-size: 0.9rem; color: var(--muted); margin-bottom: 1rem;">
         Re-run the Ollama scope classifier over <strong>all</strong> memories and diary entries, replacing existing client assignments. Each item is classified with its category, keywords and linked neighbours as context. Runs in the background — safe to navigate away.
@@ -1127,8 +1156,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
         <div id="reclassify-bar" style="height:100%; width:0%; background:var(--primary); transition:width .3s;"></div>
       </div>
     </div>
-
-    <div style="margin-top: 2rem; padding-top: 1.5rem; border-top: 1px solid var(--border);">
+<div style="margin-top: 2rem; padding-top: 1.5rem; border-top: 1px solid var(--border);">
       <h3 style="margin-top:0;">🧹 Deduplicate memories</h3>
       <p style="font-size: 0.9rem; color: var(--muted); margin-bottom: 1rem;">
         Find scope-compatible duplicate clusters, review every record, then confirm each merge manually.
@@ -1152,8 +1180,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
       <div id="dedup-status" style="margin-top:.75rem;font-size:.85rem;color:var(--muted);"></div>
       <div id="dedup-clusters"></div>
     </div>
-
-    <div style="margin-top: 2rem; padding-top: 1.5rem; border-top: 1px solid var(--border);">
+<div style="margin-top: 2rem; padding-top: 1.5rem; border-top: 1px solid var(--border);">
       <h3 style="margin-top:0;">💾 Backup &amp; Restore</h3>
       <p style="font-size: 0.9rem; color: var(--muted); margin-bottom: 1rem;">
         A savepoint is a copy of the <strong>whole vault</strong> — the graph plus both vector
@@ -1170,6 +1197,25 @@ npm install @modelcontextprotocol/sdk</code></pre>
       <div id="savepoint-list" style="margin-top:1rem; max-height:280px; overflow-y:auto;">
         <div style="font-size:.9rem; color:var(--muted);">Loading savepoints…</div>
       </div>
+    </div>
+    <div style="margin-top: 2rem; padding-top: 1.5rem; border-top: 1px solid var(--border);">
+      <h3 style="margin-top:0;">🩺 Consistency</h3>
+      <p style="font-size: 0.9rem; color: var(--muted); margin-bottom: 1rem;">
+        Two stores hold the same records: the graph and the vector index.
+        <strong>Check</strong> is read-only and reports every place they
+        disagree. <strong>Repair</strong> fixes what it found — it fills in
+        missing diary titles and timestamps, deletes vector points with no
+        record behind them, re-embeds records with no vector, and prunes
+        cross-vault links. Run the check first: the repair re-embeds records,
+        which is expensive enough to be worth seeing before you start it.
+      </p>
+      <div style="display:flex; gap:.5rem; flex-wrap:wrap; align-items:center;">
+        <button id="consistency-btn" class="btn btn-primary btn-sm" onclick="runConsistency()">🩺 Check consistency</button>
+        <button id="repair-btn" class="btn btn-sm" onclick="runRepair()">🔧 Repair what it found</button>
+        <span id="consistency-status" style="font-size:.9rem; color:var(--muted);"></span>
+      </div>
+      <div id="consistency-issues" style="margin-top:1rem;"></div>
+    </div>
     </div>
   </div>
 </div>
@@ -1288,6 +1334,11 @@ npm install @modelcontextprotocol/sdk</code></pre>
   let lastSortOrder = 'alphabetical';
   let lastSearchQuery = '';
   let activeTab = 'memories';
+  // Which Service sub-tab is open. Persisted alongside activeTab for the same
+  // reason: an admin who is mid-repair when the browser closes should come back
+  // to the repair panel, not to Users.
+  const SERVICE_TABS = ['users', 'models', 'data'];
+  let serviceTab = 'users';
   let selectedFactId = null;
   let network = null;
   let graphResizeObserver = null;
@@ -1309,6 +1360,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     try {
       const state = {
         activeTab: activeTab,
+        serviceTab: serviceTab,
         lastSearchQuery: lastSearchQuery,
         lastSortOrder: lastSortOrder,
         activeCategory: activeCategory,
@@ -1338,6 +1390,11 @@ npm install @modelcontextprotocol/sdk</code></pre>
       if (saved) {
         const state = JSON.parse(saved);
         if (state.activeTab) activeTab = state.activeTab;
+        // Validated against the list, because this is read from localStorage
+        // before any panel has rendered: a sub-tab name that has since been
+        // renamed would otherwise clear every panel's `active` class on entry
+        // and leave the Service tab blank with nothing in the console.
+        if (SERVICE_TABS.indexOf(state.serviceTab) !== -1) serviceTab = state.serviceTab;
         if (state.lastSearchQuery !== undefined) lastSearchQuery = state.lastSearchQuery;
         if (state.lastSortOrder !== undefined) lastSortOrder = state.lastSortOrder;
         if (state.activeCategory !== undefined) activeCategory = state.activeCategory;
@@ -1758,15 +1815,240 @@ npm install @modelcontextprotocol/sdk</code></pre>
     if (tab === 'setup') {
       loadPSKs();
     }
-    if (tab === 'service') loadServiceData();
+    // Through switchServiceTab, not straight to loadServiceData: the panel
+    // classes have to be applied on entry, or a remembered sub-tab shows the
+    // markup with no panel marked active and the Service tab looks blank.
+    if (tab === 'service') switchServiceTab(serviceTab);
     saveSessionState();
   }
 
   async function loadServiceData() {
+    // Entering the tab primes only the panel the admin is actually looking at.
+    // Data is the expensive one -- `loadSavepoints` reads the Qdrant snapshot
+    // list and reclassify status reads the job -- so priming all three on every
+    // entry would do work whose result is thrown away the moment they switch
+    // away from it. The models fetch is one snapshot the SSE stream is already
+    // pushing to every signed-in user, so it costs nothing extra.
+    const panel = serviceTab || 'users';
+    if (panel === 'users') loadUsers();
+    if (panel === 'data') loadDataPanel();
+    if (panel === 'models') api.get('status').then(renderServerStatus).catch(() => {});
+  }
+
+  function loadDataPanel() {
     loadReclassifyStatus();
     loadSavepoints();
     if (!duplicateClusters.length) renderDuplicateEmptyState();
-    api.get('status').then(renderServerStatus).catch(() => {});
+  }
+
+  function switchServiceTab(tab) {
+    // Guarded, not trusted: this is also reached from a persisted value, and a
+    // name matching no panel would clear every panel's `active` class and leave
+    // the Service tab blank with no error anywhere.
+    if (SERVICE_TABS.indexOf(tab) === -1) {
+      console.warn('Unknown service sub-tab "' + tab + '"; falling back to users');
+      tab = 'users';
+    }
+    serviceTab = tab;
+    document.querySelectorAll('.service-panel').forEach(p => p.classList.remove('active'));
+    document.querySelectorAll('#page-service .mode-toggle button').forEach(b => b.classList.remove('active'));
+    const panel = document.getElementById('service-' + tab);
+    if (panel) panel.classList.add('active');
+    const btn = document.getElementById('svc-tab-' + tab);
+    if (btn) btn.classList.add('active');
+    if (activeTab === 'service') loadServiceData();
+    saveSessionState();
+  }
+
+  // ---------------------------------------------------------------- Users ---
+
+  async function loadUsers(opts) {
+    const force = !!(opts && opts.force);
+    if (usersInFlight) return usersInFlight;
+    if (usersLoaded && !force) return Promise.resolve();
+    usersInFlight = fetchUsers().finally(() => { usersInFlight = null; });
+    return usersInFlight;
+  }
+
+  async function fetchUsers() {
+    const box = document.getElementById('users-table');
+    try {
+      const data = await api.get('admin/users');
+      usersLoaded = true;
+      renderSignupState(data.registration || {});
+      renderUsers(data.users || [], data);
+    } catch (e) {
+      usersLoaded = false;
+      if (box) box.innerHTML = `<div style="font-size:.9rem; color:var(--danger);">⚠️ Could not load users${e && e.status ? ' (' + e.status + ')' : ''}</div>`;
+    }
+  }
+
+  function renderSignupState(cfg) {
+    const el = document.getElementById('signup-state');
+    if (!el) return;
+    // Read-only on purpose. MEM_REGISTRATION_ENABLED is read once at import, so
+    // a toggle here would need a second store of its own and would eventually
+    // disagree with the env var the landing page actually renders from.
+    const email = cfg.email ? '✅ on' : '⏸️ off';
+    const google = cfg.google ? '✅ on' : '⏸️ off';
+    el.innerHTML = `<strong>Signup:</strong> email/password ${email} · Google ${google}. `
+      + 'Signups are turned on with <code>MEM_REGISTRATION_ENABLED=1</code> in the environment '
+      + 'and changing it needs a restart. Minimum password length is '
+      + `${cfg.password_hint || '?'} characters.`;
+  }
+
+  function renderUsers(users, data) {
+    const box = document.getElementById('users-table');
+    if (!box) return;
+    if (!users.length) {
+      box.innerHTML = '<div class="srv-empty">No accounts found.</div>';
+      return;
+    }
+    const rows = users.map(u => {
+      const tags = (u.sources || []).map(s => `<span class="tag-badge">${escHtml(s)}</span>`).join('');
+      const state = u.is_admin
+        ? '<span class="tag-badge">admin</span>'
+        : (u.disabled ? '<span class="mtag srv-warn">disabled</span>' : '<span class="mtag">active</span>');
+      const verified = u.verified ? '' : ' <span class="mtag srv-warn">unverified</span>';
+      // can_manage is false for anything with an htpasswd row, and the reason
+      // is on the row: that file is mounted read-only, so a Disable here would
+      // close the password path and leave the htpasswd one working. Saying
+      // "read-only" beats a button that half-works.
+      const actions = u.can_manage
+        ? (u.disabled
+            ? `<button class="btn btn-sm" onclick="enableUser('${escHtml(u.user_id)}')">✅ Enable</button>`
+            : `<button class="btn btn-sm" onclick="disableUser('${escHtml(u.user_id)}')">⏸️ Disable</button>`)
+          + ` <button class="btn btn-sm btn-danger" onclick="deleteUser('${escHtml(u.user_id)}')">🗑️ Delete</button>`
+        : '<span style="font-size:.78rem; color:var(--muted);">read-only — managed in htpasswd on the host</span>';
+      return `<tr>
+        <td style="font-weight:600;">${escHtml(u.user_id)} ${state}${verified}</td>
+        <td>${tags}</td>
+        <td>${escHtml(u.email || '—')}</td>
+        <td style="white-space:nowrap;">${u.created_at ? escHtml(humanStamp(new Date(u.created_at * 1000).toISOString())) : '—'}</td>
+        <td style="text-align:right;">${actions}</td>
+      </tr>`;
+    }).join('');
+    const ht = (data && data.htpasswd_path)
+      ? `<p style="font-size:.8rem; color:var(--muted); margin-top:.75rem;">Accounts found in <code>${escHtml(data.htpasswd_path)}</code> are listed but not editable — the app cannot write that file.</p>`
+      : '';
+    box.innerHTML = `<table style="width:100%; border-collapse:collapse; font-size:.85rem;">
+        <thead><tr style="text-align:left; border-bottom:1px solid var(--border);">
+          <th style="padding:.4rem .5rem;">Account</th>
+          <th style="padding:.4rem .5rem;">Sources</th>
+          <th style="padding:.4rem .5rem;">Email</th>
+          <th style="padding:.4rem .5rem;">Created</th>
+          <th style="padding:.4rem .5rem;"></th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>` + ht;
+  }
+
+  async function disableUser(name) {
+    if (!confirm(`Disable ${name}?\n\nThey will not be able to sign in or use their access keys. Their vault stays exactly where it is, and Enable puts it back.`)) return;
+    try {
+      await api.post(`admin/users/${encodeURIComponent(name)}/disable`, {});
+      toast(`⏸️ ${name} disabled`, 3000);
+      loadUsers({ force: true });
+    } catch (e) { toastApiError(e, `Could not disable ${name}`); }
+  }
+
+  async function enableUser(name) {
+    try {
+      await api.post(`admin/users/${encodeURIComponent(name)}/enable`, {});
+      toast(`✅ ${name} enabled`, 3000);
+      loadUsers({ force: true });
+    } catch (e) { toastApiError(e, `Could not enable ${name}`); }
+  }
+
+  async function deleteUser(name) {
+    // Two confirmations, because this is the one irreversible button in the
+    // app: the account goes, every credential goes with it, and nothing comes
+    // back. The second names what is deliberately NOT removed, since "delete"
+    // on an account holding a vault is otherwise a fair thing to read as
+    // "delete the vault too".
+    if (!confirm(`Delete ${name} FOREVER?\n\nThis removes their account, their Google link, every access key and every browser session.\n\nIt cannot be undone.`)) return;
+    if (!confirm(`Last confirmation: delete ${name}? Their records stay in the vault, but the account will not exist afterwards.`)) return;
+    try {
+      const res = await api.delete(`admin/users/${encodeURIComponent(name)}`);
+      const r = res.removed || {};
+      const what = [];
+      if (r.credentials) what.push('account');
+      if (r.access_keys) what.push(r.access_keys + ' key(s)');
+      if (r.sessions) what.push(r.sessions + ' session(s)');
+      toast(`🗑️ ${name} deleted${what.length ? ' — ' + what.join(', ') : ''}`, 6000);
+      loadUsers({ force: true });
+    } catch (e) { toastApiError(e, `Could not delete ${name}`); }
+  }
+
+  // ---------------------------------------------------------- Consistency ---
+
+  async function runConsistency() {
+    const btn = document.getElementById('consistency-btn');
+    const status = document.getElementById('consistency-status');
+    if (btn) btn.disabled = true;
+    if (status) status.textContent = 'Checking the graph against the vector index…';
+    try {
+      renderConsistency(await api.get('admin/consistency'));
+    } catch (e) {
+      if (status) status.textContent = '';
+      toastApiError(e, 'The consistency check failed');
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  function renderConsistency(res) {
+    const status = document.getElementById('consistency-status');
+    const box = document.getElementById('consistency-issues');
+    if (!status || !box) return;
+    const all = [].concat((res.facts || {}).issues || [], (res.diary || {}).issues || []);
+    const skipped = (res.facts || {}).skipped || (res.diary || {}).skipped;
+    if (!all.length) {
+      // A skipped run is not a clean run. Saying "the stores agree" after a
+      // check that never reached the database is the one answer here that
+      // would be a lie, so the skip is named instead.
+      status.textContent = skipped
+        ? 'The database was unavailable — nothing was checked.'
+        : '✅ The graph and the vector index agree.';
+      box.innerHTML = '';
+      return;
+    }
+    status.textContent = `⚠️ ${all.length} discrepancy(ies) found. Repair fixes the ones that have an automatic fix.`;
+    box.innerHTML = all.map(i =>
+      '<div style="display:flex; gap:.6rem; align-items:baseline; padding:.45rem .6rem; margin-bottom:.3rem; border:1px solid var(--border); border-radius:6px; font-size:.82rem;">'
+      + `<span class="mtag" style="white-space:nowrap;">${escHtml(i.kind || 'issue')}</span>`
+      + `<span>${i.user ? `<strong>${escHtml(i.user)}</strong> — ` : ''}${escHtml(i.detail || '')}</span>`
+      + '</div>').join('');
+  }
+
+  async function runRepair() {
+    const btn = document.getElementById('repair-btn');
+    const status = document.getElementById('consistency-status');
+    if (!confirm('Repair the vault?\n\nThis re-embeds records that have no vector, deletes vector points with no record behind them, fills in missing diary titles and timestamps, and prunes links that cross between vaults.\n\nRun the check first if you have not — this is the expensive one.')) return;
+    if (btn) btn.disabled = true;
+    if (status) status.textContent = 'Repairing…';
+    try {
+      const res = await api.post('admin/repair', {});
+      const o = res.orphans || {}, d = res.diary || {};
+      status.textContent = '✅ Repair complete — '
+        + `${o.deleted || 0} orphan point(s) deleted, `
+        + `${o.reembedded || 0} record(s) re-embedded, `
+        + `${o.pruned_links || 0} dangling link(s) pruned, `
+        + `${d.titled || 0} diary title(s) filled in, `
+        + `${d.dated || 0} timestamp(s) filled in.`;
+      toast('🔧 Repair complete', 5000);
+      if (o.deleted || o.reembedded) {
+        // The repair wrote vectors and deleted points, so anything cached from
+        // before it may now be wrong. Same reason a restore clears everything.
+        memories = []; diaryEntries = []; clientListCache = []; clientActiveMap = {}; graphLoaded = false;
+        await Promise.allSettled([loadMemories(), loadClients(), loadDiary()]);
+      }
+    } catch (e) {
+      if (status) status.textContent = '';
+      toastApiError(e, 'The repair failed');
+    } finally {
+      if (btn) btn.disabled = false;
+    }
   }
 
   async function loadWhoami() {
@@ -2388,6 +2670,12 @@ npm install @modelcontextprotocol/sdk</code></pre>
 
   let savepointsLoaded = false;
   let savepointsInFlight = null;
+  // Same coalescing as the savepoint list, for the same reason: the Users panel
+  // is reached from switchTab, from switchServiceTab and from a forced refresh
+  // after an action, and three concurrent GETs each rendering the whole table
+  // is three renders of the same data.
+  let usersLoaded = false;
+  let usersInFlight = null;
   let backupTimer = null;
   let backupSettled = true;
 

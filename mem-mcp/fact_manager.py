@@ -2482,12 +2482,22 @@ def _scope_and_cap_graph(node_map, edges, fact_clients, fact_contexts, diary_sco
 # Startup consistency checks: read-only validation across all stores
 # ---------------------------------------------------------------------------
 async def run_consistency_checks():
-    """Read-only consistency checks across Neo4j and Qdrant. Logs all discrepancies."""
+    """Read-only consistency checks across Neo4j and Qdrant.
+
+    Returns the same discrepancies it logs, as data. The logging is not the
+    point -- it was written for a boot-time run that nobody was watching, and
+    the admin Data panel now needs to *show* a check rather than ask the
+    operator to go and read a log file. Every log line below is unchanged, and
+    the report is collected alongside it rather than instead of it, so a
+    divergence between what is logged and what is shown cannot be introduced
+    by a return being added later.
+    """
+    issues = []
     qdrant = await get_qdrant()
     neo4j_driver = get_neo4j()
     if not qdrant or not neo4j_driver:
         logger.warning("consistency: DB not available, skipping checks")
-        return
+        return {"ok": False, "skipped": "database unavailable", "issues": []}
 
     # Collect all user IDs from both Fact and DiaryEntry nodes
     with neo4j_driver.session() as s:
@@ -2499,7 +2509,7 @@ async def run_consistency_checks():
     user_ids = [r["userId"] for r in user_rows if r["userId"]]
     if not user_ids:
         logger.info("consistency: no users found in graph")
-        return
+        return {"ok": True, "skipped": "no users in the graph", "issues": []}
 
     issues_found = False
 
@@ -2522,6 +2532,11 @@ async def run_consistency_checks():
                 f"consistency [{user_id}]: Fact count mismatch — "
                 f"Neo4j: {neo4j_fact_count}, Qdrant: {qdrant_fact_count}"
             )
+            issues.append({
+                "user": user_id,
+                "kind": "fact_count_mismatch",
+                "detail": f"Neo4j has {neo4j_fact_count}, Qdrant has {qdrant_fact_count}",
+            })
             _log_diff(neo4j_fact_ids, qdrant_fact_ids, user_id, "fact", "Neo4j", "Qdrant")
         else:
             logger.info(f"consistency [{user_id}]: Facts OK ({neo4j_fact_count})")
@@ -2533,6 +2548,11 @@ async def run_consistency_checks():
     if no_user_count:
         issues_found = True
         logger.warning(f"consistency: {no_user_count} facts have no userId")
+        issues.append({
+            "user": None,
+            "kind": "facts_without_user",
+            "detail": f"{no_user_count} facts have no userId",
+        })
 
     with neo4j_driver.session() as s:
         orphan_cats = list(s.run("""
@@ -2543,6 +2563,11 @@ async def run_consistency_checks():
     for r in orphan_cats:
         issues_found = True
         logger.warning(f"consistency: Orphan category '{r['name']}' has no facts linked")
+        issues.append({
+            "user": None,
+            "kind": "orphan_category",
+            "detail": f"category {r['name']!r} has no facts linked",
+        })
 
     # --- Facts without a title ---
     with neo4j_driver.session() as s:
@@ -2555,6 +2580,11 @@ async def run_consistency_checks():
             f"consistency: {len(untitled_facts)}+ facts without a title "
             f"(showing first IDs: {', '.join(r['id'] for r in untitled_facts[:20])})"
         )
+        issues.append({
+            "user": None,
+            "kind": "untitled_facts",
+            "detail": f"{len(untitled_facts)}+ facts without a title",
+        })
 
     # --- Dangling MENTIONS from diary entries to non-Fact nodes ---
     with neo4j_driver.session() as s:
@@ -2568,6 +2598,11 @@ async def run_consistency_checks():
             f"consistency [{row['userId']}]: {row['count']} MENTIONS link(s) "
             f"from diary entry to non-Fact node"
         )
+        issues.append({
+            "user": row["userId"],
+            "kind": "dangling_mentions",
+            "detail": f"{row['count']} MENTIONS link(s) from a diary entry to a non-Fact node",
+        })
 
     # --- Cross-user MENTIONS ---
     with neo4j_driver.session() as s:
@@ -2581,11 +2616,20 @@ async def run_consistency_checks():
             f"consistency [{row['diaryUser']}]: {row['count']} MENTIONS link(s) "
             f"crossing user boundary (fact belongs to '{row['factUser']}')"
         )
+        issues.append({
+            "user": row["diaryUser"],
+            "kind": "cross_user_mentions",
+            "detail": (
+                f"{row['count']} MENTIONS link(s) to facts belonging to "
+                f"{row['factUser']!r}"
+            ),
+        })
 
     if not issues_found:
         logger.info("consistency: All checks passed — no discrepancies found")
     else:
         logger.info(f"consistency: Summary — {len(user_ids)} users checked")
+    return {"ok": not issues_found, "users_checked": len(user_ids), "issues": issues}
 
 
 def _normalize_point_id(raw_id: str):
@@ -2657,12 +2701,20 @@ def _log_diff(set_a: set, set_b: set, user_id: str, label: str, label_a: str, la
 # Startup orphan sync: detect and fix Qdrant ↔ Neo4j inconsistencies
 # ---------------------------------------------------------------------------
 async def sync_orphans():
-    """Detect and fix Qdrant ↔ Neo4j orphans for every user on startup."""
+    """Detect and fix Qdrant ↔ Neo4j orphans for every user on startup.
+
+    Returns the counts it logs. `sync_orphans` is a boot step that runs before
+    anyone is looking at the app, and a repair an admin triggers by hand needs
+    an answer: "deleted 12 orphans, re-embedded 4" is what tells an operator
+    the run did something, where "nothing to fix" and "the run silently failed"
+    would otherwise look the same from the UI.
+    """
     qdrant = await get_qdrant()
     neo4j_driver = get_neo4j()
     if not qdrant or not neo4j_driver:
         logger.warning("sync_orphans: DB not available, skipping")
-        return
+        return {"deleted": 0, "reembedded": 0, "pruned_links": 0,
+                "orphan_categories": 0, "skipped": "database unavailable"}
 
     with neo4j_driver.session() as s:
         user_rows = list(s.run(
@@ -2673,7 +2725,8 @@ async def sync_orphans():
     user_ids = [r["userId"] for r in user_rows if r["userId"]]
     if not user_ids:
         logger.info("sync_orphans: no users found")
-        return
+        return {"deleted": 0, "reembedded": 0, "pruned_links": 0,
+                "orphan_categories": 0, "skipped": "no users in the graph"}
 
     total_deleted = 0
     total_reembedded = 0
@@ -2923,6 +2976,12 @@ async def sync_orphans():
         )
     else:
         logger.info("sync_orphans: nothing to fix")
+    return {
+        "deleted": total_deleted,
+        "reembedded": total_reembedded,
+        "pruned_links": total_pruned_links,
+        "orphan_categories": len(orphan_cats),
+    }
 
 
 # ---------------------------------------------------------------------------

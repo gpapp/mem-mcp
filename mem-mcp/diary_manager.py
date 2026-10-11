@@ -1270,19 +1270,26 @@ async def _scroll_diary_ids(qdrant, user_id: str) -> set:
 
 
 async def run_diary_consistency_checks():
-    """Read-only diary-specific consistency checks across Neo4j and Qdrant. Logs all discrepancies."""
+    """Read-only diary-specific consistency checks across Neo4j and Qdrant.
+
+    Returns the same discrepancies it logs, as data, for the same reason the
+    fact-side check does: the admin Data panel has to be able to *run* a check
+    and show the result, and "go and read the log" is not a UI. Every log line
+    is unchanged and the report is collected alongside it.
+    """
+    issues = []
     qdrant = await get_qdrant()
     neo4j_driver = get_neo4j()
     if not qdrant or not neo4j_driver:
         logger.warning("consistency: DB not available, skipping diary checks")
-        return
+        return {"ok": False, "skipped": "database unavailable", "issues": []}
 
     with neo4j_driver.session() as s:
         user_rows = list(s.run("MATCH (d:DiaryEntry) RETURN DISTINCT d.userId AS userId"))
     user_ids = [r["userId"] for r in user_rows if r["userId"]]
     if not user_ids:
         logger.info("consistency: no diary users found")
-        return
+        return {"ok": True, "skipped": "no diary users in the graph", "issues": []}
 
     issues_found = False
     dangling_links = 0
@@ -1308,6 +1315,15 @@ async def run_diary_consistency_checks():
             )
             only_neo4j = neo4j_ids - qdrant_ids
             only_qdrant = qdrant_ids - neo4j_ids
+            issues.append({
+                "user": user_id,
+                "kind": "diary_count_mismatch",
+                "detail": (
+                    f"Neo4j has {neo4j_count}, Qdrant has {qdrant_count}"
+                    f" ({len(only_neo4j)} only in the graph, "
+                    f"{len(only_qdrant)} only in the vector store)"
+                ),
+            })
             if only_neo4j:
                 logger.warning(
                     f"consistency [{user_id}]: {len(only_neo4j)} diary(s) in Neo4j only: "
@@ -1333,6 +1349,11 @@ async def run_diary_consistency_checks():
             issues_found = True
             dangling_links += count
             logger.warning(f"consistency [{user_id}]: {count} MENTIONS link(s) to non-Fact nodes")
+            issues.append({
+                "user": user_id,
+                "kind": "dangling_diary_mentions",
+                "detail": f"{count} MENTIONS link(s) from a diary entry to a non-Fact node",
+            })
 
     # --- Cross-user diary checks ---
     with neo4j_driver.session() as s:
@@ -1341,6 +1362,11 @@ async def run_diary_consistency_checks():
     if count:
         issues_found = True
         logger.warning(f"consistency: {count} diary entries have no userId")
+        issues.append({
+            "user": None,
+            "kind": "diary_without_user",
+            "detail": f"{count} diary entries have no userId",
+        })
 
     with neo4j_driver.session() as s:
         untitled = list(s.run(
@@ -1353,6 +1379,11 @@ async def run_diary_consistency_checks():
             f"consistency: {len(untitled)}+ diary entries without a title "
             f"(IDs: {', '.join(r['id'] for r in untitled)})"
         )
+        issues.append({
+            "user": None,
+            "kind": "untitled_diary_entries",
+            "detail": f"{len(untitled)}+ diary entries without a title",
+        })
 
     with neo4j_driver.session() as s:
         bad_ts = list(s.run(
@@ -1365,20 +1396,40 @@ async def run_diary_consistency_checks():
             f"consistency: {len(bad_ts)}+ diary entries without a valid timestamp "
             f"(IDs: {', '.join(r['id'] for r in bad_ts)})"
         )
+        issues.append({
+            "user": None,
+            "kind": "undated_diary_entries",
+            "detail": f"{len(bad_ts)}+ diary entries without a valid timestamp",
+        })
 
     if not issues_found:
         logger.info("consistency diary: All checks passed")
     else:
         logger.info(f"consistency diary: Summary — {len(user_ids)} users checked, {dangling_links} dangling links")
+    return {
+        "ok": not issues_found,
+        "users_checked": len(user_ids),
+        "dangling_links": dangling_links,
+        "issues": issues,
+    }
 
 
 async def fix_diary_entries():
-    """Auto-fix diary entries with missing title or timestamp."""
+    """Auto-fix diary entries with missing title or timestamp.
+
+    Returns what it changed, so a repair run can be reported rather than only
+    logged. `titled` and `dated` are always present even when nothing was
+    fixed -- "0 and 0" is the answer to "did that work", and making the caller
+    infer it from a missing key is the kind of absence that reads as a crash.
+    """
     neo4j_driver = get_neo4j()
     if not neo4j_driver:
-        return
+        return {"changed": False, "skipped": "database unavailable",
+                "titled": 0, "dated": 0}
 
     fixed_any = False
+    titled = 0
+    dated = 0
 
     with neo4j_driver.session() as s:
         # Fix missing titles
@@ -1390,6 +1441,7 @@ async def fix_diary_entries():
         count = result.single()["count"]
         if count:
             fixed_any = True
+            titled = count
             logger.info(f"fix: Set title on {count} untitled diary entries")
 
     with neo4j_driver.session() as s:
@@ -1404,7 +1456,9 @@ async def fix_diary_entries():
         count = result.single()["count"]
         if count:
             fixed_any = True
+            dated = count
             logger.info(f"fix: Set timestamp on {count} diary entries to {now}")
 
     if not fixed_any:
         logger.info("fix diary: Nothing to fix")
+    return {"changed": fixed_any, "titled": titled, "dated": dated}

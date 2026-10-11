@@ -654,6 +654,35 @@ def revoke_psk(psk_id: str, user_id: str, now=None) -> bool:
         conn.close()
 
 
+def revoke_all_psks(user_id: str, now=None) -> int:
+    """Revoke every one of `user_id`'s access keys. Count of keys killed.
+
+    Disabling an account stops a password login, but an access key is a
+    separate credential held by whatever client minted it -- and `/mcp` takes
+    *only* an access key. Disabling without revoking would leave a disabled
+    user with a working MCP client, which is the whole credential hierarchy
+    working against itself: the account is off and the key still opens the
+    vault.
+
+    Like `revoke_psk`, this keeps revoked rows rather than deleting them, so
+    an operator can still see that the key existed and that it was killed here.
+    """
+    key = str(user_id or "").strip()
+    if not key:
+        return 0
+    init_db()
+    conn = _connect()
+    try:
+        cursor = conn.execute(
+            "UPDATE psks SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL",
+            (_now(now), key),
+        )
+        conn.commit()
+        return cursor.rowcount
+    finally:
+        conn.close()
+
+
 def transfer_psks(old_user: str, new_user: str) -> int:
     """Re-own every one of `old_user`'s access keys under `new_user`.
 
@@ -1297,6 +1326,112 @@ def disable_credentials(user_id, now=None) -> bool:
         return cursor.rowcount > 0
     finally:
         conn.close()
+
+
+def enable_credentials(user_id, now=None) -> bool:
+    """Undo `disable_credentials`, so a suspended account can sign in again.
+
+    The `AND disabled_at IS NOT NULL` guard is the whole reason this is not a
+    bare `SET disabled_at = NULL`. An enabled account that was never disabled
+    would have its `updated_at` bumped on every admin page load, so "last
+    changed" would track how often somebody looked at the table rather than
+    when the account last actually changed -- the same "updated on read"
+    mistake a sliding session makes.
+    """
+    key = str(user_id or "").strip()
+    if not key:
+        return False
+    moment = _now(now)
+    init_db()
+    conn = _connect()
+    try:
+        cursor = conn.execute(
+            "UPDATE credentials SET disabled_at = NULL, updated_at = ?"
+            " WHERE user_id = ? AND disabled_at IS NOT NULL",
+            (moment, key),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        conn.close()
+
+
+def list_all_google_identities() -> list:
+    """Every linked external identity, every vault at once.
+
+    `list_google_identities` reads one vault's own rows and is what a user
+    calls about themselves. The admin table is the other direction: it has to
+    walk the whole table to decide which vaults have a Google sign-in, because
+    a vault with no row here is indistinguishable from one that has never been
+    listed. The `subject` is deliberately excluded -- it is the primary key of
+    an identity, and an admin table has no use for it.
+    """
+    init_db()
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT provider, user_id, email, display_name, created_at, last_used_at"
+            " FROM google_identities ORDER BY created_at, provider, user_id"
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(row) for row in rows]
+
+
+def delete_google_identities(user_id, now=None) -> int:
+    """Unlink every external identity for one vault. Count of rows removed.
+
+    Deleting the credentials row alone leaves the Google link in place, and a
+    link whose vault has no account is a way back in: `resolve_google_identity`
+    would resolve the subject to a user_id that can no longer be disabled,
+    because there is nothing left to disable. The delete path calls both.
+    """
+    key = str(user_id or "").strip()
+    if not key:
+        return 0
+    init_db()
+    conn = _connect()
+    try:
+        cursor = conn.execute(
+            "DELETE FROM google_identities WHERE user_id = ?", (key,)
+        )
+        conn.commit()
+        return cursor.rowcount
+    finally:
+        conn.close()
+
+
+def list_htpasswd_users() -> list:
+    """The names in the operator's htpasswd file, sorted.
+
+    Read-only, and it stays that way. The file is mounted `:ro` and is
+    deliberately the one store this app does not own: `htpasswd_user_exists`
+    shells out only in `-vb` verify mode, and adding a `-B`/`-D` call would
+    mean the app could rewrite a file an operator also edits by hand. These
+    rows appear in the admin table so a suspended signup is not invisible
+    next to the operator's own account, and every action against them is
+    refused at the endpoint rather than silently doing nothing here.
+
+    Each line is `name:hash`, and the hash is bcrypt (`$2y$...`) or apr1/MD5
+    -- both contain no colon, but a future scheme might. Split on the FIRST
+    colon only and treat the rest as opaque.
+    """
+    path = str(os.getenv("HTPASSWD_PATH") or "").strip()
+    if not path or not os.path.exists(path):
+        return []
+    names = set()
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                name, sep, _ = line.partition(":")
+                if sep and name.strip():
+                    names.add(name.strip())
+    except OSError:
+        return []
+    return sorted(names)
 
 
 def list_credentials() -> list:

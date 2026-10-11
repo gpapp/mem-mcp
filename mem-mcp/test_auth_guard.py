@@ -1008,6 +1008,14 @@ class AdminGuardTests(unittest.TestCase):
                 "api_list_savepoints", "api_run_backup", "api_run_restore",
                 "api_backup_status", "api_find_duplicates", "api_merge_duplicates",
                 "api_generate_duplicate_draft", "api_unload_model",
+                # The admin surface added with the Service tab's account
+                # management: the same gate, and the same two failure modes.
+                # `api_admin_delete_user` is the one that destroys credentials,
+                # so it is the one most worth pinning here — its own refusals
+                # are covered behaviourally by AdminUserEndpointTests below.
+                "api_admin_list_users", "api_admin_disable_user",
+                "api_admin_enable_user", "api_admin_delete_user",
+                "api_admin_consistency", "api_admin_repair",
             ):
                 continue
             segment = ast.get_source_segment(source, node)
@@ -1015,6 +1023,181 @@ class AdminGuardTests(unittest.TestCase):
                           msg=f"{node.name} must require the admin, not just a login")
             self.assertNotIn("_require_user(request)", segment,
                              msg=f"{node.name} still calls _require_user directly")
+
+
+class AdminUserEndpointTests(unittest.TestCase):
+    """api_admin_delete_user — the refusals, driven rather than read.
+
+    `AdminGuardTests` above answers "is this behind the admin guard". That is a
+    source assertion, and it is the right one for a gate: the property is that a
+    call is *present*. It says nothing about what the handler does once it is
+    past the guard, and this handler's whole value is what it does and refuses
+    to do — it is the only endpoint in the app that destroys credentials.
+
+    So this drives the real function with stubs. Four stores are involved
+    (`credentials`, google identities, sessions, access keys) and each is an
+    independent way in; a version that removed the password row and left the
+    access key behind would produce an account that no longer exists and an MCP
+    client that can still read the vault. Asserting the *return shape* alone
+    would not catch it, because `removed` is a dict the handler fills in from
+    whatever the stubs return — so every stub here records that it was called,
+    and the assertions are on the calls.
+    """
+
+    class _HTTPException(Exception):
+        def __init__(self, status_code, detail):
+            super().__init__(detail)
+            self.status_code = status_code
+            self.detail = detail
+
+    # Which of the four stores each case says the account exists in. All four
+    # truthy is the real account; all four falsy is an account in no store.
+    def _runner(self, admin="root", admins=None, exists=None, htpasswd=(),
+                handler="api_admin_delete_user"):
+        """Lift `handler` with every store stubbed, and return (call, calls).
+
+        `exists` defaults to "present everywhere", which is the case that has to
+        work; the refusals then come from what is *not* in it. `admins` defaults
+        to just the caller, so the `mem.is_admin_user(key)` refusal is
+        unreachable unless a test opens it deliberately.
+        """
+        exists = set(("credentials", "google", "sessions", "psks")) if exists is None else set(exists)
+        admins = (admin,) if admins is None else tuple(admins)
+        calls = []
+
+        def _store(kind, result=True):
+            def stub(key, *args, **kwargs):
+                calls.append((kind, key))
+                return result if kind in exists else 0
+            return stub
+
+        namespace = {
+            "HTTPException": self._HTTPException,
+            "Request": object,          # only ever an annotation
+            "logging": _NullLogger(),
+            "_require_admin": lambda request: admin,
+            # `_require_user` is here so that downgrading this handler to a
+            # plain login check reaches an *assertion* rather than a NameError.
+            # A stub that only names what the correct code calls reports green
+            # on the very defect the behavioural tests exist to catch, and does
+            # it by failing in the harness — which is indistinguishable, in a
+            # summary, from the guard working.
+            "_require_user": lambda request: admin,
+            "mem": types.SimpleNamespace(is_admin_user=lambda u: u in admins),
+            "normalise_username": lambda u: (u or "").strip().lower(),
+            "list_htpasswd_users": lambda: list(htpasswd),
+            "get_credentials": lambda key: {"user_id": key} if "credentials" in exists else None,
+            "delete_credentials": _store("credentials"),
+            "delete_google_identities": _store("google"),
+            "delete_sessions_for_user": _store("sessions"),
+            "revoke_all_psks": _store("psks"),
+        }
+        fn = _lift_undecorated("gui.py", handler, namespace)
+
+        def run(**kwargs):
+            # The handlers are `async def`, so an un-awaited coroutine would
+            # enter no function at all and every assertion below would report
+            # green against a handler that was never called.
+            return asyncio.run(fn(**kwargs))
+
+        return run, calls
+
+    def _assert_no_store_was_touched(self, calls):
+        self.assertEqual(
+            calls, [],
+            msg=("a refusal must not touch any store — this is the irreversible "
+                 f"half of the endpoint: {calls}"),
+        )
+
+    def test_deleting_an_account_removes_every_credential_in_every_store(self):
+        """The four stores are independent ways in; all four must be closed.
+
+        Each one is a separate assertion rather than one "all were called"
+        check, because the shape of the defect is a *missing* store: a handler
+        that dropped `revoke_all_psks` returns a perfectly well-formed `removed`
+        dict with three true values and one absent key, and only a per-store
+        assertion can tell that from a refusal.
+        """
+        run, calls = self._runner()
+        body = run(user_id="alice", request=object())
+        for kind in ("credentials", "google", "sessions", "psks"):
+            with self.subTest(store=kind):
+                self.assertIn((kind, "alice"), calls,
+                              msg=f"the {kind} store was never cleared")
+        # `normalise_username` lowercases; the handler must pass the derived key,
+        # not the raw path segment, or a mixed-case id would silently miss.
+        self.assertEqual(body["user_id"], "alice")
+        self.assertEqual(
+            sorted(body["removed"]),
+            ["access_keys", "credentials", "google_identities", "sessions"],
+            msg="every store must be reported, or the UI shows a partial delete",
+        )
+        for kind in ("credentials", "google_identities", "sessions", "access_keys"):
+            with self.subTest(reported=kind):
+                self.assertTrue(body["removed"][kind])
+
+    def test_it_refuses_to_delete_the_account_the_caller_is_signed_in_as(self):
+        """The lockout by a route one click away.
+
+        `_require_admin` already narrowed the caller to the configured admin, so
+        this refusal is only reachable when a *second* admin exists — which is
+        the deployment where the delete would otherwise strand the app with
+        `MEM_ADMIN_USER` naming an account that no longer exists.
+        """
+        run, calls = self._runner(admin="root")
+        with self.assertRaises(self._HTTPException) as ctx:
+            run(user_id="root", request=object())
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("signed in as", ctx.exception.detail)
+        self._assert_no_store_was_touched(calls)
+
+    def test_it_refuses_to_delete_the_configured_admin_account(self):
+        """A different admin deleting the one named in MEM_ADMIN_USER.
+
+        Reachable whenever the app has more than one admin, and it is the same
+        lockout by a different route than the refusal above, so it is a separate
+        branch in the handler and gets its own assertion. The admin set is
+        widened deliberately — with only the caller as admin the branch is
+        unreachable and the test would pass for the wrong reason.
+        """
+        run, calls = self._runner(admin="root", admins=("root", "second-admin"))
+        with self.assertRaises(self._HTTPException) as ctx:
+            run(user_id="second-admin", request=object())
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("MEM_ADMIN_USER", ctx.exception.detail)
+        self._assert_no_store_was_touched(calls)
+
+    def test_an_account_in_no_store_is_a_404_and_not_a_crash(self):
+        """Nothing to delete is a 404, and it must be raised, not returned.
+
+        Every store stub answers falsy, which is also the shape a store failure
+        produces; a handler that let the `if not any(removed.values())` branch
+        fall through would return `ok: True` for an account it never touched,
+        and the UI would then say "deleted" about nothing.
+        """
+        for label, exists, htpasswd in (
+            ("no store at all", (), ()),
+            ("htpasswd row only, which this endpoint cannot delete", (), ("alice",)),
+        ):
+            with self.subTest(account=label):
+                run, calls = self._runner(exists=exists, htpasswd=htpasswd)
+                with self.assertRaises(self._HTTPException) as ctx:
+                    run(user_id="alice", request=object())
+                self.assertEqual(ctx.exception.status_code, 404, msg=ctx.exception.detail)
+                self.assertIn("alice", ctx.exception.detail)
+
+    def test_the_response_says_the_vault_records_were_kept(self):
+        """A "delete" that kept a vault has to be able to say so out loud.
+
+        Nothing here deletes by `userId`: the facts, diary entries, clients and
+        projects stay in Neo4j and Qdrant. If that flag ever silently goes
+        false, the UI says "account deleted" over a vault that is still there and
+        still findable through the old userId.
+        """
+        run, _ = self._runner()
+        body = run(user_id="alice", request=object())
+        self.assertIs(body["vault_records_kept"], True,
+                      msg="the endpoint must report that the vault survived")
 class ApiAuthTests(unittest.TestCase):
     """The GUI/API gate, which is a *different* gate from McpAuthGuard.
 
@@ -1262,6 +1445,36 @@ class ApiAuthTests(unittest.TestCase):
         # list entry -- so assert that is what is actually there.
         self.assertIn("/api/auth", literals,
                       "the /api/auth prefix exemption is missing")
+
+    def test_the_admin_users_and_consistency_endpoints_are_not_in_the_auth_allow_list(self):
+        """`/api/admin` must fall through to the 401 branch of auth_guard.
+
+        The allow-list is a *prefix* exemption: `path.startswith("/api/auth")`
+        passes without a credential, and everything else under `/api/` gets the
+        401. The admin surface sits under `/api/`, so a second entry naming
+        `/api/admin` would open every one of these endpoints — including the one
+        that deletes an account and every credential attached to it — to any
+        caller who happened to reach the app at all. `_require_admin` is the gate
+        that is supposed to stop them, and this is the guard that runs *before*
+        it, so an entry here would answer first and never reach it.
+
+        An AST walk over auth_guard's own body, for the reason given above: the
+        comment directly above that allow-list names `/api/events` on purpose,
+        and a substring search would read it as an allow-list entry.
+        """
+        node = _module_node("gui.py", "auth_guard")
+        literals = {
+            child.value for child in ast.walk(node)
+            if isinstance(child, ast.Constant)
+            and isinstance(child.value, str)
+            and child.value.startswith("/api")
+        }
+        self.assertIn("/api/auth", literals,
+                      "the /api/auth prefix exemption is missing")
+        for offender in sorted(lit for lit in literals
+                               if lit not in ("/api/auth", "/api", "/api/")):
+            self.fail(f"{offender} is on the unauthenticated allow-list of "
+                      "auth_guard — it must fall through to the 401 branch")
 
     # -- _user does not re-derive an identity from headers ------------------
 
