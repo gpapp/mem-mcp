@@ -1261,7 +1261,8 @@ class DiarySaveEntryRoutingTests(unittest.TestCase):
     """
 
     def _lift(self, **stubs):
-        recorded = {"saved": [], "metadata": [], "deleted": []}
+        recorded = {"saved": [], "metadata": [], "deleted": [],
+                    "mentions": []}
 
         async def db_update_diary_metadata(entry_id, user, metadata):
             recorded["metadata"].append((entry_id, user, metadata))
@@ -1269,6 +1270,10 @@ class DiarySaveEntryRoutingTests(unittest.TestCase):
 
         async def db_delete_diary(entry_id, user):
             recorded["deleted"].append((entry_id, user))
+
+        async def sync_diary_mentions(entry_id, user, linked_facts):
+            recorded["mentions"].append((entry_id, user, list(linked_facts)))
+            return None
 
         async def db_save_diary(content, user, timestamp, name, **kw):
             recorded["saved"].append({"content": content, "user": user,
@@ -1292,6 +1297,7 @@ class DiarySaveEntryRoutingTests(unittest.TestCase):
         mem._diary_id = lambda user, ts: f"id-{ts}"
         mem.db_update_diary_metadata = db_update_diary_metadata
         mem.db_delete_diary = db_delete_diary
+        mem.sync_diary_mentions = sync_diary_mentions
         mem.db_save_diary = db_save_diary
         mem.db_resolve_client = db_resolve_client
         mem.db_resolve_context = db_resolve_context
@@ -1306,6 +1312,23 @@ class DiarySaveEntryRoutingTests(unittest.TestCase):
             "Optional": typing.Optional,
         })
         return fn, recorded
+
+    def _run(self, fn, recorded, **kw):
+        """Call the tool, and turn an escape into an assertion failure.
+
+        The tools raise `ValueError` to refuse a call, and these tests are
+        about the calls that must be *accepted*. Letting the exception escape
+        would report the defect as an error, which reads as a broken harness
+        rather than as the guard having been removed. `assertRaises` is the
+        right shape only for the tests that are *about* a refusal.
+        """
+        try:
+            return asyncio.run(fn(**kw))
+        except Exception as exc:
+            self.fail(
+                "diary_save_entry refused a call it must accept: "
+                f"{type(exc).__name__}: {exc}"
+            )
 
     def test_an_empty_body_with_an_id_updates_metadata_alone(self):
         fn, recorded = self._lift()
@@ -1330,6 +1353,70 @@ class DiarySaveEntryRoutingTests(unittest.TestCase):
                          "the merged value is returned; without it the caller "
                          "cannot tell what the entry now carries")
 
+    def test_links_can_be_changed_without_resending_the_body(self):
+        """The call the client actually made, and was refused for.
+
+        Three refusals in `mcp_tools.log`, across three days, for the same
+        entry: a body the client could not afford to resend, an `entryId`, and a
+        list of fact ids. The metadata-only path accepted `metadata` and nothing
+        else, so "attach these facts to that entry" had no valid call -- and the
+        client kept trying, three days running.
+
+        `linked_facts` is the other thing you can change on an entry you cannot
+        resend, and it is a *replacement* rather than an append, so it also
+        corrects a wrong id instead of accumulating on top of it.
+        """
+        fn, recorded = self._lift()
+        result = self._run(fn, recorded, content="", entryId="e1",
+                           linked_facts=["f1", "f2"])
+        self.assertEqual(recorded["mentions"],
+                         [("e1", "alice", ["f1", "f2"])])
+        self.assertEqual(recorded["saved"], [],
+                         "db_save_diary would need the body, and the premise "
+                         "is that it is not available")
+        self.assertTrue(result["metadataOnly"])
+        self.assertEqual(result["id"], "e1")
+
+    def test_an_empty_fact_list_clears_the_links_and_is_not_refused(self):
+        """`[]` is a value, not an absent one.
+
+        This is the whole reason the guard is `linked_facts is None` and not
+        `not linked_facts`: an empty list means "clear every link" and a
+        falsy check would read it as "nothing was asked for" and refuse it,
+        which is the one reading under which you cannot unlink anything.
+        """
+        fn, recorded = self._lift()
+        result = self._run(fn, recorded, content="", entryId="e1",
+                           linked_facts=[])
+        self.assertEqual(recorded["mentions"], [("e1", "alice", [])])
+        self.assertTrue(result["metadataOnly"])
+
+    def test_metadata_and_links_together_change_both(self):
+        fn, recorded = self._lift()
+        result = self._run(fn, recorded, content="", entryId="e1",
+                           metadata={"original_file": "m.md"},
+                           linked_facts=["f1"])
+        self.assertEqual(recorded["metadata"],
+                         [("e1", "alice", {"original_file": "m.md"})])
+        self.assertEqual(recorded["mentions"], [("e1", "alice", ["f1"])])
+        self.assertTrue(result["metadataOnly"])
+
+    def test_the_mentions_count_comes_back_so_the_caller_can_verify(self):
+        """A write with no observable result is a write you cannot check.
+
+        The count is the one thing that distinguishes "linked 3 facts" from
+        "linked 3 of the 5 you asked for", which is what the id filter does to
+        the ones that do not exist.
+        """
+        fn, recorded = self._lift()
+        result = self._run(fn, recorded, content="", entryId="e1",
+                           linked_facts=["f1", "f2", "f3"])
+        # `.get` and a named message, not `result["mentions"]`: a missing key is
+        # a KeyError, which reads as a broken test rather than as the return
+        # value having been dropped.
+        self.assertEqual(result.get("mentions"), 3,
+                         msg="the response must report how many links were written")
+
     def test_whitespace_counts_as_empty(self):
         fn, recorded = self._lift()
         asyncio.run(fn(content="   \n\t ", entryId="e1", metadata={"a": 1}))
@@ -1345,14 +1432,21 @@ class DiarySaveEntryRoutingTests(unittest.TestCase):
                       "the message has to name the way out, not just the refusal")
         self.assertEqual(recorded["saved"], [])
 
-    def test_an_empty_body_and_an_id_but_no_metadata_is_refused(self):
+    def test_an_empty_body_naming_nothing_at_all_is_refused(self):
         # Otherwise the condition silently means "do nothing" and returns
         # success, which reads as an update that happened.
         fn, recorded = self._lift()
-        with self.assertRaises(ValueError):
+        with self.assertRaises(ValueError) as ctx:
             asyncio.run(fn(content="", entryId="e1"))
+        # Both payloads named in the message: the caller has to be told what
+        # would have made the call valid, not just that it was not.
+        message = str(ctx.exception)
+        self.assertIn("metadata", message)
+        self.assertIn("linked_facts", message)
         self.assertEqual(recorded["metadata"], [])
         self.assertEqual(recorded["saved"], [])
+        self.assertEqual(recorded["mentions"], [],
+                         "nothing may be written for a call that changes nothing")
 
     def test_an_unknown_id_is_reported_rather_than_created(self):
         async def missing(entry_id, user, metadata):
@@ -1605,6 +1699,101 @@ class WriteScopeResolutionTests(unittest.TestCase):
 class _NullLogger:
     def __getattr__(self, _name):
         return lambda *a, **kw: None
+
+
+class DedupToolDescriptionTests(unittest.TestCase):
+    """The three dedup tools' descriptions, which are the only ones that bite.
+
+    `find_duplicates`, `suggest_merge` and `merge_facts` were **never called in
+    1,176 logged MCP calls.** Not once, in thirteen days, while the shell that
+    documents them -- the `memory-deduplication` prompt and the skill markdown
+    -- was invoked once. An MCP prompt only reaches the model if the client
+    pulls it, so the only text guaranteed to be in context is the tool list, and
+    these were the three worst-written entries on it.
+
+    That matters because two of them *understated what the tool does*, which is
+    worse than being terse: `find_duplicates` described itself as "comparing
+    embeddings similarity ranking" -- grammatically broken, and wrong, since the
+    tool filters to compatible client/context scope and blends name, alias and
+    email evidence. A model told "embeddings ranking" will distrust it for a
+    scope-aware job and pick a different route.
+
+    So these pin the facts a model needs in order to *use* the tools, not
+    properties of their code. A source assertion would pass on the old text;
+    these fail on the absence of the claim.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        with open(MCP_TOOLS, "r", encoding="utf-8") as handle:
+            tree = ast.parse(handle.read())
+        cls.docs = {}
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                cls.docs[node.name] = ast.get_docstring(node) or ""
+
+    def _assert_says(self, tool, *phrases):
+        # Whitespace-collapsed, because the sentence is the claim and the line
+        # break is not. Asserting on the wrapped form would fail the day
+        # somebody reflows a paragraph, and passing on a reflow says nothing.
+        doc = " ".join(self.docs.get(tool, "").split())
+        for phrase in phrases:
+            self.assertIn(" ".join(phrase.split()), doc,
+                          msg="%s must say %r — a model reading only the tool "
+                              "list has no other way to learn it" % (tool, phrase))
+
+
+    def test_find_duplicates_says_it_is_scope_aware(self):
+        """The fact that makes it safe, which the old text denied.
+
+        Without this a model has no reason to check scope before merging, and
+        two records called "Tim" under different clients look like duplicates.
+        """
+        self._assert_says(
+            "find_duplicates",
+            "NOT a plain cosine scan",
+            "filtered to **compatible client and project scope** first",
+            "same person or project name can legitimately exist under "
+            "different clients",
+            "never a finished merge",
+        )
+
+    def test_suggest_merge_says_the_caller_decides(self):
+        """It reads; it does not choose. The dangerous ambiguity is silence.
+
+        A tool described as "analyze this cluster" without saying who decides
+        invites the model to treat the suggestion as the answer, which is how a
+        wrong master gets written.
+        """
+        self._assert_says("suggest_merge", "does **not** choose the master",
+                          "suggested_master_id")
+
+    def test_merge_facts_says_it_destroys_and_that_review_precedes_it(self):
+        """The destructive step must say so, and say what precedes it.
+
+        "Irreversible" alone would be the honest half; naming the two tools that
+        come first is the useful half, because a model that knows the merge
+        cannot be undone but has no recalled route to review will merge anyway.
+        """
+        self._assert_says("merge_facts", "**Irreversible.**",
+                          "run `find_duplicates` then `suggest_merge` first")
+
+    def test_all_three_point_at_the_next_step_in_the_workflow(self):
+        """A tool that does not name its successor is a dead end.
+
+        The old `find_duplicates` never mentioned `suggest_merge` or
+        `merge_facts`, so the workflow was undiscoverable from the tool list
+        even though the whole chain was deployed and working.
+        """
+        self._assert_says("find_duplicates", "suggest_merge", "merge_facts")
+        self._assert_says("suggest_merge", "merge_facts", "find_duplicates")
+
+    def test_none_of_the_three_reads_as_a_plain_embedding_scan(self):
+        """The specific phrase that cost the old description its credibility."""
+        doc = self.docs.get("find_duplicates", "")
+        self.assertNotIn("embeddings similarity ranking", doc,
+                         msg="that phrasing both misdescribes the tool and "
+                             "reads as an unedited first draft")
 
 
 class DiarySaveScopeRoutingTests(unittest.TestCase):

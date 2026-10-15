@@ -329,7 +329,8 @@ async def diary_save_entry(content: str, name: Optional[str] = None, timestamp: 
     """Save a new diary entry, or update an existing one.
 
     - content: The entry body. **Pass an empty string with `entryId` to change
-      metadata only** — see "Updating an entry you cannot resend" below.
+      an entry you cannot resend** — `metadata`, `linked_facts` or both; see
+      "Updating an entry you cannot resend" below.
     - name: Concise name for the entry. Required for a new entry.
     - timestamp: ISO-8601 datetime string including time (e.g. '2026-05-15T14:30:00').
       Required for a new entry. **Must be aligned to 15-minute boundaries**
@@ -342,6 +343,10 @@ async def diary_save_entry(content: str, name: Optional[str] = None, timestamp: 
       Keys are **merged** into whatever the entry already carries, so sending one
       field does not drop the others. Send `metadata` alone to update an entry
       you cannot resend.
+    - An empty `content` with an `entryId` updates **only** what you name:
+      `metadata` merges its keys, `linked_facts` replaces the MENTIONS link set
+      (pass `[]` to clear them). Naming neither is refused rather than treated
+      as a no-op that reports success.
     - linked_facts: Optional list of fact IDs to link via MENTIONS. Pass [] to clear existing links.
       When omitted, existing MENTIONS relationships are preserved.
     - client: Optional client name to scope the entry. Must match an existing
@@ -370,30 +375,55 @@ async def diary_save_entry(content: str, name: Optional[str] = None, timestamp: 
     ## Updating an entry you cannot resend
 
     A long transcription is expensive to re-send: it has to be read back, split,
-    embedded and re-keyworded. To attach or correct metadata on an entry you do
-    not have the body of, pass the existing entry's `id` as `entryId` with
-    `content` empty:
+    embedded and re-keyworded. To change an entry you do not have the body of,
+    pass the existing entry's `id` as `entryId` with `content` empty, and name
+    what you are changing:
 
+        # metadata only
         diary_save_entry(content="", entryId="...", metadata={"original_file": "meeting.md"})
+        # link facts to it, no re-embed
+        diary_save_entry(content="", entryId="...", linked_facts=["<fact id>", ...])
+        # both at once
+        diary_save_entry(content="", entryId="...", metadata={"topic": "..."}, linked_facts=[...])
+
+    `linked_facts` **replaces** the link set — it removes the MENTIONS edges not
+    in the list and adds the ones that are missing, so attaching a fact after a
+    wrong id was sent corrects it instead of accumulating. Pass `[]` to clear
+    them all.
 
     The body, name, timestamp and keywords are left exactly as they are, and no
-    embedding or LLM call is made. **Do not do this for a new entry** — an empty
-    body with no `entryId` is rejected rather than stored as a blank entry.
+    embedding or LLM call is made. Naming neither `metadata` nor `linked_facts`
+    is refused, because a call that changes nothing and reports success is a
+    write you cannot see the result of. **Do not do this for a new entry** — an
+    empty body with no `entryId` is rejected rather than stored as a blank entry.
     """
     user = _current_user()
     metadata_only = entryId is not None and not (content or "").strip()
     if metadata_only:
-        if not metadata:
+        # `linked_facts` is the other thing you can change without resending the
+        # body. The guard used to be `if not metadata`, so a caller with a
+        # transcription it could not afford to resend had no valid call for
+        # "attach these facts to that entry" -- it sent the empty body with the
+        # ids attached and was refused. Three of those refusals are in
+        # `mcp_tools.log`, across three days, for the same entry. Metadata is now
+        # only required when it is the *only* thing being changed, and `[]` still
+        # clears every link because the caller distinguishes it from `None`.
+        if not metadata and linked_facts is None:
             raise ValueError(
-                "An empty content with an entryId only updates metadata, so "
-                "metadata is required — pass the fields to change, or pass the "
-                "full content to rewrite the entry."
+                "An empty content with an entryId changes only what it is "
+                "given: pass `metadata` for the metadata fields, "
+                "`linked_facts` for the MENTIONS links, or the full content to "
+                "rewrite the entry."
             )
-        merged = await mem.db_update_diary_metadata(entryId, user, metadata)
+        merged = await mem.db_update_diary_metadata(entryId, user, metadata or {})
         if merged is None:
             raise ValueError(f"No diary entry with id {entryId!r}.")
+        links = None
+        if linked_facts is not None:
+            await mem.sync_diary_mentions(entryId, user, linked_facts)
+            links = len(linked_facts)
         return {"id": entryId, "timestamp": None, "metadataOnly": True,
-                "metadata": merged}
+                "metadata": merged, "mentions": links}
 
     if not name or not timestamp:
         raise ValueError(
@@ -500,13 +530,34 @@ async def diary_delete_entry(entryId: str):
 @mcp.tool()
 @monitor_mcp_tool("find_duplicates", context_provider=_current_user)
 async def find_duplicates(category: str = "People", limit: int = 50, threshold: float = 0.75, max_cluster: int = 4):
-    """
-    Find potential duplicate entries in memory by comparing embeddings similarity ranking.
-    Returns grouped clusters of similar items for manual deduplication.
+    """Find clusters of records that are probably the same entity, for review.
+
+    NOT a plain cosine scan. Candidates are filtered to **compatible client and
+    project scope** first, then scored by blended evidence — vector similarity
+    plus name, alias and email matches — so a strong name match cannot by
+    itself override a weak vector. Clusters are only kept when they contain a
+    threshold-qualified core member, which is what stops a chain of weak
+    lookalikes being presented as a duplicate group.
+
+    **Check scope before merging.** The same person or project name can
+    legitimately exist under different clients — "Tim" at SAP and "Tim" at
+    Deutsche Bank are two people. Each record carries its scope tier, and two
+    records that surface under the same tier are the ones actually competing; a
+    tier difference is itself a reason NOT to merge. Client abbreviations
+    resolve — `"DB"` finds `Deutsche Bank (DB)` — and `list_clients` gives the
+    exact stored spellings.
+
+    Use `suggest_merge` on a cluster to get a structured comparison, then
+    `merge_facts` to execute what you decided.
+
     - category: category to search (default 'People')
     - limit: max items to fetch (default 50)
-    - threshold: starting similarity threshold (default 0.75). If clusters exceed max_cluster, threshold is increased iteratively.
-    - max_cluster: max items per cluster (default 4). Large clusters are split by increasing threshold.
+    - threshold: starting similarity threshold (default 0.75). If clusters exceed
+      max_cluster, threshold is increased iteratively.
+    - max_cluster: max items per cluster (default 4). Large clusters are split
+      by increasing threshold.
+    - Returns clusters with an avg_similarity score, the scope each record sits
+      under, and a basic recommendation — never a finished merge.
     """
     try:
         return await mem.db_find_duplicates(_current_user(), category, limit, threshold, max_cluster)
@@ -517,8 +568,13 @@ async def find_duplicates(category: str = "People", limit: int = 50, threshold: 
 @mcp.tool()
 @monitor_mcp_tool("merge_facts", context_provider=_current_user)
 async def merge_facts(masterId: str, duplicateIds: List[str], mergedName: str, mergedText: str):
-    """
-    Merge duplicate facts into a single master record.
+    """Execute a merge you have already reviewed. **Irreversible.**
+
+    This is the destructive step: it moves every graph relationship from the
+    duplicates to the master, deletes the duplicate nodes, and records pending
+    Qdrant deletions against the master for the next reconcile. There is no
+    undo, so run `find_duplicates` then `suggest_merge` first, check the scope
+    tiers are the same, and get confirmation before calling this.
 
     The caller is responsible for consolidating content before calling this tool:
     use suggest_merge to retrieve all records, write a comprehensive mergedName
@@ -555,14 +611,23 @@ async def merge_facts(masterId: str, duplicateIds: List[str], mergedName: str, m
 @mcp.tool()
 @monitor_mcp_tool("suggest_merge", context_provider=_current_user)
 async def suggest_merge(cluster_json: str):
-    """
-    Analyze a cluster of potential duplicates and return a structured comparison
-    for the client to evaluate. The client decides which record is the master
-    and what to merge, then calls merge_facts to execute.
+    """Compare the members of one duplicate cluster. You decide, this reads.
 
-    cluster_json may be:
+    The tool returns every record in the cluster sorted by completeness, with a
+    `suggested_master_id` and the graph relationships each record carries. It
+    does **not** choose the master and it does **not** merge — that is yours, and
+    deliberately: a wrong merge moves graph edges and deletes the duplicates,
+    which is not recoverable from either side.
+
+    Pass the cluster you got from `find_duplicates` straight through as JSON, or
+    hand it a list of ids and it will fetch them. `cluster_json` may be:
       - A JSON array of full record dicts (from find_duplicates output), OR
       - A JSON array of string IDs — records will be fetched automatically.
+
+    Before deciding: read every record's `text` and extra fields, check the
+    scope tier above (same name under different clients is not a duplicate), and
+    write a consolidated `mergedName`/`mergedText` that keeps every unique fact
+    rather than the longest version. Then call `merge_facts` with it.
     """
     import json
 

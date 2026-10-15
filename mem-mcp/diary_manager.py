@@ -420,6 +420,60 @@ async def _auto_link_people(entry_id: str, content: str, user_id: str,
     return created
 
 
+async def sync_diary_mentions(entry_id: str, user_id: str,
+                             linked_facts: list) -> None:
+    """Make an entry's MENTIONS edges exactly `linked_facts`.
+
+    Extracted from `db_save_diary` because the metadata-only path needs it and
+    a second copy would be a second definition of "what does `linked_facts`
+    mean" to drift. The whole reason it is a function rather than an inline
+    block is the failure this fixes: a client holding a 40k transcription it
+    cannot resend had no valid call for "attach these facts to that entry" --
+    `db_save_diary` would need the body again, and the metadata-only path
+    accepted only `metadata`. So the client sent an empty body with the fact ids
+    attached and was refused, three times over three days.
+
+    Two edges removed and one added, all inside one transaction. `[]` is a real
+    value here (clear them all) rather than an absent one, which is why the
+    caller distinguishes `None` from `[]` before it gets here.
+
+    `NOT f.id IN $factIds` is correct because `IN` is the operator that takes a
+    list on the right; see AGENTS.md on a list on the right of a property test
+    comparing for equality and matching nothing, silently.
+    """
+    neo4j_driver = get_neo4j()
+    if not neo4j_driver:
+        return
+    with neo4j_driver.session() as s:
+        if linked_facts:
+            # Drop the links the incoming list took away. Without this,
+            # attaching a fact after a wrong id was sent would accumulate
+            # rather than correct, and nothing downstream could tell.
+            s.run(
+                """
+                MATCH (d:DiaryEntry {id: $id, userId: $userId})-[r:MENTIONS]->(f:Fact)
+                WHERE NOT f.id IN $factIds
+                DELETE r
+                """,
+                id=entry_id, userId=user_id, factIds=linked_facts,
+            )
+            s.run(
+                """
+                MATCH (d:DiaryEntry {id: $id, userId: $userId})
+                MATCH (f:Fact) WHERE f.id IN $factIds
+                MERGE (d)-[r:MENTIONS]->(f)
+                SET r.source = 'manual'
+                """,
+                id=entry_id, userId=user_id, factIds=linked_facts,
+            )
+        else:
+            # An explicit empty list clears them.
+            s.run(
+                "MATCH (d:DiaryEntry {id: $id, userId: $userId})-[r:MENTIONS]->() DELETE r",
+                id=entry_id, userId=user_id,
+            )
+
+
 async def db_save_diary(content: str, user_id: str, timestamp: str, name: str, metadata: Optional[dict] = None, linked_facts: Optional[list] = None, client_id: Optional[str] = None, context_id: Optional[str] = None) -> str:
     """Upsert a diary entry keyed by user + timestamp. Returns the ISO timestamp string.
     Optional linked_facts is a list of fact IDs to create MENTIONS relationships.
@@ -502,32 +556,7 @@ async def db_save_diary(content: str, user_id: str, timestamp: str, name: str, m
 
         # Sync linked facts: only modify MENTIONS if explicitly provided
         if linked_facts is not None:
-            if linked_facts:
-                # Remove MENTIONS to facts NOT in the incoming list
-                s.run(
-                    """
-                    MATCH (d:DiaryEntry {id: $id, userId: $userId})-[r:MENTIONS]->(f:Fact)
-                    WHERE NOT f.id IN $factIds
-                    DELETE r
-                    """,
-                    id=doc_id, userId=user_id, factIds=linked_facts
-                )
-                # Add MENTIONS for links not yet present
-                s.run(
-                    """
-                    MATCH (d:DiaryEntry {id: $id, userId: $userId})
-                    MATCH (f:Fact) WHERE f.id IN $factIds
-                    MERGE (d)-[r:MENTIONS]->(f)
-                    SET r.source = 'manual'
-                    """,
-                    id=doc_id, userId=user_id, factIds=linked_facts
-                )
-            else:
-                # Explicit empty list: clear all MENTIONS
-                s.run(
-                    "MATCH (d:DiaryEntry {id: $id, userId: $userId})-[r:MENTIONS]->() DELETE r",
-                    id=doc_id, userId=user_id
-                )
+            await sync_diary_mentions(doc_id, user_id, linked_facts)
 
     await publish_db_event(user_id, "diary_changed", {
         "action": "add",
@@ -864,28 +893,12 @@ async def db_update_diary(entry_id: str, user_id: str, content: Optional[str] = 
             **params
         )
 
-        # Sync linked facts: remove stale, add new
+        # Sync linked facts: remove stale, add new. Through the shared helper
+        # rather than a second copy of the same two queries -- this block was the
+        # one the extraction missed, and "what `linked_facts` means" was already
+        # the thing a copy of this shape had been allowed to mean twice.
         if linked_facts is not None:
-            # Remove MENTIONS to facts NOT in the incoming list
-            s.run(
-                """
-                MATCH (d:DiaryEntry {id: $id, userId: $userId})-[r:MENTIONS]->(f:Fact)
-                WHERE NOT f.id IN $factIds
-                DELETE r
-                """,
-                id=entry_id, userId=user_id, factIds=linked_facts
-            )
-            # Add MENTIONS for links not yet present
-            if linked_facts:
-                s.run(
-                    """
-                    MATCH (d:DiaryEntry {id: $id, userId: $userId})
-                    MATCH (f:Fact) WHERE f.id IN $factIds
-                    MERGE (d)-[r:MENTIONS]->(f)
-                    SET r.source = 'manual'
-                    """,
-                    id=entry_id, userId=user_id, factIds=linked_facts
-                )
+            await sync_diary_mentions(entry_id, user_id, linked_facts)
 
         # A scope named on the edit form is a decision like any other, so it is
         # linked and stamped the same way db_save_diary does it. MERGE, so

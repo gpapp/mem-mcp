@@ -119,6 +119,15 @@ def _list_arg_names(node):
     `status`; the AST does not. Covers a list literal, a list comprehension, a
     call to ``list()``/``sorted()``/``set()``, and a name assigned from any of
     those at any point in the same function.
+
+    Also covers a parameter **annotated** `list` / `list[str]` / `List[str]`,
+    which is the other half and the one that was missing. `sync_diary_mentions`
+    passes `factIds=linked_facts` where `linked_facts: list` is a parameter, so
+    no assignment binds it to a list expression and the property-map scan never
+    registered `$factIds` as a list -- which would have left the new queries
+    unpinned by exactly the lint that exists to catch a list compared for
+    equality. The annotation *is* the declaration; deriving it from the name
+    alone would be the guess this function is written to avoid.
     """
     lists = set()
     for child in ast.walk(node):
@@ -129,11 +138,44 @@ def _list_arg_names(node):
         elif isinstance(child, ast.AnnAssign) and isinstance(child.target, ast.Name):
             targets = [child.target]
             value = child.value
+        elif (isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+              and child.name != node.name):
+            # A nested function inherits its parent's bindings too.
+            targets = [a.arg for a in
+                       child.args.posonlyargs + child.args.args + child.args.kwonlyargs]
+            value = None
+            _mark_annotated_lists(child.args, lists)
+            continue
         else:
             continue
         if value is not None and _is_list_expr(value):
             lists.update(t.id for t in targets)
+    _mark_annotated_lists(node.args, lists)
     return lists
+
+
+def _mark_annotated_lists(args, lists):
+    """Mark every parameter whose annotation says it holds a list."""
+    every = args.posonlyargs + args.args + args.kwonlyargs
+    for vararg in (args.vararg, args.kwarg):
+        if vararg is not None:
+            every.append(vararg)
+    for arg in every:
+        if arg.annotation is not None and _is_list_annotation(arg.annotation):
+            lists.add(arg.arg)
+
+
+def _is_list_annotation(ann):
+    """`list`, `list[str]`, `typing.List[str]`, `Sequence[str]` ..."""
+    if isinstance(ann, ast.Name):
+        return ann.id in ("list", "List", "Sequence", "Iterable", "tuple", "Tuple")
+    if isinstance(ann, ast.Attribute):
+        return ann.attr in ("List", "Sequence", "Iterable")
+    if isinstance(ann, ast.Subscript):
+        return _is_list_annotation(ann.value)
+    if isinstance(ann, ast.BinOp) and isinstance(ann.op, ast.BitOr):
+        return _is_list_annotation(ann.left) or _is_list_annotation(ann.right)
+    return False
 
 
 def _run_calls(source):

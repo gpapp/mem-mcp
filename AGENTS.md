@@ -826,6 +826,23 @@ and `client_manager.py` it needs ~90 legitimate column names in the allowlist
 and would rot on the next schema change, and a guard that needs updating whenever
 unrelated code moves is a guard that gets deleted.
 
+- **`diary_save_entry`'s metadata-only path takes `metadata`, `linked_facts`, or both.** A caller
+  with a body it cannot resend had no valid call for "attach these facts to that entry" — the path
+  accepted `metadata` and nothing else, so the client sent an empty body with the fact ids attached
+  and was refused. Three such refusals are in `mcp_tools.log`, across three days, for the same
+  `entryId`. `[]` is a real value and clears every link, which is why the guard is
+  `linked_facts is None` and not `not linked_facts`; naming *neither* is still refused, because a
+  call that changes nothing and reports success is a write you cannot see the result of.
+- **`sync_diary_mentions` is the only definition of "what `linked_facts` means".** It was an
+  inline block in **two** functions (`db_save_diary` and `db_update_diary`) and the first
+  extraction wired only one of them, so a third copy was left behind to drift — doubly embarrassing
+  given the docstring says that is the reason it is a function. Its queries are now pinned by
+  `ListParameterInPropertyMapTests`, which had to widen: `_list_arg_names` only tracked names
+  *assigned* to a list expression, so `factIds=linked_facts` where `linked_facts: list` is a
+  parameter was never registered and the new queries sat outside the lint that exists to catch a
+  list compared for equality. **When you add a query, add it to that lint — and derive the
+  list-valued names from annotations as well as assignments.**
+
 ## Long Records & Chunking
 
 One embedding vector over a long fact or diary entry is a lossy average of the whole document: a query about a detail in the middle scores poorly against everything else. `mem-mcp/chunking.py` splits a long record into several vector points instead. It is dependency-light (no DB drivers) so it is unit-testable on its own, like `matching_utils.py`.
@@ -991,6 +1008,19 @@ Rules that matter when changing this code:
 ## Scope-Priority Search
 
 `search_facts` and `diary_search_entries` take `client` / `context`, and both **prioritise and never exclude**. The motivating case is two people called John, both at Deutsche Bank: asked for DB/AI Adoption, `John Lochas` must beat `John Benjamin Porter`; asked for SAP, the SAP people must come first. A record filed under another client, or under none, still comes back — it ranks lower. That is a design rule, not a tuning knob, and it is the reason the feature works at all.
+
+- **The search rewriter echoes the filter line back as a keyword, and the guard is a stem match on
+  the filter *keys*.** Measured: **69 of 469 rewrites** returned it, `"People category"` for 102
+  distinct queries, all on one day, because the prompt puts `SEARCH FILTERS: category=People` in
+  front of the query and a small model reads that as content to preserve. Each leak became an extra
+  vector query at weight 0.85 next to the real name, and it was **cached for the TTL** so it was
+  served repeatedly. `_is_filter_echo` matches `categor|client|context|scope` as *substrings*
+  (`"categories"` must be caught) on whole keyword phrases, **not** as a token-subset test — a
+  subset test would also drop `"bank"` under `client=Deutsche Bank`, and a recall loss is worse than
+  the dilution this fixes. This is the same rule the scope classifier already applies to its own
+  placeholder echo. Re-measure after deploy with
+  `grep -c '"People category"' memory-vault.log`, which should hold at 102 until it ships, then go
+  to 0.
 
 - **The old implementation filtered, and that was wrong three times over.** It was a Qdrant `FieldCondition` on the payload key `clientName` *and* a Cypher `EXISTS((f)-[:FOR_CLIENT]->(:Client {name: $clientName}))`; both compared a **raw user string against the stored node name**, so `"DB"` against `Deutsche Bank (DB)` matched nothing and the search returned an empty list with no error anywhere. The `+0.3` scope boosts that were supposed to reorder the survivors ran *after* the filter, so they could never fire on a record the filter had kept. `ScopeIsRankedNotFilteredTests` in `test_cypher_safety.py` pins the absence of both shapes, and re-injecting either one fails it.
 - **Resolution is a pure function, and the abbreviation path is the load-bearing half.** `plan_search_scope(client, context, clients)` in `matching_utils.py` returns `(client, context, client_evidence, context_evidence)`, always in the **stored** spelling. It tries a name's self-declared parenthetical first — `Deutsche Bank (DB)` declares `(DB)`, so `DB` is an *exact* hit — and only then falls back to `resolve_scope_name`. Without it, `resolve_scope_name('DB')` returns nothing: `SCOPE_NAME_MIN_CHARS = 4` drops every short name, which is right for fuzzy matching and fatal for an abbreviation. A context is resolved **only against the resolved client's own `contexts`**, because the failure this replaces was SAP SE being handed Deutsche Bank's `DB AI Adoption`; an unresolvable or ambiguous answer is `(None, …, SCOPE_EVIDENCE_NONE)`, which means "no scope signal" and never "no results". `db_plan_search_scope` in `client_manager.py` is the thin `db_list_clients` wrapper.

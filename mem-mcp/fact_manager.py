@@ -821,6 +821,28 @@ def db_get_connections_by_type(fact_id: str, user_id: str) -> dict:
         return connections
 
 
+# The rewriter is handed the filters in the prompt, and a small model treats
+# that as content to be preserved. Measured over one vault's logs: 69 of 469
+# rewrites returned the filter line back as a keyword -- "People category" for
+# 102 distinct queries -- and each of those became an extra vector query at
+# weight 0.85 alongside the real name. The rule is a stem match on the filter
+# *keys* rather than a token-subset test, because the subset test would also
+# drop a legitimate keyword that happens to share a word with a client name.
+REWRITE_FILTER_ECHO_STEMS = ("categor", "client", "context", "scope")
+
+
+def _is_filter_echo(keyword: str) -> bool:
+    """Whether a rewritten keyword is just the filter line read back.
+
+    `"People category"`, `"Category People"`, `"SAP context"` and friends. None
+    is a useful vector query: the scope is already applied by `scopeStrength`
+    ranking on the record side, so re-asking for it in the query only dilutes
+    the embedding that should have been spent on the name.
+    """
+    folded = keyword.casefold()
+    return any(stem in folded for stem in REWRITE_FILTER_ECHO_STEMS)
+
+
 async def rewrite_search_query(query: str, category: Optional[str] = None,
                                client: Optional[str] = None,
                                context: Optional[str] = None,
@@ -884,9 +906,12 @@ async def rewrite_search_query(query: str, category: Optional[str] = None,
                 if not isinstance(keyword, str):
                     continue
                 cleaned = keyword.strip()
-                if cleaned and len(cleaned.split()) <= 3 and cleaned.casefold() not in {
-                    q.casefold(), *(item.casefold() for item in keywords)
-                }:
+                if (cleaned
+                        and len(cleaned.split()) <= 3
+                        and cleaned.casefold() not in {
+                            q.casefold(), *(item.casefold() for item in keywords)
+                        }
+                        and not _is_filter_echo(cleaned)):
                     keywords.append(cleaned)
             if keywords:
                 logger.debug(f"[rewrite_search_query] '{q}' → {keywords}")

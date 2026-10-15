@@ -1545,7 +1545,13 @@ class QueryRewriteCacheTests(unittest.TestCase):
 FACT_MANAGER_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                "fact_manager.py")
 _REWRITE = "rewrite_search_query"
-_REWRITE_HELPERS = ("_expand_query",)
+# Module-level constants the lifted functions close over. Lifting only
+# functions leaves these as free names, and every failure path in the rewrite
+# swallows its own exception -- so a missing global reads as "the model
+# returned something unusable" and the tests keep passing against the heuristic
+# fallback. That is how the first version of this list shipped wrong.
+_REWRITE_CONSTANTS = ("REWRITE_FILTER_ECHO_STEMS",)
+_REWRITE_HELPERS = ("_expand_query", "_is_filter_echo")
 
 
 def _load_rewrite(cache, responder):
@@ -1568,9 +1574,18 @@ def _load_rewrite(cache, responder):
         ):
             chunks.append(ast.get_source_segment(source, node))
             found.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if (isinstance(target, ast.Name)
+                        and target.id in _REWRITE_CONSTANTS):
+                    chunks.append(ast.get_source_segment(source, node))
+                    found.add(target.id)
     if _REWRITE not in found:
         raise AssertionError(f"fact_manager.py no longer defines {_REWRITE}")
     for name in _REWRITE_HELPERS:
+        if name not in found:
+            raise AssertionError(f"fact_manager.py no longer defines {name}")
+    for name in _REWRITE_CONSTANTS:
         if name not in found:
             raise AssertionError(f"fact_manager.py no longer defines {name}")
 
@@ -1692,6 +1707,71 @@ class RewriteSearchQueryCallSiteTests(unittest.TestCase):
         self.assertEqual(len(self.calls), 2,
                          msg="the client filter changes the prompt, so it must "
                              "not share a cache entry")
+
+    def test_a_keyword_that_just_repeats_the_filters_is_dropped(self):
+        """The rewriter echoes the filter line back. It becomes a vector query.
+
+        Measured on the live logs: 69 of 469 rewrites returned the filter line as
+        a keyword, `"People category"` for 102 distinct queries, all on one day.
+        The prompt puts `SEARCH FILTERS: category=People` in front of the query
+        and a small model reads that as content to preserve, so the keyword
+        passes every existing filter -- it is a string, it is short, it differs
+        from the query -- and is appended at weight 0.85 next to the real name.
+        Each leak is one extra embedding and a diluted ranking, and it is cached
+        for the TTL so it is served repeatedly.
+
+        The scope is already applied on the record side by `scopeStrength`.
+        Re-asking for it in the query spends the embedding on the wrong thing.
+        """
+        # (filter kwargs, the full keyword list, the one that is pure echo)
+        cases = (
+            ({"category": "People"}, ["Tim Lohmann", "People category"], "People category"),
+            ({"category": "People"}, ["Category People", "Tim Lohmann"], "Category People"),
+            ({"client": "Deutsche Bank (DB)"}, ["Tim Lohmann", "Deutsche Bank client"], "Deutsche Bank client"),
+            ({"context": "AI Adoption"}, ["SAP context", "Tim Lohmann"], "SAP context"),
+            ({"category": "People"}, ["categories", "Tim Lohmann"], "categories"),
+        )
+        for prompt_kw, leaked, echo in cases:
+            with self.subTest(filter=prompt_kw, echo=echo):
+                cache = TTLCache(ttl=900.0, max_entries=8)
+                import json as _json
+                responder = self._responder(
+                    _json.dumps({"keywords": leaked}))
+                result = self._run(
+                    cache, responder, "who is the delivery lead on the ai adoption wave",
+                    **prompt_kw)
+                returned = [kw for kw, _ in result]
+                # Assert on *this case's* echo, not on a fixed string. Checking
+                # a literal "People category" would stay green under a guard that
+                # only knows the category stem, and the client/context leaks are
+                # exactly as real.
+                self.assertNotIn(echo, returned,
+                                 msg=f"{echo!r} is the filter line read back as a query")
+                self.assertEqual(returned[0],
+                                 "who is the delivery lead on the ai adoption wave",
+                                 msg="the query itself must still lead the variants")
+                self.assertIn("Tim Lohmann", returned,
+                              msg="a real name must survive the filter")
+
+    def test_a_legitimate_keyword_sharing_a_word_with_the_client_keeps_it(self):
+        """The guard is a stem match on filter *keys*, not a token-subset test.
+
+        A subset test would also drop a keyword that happens to share a word with
+        a client name -- `"bank"` under `client=Deutsche Bank` is a real search
+        term and losing it is a recall loss, which is a worse failure than the
+        dilution this fixes. The stems are the words that appear in the prompt's
+        own filter line, so a keyword is only dropped when it names the filter
+        mechanism itself.
+        """
+        cache = TTLCache(ttl=900.0, max_entries=8)
+        import json as _json
+        responder = self._responder(
+            _json.dumps({"keywords": ["bank", "private bank ai maturity"]}))
+        result = self._run(cache, responder, "what is the ai maturity level in the private bank",
+                          client="Deutsche Bank (DB)")
+        returned = [kw for kw, _ in result]
+        self.assertIn("bank", returned,
+                      msg="a term that shares a word with the client name is still a query")
 
     def test_a_short_query_is_answered_without_the_llm_at_all(self):
         cache = TTLCache(ttl=900.0, max_entries=8)
