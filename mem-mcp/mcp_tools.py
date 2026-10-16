@@ -141,16 +141,30 @@ async def add_fact(name: str, text: str, category: str, client: Optional[str] = 
     'text' should be the detailed content of the fact. Use Markdown formatting (bold for field labels, bullet lists, etc.) to ensure readable output.
     'category' should be one of: People, Technology, Client, Project, Tool.
 
+    SCOPING — IMPORTANT. Almost every fact belongs to a client and (when known) a
+    project context. Always pass `client` and `context` when you know them, or the
+    fact is filed unscoped and will only ever surface in global (unfiltered) search.
+    The `client` and `context` arguments drive scope-priority ranking: a fact filed
+    under Deutsche Bank / DB AI Adoption sorts ahead of a generically-named one
+    when those are asked for, and feeds the reclassify / merge / graph filters.
+
+      client  - the organisation the fact is about (e.g. "Deutsche Bank"). The
+                stored spelling is reused if it matches; otherwise a new client
+                node is created, so pass the canonical name, ideally via list_clients first.
+      context - the project within that client (e.g. "DB AI Adoption"). Created if
+                missing, but only when `client` is also given.
+
     People facts should follow this format:
     **Role:** [job title or function]
     **Company/Team:** [organization or team name]
     **Domain:** [area of expertise or responsibility]
     **Notes:** [any other relevant stable information]
+    (Add **Client:** and **Project:** lines mirroring the `client`/`context` you pass so they agree.)
 
     Other categories should use similar structured Markdown: bold field labels followed by content.
 
-    Optional: 'client' to scope the fact to a specific client (will create if not exists).
-    Optional: 'context' to scope the fact to a specific context within the client (will create if not exists).
+    `client` and `context` are optional in type only; omitting them leaves the
+    fact unclassified. Prefer passing the real scope over guessing.
     """
     user_id = _current_user()
     client_id = None
@@ -178,6 +192,11 @@ async def add_fact(name: str, text: str, category: str, client: Optional[str] = 
 async def search_facts(query: str, category: Optional[str] = None, limit: int = 5, top_p: float = 0.5, names_only: bool = False, client: Optional[str] = None, context: Optional[str] = None):
     """
     Search for facts in the knowledge graph. Returns Markdown-formatted results.
+
+    SCOPE - pass `client` (and optionally `context`) whenever you want a particular
+    organisation's facts to surface first. Scope PRIORITISES instead of filtering:
+    records filed under another client, or under none, still come back, ranked lower.
+    Ask unscoped only when you genuinely want the whole vault.
 
     HOW TO QUERY — use keywords that appear in fact names, not natural language:
       Good: "Alice" (name), "SAP" (keyword), "DB AI Adoption" (project name),
@@ -295,6 +314,11 @@ async def update_fact(memoryId: str, name: Optional[str] = None, text: Optional[
     """
     Update an existing memory by ID. Provide only the fields that need updating.
     For text updates, use Markdown formatting to maintain consistent, readable content.
+
+    Note: this does NOT change scope (client/project) - that is set when the
+    fact is added and adjusted via reclassification or the client Management UI.
+    If the fact should move to a different client or project, prefer adding a
+    new fact under that scope rather than repainting the old one.
     """
     success = await mem.db_update_memory(memoryId, name, text, category, _current_user())
     if success:
@@ -460,6 +484,11 @@ async def diary_save_entry(content: str, name: Optional[str] = None, timestamp: 
 async def diary_search_entries(query: str, limit: int = 3, top_p: float = 0.4, client: Optional[str] = None, context: Optional[str] = None):
     """
     Search diary entries by vector similarity. Best for finding entries about specific topics.
+
+    SCOPE - pass `client` (and optionally `context`) whenever you want one
+    organisation's or one project's entries to surface first. Scope PRIORITISES
+    instead of filtering: entries filed under another client, or under none,
+    still come back, ranked lower.
 
     HOW TO QUERY — use topic keywords or dates, not full sentences:
       Good: "SAP evaluation" (topic), "Deutsche Bank" (client), "AI kickoff" (event),
@@ -740,7 +769,16 @@ async def suggest_merge(cluster_json: str):
 @mcp.tool()
 @monitor_mcp_tool("list_clients", context_provider=_current_user)
 async def list_clients():
-    """List all clients with their contexts for the current user."""
+    """List all clients (organisations) and their project contexts for this vault.
+
+    Every fact, diary entry and merge is scoped to one of these clients and
+    (optionally) one of its contexts. Always call this first when you need exact
+    client/context spellings for `add_fact`, `diary_save_entry`, `search_facts`,
+    or `diary_search_entries` - abbreviations like "DB" usually resolve, but the
+    stored name ("Deutsche Bank (DB)") is what lands in records. Returns clients
+    with `active` and `statusPinned` (manually pinned inactive clients still
+    match when asked for explicitly).
+    """
     return mem.db_list_clients(_current_user())
 
 @mcp.tool()
