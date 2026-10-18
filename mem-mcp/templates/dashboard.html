@@ -904,6 +904,10 @@
     </div>
     <div id="client-list"><p class="empty">Loading…</p></div>
   </div>
+  <div class="card" style="margin-top:.75rem;">
+    <h2 style="margin-top:0;">🔗 Shared with me</h2>
+    <div id="shared-with-me"><p class="empty">Loading…</p></div>
+  </div>
 </div>
 
 <div id="page-projects" class="page">
@@ -1217,6 +1221,11 @@ npm install @modelcontextprotocol/sdk</code></pre>
       <div id="consistency-issues" style="margin-top:1rem;"></div>
     </div>
     </div>
+    <div style="margin-top:2rem; padding-top:1.5rem; border-top:1px solid var(--border);">
+      <h3 style="margin-top:0;">📜 Audit log (shared targets)</h3>
+      <button class="btn btn-sm" onclick="loadAudit()">↻ Refresh</button>
+      <div id="audit-log" style="margin-top:.75rem;font-size:.85rem;max-height:300px;overflow:auto;"></div>
+    </div>
   </div>
 </div>
 {% endif %}
@@ -1428,6 +1437,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
     loadDiary();
     loadWhoami();
     loadClients();   // populate clientListCache + clientActiveMap for the filter dropdown
+    loadSharedWithMe();
     if (document.getElementById('page-service')) loadSavepoints();  // admin only; deduped against switchTab('service')
     loadPSKs();  // same deal as loadSavepoints
     initSSE();
@@ -2206,30 +2216,64 @@ npm install @modelcontextprotocol/sdk</code></pre>
   function _renderClientCard(c) {
     const on = c.effectiveActive !== false;
     const pinned = c.statusPinned ? ' 📌' : '';
-    const ctxRows = (c.contexts || []).map(x => `
+    const sharedBadge = c.shared ? ` <span title="Shared by ${escHtml(c.owner || '')}" style="font-size:.75rem;color:var(--muted);">🔗 shared by ${escHtml(c.owner || '')} (${escHtml(c.permission || 'read')})</span>` : '';
+    const ctxRows = (c.contexts || []).map(x => {
+      const xshared = x.shared ? ` <span title="Shared by ${escHtml(x.owner || '')}" style="font-size:.75rem;color:var(--muted);">🔗 shared (${escHtml(x.permission || 'read')})</span>` : '';
+      const xactions = x.shared ? '' : `
+          <button class="btn btn-sm btn-ghost" onclick="renameContext('${x.id}')">✏️ Rename</button>
+          <button class="btn btn-sm btn-danger" onclick="deleteContext('${x.id}')">🗑️</button>`;
+      const xshare = x.shared ? '' : `<button class="btn btn-sm btn-ghost" onclick="openShareDialog('context','${x.id}','${escHtml(x.name)}')">🔗 Share</button>`;
+      return `
       <div class="scope-card" style="margin:.3rem 0 0 1.2rem;">
         <div class="scope-card-header" onclick="toggleScopeItems('ctx-${x.id}', 'context', '${x.id}')">
-          <span class="scope-card-name" style="font-size:.83rem;">📁 ${escHtml(x.name)}</span>
+          <span class="scope-card-name" style="font-size:.83rem;">📁 ${escHtml(x.name)}${xshared}</span>
           <div class="scope-card-actions" onclick="event.stopPropagation()">
-            <button class="btn btn-sm btn-ghost" onclick="renameContext('${x.id}')">✏️ Rename</button>
-            <button class="btn btn-sm btn-danger" onclick="deleteContext('${x.id}')">🗑️</button>
+            ${xshare}${xactions}
           </div>
         </div>
         <div class="scope-items-panel" id="scope-items-ctx-${x.id}"></div>
-      </div>`).join('');
-    return `<div class="scope-card">
-      <div class="scope-card-header" onclick="toggleScopeItems('cli-${c.id}', 'client', '${c.id}')">
-        <span class="scope-card-name">${on ? '🟢' : '⚪'} ${escHtml(c.name)}${pinned}${c.crossClient ? ' <span title="Cross-client: facts from this client do not drive diary scoping" style="font-size:.75rem;color:var(--muted);">[cross]</span>' : ''}</span>
-        <div class="scope-card-actions" onclick="event.stopPropagation()">
+      </div>`;
+    }).join('');
+    const clientActions = c.shared ? '' : `
           <button class="btn btn-sm btn-ghost" onclick="toggleClient('${c.id}', ${on ? 'false' : 'true'})">${on ? 'Deactivate' : 'Activate'}</button>
           <button class="btn btn-sm btn-ghost" onclick="toggleCrossClient('${c.id}', ${c.crossClient ? 'false' : 'true'})" title="Toggle cross-client flag">${c.crossClient ? 'Un-cross' : 'Cross-client'}</button>
           <button class="btn btn-sm btn-ghost" onclick="renameClient('${c.id}')">✏️ Rename</button>
           <button class="btn btn-sm btn-danger" onclick="deleteClient('${c.id}')">🗑️</button>
+          <button class="btn btn-sm btn-ghost" onclick="openShareDialog('client','${c.id}','${escHtml(c.name)}')">🔗 Share</button>`;
+    return `<div class="scope-card">
+      <div class="scope-card-header" onclick="toggleScopeItems('cli-${c.id}', 'client', '${c.id}')">
+        <span class="scope-card-name">${on ? '🟢' : '⚪'} ${escHtml(c.name)}${pinned}${c.crossClient ? ' <span title="Cross-client" style="font-size:.75rem;color:var(--muted);">[cross]</span>' : ''}${sharedBadge}</span>
+        <div class="scope-card-actions" onclick="event.stopPropagation()">
+          ${clientActions}
         </div>
       </div>
       <div class="scope-items-panel" id="scope-items-cli-${c.id}"></div>
       ${ctxRows}
     </div>`;
+  }
+
+  async function loadAudit() {
+    const el = document.getElementById('audit-log');
+    if (!el) return;
+    try {
+      const r = await api.get('audit?limit=100');
+      const rows = (r && r.audit) ? r.audit : (Array.isArray(r) ? r : []);
+      if (!rows.length) { el.innerHTML = '<p class="empty">No audit entries.</p>'; return; }
+      el.innerHTML = rows.map(x => `<div>${escHtml(x.ts||'')} · ${escHtml(x.actor_user_id||'')} · ${escHtml(x.action||'')} · ${escHtml(x.target_type||'')}:${escHtml(x.target_id||'')} ${x.shared?'(shared)':''}</div>`).join('');
+    } catch(e) { el.innerHTML = '<p class="empty">⚠️ Could not load.</p>'; }
+  }
+
+  async function loadSharedWithMe() {
+    const el = document.getElementById('shared-with-me');
+    if (!el) return;
+    try {
+      const r = await api.get('share/mine');
+      const grants = (r && r.grants) ? r.grants : (Array.isArray(r) ? r : []);
+      if (!grants.length) { el.innerHTML = '<p class="empty">Nothing shared with you.</p>'; return; }
+      el.innerHTML = grants.map(g => `<div class="scope-card" style="margin:.3rem 0;">
+        <span>${escHtml(g.targetType||'')} <code>${escHtml(g.targetId||'')}</code> — by ${escHtml(g.owner_user_id||g.owner||'')} (${escHtml(g.permission||'read')})</span>
+      </div>`).join('');
+    } catch(e) { el.innerHTML = '<p class="empty">⚠️ Could not load.</p>'; }
   }
 
   async function loadProjects() {
@@ -6103,6 +6147,76 @@ let contextMenu = null;
     try { const info = await api.get('whoami'); document.getElementById('user-badge').textContent = '👤 ' + info.user; } catch(_) {}
     loadMemories();
   })();
+</script>
+<div id="share-dialog" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:9999;align-items:center;justify-content:center;">
+  <div style="background:var(--bg,#fff);color:var(--fg,#111);max-width:520px;width:92%;border-radius:12px;padding:1.2rem;box-shadow:0 8px 30px rgba(0,0,0,.25);">
+    <h3 id="share-title">Share</h3>
+    <p style="font-size:.85rem;color:var(--muted);">Permission: <select id="share-perm"><option value="read">read</option><option value="write">read-write</option></select> · Expires in (days, blank=never): <input id="share-days" type="number" min="1" style="width:70px;" placeholder="30"></p>
+    <p><button class="btn btn-sm" onclick="createShareLink()">Create link</button> <button class="btn btn-sm btn-ghost" onclick="closeShareDialog()">Close</button></p>
+    <div id="share-result" style="font-size:.85rem;margin:.5rem 0;"></div>
+    <h4>Existing links</h4>
+    <div id="share-links-list" style="font-size:.85rem;max-height:200px;overflow:auto;"></div>
+    <h4>Recipients</h4>
+    <div id="share-grants-list" style="font-size:.85rem;max-height:200px;overflow:auto;"></div>
+    <p style="font-size:.85rem;">Direct-add by username: <input id="share-add-user" style="width:120px;"> <select id="share-add-perm"><option value="read">read</option><option value="write">write</option></select> <button class="btn btn-sm" onclick="addShareGrant()">Add</button></p>
+  </div>
+</div>
+<script>
+  let _shareTarget = null;
+  function openShareDialog(type, id, name) {
+    _shareTarget = {type, id};
+    document.getElementById('share-title').textContent = 'Share ' + type + ': ' + name;
+    document.getElementById('share-result').textContent = '';
+    document.getElementById('share-dialog').style.display = 'flex';
+    loadShareLinks(); loadShareGrants();
+  }
+  function closeShareDialog(){ document.getElementById('share-dialog').style.display='none'; _shareTarget=null; }
+  async function createShareLink() {
+    if (!_shareTarget) return;
+    const perm = document.getElementById('share-perm').value;
+    const days = document.getElementById('share-days').value;
+    const body = {targetType: _shareTarget.type, targetId: _shareTarget.id, permission: perm};
+    if (days) body.expiresInDays = parseInt(days,10);
+    const r = await api.post('share/links', body);
+    if (r && r.token) {
+      const url = r.acceptUrl || (location.origin + '/share/' + r.token);
+      document.getElementById('share-result').innerHTML = 'Link (copy once): <code>' + escHtml(url) + '</code>';
+      await loadShareLinks();
+    } else {
+      document.getElementById('share-result').textContent = (r && r.detail) || 'Failed';
+    }
+  }
+  async function loadShareLinks() {
+    if (!_shareTarget) return;
+    const r = await api.get('share/links?targetType=' + _shareTarget.type + '&targetId=' + _shareTarget.id);
+    const el = document.getElementById('share-links-list');
+    if (!Array.isArray(r)) { el.textContent = (r && r.detail) || 'none'; return; }
+    el.innerHTML = r.map(l => `<div>${escHtml(l.status||'')} · ${escHtml(l.prefix||'')} · uses ${l.useCount||0}/${l.maxUses||'∞'} · <button class="btn btn-sm btn-danger" onclick="revokeShareLink('${l.id}')">revoke</button></div>`).join('') || '_none_';
+  }
+  async function revokeShareLink(id) {
+    await api.del('share/links/' + id);
+    await loadShareLinks();
+  }
+  async function loadShareGrants() {
+    if (!_shareTarget) return;
+    const r = await api.get('share/grants?targetType=' + _shareTarget.type + '&targetId=' + _shareTarget.id);
+    const el = document.getElementById('share-grants-list');
+    const list = (r && r.grants) ? r.grants : (Array.isArray(r) ? r : []);
+    if (!list.length) { el.textContent = 'none'; return; }
+    el.innerHTML = list.map(g => `<div>${escHtml(g.grantee_user_id||g.grantee)} — ${escHtml(g.permission)} ${g.revoked_at?'(revoked)':''} <button class="btn btn-sm btn-danger" onclick="revokeShareGrant('${g.id}')">revoke</button></div>`).join('');
+  }
+  async function addShareGrant() {
+    if (!_shareTarget) return;
+    const user = document.getElementById('share-add-user').value.trim();
+    const perm = document.getElementById('share-add-perm').value;
+    const r = await api.post('share/grants', {targetType:_shareTarget.type, targetId:_shareTarget.id, username:user, permission:perm});
+    if (r && r.detail) document.getElementById('share-result').textContent = r.detail;
+    await loadShareGrants();
+  }
+  async function revokeShareGrant(id) {
+    await api.del('share/grants/' + id);
+    await loadShareGrants();
+  }
 </script>
 </body>
 </html>
