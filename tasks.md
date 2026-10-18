@@ -261,17 +261,17 @@ concern → Phase 3 task to benchmark.
 
 ### Phase 6 — UI
 
-- [ ] P6.1 Projects page: badge shared clients/contexts ("shared by X"); filter
+- [x] P6.1 Projects page: badge shared clients/contexts ("shared by X"); filter
       chips for "Owned / Shared with me".
-- [ ] P6.2 Share dialog on a client/context (owner only): permission picker,
+- [x] P6.2 Share dialog on a client/context (owner only): permission picker,
       expiry, max uses, "Copy link", list of existing links with revoke.
-- [ ] P6.3 Recipients management panel (owner only): list grants, change
+- [x] P6.3 Recipients management panel (owner only): list grants, change
       permission, revoke; direct-add by username.
-- [ ] P6.4 "Shared with me" section listing targets grouped by owner.
+- [x] P6.4 "Shared with me" section listing targets grouped by owner.
 - [ ] P6.5 Read-only indicator in record editors (disable save when no write).
-- [ ] P6.6 Audit log viewer in Settings/Service (owner sees own targets; admin
+- [x] P6.6 Audit log viewer in Settings/Service (owner sees own targets; admin
       sees all).
-- [ ] P6.7 Share acceptance landing page with sign-in redirect and success/
+- [x] P6.7 Share acceptance landing page with sign-in redirect and success/
       error states.
 - [ ] P6.8 Mobile layout tests for new panels (follow existing
       `test_mobile_layout.py` pattern).
