@@ -2252,7 +2252,12 @@ def _share_target_owner(user_id: str, target_type: str, target_id: str) -> str:
                             detail="targetType must be 'client' or 'context'")
     if not target_id:
         raise HTTPException(status_code=400, detail="A share needs a target")
-    clients = mem.db_list_clients(user_id)
+    # OWNED targets only. db_list_clients also returns clients reachable
+    # through someone else's grant (flagged shared=True), and a grant is
+    # not a licence to re-share: letting a grantee mint a link here would
+    # make sharing transitive, which is explicitly out of scope.
+    clients = [c for c in mem.db_list_clients(user_id)
+               if not dict(c).get("shared")]
     if target_type == "client":
         for client in clients:
             if dict(client).get("id") == target_id:
@@ -2261,7 +2266,8 @@ def _share_target_owner(user_id: str, target_type: str, target_id: str) -> str:
                             detail="No such client among yours")
     for client in clients:
         for context in client.get("contexts", []):
-            if context.get("id") == target_id:
+            if (not dict(context).get("shared")
+                    and context.get("id") == target_id):
                 return dict(client).get("id")
     # Same generic detail for "no such project" and "not yours": a caller
     # cannot probe for the existence of somebody else's context by name.

@@ -8,7 +8,188 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-  <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+  <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js">  /* ---- sharing dialog ---------------------------------------------------
+     Every call goes through shareRun(): apiFail REJECTS on a non-2xx, so an
+     unwrapped await here produced a silent no-op -- a button that appeared
+     dead rather than one that reported why it failed. Errors are surfaced in
+     the footer status line and as a toast, never swallowed. */
+  let _shareTarget = null;
+  const SHARE_PERM_LABEL = { read: 'Read only', write: 'Read & write' };
+
+  function shareStatus(msg, kind) {
+    const el = document.getElementById('share-status');
+    if (!el) return;
+    el.textContent = msg || '';
+    el.className = 'share-status' + (kind ? ' ' + kind : '');
+  }
+
+  async function shareRun(btn, fn, okMsg) {
+    const label = btn ? btn.textContent : '';
+    if (btn) { btn.disabled = true; }
+    shareStatus('Working\u2026');
+    try {
+      await fn();
+      shareStatus(okMsg || '', 'ok');
+    } catch (e) {
+      const why = (e && (e.detail || e.message)) || 'Request failed';
+      shareStatus(why, 'err');
+      toast('\u26a0\ufe0f ' + why);
+      console.error('[share]', e);
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = label; }
+    }
+  }
+
+  function openShareDialog(type, id, name) {
+    _shareTarget = { type: type, id: id, name: name };
+    document.getElementById('share-title').textContent =
+      'Share ' + (type === 'context' ? 'project' : 'client') + ': ' + (name || '');
+    document.getElementById('share-result').hidden = true;
+    document.getElementById('share-add-user').value = '';
+    shareStatus('');
+    const ov = document.getElementById('share-overlay');
+    ov.hidden = false;
+    loadShareGrants();
+    loadShareLinks();
+    const first = document.getElementById('share-add-user');
+    if (first) first.focus();
+  }
+
+  function closeShareDialog() {
+    document.getElementById('share-overlay').hidden = true;
+    _shareTarget = null;
+  }
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !document.getElementById('share-overlay').hidden)
+      closeShareDialog();
+  });
+
+  async function createShareLink() {
+    if (!_shareTarget) return;
+    const btn = document.getElementById('share-create-btn');
+    const body = {
+      targetType: _shareTarget.type,
+      targetId: _shareTarget.id,
+      permission: document.getElementById('share-perm').value
+    };
+    const days = document.getElementById('share-days').value.trim();
+    const uses = document.getElementById('share-uses').value.trim();
+    if (days) body.expiresInDays = parseInt(days, 10);
+    else body.neverExpires = true;
+    if (uses) body.maxUses = parseInt(uses, 10);
+
+    await shareRun(btn, async () => {
+      const r = await api.post('share/links', body);
+      const box = document.getElementById('share-result');
+      const url = r.acceptUrl || (location.origin + '/share/' + r.token);
+      box.hidden = false;
+      box.innerHTML = '<strong>Share link</strong> (shown once):<br><code>' + escHtml(url) + '</code> ' +
+        '<button class="btn btn-sm" onclick="copyShareLink(\'' + escHtml(url) + '\')">Copy</button>';
+      loadShareLinks();
+    }, 'Link created');
+  }
+
+  function copyShareLink(url) {
+    const done = () => toast('\ud83d\udccb Link copied');
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(url).then(done, () => toast('Copy failed \u2014 select the link instead', 'err'));
+    } else {
+      const ta = document.createElement('textarea');
+      ta.value = url; document.body.appendChild(ta); ta.select();
+      try { document.execCommand('copy'); done(); } catch (_) { toast('Copy failed', 'err'); }
+      ta.remove();
+    }
+  }
+
+  async function loadShareLinks() {
+    if (!_shareTarget) return;
+    const el = document.getElementById('share-links-list');
+    try {
+      const r = await api.get('share/links', { targetType: _shareTarget.type, targetId: _shareTarget.id });
+      const links = (r && r.links) ? r.links : [];
+      if (!links.length) { el.innerHTML = '<div class="share-empty">No links yet.</div>'; return; }
+      el.innerHTML = links.map(function (l) {
+        const uses = l.max_uses ? (l.use_count + '/' + l.max_uses) : (l.use_count + ' use(s)');
+        const dead = l.status !== 'active';
+        const exp = l.expires_at ? (' \u00b7 expires ' + new Date(l.expires_at * 1000).toLocaleDateString()) : ' \u00b7 never expires';
+        return '<div class="share-rowline"' + (dead ? ' style="opacity:.55;"' : '') + '>' +
+          '<span class="share-name">' + escHtml(l.token_prefix || '???') + ' \u00b7 ' +
+            escHtml(SHARE_PERM_LABEL[l.permission] || l.permission) + exp + '</span>' +
+          '<span class="share-empty">' + escHtml(l.status) + ' \u00b7 ' + escHtml(uses) + '</span>' +
+          (dead ? '' : '<button class="btn btn-sm btn-danger" onclick="revokeShareLink(\'' + l.id + '\', this)">Revoke</button>') +
+          '</div>';
+      }).join('');
+    } catch (e) {
+      el.innerHTML = '<div class="share-empty">\u26a0\ufe0f ' + escHtml((e && (e.detail || e.message)) || 'could not load') + '</div>';
+    }
+  }
+
+  async function revokeShareLink(id, btn) {
+    await shareRun(btn, async () => {
+      await api.delete('share/links/' + id);
+      await loadShareLinks();
+    }, 'Link revoked');
+  }
+
+  async function loadShareGrants() {
+    if (!_shareTarget) return;
+    const el = document.getElementById('share-grants-list');
+    try {
+      const r = await api.get('share/grants', { targetType: _shareTarget.type, targetId: _shareTarget.id });
+      const grants = (r && r.grants) ? r.grants : [];
+      if (!grants.length) { el.innerHTML = '<div class="share-empty">Nobody has access.</div>'; return; }
+      el.innerHTML = grants.map(function (g) {
+        const dead = g.status !== 'active';
+        const permSel = '<select onchange="changeShareGrant(\'' + g.id + '\', this.value, this)">' +
+          '<option value="read"' + (g.permission === 'read' ? ' selected' : '') + '>Read only</option>' +
+          '<option value="write"' + (g.permission === 'write' ? ' selected' : '') + '>Read &amp; write</option></select>';
+        return '<div class="share-rowline"' + (dead ? ' style="opacity:.55;"' : '') + '>' +
+          '<span class="share-name">\ud83d\udc65 ' + escHtml(g.grantee_user_id || '') +
+            (dead ? ' <em>(revoked)</em>' : '') + '</span>' +
+          (dead ? '' : permSel) +
+          (dead ? '' : '<button class="btn btn-sm btn-danger" onclick="revokeShareGrant(\'' + g.id + '\', this)">Revoke</button>') +
+          '</div>';
+      }).join('');
+    } catch (e) {
+      el.innerHTML = '<div class="share-empty">\u26a0\ufe0f ' + escHtml((e && (e.detail || e.message)) || 'could not load') + '</div>';
+    }
+  }
+
+  async function addShareGrant() {
+    if (!_shareTarget) return;
+    const input = document.getElementById('share-add-user');
+    const btn = document.getElementById('share-add-btn');
+    const username = input.value.trim();
+    if (!username) { shareStatus('Enter an account name first', 'err'); return; }
+    await shareRun(btn, async () => {
+      await api.post('share/grants', {
+        targetType: _shareTarget.type,
+        targetId: _shareTarget.id,
+        username: username,
+        permission: document.getElementById('share-add-perm').value
+      });
+      input.value = '';
+      await loadShareGrants();
+    }, 'Recipient added');
+  }
+
+  async function changeShareGrant(id, permission, sel) {
+    // The select already shows the new value; on a failure the server's value
+    // is the truth, so reload rather than guess what to restore.
+    await shareRun(null, async () => {
+      await api.put('share/grants/' + id, { permission: permission });
+      await loadShareGrants();
+    }, 'Permission updated');
+  }
+
+  async function revokeShareGrant(id, btn) {
+    await shareRun(btn, async () => {
+      await api.delete('share/grants/' + id);
+      await loadShareGrants();
+    }, 'Access revoked');
+  }
+</script>
   <style>
     :root {
       --primary: #4f46e5; --primary-light: #eef2ff; --primary-dark: #3730a3;
@@ -80,6 +261,61 @@
     .dedup-record-name { font-weight: 700; font-size: .88rem; margin-bottom: .35rem; }
     .dedup-record-text { font-size: .8rem; line-height: 1.45; color: var(--muted); max-height: 110px; overflow: auto; white-space: pre-wrap; }
     .dedup-record-scope { font-size: .7rem; color: var(--muted); margin-top: .5rem; }
+    /* ---- share modal ---------------------------------------------------- */
+    .share-overlay { position: fixed; inset: 0; z-index: 9999; display: flex;
+                     align-items: center; justify-content: center;
+                     background: rgba(0,0,0,.45); padding: 1rem; }
+    .share-overlay[hidden] { display: none; }
+    .share-modal { background: var(--surface); color: var(--text);
+                   border: 1px solid var(--border); border-radius: 12px;
+                   box-shadow: 0 12px 40px rgba(0,0,0,.3);
+                   width: min(620px, 100%); max-height: min(86vh, 760px);
+                   display: flex; flex-direction: column; }
+    .share-modal-head { display: flex; align-items: center; gap: .5rem;
+                        padding: .9rem 1rem; border-bottom: 1px solid var(--border);
+                        flex: 0 0 auto; }
+    .share-modal-head h3 { margin: 0; font-size: 1rem; flex: 1 1 auto;
+                           overflow: hidden; text-overflow: ellipsis;
+                           white-space: nowrap; }
+    .share-x { background: none; border: 1px solid var(--border); cursor: pointer;
+               border-radius: 6px; width: 30px; height: 30px; flex: 0 0 auto;
+               color: var(--muted); font-size: .95rem; line-height: 1; }
+    .share-x:hover { color: var(--text); border-color: var(--muted); }
+    .share-modal-body { padding: .25rem 1rem 1rem; overflow-y: auto;
+                        flex: 1 1 auto; min-height: 0; }
+    .share-modal-foot { display: flex; align-items: center; gap: .75rem;
+                        justify-content: flex-end; padding: .75rem 1rem;
+                        border-top: 1px solid var(--border);
+                        background: var(--bg); border-radius: 0 0 12px 12px;
+                        flex: 0 0 auto; }
+    .share-status { flex: 1 1 auto; font-size: .8rem; color: var(--muted);
+                    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .share-status.err { color: #b91c1c; white-space: normal; }
+    .share-status.ok  { color: #15803d; }
+    .share-section { border-top: 1px solid var(--border); padding: .9rem 0 .3rem; }
+    .share-section:first-child { border-top: none; }
+    .share-section h4 { margin: 0 0 .55rem; font-size: .85rem;
+                        text-transform: uppercase; letter-spacing: .04em;
+                        color: var(--muted); }
+    .share-row { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem;
+                 margin-bottom: .5rem; }
+    .share-row > label { flex: 0 0 120px; font-size: .85rem; color: var(--muted); }
+    .share-row > input[type=number] { width: 110px; }
+    .share-row > input[type=text] { flex: 1 1 160px; min-width: 120px; }
+    .share-row > select { flex: 0 0 auto; }
+    .share-hint { font-size: .78rem; color: var(--muted); margin: .1rem 0 .6rem; }
+    .share-result { font-size: .82rem; padding: .55rem .65rem; margin: .3rem 0 .6rem;
+                    border: 1px dashed var(--border); border-radius: 7px;
+                    word-break: break-all; }
+    .share-result[hidden] { display: none; }
+    .share-rowline { display: flex; align-items: center; gap: .5rem;
+                     font-size: .82rem; padding: .4rem 0;
+                     border-bottom: 1px dashed var(--border); }
+    .share-rowline:last-child { border-bottom: none; }
+    .share-rowline .share-name { flex: 1 1 auto; overflow: hidden;
+                                 text-overflow: ellipsis; white-space: nowrap; }
+    .share-rowline select { font-size: .78rem; padding: .2rem; }
+    .share-empty { font-size: .8rem; color: var(--muted); font-style: italic; }
     .dedup-editor { display: grid; grid-template-columns: 1fr 2fr; gap: .75rem; margin-top: 1rem; }
     .dedup-editor textarea { min-height: 130px; }
     @media (max-width: 700px) { .dedup-editor { grid-template-columns: 1fr; } }
@@ -687,6 +923,13 @@
 
     @media (max-width: 640px) {
       .page { padding: .5rem; }
+      /* The share dialog is a bottom sheet on a phone: full width,
+         and the label of every row gets its own line. */
+      .share-overlay { padding: 0; align-items: flex-end; }
+      .share-modal { width: 100%; max-height: 92vh;
+                      border-radius: 12px 12px 0 0; }
+      .share-modal-foot { border-radius: 0; }
+      .share-row > label { flex: 0 0 100%; }
       /* 28px targets are below the reliable thumb size. */
       .alpha-btn { width: 36px; height: 36px; }
       .item-menu-btn { padding: .45rem .6rem; min-height: 36px; }
@@ -6149,75 +6392,66 @@ let contextMenu = null;
     loadMemories();
   })();
 </script>
-<div id="share-dialog" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:9999;align-items:center;justify-content:center;">
-  <div style="background:var(--bg,#fff);color:var(--fg,#111);max-width:520px;width:92%;border-radius:12px;padding:1.2rem;box-shadow:0 8px 30px rgba(0,0,0,.25);">
-    <h3 id="share-title">Share</h3>
-    <p style="font-size:.85rem;color:var(--muted);">Permission: <select id="share-perm"><option value="read">read</option><option value="write">read-write</option></select> · Expires in (days, blank=never): <input id="share-days" type="number" min="1" style="width:70px;" placeholder="30"></p>
-    <p><button class="btn btn-sm" onclick="createShareLink()">Create link</button> <button class="btn btn-sm btn-ghost" onclick="closeShareDialog()">Close</button></p>
-    <div id="share-result" style="font-size:.85rem;margin:.5rem 0;"></div>
-    <h4>Existing links</h4>
-    <div id="share-links-list" style="font-size:.85rem;max-height:200px;overflow:auto;"></div>
-    <h4>Recipients</h4>
-    <div id="share-grants-list" style="font-size:.85rem;max-height:200px;overflow:auto;"></div>
-    <p style="font-size:.85rem;">Direct-add by username: <input id="share-add-user" style="width:120px;"> <select id="share-add-perm"><option value="read">read</option><option value="write">write</option></select> <button class="btn btn-sm" onclick="addShareGrant()">Add</button></p>
+<div id="share-overlay" class="share-overlay" hidden>
+  <div class="share-modal" role="dialog" aria-modal="true" aria-labelledby="share-title">
+    <div class="share-modal-head">
+      <h3 id="share-title">Share</h3>
+      <button class="share-x" onclick="closeShareDialog()" title="Close" aria-label="Close">&#10005;</button>
+    </div>
+    <div class="share-modal-body">
+
+      <div class="share-section">
+        <h4>Create a share link</h4>
+        <div class="share-row">
+          <label for="share-perm">Permission</label>
+          <select id="share-perm">
+            <option value="read">Read only</option>
+            <option value="write">Read &amp; write</option>
+          </select>
+        </div>
+        <div class="share-row">
+          <label for="share-days">Expires in (days)</label>
+          <input id="share-days" type="number" min="1" placeholder="30">
+        </div>
+        <div class="share-row">
+          <label for="share-uses">Max uses</label>
+          <input id="share-uses" type="number" min="1" placeholder="unlimited">
+        </div>
+        <button class="btn btn-primary btn-sm" id="share-create-btn" onclick="createShareLink()">Create link</button>
+        <p class="share-hint">The link is shown once. Blank expiry means it never expires; you can revoke it any time.</p>
+        <div id="share-result" class="share-result" hidden></div>
+      </div>
+
+      <div class="share-section">
+        <h4>Add a recipient directly</h4>
+        <div class="share-row">
+          <input id="share-add-user" type="text" placeholder="account name" autocomplete="off">
+          <select id="share-add-perm">
+            <option value="read">Read only</option>
+            <option value="write">Read &amp; write</option>
+          </select>
+          <button class="btn btn-sm" id="share-add-btn" onclick="addShareGrant()">Add recipient</button>
+        </div>
+        <p class="share-hint">For someone who already has an account here. No link needed.</p>
+      </div>
+
+      <div class="share-section">
+        <h4>Recipients</h4>
+        <div id="share-grants-list"></div>
+      </div>
+
+      <div class="share-section">
+        <h4>Links</h4>
+        <div id="share-links-list"></div>
+      </div>
+
+    </div>
+    <div class="share-modal-foot">
+      <span id="share-status" class="share-status"></span>
+      <button class="btn" onclick="closeShareDialog()">Close</button>
+    </div>
   </div>
 </div>
-<script>
-  let _shareTarget = null;
-  function openShareDialog(type, id, name) {
-    _shareTarget = {type, id};
-    document.getElementById('share-title').textContent = 'Share ' + type + ': ' + name;
-    document.getElementById('share-result').textContent = '';
-    document.getElementById('share-dialog').style.display = 'flex';
-    loadShareLinks(); loadShareGrants();
-  }
-  function closeShareDialog(){ document.getElementById('share-dialog').style.display='none'; _shareTarget=null; }
-  async function createShareLink() {
-    if (!_shareTarget) return;
-    const perm = document.getElementById('share-perm').value;
-    const days = document.getElementById('share-days').value;
-    const body = {targetType: _shareTarget.type, targetId: _shareTarget.id, permission: perm};
-    if (days) body.expiresInDays = parseInt(days,10);
-    const r = await api.post('share/links', body);
-    if (r && r.token) {
-      const url = r.acceptUrl || (location.origin + '/share/' + r.token);
-      document.getElementById('share-result').innerHTML = 'Link (copy once): <code>' + escHtml(url) + '</code>';
-      await loadShareLinks();
-    } else {
-      document.getElementById('share-result').textContent = (r && r.detail) || 'Failed';
-    }
-  }
-  async function loadShareLinks() {
-    if (!_shareTarget) return;
-    const r = await api.get('share/links?targetType=' + _shareTarget.type + '&targetId=' + _shareTarget.id);
-    const el = document.getElementById('share-links-list');
-    if (!Array.isArray(r)) { el.textContent = (r && r.detail) || 'none'; return; }
-    el.innerHTML = r.map(l => `<div>${escHtml(l.status||'')} · ${escHtml(l.prefix||'')} · uses ${l.useCount||0}/${l.maxUses||'∞'} · <button class="btn btn-sm btn-danger" onclick="revokeShareLink('${l.id}')">revoke</button></div>`).join('') || '_none_';
-  }
-  async function revokeShareLink(id) {
-    await api.del('share/links/' + id);
-    await loadShareLinks();
-  }
-  async function loadShareGrants() {
-    if (!_shareTarget) return;
-    const r = await api.get('share/grants?targetType=' + _shareTarget.type + '&targetId=' + _shareTarget.id);
-    const el = document.getElementById('share-grants-list');
-    const list = (r && r.grants) ? r.grants : (Array.isArray(r) ? r : []);
-    if (!list.length) { el.textContent = 'none'; return; }
-    el.innerHTML = list.map(g => `<div>${escHtml(g.grantee_user_id||g.grantee)} — ${escHtml(g.permission)} ${g.revoked_at?'(revoked)':''} <button class="btn btn-sm btn-danger" onclick="revokeShareGrant('${g.id}')">revoke</button></div>`).join('');
-  }
-  async function addShareGrant() {
-    if (!_shareTarget) return;
-    const user = document.getElementById('share-add-user').value.trim();
-    const perm = document.getElementById('share-add-perm').value;
-    const r = await api.post('share/grants', {targetType:_shareTarget.type, targetId:_shareTarget.id, username:user, permission:perm});
-    if (r && r.detail) document.getElementById('share-result').textContent = r.detail;
-    await loadShareGrants();
-  }
-  async function revokeShareGrant(id) {
-    await api.del('share/grants/' + id);
-    await loadShareGrants();
-  }
-</script>
+
 </body>
 </html>

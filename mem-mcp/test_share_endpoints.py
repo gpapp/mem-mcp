@@ -626,5 +626,132 @@ class CallSitePinTests(unittest.TestCase):
                              "nowhere else")
 
 
+class NoTransitiveReShareTests(ShareRoutesCase):
+    """A grant is not a licence to re-share.
+
+    ``db_list_clients`` returns a grantee's OWN clients *and* the ones other
+    owners shared with them (``shared: True``). The owner check behind every
+    owner-only share route ran over that combined list, so a grantee could
+    mint a link for -- or direct-add a recipient to -- a target belonging to
+    somebody else. Sharing is explicitly non-transitive, and the recipient
+    cap is bypassed the moment a second owner starts handing the same target
+    on.
+    """
+
+    def _shared_clients(self):
+        return [{"id": "cid-9", "name": "SAP SE", "shared": True,
+                 "owner": "alice", "permission": "read",
+                 "contexts": [{"id": "xtid-9", "name": "S4 rollout",
+                               "shared": True, "owner": "alice",
+                               "permission": "read"}]}]
+
+    def test_a_shared_client_is_not_mintable(self):
+        self.clients = self._shared_clients()
+        with self.assertRaises(_HTTPException) as ctx:
+            self._call(self.namespace["api_share_create_link"](
+                self._request(),
+                self._body(targetType="client", targetId="cid-9",
+                           permission="read")))
+        self.assertEqual(ctx.exception.status_code, 404)
+
+    def test_a_shared_project_is_not_mintable(self):
+        self.clients = self._shared_clients()
+        with self.assertRaises(_HTTPException) as ctx:
+            self._call(self.namespace["api_share_create_link"](
+                self._request(),
+                self._body(targetType="context", targetId="xtid-9",
+                           permission="read")))
+        self.assertEqual(ctx.exception.status_code, 404)
+
+    def test_a_grantee_cannot_direct_add_a_recipient_either(self):
+        self.clients = self._shared_clients()
+        with self.assertRaises(_HTTPException) as ctx:
+            self._call(self.namespace["api_share_add_grant"](
+                self._request(),
+                self._body(targetType="client", targetId="cid-9",
+                           username="bob", permission="read")))
+        self.assertEqual(ctx.exception.status_code, 404)
+
+    def test_the_owner_can_still_share_their_own_client(self):
+        self.clients = self._shared_clients() + [
+            {"id": "cid-1", "name": "Deutsche Bank",
+             "contexts": [{"id": "xtid-1", "name": "AI Adoption"}]}]
+        result = self._call(self.namespace["api_share_create_link"](
+            self._request(),
+            self._body(targetType="client", targetId="cid-1",
+                       permission="read", neverExpires=False,
+                       expiresInDays=None, maxUses=None)))
+        self.assertTrue(result["token"])
+
+
+class ShareDialogTests(unittest.TestCase):
+    """The share dialog's own failure modes, from the template.
+
+    Every assertion here guards a *silent* defect: the ``api`` helper's
+    ``apiFail`` REJECTS on a non-2xx, so an unwrapped ``await`` inside these
+    handlers turned every 4xx into a button that appeared dead -- which is
+    exactly what a disabled feature flag looks like to the person clicking.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = _read("mem-mcp/templates/dashboard.html")
+
+    def _dialog_js(self) -> str:
+        start = self.src.index("let _shareTarget")
+        return self.src[start:self.src.index("</script>", start)]
+
+    def test_no_handler_calls_a_method_the_api_object_does_not_have(self):
+        # api defines get/post/put/delete only. `api.del` was a TypeError on
+        # click -- a revoke button that did nothing and logged nothing.
+        for name in ("api.del(", "api.postx(", "api.gets("):
+            self.assertNotIn(name, self.src,
+                             msg=f"{name} is not a method on the api object")
+
+    def test_every_state_changing_call_goes_through_share_run(self):
+        js = self._dialog_js()
+        for call in ("api.post('share/links'", "api.post('share/grants'",
+                     "api.put('share/grants/", "api.delete('share/links/",
+                     "api.delete('share/grants/"):
+            self.assertIn(call, js, msg=f"{call} vanished from the dialog")
+        # Each of those sits inside shareRun, which is what catches the
+        # rejection. A bare `await api.` inside these handlers is the bug.
+        for line in js.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("await api.") :
+                self.assertFalse(
+                    stripped.startswith("await api.get"),
+                    msg="a bare await outside shareRun swallows its error")
+        self.assertIn("catch (e)", js)
+
+    def test_the_dialog_has_a_footer_and_close_is_bottom_right(self):
+        markup = self.src[self.src.index('<div class="share-modal-foot">'):]
+        foot = markup[:markup.index("</div>")]
+        self.assertIn('onclick="closeShareDialog()"', foot,
+                      msg="the footer is where Close belongs, and it was "
+                          "parked mid-dialog where it read as a form field")
+        foot_css = self.src[self.src.index(".share-modal-foot {"):]
+        foot_css = foot_css[:foot_css.index("}")]
+        self.assertIn("justify-content: flex-end", foot_css,
+                      msg="the footer must right-align its Close button")
+        # ...and the header's X is a close control too, not the only one.
+        self.assertIn('class="share-x"', self.src)
+
+    def test_the_links_list_reads_the_links_key_not_the_bare_object(self):
+        # GET /api/share/links answers {"links": [...]}; reading the response
+        # as an array rendered "none" for every link the owner had minted.
+        js = self._dialog_js()
+        self.assertIn("(r && r.links)", js)
+        self.assertIn("(r && r.grants)", js)
+        # and the row fields are the store's snake_case, not camelCase guesses
+        self.assertIn("l.token_prefix", js)
+        self.assertIn("l.use_count", js)
+
+    def test_the_expiry_field_cannot_send_both_forms_at_once(self):
+        js = self._dialog_js()
+        self.assertIn("neverExpires", js)
+        self.assertIn("expiresInDays", js)
+
+
 if __name__ == "__main__":
     unittest.main()
