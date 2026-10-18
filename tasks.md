@@ -26,27 +26,27 @@ Out of scope for v1 (explicit):
 
 ## 1. Open decisions (resolve before Phase 1)
 
-- [ ] **Where do records created under a shared context live?** Proposed:
+- [x] **Where do records created under a shared context live?** Proposed:
       stored with the **owner's `userId`** (shared workspace semantics) with a
       `createdBy` attribute naming the acting user. Alternative: stored under the
       acting user's `userId`, which fragments the shared view. Decision affects
       every read query.
-- [ ] **Read access to the owner's other clients.** A shared context must not
+- [x] **Read access to the owner's other clients.** A shared context must not
       leak sibling clients/contexts or unscoped facts. Scope filters are already
       edge-based; confirm no code path returns the owner's full client list to a
       grantee.
-- [ ] **Expiry of share links.** Proposed default: 30 days, revocable anytime.
+- [x] **Expiry of share links.** Proposed default: 30 days, revocable anytime.
       Also allow "never expires" for long-lived links (owner's choice).
-- [ ] **Maximum recipients per shared target.** Proposed 50; revisit if needed.
-- [ ] **Audit log storage.** Proposed: a dedicated SQLite database
+- [x] **Maximum recipients per shared target.** Proposed 50; revisit if needed.
+- [x] **Audit log storage.** Proposed: a dedicated SQLite database
       `audit.db` next to the session store (stdlib only, like `sessions.py`) so
       it is importable/testable without DB drivers. Alternative: Neo4j nodes.
       SQLite keeps audit writes cheap and queryable.
-- [ ] **Audit log retention.** Proposed 90 days, configurable
+- [x] **Audit log retention.** Proposed 90 days, configurable
       (`MEM_AUDIT_KEEP_DAYS`).
-- [ ] **Should a read-only recipient see the owner's name in the UI?** Yes
+- [x] **Should a read-only recipient see the owner's name in the UI?** Yes
       (attribution), but never the owner's other data.
-- [ ] **MCP exposure.** Should an access key (mvk_) be able to act on shared
+- [x] **MCP exposure.** Should an access key (mvk_) be able to act on shared
       targets on behalf of its owner? Proposed: yes, but only targets the key's
       owner has access to (owned or granted). No new credential type.
 
@@ -157,24 +157,24 @@ concern → Phase 3 task to benchmark.
 
 ### Phase 1 — Foundations (data model + core helpers)
 
-- [ ] P1.1 Create `audit.py` (stdlib only) with `share_links`, `share_grants`,
+- [x] P1.1 Create `audit.py` (stdlib only) with `share_links`, `share_grants`,
       `audit_log` tables, migration-on-open, and helpers:
       `mint_share_link`, `resolve_share_link`, `revoke_share_link`,
       `list_share_links`, `grant_access`, `revoke_grant`, `list_grants_for_target`,
       `list_grants_for_user`, `log_access`, `query_audit_log`.
-- [ ] P1.2 Add Neo4j schema helpers in `client_manager.py`:
+- [x] P1.2 Add Neo4j schema helpers in `client_manager.py`:
       `db_mint_share_link`, `db_resolve_share_link`, `db_revoke_share_link`,
       `db_grant_access`, `db_revoke_grant`, `db_list_grants`, `db_has_access`,
       `db_accessible_client_ids`, `db_accessible_context_ids`,
       `db_accessible_fact_ids` (for a grantee).
-- [ ] P1.3 Add permission helpers (new `sharing.py` or extend `client_manager.py`):
+- [x] P1.3 Add permission helpers (new `sharing.py` or extend `client_manager.py`):
       `can_read(user, target)`, `can_write(user, target)`,
       `is_owner(user, target)`. Must consult grants + ownership.
-- [ ] P1.4 Env wiring: `MEM_AUDIT_DB`, `MEM_AUDIT_KEEP_DAYS`,
+- [x] P1.4 Env wiring: `MEM_AUDIT_DB`, `MEM_AUDIT_KEEP_DAYS`,
       `MEM_SHARE_LINK_TTL_DAYS` (default 30), `MEM_SHARE_MAX_RECIPIENTS`
       (default 50), `MEM_SHARING_ENABLED` (default 0). Add to `.env.example`
       and `docker-compose.yml` environment block (per env-wiring rule).
-- [ ] P1.5 Document in `scoped_ids.py` docstring that shared targets reuse
+- [x] P1.5 Document in `scoped_ids.py` docstring that shared targets reuse
       owner's ids (no new id derivation).
 
 ### Phase 2 — Share link lifecycle (backend)
@@ -285,25 +285,25 @@ concern → Phase 3 task to benchmark.
 
 ### Phase 8 — Tests
 
-- [ ] P8.1 New `test_sharing.py` suite covering: link mint/hash/verify,
+- [x] P8.1 New `test_sharing.py` suite covering: link mint/hash/verify,
       expiry, revocation, max uses, enumeration-safe revoke, grant idempotency,
       permission checks (read vs write), cross-user access, audit writes.
-- [ ] P8.2 Cypher safety tests: new queries added to `test_cypher_safety.py`
+- [x] P8.2 Cypher safety tests: new queries added to `test_cypher_safety.py`
       list-parameter lint; alias tests for any new multi-match reads.
-- [ ] P8.3 Env wiring test auto-covers new vars.
-- [ ] P8.4 Mobile layout tests for new panels.
-- [ ] P8.5 Re-injection verification for any guard that is "looks right but
+- [x] P8.3 Env wiring test auto-covers new vars.
+- [x] P8.4 Mobile layout tests for new panels.
+- [x] P8.5 Re-injection verification for any guard that is "looks right but
       wrong" (per AGENTS.md lesson).
 
 ### Phase 9 — Migration, docs, rollout
 
-- [ ] P9.1 Backfill: no data migration needed (grants are new). Ensure old
+- [x] P9.1 Backfill: no data migration needed (grants are new). Ensure old
       vaults unaffected.
 - [x] P9.2 Backup/restore: include `audit.db` in savepoint as an additional
       file in the savepoint directory. Update `backup.py`.
 - [x] P9.3 Update AGENTS.md with sharing section and new env vars.
-- [ ] P9.4 Update README with user-facing sharing docs.
-- [ ] P9.5 Staged rollout: feature flag `MEM_SHARING_ENABLED` (default 0)
+- [x] P9.4 Update README with user-facing sharing docs.
+- [x] P9.5 Staged rollout: feature flag `MEM_SHARING_ENABLED` (default 0)
       initially, like registration. Start with read-only sharing only, then add
       write in a follow-up.
 

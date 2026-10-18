@@ -553,3 +553,14 @@ naming the access-key header it needs.)*
 - **Databases**: Qdrant (Vector), Neo4j (Graph)
 - **AI/ML**: Ollama (`nomic-embed-text` for embeddings; `granite3.3:2b` for extraction, `nemotron-3-nano:4b` for scope/search/merge — see [Chat models](#chat-models))
 - **Frontend**: Vanilla JS, Modern CSS3
+
+## Project/Context Sharing
+
+A vault owner can share a single client or context with another signed-in user via a link or direct grant, with read or read-write permission.
+
+- Feature flag `MEM_SHARING_ENABLED` (default 0). Enable to turn on.
+- Endpoints: `POST /api/share/links`, `GET /api/share/links`, `DELETE /api/share/links/{id}`, `POST /api/share/accept/{token}`, `POST /api/share/grants`, `GET /api/share/grants`, `PUT /api/share/grants/{id}`, `DELETE /api/share/grants/{id}`, `GET /api/share/mine`, `GET /api/audit`.
+- MCP tools: `list_shared_with_me`, `accept_share_link`, `list_share_grants`.
+- Records created under a shared target are stored under the owner's userId with `createdBy`/`updatedBy` set.
+- Audit log in a separate SQLite DB (`MEM_AUDIT_DB`), 90-day retention (`MEM_AUDIT_KEEP_DAYS`).
+- Link TTL default 30 days (`MEM_SHARE_LINK_TTL_DAYS`), max 50 recipients (`MEM_SHARE_MAX_RECIPIENTS`).
