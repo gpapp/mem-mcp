@@ -13,6 +13,7 @@ from typing import Optional
 from common import get_neo4j, get_qdrant, get_llm_response, logger, COLLECTION_NAME, DIARY_COLLECTION
 from matching_utils import plan_search_scope
 from scoped_ids import client_id_for, context_id_for
+import sharing
 
 # ---------------------------------------------------------------------------
 # Scope ranking tunables (shared by fact_manager and diary_manager)
@@ -131,10 +132,21 @@ def db_list_clients(user_id: str) -> list:
     identical cards and the client filter offered the name twice. The collect
     belongs in a `WITH` before the `RETURN`; see
     `test_cypher_safety.OneRowPerRecordTests`.
+
+    **With sharing enabled this list is the owned vault PLUS explicitly granted
+    targets.** Shared clients/contexts are merged in (sorted by name) and
+    flagged `shared: True`, `owner: <ownerId>`, `permission: <read|write>`;
+    own rows carry none of those keys, which keeps every pre-sharing consumer
+    byte-compatible. A context grant keeps its parent client visible with
+    only the granted context underneath — siblings are never granted along
+    with the parent node, and a client grant shares the whole client subtree
+    (all of its contexts), which is what sharing a client means.
     """
     neo4j_driver = get_neo4j()
     if not neo4j_driver:
         raise RuntimeError("Neo4j not connected.")
+
+    scope_map = sharing.accessible_owner_scope(user_id)
 
     with neo4j_driver.session() as s:
         result = s.run(
@@ -164,7 +176,127 @@ def db_list_clients(user_id: str) -> list:
                 "effectiveActive": _effective_active(dict(c_node)),
                 "contexts": contexts
             })
-        return clients
+
+    if scope_map and scope_map["owners"]:
+        with neo4j_driver.session() as s:
+            clients.extend(_shared_client_entries(s, scope_map["owners"]))
+        clients.sort(key=lambda c: c.get("name") or "")
+    return clients
+
+
+def _shared_client_entries(neo4j_session, owners: dict) -> list:
+    """Client entries reachable through grants, one per shared target.
+
+    Three passes per owner, because the shapes differ:
+
+    - **granted clients** — the client plus *all* of its contexts (a client
+      grant shares the client's whole subtree);
+    - **granted contexts** — the context plus its parent client id;
+    - **parent clients** of context grants that are not themselves granted —
+      their entry carries only the granted context underneath, so a sibling
+      project never rides along.
+    """
+    entries: dict = {}
+
+    for owner, granted in sorted(owners.items()):
+        client_ids = sorted(c for c, _p in granted["clients"].items())
+        context_ids = sorted(x for x, _p in granted["contexts"].items())
+
+        # Pass 1: granted clients and every context they own.
+        if client_ids:
+            rows = neo4j_session.run(
+                """
+                MATCH (c:Client {userId: $ownerId})
+                WHERE c.id IN $clientIds
+                OPTIONAL MATCH (c)-[:HAS_CONTEXT]->(ctx:Context)
+                WITH c, collect(ctx) as contexts
+                RETURN c, contexts
+                """,
+                ownerId=owner, clientIds=client_ids,
+            )
+            for r in rows:
+                c_node = r["c"]
+                cid = c_node["id"]
+                contexts = [
+                    {"id": ctx["id"], "name": ctx["name"],
+                     "active": ctx.get("active", True),
+                     **_shared_stamp(owner, granted["clients"][cid])}
+                    for ctx in r["contexts"] if ctx.get("id")
+                ]
+                entry = _shared_client_node(c_node, owner, cid, granted["clients"][cid])
+                entry["contexts"] = contexts
+                entries[cid] = entry
+
+        # Pass 2: granted contexts and their parent client ids.
+        parents: dict = {}
+        if context_ids:
+            rows = neo4j_session.run(
+                """
+                MATCH (ctx:Context {userId: $ownerId})
+                WHERE ctx.id IN $contextIds
+                OPTIONAL MATCH (parent:Client)-[:HAS_CONTEXT]->(ctx)
+                RETURN ctx, parent.id AS parentId, parent.name AS parentName
+                """,
+                ownerId=owner, contextIds=context_ids,
+            )
+            ctx_rows = []
+            for r in rows:
+                ctx = r["ctx"]
+                if not ctx.get("id"):
+                    continue
+                perm = granted["contexts"][ctx["id"]]
+                ctx_rows.append((ctx, perm))
+                if r["parentId"]:
+                    parents[ctx["id"]] = (r["parentId"], r["parentName"], perm)
+
+            # Pass 3: parents that need their own entry (navigation only).
+            parent_ids = sorted({pid for pid, _n, _p in parents.values()
+                                 if pid not in entries})
+            if parent_ids:
+                prows = neo4j_session.run(
+                    "MATCH (c:Client {userId: $ownerId}) WHERE c.id IN $parentIds RETURN c",
+                    ownerId=owner, parentIds=parent_ids,
+                )
+                for pr in prows:
+                    pc = pr["c"]
+                    entries[pc["id"]] = _shared_client_node(pc, owner, pc["id"], "read")
+
+            for ctx, perm in ctx_rows:
+                parent_pid = parents.get(ctx["id"], (None,))[0]
+                xentry = {"id": ctx["id"], "name": ctx["name"],
+                          "active": ctx.get("active", True), **_shared_stamp(owner, perm)}
+                if parent_pid and parent_pid in entries:
+                    clist = entries[parent_pid]["contexts"]
+                    if not any(x["id"] == ctx["id"] for x in clist):
+                        clist.append(xentry)
+                    # The parent's permission stays navigation-only ("read")
+                    # unless a real client grant says otherwise: a context
+                    # grant covers the context and its records, never the
+                    # client node — audit.grant_permits refuses exactly that,
+                    # so the list must not advertise what a check will 404.
+                if ctx["id"] not in entries:
+                    entries[ctx["id"]] = xentry
+
+    return list(entries.values())
+
+
+def _shared_stamp(owner: str, perm: str) -> dict:
+    """The flags every shared row carries and no own row does."""
+    return {"shared": True, "owner": owner, "permission": perm}
+
+
+def _shared_client_node(node, owner: str, cid: str, perm: str) -> dict:
+    return {
+        "id": cid,
+        "name": node["name"],
+        "active": node.get("active", True),
+        "statusPinned": node.get("statusPinned", False),
+        "crossClient": bool(node.get("crossClient", False)),
+        "lastMentioned": node.get("lastMentioned"),
+        "effectiveActive": _effective_active(dict(node)),
+        "contexts": [],
+        **_shared_stamp(owner, perm),
+    }
 
 
 def _effective_active(props: dict) -> bool:

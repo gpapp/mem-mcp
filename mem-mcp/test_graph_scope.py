@@ -14,6 +14,7 @@ import asyncio
 import os
 import re
 import time
+import types
 import unittest
 from typing import Optional
 
@@ -828,7 +829,7 @@ class ScopePrioritySearchTests(unittest.TestCase):
             "_single_vector_search": _vector, "_hydrate_chunk_texts": _hydrate,
             "_boost_result_score": lambda r, q: r.score,
             "parent_of": lambda pid, payload: str(pid),
-            "_db_relevant_scope": lambda driver, uid, ids: relevant,
+            "_db_relevant_scope": lambda driver, uid, ids, owner_ids=None: relevant,
             "db_get_client_status_map": lambda uid: {
                 "deutsche bank (db)": True, "sap se": False, "sap": True,
                 "epam": True, "white cube": True, "lc security": True,
@@ -838,6 +839,9 @@ class ScopePrioritySearchTests(unittest.TestCase):
             "infer_scope_from_text": lambda q, uid: (None, ""),
             "identity_confidence": identity_confidence,
             "log_search_stats": lambda **kwargs: None,
+            # Phase 3 stub: sharing off → the pre-sharing shape, unchanged sets.
+            "sharing": types.SimpleNamespace(accessible_owner_scope=lambda uid: None,
+                                             record_visible=lambda *a, **k: True),
         }
         fn = _lift_into("db_search_memories", namespace)
         loop = asyncio.new_event_loop()

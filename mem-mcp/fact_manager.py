@@ -9,7 +9,9 @@ import time
 import uuid
 import numpy as np
 import difflib
-from qdrant_client.models import PointStruct, Filter, FieldCondition, MatchValue, PointIdsList
+from qdrant_client.models import (PointStruct, Filter, FieldCondition, MatchValue,
+                                  MatchAny, PointIdsList)
+import sharing
 
 from common import (
     get_qdrant, get_neo4j, logger, get_embedding, get_llm_response, publish_db_event,
@@ -672,6 +674,47 @@ async def db_unlink_facts(source_id: str, target_id: str, rel_type: str, user_id
             )
 
 
+def _record_scope_ids(session, record_ids):
+    """Client and context ids each temporal record is filed under, from its edges.
+
+    Scope lives on the FOR_CLIENT / IN_CONTEXT relationships, not on properties,
+    so a visibility decision cannot be made from the node alone. Batched: the
+    neighbourhood check runs over a list, not one query per record.
+    """
+    clients, contexts = {}, {}
+    for row in session.run(
+        "MATCH (n)-[:FOR_CLIENT]->(c:Client) WHERE n.id IN $ids RETURN n.id as id, c.id as cid",
+        ids=list(record_ids),
+    ):
+        clients.setdefault(row["id"], set()).add(row["cid"])
+    for row in session.run(
+        "MATCH (n)-[:IN_CONTEXT]->(cx:Context) WHERE n.id IN $ids RETURN n.id as id, cx.id as cxid",
+        ids=list(record_ids),
+    ):
+        contexts.setdefault(row["id"], set()).add(row["cxid"])
+    return clients, contexts
+
+
+def _shared_records_visible(session, pairs, owners):
+    """Filter ``pairs`` [(record_id, owner), ...] down to the visible shared ones.
+
+    A record is visible through any ONE granted scope id: a fact filed under
+    several clients is reachable through whichever the caller can see. Own
+    records never reach this function — callers branch on owner == user first.
+    """
+    if not pairs or not owners:
+        return set()
+    clients, contexts = _record_scope_ids(session, [rid for rid, _ in pairs])
+    visible = set()
+    for rid, owner in pairs:
+        fc = clients.get(rid, set())
+        fx = contexts.get(rid, set())
+        if any(sharing.record_visible(owner, cid, None, owners) for cid in fc) \
+                or any(sharing.record_visible(owner, None, xid, owners) for xid in fx):
+            visible.add(rid)
+    return visible
+
+
 def db_get_neighborhood(fact_id: str, depth: int, rel_types: List[str], user_id: str,
                         client_id: str = "", context_id: str = "",
                         unassigned: bool = False) -> list:
@@ -696,31 +739,44 @@ def db_get_neighborhood(fact_id: str, depth: int, rel_types: List[str], user_id:
         types = "|:".join([t.upper() for t in rel_types])
         rel_filter = f":{types}"
 
+    # Phase 3: seed and neighbourhood may sit in a shared vault. The seed must
+    # itself be visible before the expansion means anything — a hidden record is
+    # indistinguishable from a disconnected one.
+    scope_map = sharing.accessible_owner_scope(user_id)
+    owners = scope_map["owners"] if scope_map else None
+    owner_ids = sharing.readable_owner_ids(user_id) or [user_id]
+
     with neo4j_driver.session() as s:
         result = s.run(
             f"""
-            MATCH (f:Fact {{id: $id, userId: $userId}})
+            MATCH (f:Fact) WHERE f.id = $id AND f.userId IN $ownerIds
             MATCH path = (f)-[{rel_filter}*1..{depth}]-(neighbor)
-            WHERE (neighbor:Fact AND neighbor.userId = $userId)
-               OR (neighbor:DiaryEntry AND neighbor.userId = $userId)
-               OR (neighbor:Client AND neighbor.userId = $userId)
-               OR (neighbor:Context AND neighbor.userId = $userId)
-            RETURN neighbor, labels(neighbor) as labels,
+            WHERE (neighbor:Fact AND neighbor.userId = f.userId)
+               OR (neighbor:DiaryEntry AND neighbor.userId = f.userId)
+               OR (neighbor:Client AND neighbor.userId = f.userId)
+               OR (neighbor:Context AND neighbor.userId = f.userId)
+            RETURN neighbor, labels(neighbor) as labels, neighbor.userId as ownerUserId,
                    [r IN relationships(path) | type(r)] as rels,
                    length(path) as distance
             """,
-            id=fact_id, userId=user_id
+            id=fact_id, ownerIds=owner_ids
         )
         nodes = []
         seen = set()
+        owner_of = {}  # record-ish node id -> vault it belongs to
+        shared_of = {}  # subset of owner_of where owner != caller
         for r in result:
             node = r["neighbor"]
+            owner = r.get("ownerUserId") or user_id
             labels = r["labels"] or []
             if "Fact" in labels:
                 node_id, label, name = node["id"], "Fact", (node.get("name") or node.get("text") or "")
                 group = node.get("category", "General")
             elif "DiaryEntry" in labels:
                 node_id, label = node["id"], "DiaryEntry"
+                owner_of[node_id] = owner
+                if owner != user_id:
+                    shared_of[node_id] = owner
                 name = node.get("title") or node.get("content", "")
                 group = "Diary"
             elif "Client" in labels:
@@ -729,6 +785,12 @@ def db_get_neighborhood(fact_id: str, depth: int, rel_types: List[str], user_id:
                 node_id, label, name, group = node["id"], "Context", node["name"], "Context"
             else:
                 continue
+            if label == "Fact":
+                owner_of[node_id] = owner
+                if owner != user_id:
+                    shared_of[node_id] = owner
+            else:
+                owner_of.setdefault(node_id, owner)
             if node_id == fact_id or node_id in seen:
                 continue
             seen.add(node_id)
@@ -743,6 +805,25 @@ def db_get_neighborhood(fact_id: str, depth: int, rel_types: List[str], user_id:
                 "rel": (r["rels"] or [None])[-1],
                 "distance": r["distance"],
             })
+
+        # Phase 3: the seed itself must be visible — resolve its scope ids along
+        # with the shared neighbours' in one batched pass.
+        seed_owner = user_id
+        seed_rec = s.run(
+            "MATCH (f:Fact {id: $id}) RETURN f.userId as uid", id=fact_id
+        ).single()
+        if seed_rec and seed_rec["uid"] and seed_rec["uid"] != user_id:
+            seed_owner = seed_rec["uid"]
+        check_pairs = list(shared_of.items())
+        if seed_owner != user_id:
+            check_pairs.append((fact_id, seed_owner))
+        visible = _shared_records_visible(s, check_pairs, owners)
+        if seed_owner != user_id and fact_id not in visible:
+            # The node "Show all connected" was pressed on is not accessible.
+            return []
+        nodes = [n for n in nodes
+                 if (o := shared_of.get(n["id"], user_id)) == user_id or n["id"] in visible]
+
         return _filter_neighborhood_scope(nodes, client_id, context_id, unassigned)
 
 
@@ -771,44 +852,83 @@ def _filter_neighborhood_scope(nodes, client_id, context_id, unassigned=False):
 
 
 def db_get_fact_by_id(fact_id: str, user_id: str) -> Optional[dict]:
-    """Get a single fact by its ID."""
+    """Get a single fact by its ID.
+
+    Phase 3: a shared owner's fact is a read the caller can make through a
+    grant; one the grants do not cover must stay exactly as invisible as an
+    unknown id, so the endpoint answers the same 404 for both.
+    """
     neo4j_driver = get_neo4j()
     if not neo4j_driver:
         raise RuntimeError("Neo4j not connected.")
 
+    owner_ids = sharing.readable_owner_ids(user_id) or [user_id]
     with neo4j_driver.session() as s:
         result = s.run(
             """
-            MATCH (f:Fact {id: $id, userId: $userId})
+            MATCH (f:Fact) WHERE f.id = $id AND f.userId IN $ownerIds
             RETURN f
             """,
-            id=fact_id, userId=user_id
+            id=fact_id, ownerIds=owner_ids
         )
         record = result.single()
-        if record:
-            return dict(record["f"])
-        return None
+        if not record:
+            return None
+        f = record["f"]
+        owner = f.get("userId") or user_id
+        if owner != user_id:
+            # An owner's record must be readable through a grant; scope ids come
+            # from the edges, one batched pass shared with the caller's check.
+            owners = (sharing.accessible_owner_scope(user_id) or {}).get("owners")
+            if owners:
+                clients, contexts = _record_scope_ids(s, [fact_id])
+                visible = any(sharing.record_visible(owner, cid, None, owners) for cid in clients.get(fact_id, ())) \
+                    or any(sharing.record_visible(owner, None, xid, owners) for xid in contexts.get(fact_id, ()))
+            else:
+                visible = False
+            if not visible:
+                return None
+        return dict(f)
 
 
 def db_get_connections_by_type(fact_id: str, user_id: str) -> dict:
-    """Get all connections for a fact grouped by relationship type."""
+    """Get all connections for a fact grouped by relationship type.
+
+    Phase 3: the fact may live in a shared vault; its connections are then the
+    same vault's records, matched through the fact's own userId rather than the
+    caller's. An invisible fact returns {} — the same shape an unknown id gives.
+    """
     neo4j_driver = get_neo4j()
     if not neo4j_driver:
         raise RuntimeError("Neo4j not connected.")
 
+    owner_ids = sharing.readable_owner_ids(user_id) or [user_id]
     with neo4j_driver.session() as s:
         result = s.run(
             """
-            MATCH (f:Fact {id: $id, userId: $userId})
+            MATCH (f:Fact) WHERE f.id = $id AND f.userId IN $ownerIds
             MATCH (f)-[r]-(neighbor:Fact)
-            WHERE neighbor.userId = $userId
+            WHERE neighbor.userId = f.userId
             RETURN type(r) as rel_type, collect({id: neighbor.id, name: neighbor.name, text: neighbor.text, category: neighbor.category}) as connections
             """,
-            id=fact_id, userId=user_id
+            id=fact_id, ownerIds=owner_ids
         )
+        rows = list(result)
+        if rows:
+            owner_rec = s.run(
+                "MATCH (f:Fact {id: $id}) RETURN f.userId as uid", id=fact_id
+            ).single()
+            f_owner = (owner_rec["uid"] if owner_rec else None) or user_id
+            if f_owner != user_id:
+                owners = (sharing.accessible_owner_scope(user_id) or {}).get("owners")
+                clients, contexts = _record_scope_ids(s, [fact_id])
+                visible = any(sharing.record_visible(f_owner, cid, None, owners) for cid in clients.get(fact_id, ())) \
+                    or any(sharing.record_visible(f_owner, None, xid, owners) for xid in contexts.get(fact_id, ()))
+                if not visible:
+                    return {}
 
         connections = {}
-        for r in result:
+        for r in rows:
             rel_type = r["rel_type"]
             connections[rel_type] = []
             for conn in r["connections"]:
@@ -1015,13 +1135,18 @@ async def _hydrate_chunk_texts(qdrant, entries: list) -> None:
         entry["matchedChunk"] = payload.get("chunkText")
 
 
-async def _single_vector_search(qdrant, query: str, user_id: str, category: Optional[str], fetch_limit: int, top_p: float) -> list:
+async def _single_vector_search(qdrant, query: str, user_id: str, category: Optional[str], fetch_limit: int, top_p: float, owner_ids: Optional[list] = None) -> list:
     """Run a single vector search against Qdrant. Returns raw results before boosting.
 
     ``top_p`` is a normalized confidence floor, not a raw cosine threshold: the
     embedder's useful band starts well above 0, so filtering here only discards
     results that could not pass the confidence gate after boosting. Passing 0.0
     disables the pre-filter and lets the caller decide.
+
+    ``owner_ids`` widens the vault filter for sharing: a grantee searches their
+    own vault PLUS the owners they hold grants from. ``None`` keeps the exact
+    pre-sharing shape. The widened set is the caller's responsibility — this
+    function only translates ids into the Qdrant filter.
 
     There is deliberately no client/context filter here. Scope is a *ranking*
     input, so filtering on ``clientName``/``contextName`` at this stage would
@@ -1031,7 +1156,11 @@ async def _single_vector_search(qdrant, query: str, user_id: str, category: Opti
     silence rather than a lower-ranked list.
     """
     vec = await get_embedding(query)
-    conditions = [FieldCondition(key="userId", match=MatchValue(value=user_id))]
+    if owner_ids and owner_ids != [user_id]:
+        user_match = MatchAny(any_=owner_ids)
+    else:
+        user_match = MatchValue(value=user_id)
+    conditions = [FieldCondition(key="userId", match=user_match)]
     if category:
         conditions.append(FieldCondition(key="category", match=MatchValue(value=category.strip().capitalize())))
 
@@ -1132,7 +1261,7 @@ def _boost_result_score(point, query_lower: str) -> float:
     return score
 
 
-def _db_relevant_scope(neo4j_driver, user_id: str, record_ids: list) -> dict:
+def _db_relevant_scope(neo4j_driver, user_id: str, record_ids: list, owner_ids: Optional[list] = None) -> dict:
     """``{record_id: {"clients": [...], "contexts": [...]}}`` from RELEVANT_TO edges.
 
     Read in one batched query per search rather than denormalised into the Qdrant
@@ -1154,6 +1283,10 @@ def _db_relevant_scope(neo4j_driver, user_id: str, record_ids: list) -> dict:
 
     A failure here degrades to "no relevant links", which is a weaker ranking and
     never a lost result.
+
+    ``owner_ids`` widens the match to the callers' own vault plus every owner
+    whose shared records are in play (Phase 3). ``None`` is the pre-sharing
+    shape: the caller's own id only.
     """
     out = {}
     if not record_ids:
@@ -1162,14 +1295,15 @@ def _db_relevant_scope(neo4j_driver, user_id: str, record_ids: list) -> dict:
         with neo4j_driver.session() as s:
             result = s.run(
                 """
-                MATCH (n {userId: $userId})
-                WHERE n.id IN $ids AND (n:Fact OR n:DiaryEntry)
+                MATCH (n)
+                WHERE n.id IN $ids AND n.userId IN $ownerIds AND (n:Fact OR n:DiaryEntry)
                 OPTIONAL MATCH (n)-[:RELEVANT_TO]->(rc)
                 RETURN n.id AS id,
                        collect(DISTINCT {name: rc.name,
                                          kind: CASE WHEN rc:Context THEN 'context' ELSE 'client' END}) AS relevant
                 """,
                 userId=user_id, ids=list(record_ids),
+                ownerIds=list(owner_ids or [user_id]),
             )
             for r in result:
                 clients, contexts = [], []
@@ -1221,6 +1355,16 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
     want_client = scope["client"]
     want_context = scope["context"]
 
+    # 0b. Sharing widens the candidate set: the caller's own vault plus every
+    # owner they hold a grant from. The *raw* match set is widened once here,
+    # and each owner's records are filtered against the actual grants below —
+    # a read grant on one client must not surface that owner's other clients.
+    # With sharing off (or no grants) `owners` stays None and every branch
+    # below takes its pre-sharing shape.
+    scope_map = sharing.accessible_owner_scope(user_id)
+    owners = scope_map["owners"] if scope_map else None
+    owner_ids = [user_id] + sorted(owners) if owners else None
+
     # 1. Neo4j exact/substring match on name or aliases
     # We do a quick lookup for nodes containing the query
     exact_matches = []
@@ -1230,15 +1374,17 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
         # Only do broad CONTAINS match on text if the query is reasonably long to avoid massive irrelevant noise
         if len(query) > 3 and not name_like:
             cypher = """
-            MATCH (f:Fact {userId: $userId})
-            WHERE toLower(f.name) CONTAINS toLower($query_str)
+            MATCH (f:Fact)
+            WHERE f.userId IN $ownerIds
+              AND (toLower(f.name) CONTAINS toLower($query_str)
                OR (size(f.name) > 3 AND toLower($query_str) CONTAINS toLower(f.name))
-               OR toLower(f.text) CONTAINS toLower($query_str)
+               OR toLower(f.text) CONTAINS toLower($query_str))
             """
         else:
             cypher = """
-            MATCH (f:Fact {userId: $userId})
-            WHERE toLower(f.name) CONTAINS toLower($query_str)
+            MATCH (f:Fact)
+            WHERE f.userId IN $ownerIds
+              AND toLower(f.name) CONTAINS toLower($query_str)
             """
         if category:
             cypher += " AND toLower(f.category) = toLower($category)"
@@ -1249,15 +1395,25 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
         # ranks; it never removes.
         cypher += " OPTIONAL MATCH (f)-[:FOR_CLIENT]->(fc:Client)"
         cypher += " OPTIONAL MATCH (f)-[:IN_CONTEXT]->(fx:Context)"
-        cypher += " RETURN f, fc.name AS clientName, fx.name AS contextName ORDER BY f.name LIMIT 25"
+        cypher += (" RETURN f, fc.name AS clientName, fx.name AS contextName,"
+                   " fc.id AS clientId, fx.id AS contextId")
+        cypher += " ORDER BY f.name LIMIT 25"
 
-        params = {"userId": user_id, "query_str": query}
+        params = {"ownerIds": owner_ids or [user_id], "query_str": query}
         if category:
             params["category"] = category.strip()
 
         neo_result = s.run(cypher, **params)
         for r in neo_result:
             f = r["f"]
+            # A shared record is visible only through a grant the caller
+            # actually holds. The id sets above widened the *match*; this is
+            # where the per-owner grant decides. Own records never pass
+            # through a grant check.
+            owner = f.get("userId") or user_id
+            if owner != user_id and not sharing.record_visible(
+                    owner, r["clientId"], r["contextId"], owners):
+                continue
             # Construct a result matching Qdrant format
             meta = {k: v for k, v in f.items() if k not in {"id", "text", "name", "category", "timestamp", "userId"}}
 
@@ -1312,6 +1468,8 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
                 "contextName": r["contextName"],
                 "metadata": meta
             })
+            if owner != user_id:
+                exact_matches[-1]["ownerUserId"] = owner
 
     # 2. Multi-query vector search
     # Long queries go through the LLM rewriter. Short queries only get expanded
@@ -1335,7 +1493,8 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
     all_vector_results = {}  # record id -> best result across all variants
 
     for variant_query, weight in query_variants:
-        raw_points = await _single_vector_search(qdrant, variant_query, user_id, category, fetch_limit, top_p)
+        raw_points = await _single_vector_search(qdrant, variant_query, user_id, category,
+                                                 fetch_limit, top_p, owner_ids=owner_ids)
 
         for r in raw_points:
             boosted_score = _boost_result_score(r, variant_query.lower())
@@ -1348,6 +1507,11 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
             # fills the result list with N copies of itself.
             record_id = parent_of(r.id, r.payload)
 
+            owner = r.payload.get("userId") or user_id
+            if owner != user_id:
+                if not sharing.record_visible(owner, r.payload.get("clientId"),
+                                              r.payload.get("contextId"), owners):
+                    continue
             result_entry = {
                 "id": record_id,
                 "text": r.payload.get("text"),
@@ -1357,6 +1521,7 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
                 "raw_score": r.score,
                 "clientName": r.payload.get("clientName"),
                 "contextName": r.payload.get("contextName"),
+                "ownerUserId": owner if owner != user_id else None,
                 "metadata": r.payload.get("metadata", {})
             }
 
@@ -1389,7 +1554,8 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
     # `max(identity_strength, vector_confidence)`, so a scope term folded in there
     # would outrank identity evidence and report a record with no name match at
     # all as a confirmed identity match.
-    relevant_by_id = _db_relevant_scope(neo4j_driver, user_id, [r["id"] for r in final_list])
+    relevant_by_id = _db_relevant_scope(neo4j_driver, user_id, [r["id"] for r in final_list],
+                                        owner_ids=owner_ids)
     status_map = db_get_client_status_map(user_id)
     for r in final_list:
         meta = r.get("metadata") or {}
@@ -1558,10 +1724,18 @@ def db_list_memories(user_id: str) -> list:
     if not neo4j_driver:
         raise RuntimeError("Neo4j not connected.")
 
+    # Sharing (Phase 3): the raw match is widened once to every owner the caller
+    # can read, and owners' rows are filtered per record below — the same shape
+    # as db_search_memories. `clientId`/`contextId` already come back on the row,
+    # so nothing extra has to be threaded through the WITH chain.
+    scope_map = sharing.accessible_owner_scope(user_id)
+    owners = scope_map["owners"] if scope_map else None
+
     with neo4j_driver.session() as s:
         result = s.run(
             """
-            MATCH (c:Category)<-[:IN_CATEGORY]-(f:Fact {userId: $userId})
+            MATCH (c:Category)<-[:IN_CATEGORY]-(f:Fact)
+            WHERE f.userId IN $ownerIds
             WITH f, head(collect(c.name)) as category
             OPTIONAL MATCH (f)-[:FOR_CLIENT]->(cl:Client)
             WITH f, category,
@@ -1575,8 +1749,9 @@ def db_list_memories(user_id: str) -> list:
                                    kind: CASE WHEN rc:Context THEN 'context' ELSE 'client' END}) as relevantClients
             RETURN f, category, clientName, clientId, contextName, contextId,
                    relevantClients,
-                   [(f)-[r]-(other {userId: $userId})
+                   [(f)-[r]-(other)
                     WHERE (other:Fact OR other:DiaryEntry)
+                      AND other.userId = f.userId
                       AND type(r) <> 'IN_CATEGORY' AND type(r) <> 'KNOWS'
                     | {
                       rel: type(r),
@@ -1588,11 +1763,14 @@ def db_list_memories(user_id: str) -> list:
                     }] as links
             ORDER BY coalesce(f.name, f.text) ASC
             """,
-            userId=user_id,
+            ownerIds=owner_ids or [user_id],
         )
         memories = []
         for r in result:
             f_node = r["f"]
+            owner = f_node.get("userId") or user_id
+            if owner != user_id and not sharing.record_visible(owner, r["clientId"], r["contextId"], owners):
+                continue
             # Extract metadata (all properties except core ones)
             core_keys = {"id", "text", "name", "category", "timestamp", "userId"}
             metadata = {}
@@ -1620,6 +1798,7 @@ def db_list_memories(user_id: str) -> list:
                 "metadata":  metadata,
                 "links":     links
             })
+            memories[-1]["ownerUserId"] = owner if owner != user_id else None
         return memories
 
 
@@ -2203,15 +2382,25 @@ def db_get_graph(user_id: str, client_id: str = "", context_id: str = "", limit:
     if not neo4j_driver:
         raise RuntimeError("Neo4j not connected.")
 
+    # Phase 3: the same zero-restriction-under-sharing contract as every other
+    # read path. The owner ids widen the raw matches; the visibility pre-pass
+    # below removes an owner's records a grant does not cover, so only the
+    # record set — not the policy — ever reaches _scope_and_cap_graph.
+    scope_map = sharing.accessible_owner_scope(user_id)
+    owners = scope_map["owners"] if scope_map else None
+    owner_ids = sharing.readable_owner_ids(user_id)
+    owner_param = owner_ids or [user_id]
+
     with neo4j_driver.session() as s:
         result = s.run(
             """
-            MATCH (f:Fact {userId: $userId})
+            MATCH (f:Fact)
+            WHERE f.userId IN $ownerIds
             OPTIONAL MATCH (f)-[r]->(m)
-            WHERE (m:Fact AND m.userId = $userId) OR (m:Category)
+            WHERE (m:Fact AND m.userId = f.userId) OR (m:Category)
             RETURN f, type(r) as rel_type, m
             """,
-            userId=user_id
+            ownerIds=owner_param
         )
 
         node_map = {}
@@ -2222,9 +2411,13 @@ def db_get_graph(user_id: str, client_id: str = "", context_id: str = "", limit:
         fact_clients = {}
         fact_contexts = {}
         diary_scope = {}  # diary id -> [client_id, context_id]
+        # Phase 3: record node id -> the vault the record belongs to, so the
+        # visibility pre-pass can tell a grantee's own records from an owner's.
+        record_owners = {}
 
         for r in result:
             f = r["f"]
+            record_owners[f["id"]] = f.get("userId")
             if f["id"] not in node_map:
                 node_map[f["id"]] = {
                     "id": f["id"],
@@ -2239,6 +2432,9 @@ def db_get_graph(user_id: str, client_id: str = "", context_id: str = "", limit:
                 # Category nodes have 'name', Facts have 'id'
                 m_label = "Category" if "name" in m and "id" not in m else "Fact"
                 m_id = m.get("name") if m_label == "Category" else m.get("id")
+
+                if m_label == "Fact":
+                    record_owners[m["id"]] = m.get("userId")
 
                 if m_id not in node_map:
                     if m_label == "Category":
@@ -2276,16 +2472,18 @@ def db_get_graph(user_id: str, client_id: str = "", context_id: str = "", limit:
         # Add DiaryEntry nodes and MENTIONS edges
         diag_res = s.run(
             """
-            MATCH (d:DiaryEntry {userId: $userId})
+            MATCH (d:DiaryEntry)
+            WHERE d.userId IN $ownerIds
             OPTIONAL MATCH (d)-[r:MENTIONS]->(f:Fact)
-            WHERE f.userId = $userId
+            WHERE f.userId = d.userId
             RETURN d, type(r) as rel_type, f
             """,
-            userId=user_id
+            ownerIds=owner_param
         )
         for dr in diag_res:
             d_node = dr["d"]
             d_id = d_node["id"]
+            record_owners[d_id] = d_node.get("userId")
             if d_id not in node_map:
                 node_map[d_id] = {
                     "id": d_id,
@@ -2321,12 +2519,13 @@ def db_get_graph(user_id: str, client_id: str = "", context_id: str = "", limit:
         # Add Client nodes and FOR_CLIENT edges
         client_res = s.run(
             """
-            MATCH (c:Client {userId: $userId})
+            MATCH (c:Client)
+            WHERE c.userId IN $ownerIds
             OPTIONAL MATCH (n)-[:FOR_CLIENT]->(c)
-            WHERE (n:Fact OR n:DiaryEntry) AND n.userId = $userId
+            WHERE (n:Fact OR n:DiaryEntry) AND n.userId = c.userId
             RETURN c, n
             """,
-            userId=user_id
+            ownerIds=owner_param
         )
         for cr in client_res:
             c_node = cr["c"]
@@ -2366,13 +2565,14 @@ def db_get_graph(user_id: str, client_id: str = "", context_id: str = "", limit:
         # Add Context nodes and IN_CONTEXT/HAS_CONTEXT edges
         ctx_res = s.run(
             """
-            MATCH (ctx:Context {userId: $userId})
+            MATCH (ctx:Context)
+            WHERE ctx.userId IN $ownerIds
             OPTIONAL MATCH (n)-[:IN_CONTEXT]->(ctx)
-            WHERE (n:Fact OR n:DiaryEntry) AND n.userId = $userId
+            WHERE (n:Fact OR n:DiaryEntry) AND n.userId = ctx.userId
             OPTIONAL MATCH (c:Client)-[:HAS_CONTEXT]->(ctx)
             RETURN ctx, n, c
             """,
-            userId=user_id
+            ownerIds=owner_param
         )
         for xrr in ctx_res:
             ctx_node = xrr["ctx"]
@@ -2416,6 +2616,44 @@ def db_get_graph(user_id: str, client_id: str = "", context_id: str = "", limit:
                     }
                     edge_lookup[edge_sig] = new_edge
                     edges.append(new_edge)
+
+        # Phase 3: prune an owner's records the caller's grants do not cover.
+        # Removing them here — from node_map and from the scope maps — lets
+        # _scope_and_cap_graph's existing edge cleanup drop every dangling
+        # edge for free; the hidden ids themselves must be applied to the edge
+        # list only on the cap branch, where the removed ids are neither in
+        # `kept` nor in `dropped`.
+        if owners:
+            hidden = set()
+            for nid, n in node_map.items():
+                label = n["label"]
+                if label not in ("Fact", "DiaryEntry"):
+                    continue
+                owner = record_owners.get(nid) or user_id
+                if owner == user_id:
+                    continue
+                if label == "Fact":
+                    # Any one granted scope id covers the record: a fact filed
+                    # under several clients is reachable through whichever of
+                    # them the caller can see.
+                    fc = fact_clients.get(nid, ())
+                    fx = fact_contexts.get(nid, ())
+                    visible = (
+                        any(sharing.record_visible(owner, cid, None, owners) for cid in fc)
+                        or any(sharing.record_visible(owner, None, xid, owners) for xid in fx)
+                    )
+                else:
+                    d_client, d_context = diary_scope.get(nid, ("", ""))
+                    visible = sharing.record_visible(owner, d_client, d_context, owners)
+                if not visible:
+                    hidden.add(nid)
+            if hidden:
+                for nid in hidden:
+                    node_map.pop(nid, None)
+                    fact_clients.pop(nid, None)
+                    fact_contexts.pop(nid, None)
+                    diary_scope.pop(nid, None)
+                edges = [e for e in edges if e["from"] not in hidden and e["to"] not in hidden]
 
         return _scope_and_cap_graph(
             node_map, edges, fact_clients, fact_contexts, diary_scope,

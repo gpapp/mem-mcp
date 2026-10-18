@@ -493,6 +493,57 @@ class PurePolicyTests(unittest.TestCase):
                                 level="admin")
 
 
+class AccessibleScopeTests(unittest.TestCase):
+    """``accessible_scope`` / ``record_visible``: the read-path widening rules."""
+
+    @staticmethod
+    def _grant(owner, ttype, tid, perm):
+        return {"owner_user_id": owner, "target_type": ttype,
+                "target_id": tid, "permission": perm}
+
+    def test_grants_reduce_to_per_owner_id_sets(self):
+        owners = sharing.accessible_scope([
+            self._grant("alice", "client", "c1", "read"),
+            self._grant("alice", "context", "x1", "read"),
+            self._grant("dave", "client", "z9", "write"),
+        ])
+        self.assertEqual(owners["alice"]["clients"], {"c1": "read"})
+        self.assertEqual(owners["alice"]["contexts"], {"x1": "read"})
+        self.assertEqual(owners["dave"]["clients"], {"z9": "write"})
+
+    def test_write_grant_wins_over_a_later_read_row(self):
+        owners = sharing.accessible_scope([
+            self._grant("alice", "client", "c1", "write"),
+            self._grant("alice", "client", "c1", "read"),
+        ])
+        self.assertEqual(owners["alice"]["clients"]["c1"], "write",
+                         "a later read row must not erase the write it "
+                         "collides with")
+
+    def test_empty_and_garbage_rows_yield_nothing(self):
+        self.assertEqual(sharing.accessible_scope([]), {})
+        self.assertEqual(sharing.accessible_scope([{}, {
+            "owner_user_id": "alice", "target_type": "user", "target_id": "x",
+            "permission": "read",
+        }]), {})
+
+    def test_record_visible_by_client_or_context_id_only(self):
+        owners = {"alice": {"clients": {"c1": "read"}, "contexts": {"x1": "read"}}}
+        # Granted client covers the record, granted context id covers it too —
+        # and record ids named for no granted target do not.
+        self.assertTrue(sharing.record_visible("alice", "c1", "x2", owners))
+        self.assertTrue(sharing.record_visible("alice", "c9", "x1", owners))
+        self.assertFalse(sharing.record_visible("alice", "c9", "x2", owners))
+        self.assertFalse(sharing.record_visible("alice", None, None, owners))
+        self.assertFalse(sharing.record_visible("dave", "c1", "x1", owners))
+
+    def test_an_unscoped_record_is_never_shared(self):
+        owners = {"alice": {"clients": {"c1": "read"}, "contexts": {}}}
+        self.assertFalse(sharing.record_visible("alice", None, None, owners),
+                         "a record with no scope ids matches no grant — "
+                         "sharing a target shares its subtree, not the vault")
+
+
 class SharingModuleTests(SharingStoreTestCase):
     """sharing.py is policy over the store — driven against real grants."""
 
@@ -515,6 +566,23 @@ class SharingModuleTests(SharingStoreTestCase):
         audit.grant_access("dave", "bob", "client", "z9", "read", now=3.0)
         self.assertEqual(sharing.shared_owners("bob"), ["alice", "dave"],
                          "sorted owners, deduplicated — no other data leaks")
+
+    def test_accessible_owner_scope_drives_the_read_paths(self):
+        self.assertIsNone(sharing.accessible_owner_scope("bob"),
+                          "flag off → None → read paths keep their fast path")
+        os.environ["MEM_SHARING_ENABLED"] = "1"
+        self.assertIsNone(sharing.accessible_owner_scope("bob"),
+                          "flag on but grant-free → None → same fast path")
+        audit.grant_access("alice", "bob", "context", "x1", "read", now=1.0)
+        scope_map = sharing.accessible_owner_scope("bob")
+        self.assertEqual(scope_map["owners"]["alice"]["contexts"],
+                         {"x1": "read"})
+        self.assertNotIn("bob", scope_map["owners"],
+                         "the caller's own id is never an entry — ownership "
+                         "never needs a lookup")
+        os.environ["MEM_SHARING_ENABLED"] = "0"
+        self.assertIsNone(sharing.accessible_owner_scope("bob"),
+                          "must re-read the flag per call")
 
 
 class ImportDisciplineTests(unittest.TestCase):

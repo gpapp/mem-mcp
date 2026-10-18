@@ -22,6 +22,7 @@ import json
 import os
 import re
 import sys
+import types
 import typing
 import unittest
 from typing import Optional
@@ -68,7 +69,15 @@ class _Recorder:
 def _lift(name, **overrides):
     """Exec one top-level function out of diary_manager.py with stubs."""
     _source, _tree, _target, segment = _segment(name)
-    namespace = {"normalize_text": normalize_text, "os": os, "re": re, "json": json}
+    namespace = {"normalize_text": normalize_text, "os": os, "re": re, "json": json,
+                 # Phase 3: the read paths consult the sharing policy; stub it
+                 # off exactly as production is off by default, so lifted
+                 # behaviour tests keep driving the pre-sharing shape.
+                 "sharing": types.SimpleNamespace(
+                     accessible_owner_scope=lambda uid: None,
+                     readable_owner_ids=lambda uid: None,
+                     record_visible=lambda *a, **k: True,
+                 )}
     namespace.update(overrides)
     exec(segment, namespace)  # noqa: S102 - executing our own source
     return namespace[name]
@@ -975,7 +984,8 @@ class ListDiaryEntriesTests(unittest.TestCase):
         run = _list_entries_runner(self.SCOPED)
         run()
         params = run.session.queries[0][1]
-        self.assertEqual(params["userId"], "alice")
+        # Phase 3: the owner filter is a widened id list now, not a single user.
+        self.assertEqual(params["ownerIds"], ["alice"])
         self.assertTrue(params["fromTs"] < params["toTs"])
         span = (datetime.datetime.fromisoformat(params["toTs"])
                 - datetime.datetime.fromisoformat(params["fromTs"]))

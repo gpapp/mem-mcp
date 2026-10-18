@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
-from qdrant_client.models import PointStruct, Filter, FieldCondition, MatchValue
+from qdrant_client.models import PointStruct, Filter, FieldCondition, MatchValue, MatchAny
 
 import re
 from common import (
@@ -38,6 +38,8 @@ from client_manager import (
     infer_scope_from_text, db_get_client_status_map, db_plan_search_scope,
     INFERRED_SCOPE_BOOST, INACTIVE_PENALTY
 )
+
+import sharing  # Phase 3: shared-vault read access policy layer
 
 # ---------------------------------------------------------------------------
 # Diary helpers
@@ -604,7 +606,18 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
     # several times in a single result set. Over-fetch or a long entry crowds
     # every other entry out of the window before the merge below can collapse it.
     fetch_limit = max(limit * 4 * CHUNK_FETCH_MULTIPLIER, 20)
-    conditions = [FieldCondition(key="userId", match=MatchValue(value=user_id))]
+
+    # Phase 3: when the caller has access to shared vaults the owner filter widens.
+    # The ids only widen the raw match — an owner's record below must then clear
+    # record_visible() against the caller's grants before it can appear, so the
+    # count is a candidate set, not a permission.
+    scope_map = sharing.accessible_owner_scope(user_id)
+    owners = scope_map["owners"] if scope_map else None
+    owner_ids = sharing.readable_owner_ids(user_id)
+    if owner_ids and owner_ids != [user_id]:
+        conditions = [FieldCondition(key="userId", match=MatchAny(any_=owner_ids))]
+    else:
+        conditions = [FieldCondition(key="userId", match=MatchValue(value=user_id))]
     filt = Filter(must=conditions)
 
     # 2. Multi-variant vector search — merge by best score per entry
@@ -621,6 +634,16 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
         )
         variant_lower = variant_query.lower()
         for r in result.points:
+            # Phase 3: an owner's record only counts once it is visible through
+            # this caller's grants. Own records always are.
+            owner = (r.payload or {}).get("userId") or user_id
+            if owner != user_id and not sharing.record_visible(
+                owner,
+                (r.payload or {}).get("clientId"),
+                (r.payload or {}).get("contextId"),
+                owners,
+            ):
+                continue
             score = r.score * weight
 
             # Boost if variant matches the entry name
@@ -661,7 +684,7 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
     #    limit is spent on the entries the caller asked for; the threshold still
     #    runs on the blended `score` alone, which is this path's existing
     #    (inconsistent with fact search) behaviour and is deliberately unchanged.
-    relevant_by_id = _db_relevant_scope(neo4j_driver, user_id, list(all_results.keys()))
+    relevant_by_id = _db_relevant_scope(neo4j_driver, user_id, list(all_results.keys()), owner_ids=owner_ids)
     status_map = db_get_client_status_map(user_id)
     for rid, v in all_results.items():
         p = v["point"].payload or {}
@@ -747,9 +770,12 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
 
         mentions = []
         with neo4j_driver.session() as s:
+            # Phase 3: a shared owner's entry mentions facts in the owner's vault,
+            # not the caller's — constrain the fact side to the entry's own vault
+            # rather than to the caller's id.
             m_res = s.run(
-                "MATCH (d:DiaryEntry {id: $id, userId: $userId})-[:MENTIONS]->(f:Fact) RETURN f.id as id, f.text as text",
-                id=str(rid), userId=user_id
+                "MATCH (d:DiaryEntry)-[:MENTIONS]->(f:Fact) WHERE d.id = $id AND d.userId IN $ownerIds AND f.userId = d.userId RETURN f.id as id, f.text as text",
+                id=str(rid), ownerIds=owner_ids or [user_id]
             )
             mentions = [{"id": mr["id"], "text": mr["text"]} for mr in m_res]
 
@@ -765,6 +791,7 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
             "contextName": r.payload.get("contextName"),
             "metadata": r.payload.get("metadata") or {},
             "mentions": mentions,
+            "ownerUserId": r.payload.get("userId") if r.payload.get("userId") and r.payload.get("userId") != user_id else None,
             "scopeStrength": v.get("scopeStrength", 0.0),
             "scope": {
                 "requestedClient": want_client,
@@ -1120,6 +1147,14 @@ def db_list_diary_entries(user_id: str, from_ts: Optional[str] = None, to_ts: Op
     if not neo4j_driver:
         raise RuntimeError("Neo4j not connected.")
 
+    # Phase 3: widen the raw match to accessible owners, then filter rows by
+    # what the caller's grants actually make visible. An owner's entry's scope
+    # edges (FOR_CLIENT/IN_CONTEXT) name the owner's clients, which is exactly
+    # what record_visible checks against.
+    scope_map = sharing.accessible_owner_scope(user_id)
+    owners = scope_map["owners"] if scope_map else None
+    owner_ids = sharing.readable_owner_ids(user_id)
+
     now = datetime.now(timezone.utc)
     default_from = (now - timedelta(days=30)).isoformat()
     default_to = now.isoformat()
@@ -1129,22 +1164,30 @@ def db_list_diary_entries(user_id: str, from_ts: Optional[str] = None, to_ts: Op
     with neo4j_driver.session() as s:
         result = s.run(
             """
-            MATCH (d:DiaryEntry {userId: $userId})
-            WHERE d.timestamp >= $fromTs AND d.timestamp <= $toTs
+            MATCH (d:DiaryEntry)
+            WHERE d.userId IN $ownerIds
+              AND d.timestamp >= $fromTs AND d.timestamp <= $toTs
             OPTIONAL MATCH (d)-[:FOR_CLIENT]->(c:Client)
-            WITH d, head(collect(c.name)) AS clientName
+            WITH d, head(collect(c.id)) AS clientId, head(collect(c.name)) AS clientName
             OPTIONAL MATCH (d)-[:IN_CONTEXT]->(cx:Context)
-            WITH d, clientName, head(collect(cx.name)) AS contextName
-            RETURN d.id as id, d.timestamp as timestamp, d.name as name,
-                   d.metadata as metadata, clientName, contextName
+            WITH d, clientId, clientName, head(collect(cx.id)) AS contextId, head(collect(cx.name)) AS contextName
+            RETURN d.id as id, d.userId as userId, d.timestamp as timestamp, d.name as name,
+                   d.metadata as metadata, clientName, contextName, clientId, contextId
             ORDER BY d.timestamp DESC
             """,
-            userId=user_id,
+            ownerIds=owner_ids or [user_id],
             fromTs=from_clause,
             toTs=to_clause,
         )
         entries = []
         for r in result:
+            # Phase 3: visibility — own rows always pass; an owner's rows only
+            # through a grant on one of the scope ids the entry is filed under.
+            owner = r.get("userId") or user_id
+            if owner != user_id and not sharing.record_visible(
+                owner, r.get("clientId"), r.get("contextId"), owners
+            ):
+                continue
             raw_meta = r.get("metadata")
             # Stored as a JSON string, but a node written by hand or by another
             # tool may hold a map; both are accepted rather than raising on the
@@ -1160,6 +1203,7 @@ def db_list_diary_entries(user_id: str, from_ts: Optional[str] = None, to_ts: Op
                 "original_file": meta.get("original_file") or meta.get("original_filename") or "",
                 "client": r.get("clientName") or None,
                 "context": r.get("contextName") or None,
+                "ownerUserId": owner if owner != user_id else None,
             })
         return entries
 
@@ -1202,9 +1246,16 @@ def db_list_diary(user_id: str) -> list:
         return s_ts[:16]
 
     with neo4j_driver.session() as s:
+        # Phase 3: widen to accessible owners, then filter rows below by the
+        # caller's grants. The OPTIONAL MATCH chain (and the one-row-per-entry
+        # property it earns) must stay intact — only the opening MATCH changes.
+        scope_map = sharing.accessible_owner_scope(user_id)
+        owners = scope_map["owners"] if scope_map else None
+        owner_ids = sharing.readable_owner_ids(user_id)
         result = s.run(
             """
-            MATCH (d:DiaryEntry {userId: $userId})
+            MATCH (d:DiaryEntry)
+            WHERE d.userId IN $ownerIds
             OPTIONAL MATCH (d)-[:FOR_CLIENT]->(cl:Client)
             WITH d, head(collect(cl.id)) as clientId, head(collect(cl.name)) as clientName
             OPTIONAL MATCH (d)-[:IN_CONTEXT]->(ctx:Context)
@@ -1218,7 +1269,7 @@ def db_list_diary(user_id: str) -> list:
             WITH d, clientId, clientName, contextId, contextName, mentions,
                  collect(DISTINCT {id: rc.id, name: rc.name,
                                    kind: CASE WHEN rc:Context THEN 'context' ELSE 'client' END}) as relevantClients
-            RETURN d.id as id, d.date as date, d.content as content, d.timestamp as timestamp, d.name as name,
+            RETURN d.id as id, d.userId as userId, d.date as date, d.content as content, d.timestamp as timestamp, d.name as name,
                    d.metadata as metadata, d.keywords as keywords,
                    clientName, clientId, contextName, contextId,
                    mentions, relevantClients,
@@ -1226,11 +1277,20 @@ def db_list_diary(user_id: str) -> list:
                                                                 timestamp: e.timestamp}] WHERE x.id <> d.id] as entryLinks
             ORDER BY d.date DESC, d.timestamp DESC
             """,
-            userId=user_id,
+            ownerIds=owner_ids or [user_id],
         )
-        return [
-            {
+        entries = []
+        for r in result:
+            # Phase 3: visibility — own rows always pass; an owner's rows only
+            # through a grant on one of the scope ids the entry is filed under.
+            owner = r.get("userId") or user_id
+            if owner != user_id and not sharing.record_visible(
+                owner, r.get("clientId"), r.get("contextId"), owners
+            ):
+                continue
+            entries.append({
                 "id": r["id"],
+                "ownerUserId": owner if owner != user_id else None,
                 "date": r["date"],
                 "content": r["content"],
                 "name": r.get("name") or "Unnamed Entry",
@@ -1248,8 +1308,8 @@ def db_list_diary(user_id: str) -> list:
                      "timestamp": format_ts_for_picker(el.get("timestamp"))}
                     for el in (r.get("entryLinks") or []) if el.get("id")
                 ],
-            } for r in result
-        ]
+            })
+        return entries
 
 
 async def _scroll_diary_ids(qdrant, user_id: str) -> set:
