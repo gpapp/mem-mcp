@@ -320,7 +320,10 @@ async def update_fact(memoryId: str, name: Optional[str] = None, text: Optional[
     If the fact should move to a different client or project, prefer adding a
     new fact under that scope rather than repainting the old one.
     """
-    success = await mem.db_update_memory(memoryId, name, text, category, _current_user())
+    try:
+        success = await mem.db_update_memory(memoryId, name, text, category, _current_user())
+    except PermissionError as e:
+        return f"Error: {e} (write access required)."
     if success:
         return f"Successfully updated memory {memoryId}"
     return f"Error: Memory {memoryId} not found or unauthorized."
@@ -329,7 +332,10 @@ async def update_fact(memoryId: str, name: Optional[str] = None, text: Optional[
 @monitor_mcp_tool("delete_fact", context_provider=_current_user)
 async def delete_fact(factId: str):
     """Delete a fact."""
-    await mem.db_delete_memory(factId, _current_user())
+    try:
+        await mem.db_delete_memory(factId, _current_user())
+    except PermissionError as e:
+        return f"Error: {e} (write access required)."
     return f"Fact {factId} deleted"
 
 @mcp.tool()
@@ -551,7 +557,10 @@ async def diary_delete_entry(entryId: str):
     - entryId: the 'id' field returned by diary_save_entry or diary_search_entries.
     - Returns a confirmation message, or an error if the entry was not found.
     """
-    deleted = await mem.db_delete_diary(entryId, _current_user())
+    try:
+        deleted = await mem.db_delete_diary(entryId, _current_user())
+    except PermissionError as e:
+        return f"Error: {e} (write access required)."
     if not deleted:
         return f"Entry '{entryId}' not found or does not belong to the current user."
     return f"Deleted diary entry {entryId}"

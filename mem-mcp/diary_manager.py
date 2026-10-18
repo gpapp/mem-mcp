@@ -36,6 +36,7 @@ from client_manager import (
     link_diary_to_client, link_diary_to_context,
     _resolve_client_by_id, _resolve_context_by_id, _stamp_manual_scope,
     infer_scope_from_text, db_get_client_status_map, db_plan_search_scope,
+    db_owner_of_target,
     INFERRED_SCOPE_BOOST, INACTIVE_PENALTY
 )
 
@@ -585,7 +586,7 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
     nothing at all and the search came back empty), and it deleted the very
     entries ``scopeStrength`` needs in order to rank the rest.
     """
-    from fact_manager import rewrite_search_query, _db_relevant_scope
+    from fact_manager import rewrite_search_query, _db_relevant_scope, _record_scope_ids
 
     qdrant = await get_qdrant()
     neo4j_driver = get_neo4j()
@@ -827,6 +828,24 @@ async def db_update_diary(entry_id: str, user_id: str, content: Optional[str] = 
     neo4j_driver = get_neo4j()
     if not qdrant or not neo4j_driver:
         raise RuntimeError("Database connections not established.")
+
+    # Phase 4: write gate.
+    actor = user_id
+    owner = db_owner_of_target(entry_id)
+    if owner is None:
+        return False
+    if owner != user_id:
+        with neo4j_driver.session() as s:
+            clients, contexts = _record_scope_ids(s, [entry_id])
+            fc = clients.get(entry_id, ())
+            fx = contexts.get(entry_id, ())
+            owners = (sharing.accessible_owner_scope(user_id) or {}).get("owners")
+            if not (any(sharing.has_access(user_id, owner, "client", cid,
+                                          level="write") for cid in fc)
+                    or any(sharing.has_access(user_id, owner, "context", xid,
+                                             level="write") for xid in fx)):
+                raise PermissionError("write access required")
+        user_id = owner
 
     with neo4j_driver.session() as s:
         res = s.run(
@@ -1098,6 +1117,24 @@ async def db_delete_diary(entry_id: str, user_id: str) -> bool:
     neo4j_driver = get_neo4j()
     if not qdrant or not neo4j_driver:
         raise RuntimeError("Database connections not established.")
+
+    # Phase 4: write gate.
+    actor = user_id
+    owner = db_owner_of_target(entry_id)
+    if owner is None:
+        return False
+    if owner != user_id:
+        with neo4j_driver.session() as s:
+            clients, contexts = _record_scope_ids(s, [entry_id])
+            fc = clients.get(entry_id, ())
+            fx = contexts.get(entry_id, ())
+            owners = (sharing.accessible_owner_scope(user_id) or {}).get("owners")
+            if not (any(sharing.has_access(user_id, owner, "client", cid,
+                                          level="write") for cid in fc)
+                    or any(sharing.has_access(user_id, owner, "context", xid,
+                                             level="write") for xid in fx)):
+                raise PermissionError("write access required")
+        user_id = owner
 
     # Verify ownership before deleting
     with neo4j_driver.session() as s:

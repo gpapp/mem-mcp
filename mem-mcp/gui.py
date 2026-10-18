@@ -741,6 +741,8 @@ async def api_admin_consistency(request: Request):
         facts, diary = await asyncio.gather(
             mem.run_consistency_checks(), mem.run_diary_consistency_checks()
         )
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
     return {"ok": bool(facts.get("ok")) and bool(diary.get("ok")),
@@ -769,6 +771,8 @@ async def api_admin_repair(request: Request):
     try:
         diary_fix = await mem.fix_diary_entries()
         orphans = await mem.sync_orphans()
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
     finally:
@@ -836,6 +840,8 @@ async def api_update_memory(memory_id: str, request: Request, body: MemoryUpdate
                 context_id = cx["id"] if cx else await mem.db_create_context(body.context, client_id, user_id)
                 await mem.link_fact_to_context(memory_id, context_id, user_id)
         return {"id": memory_id, "name": body.name, "text": body.text, "category": (body.category.strip().capitalize() if body.category else "General"), "metadata": metadata}
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -845,6 +851,8 @@ async def api_list_memories(request: Request):
     """List all memories for the current user."""
     try:
         return mem.db_list_memories(_require_user(request))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -877,6 +885,8 @@ async def api_find_duplicates(
         )
     except HTTPException:
         raise
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -899,6 +909,8 @@ async def api_merge_duplicates(request: Request, body: MemoryMerge):
         return {"masterId": master_id, "duplicateIds": duplicate_ids}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -1018,6 +1030,8 @@ async def api_generate_duplicate_draft(request: Request, body: MemoryMergeDraft)
         )
     except (ValueError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=502, detail=f"Could not generate merge draft: {exc}")
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -1043,6 +1057,8 @@ async def api_reclassify_memory(memory_id: str, request: Request):
         await reclassify_single_fact(memory_id, user_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
     # Re-fetch enriched item and emit SSE so other tabs update.
@@ -1063,6 +1079,8 @@ async def api_search_diary(request: Request, q: str = "", limit: int = 10, top_p
         if not q.strip():
             return await mem.db_list_diary(user_id)
         return await mem.db_search_diary(q.strip(), user_id, limit=limit, top_p=top_p)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -1087,6 +1105,8 @@ async def api_reclassify_diary_entry(entry_id: str, request: Request):
         await reclassify_single_diary(entry_id, user_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
     # Re-fetch and emit SSE so other tabs update.
@@ -1148,6 +1168,8 @@ async def api_delete_diary_entry(entry_id: str, request: Request):
         if not deleted:
             raise HTTPException(status_code=404, detail="Diary entry not found or access denied.")
         return {"deleted": entry_id}
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -1187,6 +1209,8 @@ async def api_update_diary_entry(entry_id: str, request: Request, body: DiaryCre
         if not ok:
             raise HTTPException(status_code=404, detail="Diary entry not found or access denied.")
         return {"id": entry_id, "content": body.content, "name": body.name, "timestamp": body.timestamp, "metadata": body.metadata}
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -1197,6 +1221,8 @@ async def api_link_diary_mention(entry_id: str, request: Request, body: DiaryLin
     try:
         await mem.db_link_diary_mention(entry_id, body.factId, _require_user(request))
         return {"status": "linked"}
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -1207,6 +1233,8 @@ async def api_unlink_diary_mention(entry_id: str, fact_id: str, request: Request
     try:
         await mem.db_unlink_diary_mention(entry_id, fact_id, _require_user(request))
         return {"status": "unlinked"}
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -1221,6 +1249,8 @@ async def api_add_diary_relevant(entry_id: str, request: Request, body: DiaryRel
     try:
         await mem.db_add_diary_relevant(entry_id, body.clientId, _require_user(request))
         return {"status": "linked"}
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -1231,6 +1261,8 @@ async def api_remove_diary_relevant(entry_id: str, client_id: str, request: Requ
     try:
         await mem.db_remove_diary_relevant(entry_id, client_id, _require_user(request))
         return {"status": "unlinked"}
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -1245,6 +1277,8 @@ async def api_add_memory_relevant(memory_id: str, request: Request, body: FactRe
     try:
         await mem.db_add_fact_relevant(memory_id, body.clientId, _require_user(request))
         return {"status": "linked"}
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -1255,6 +1289,8 @@ async def api_remove_memory_relevant(memory_id: str, client_id: str, request: Re
     try:
         await mem.db_remove_fact_relevant(memory_id, client_id, _require_user(request))
         return {"status": "unlinked"}
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -1279,6 +1315,8 @@ async def api_create_memory(request: Request, body: MemoryCreate):
             "clientId": client_id, "clientName": c["name"] if client_id and c else None,
             "contextId": context_id, "contextName": cx["name"] if context_id and cx else None,
         }
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -1288,6 +1326,8 @@ async def api_link_memory(request: Request, body: MemoryLink):
     try:
         await mem.db_link_facts(body.sourceId, body.targetId, body.relType, {}, _require_user(request))
         return {"status": "linked"}
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -1303,6 +1343,8 @@ async def api_unlink_memory(request: Request, body: MemoryUnlink):
     try:
         await mem.db_unlink_facts(body.sourceId, body.targetId, body.relType or "", _require_user(request))
         return {"status": "unlinked"}
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -1312,6 +1354,8 @@ async def api_delete_memory(memory_id: str, request: Request):
     try:
         await mem.db_delete_memory(memory_id, _require_user(request))
         return {"deleted": memory_id}
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -1320,6 +1364,8 @@ async def api_delete_memory(memory_id: str, request: Request):
 async def api_list_categories(request: Request):
     try:
         return mem.db_list_categories(_require_user(request))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -1329,6 +1375,8 @@ async def api_list_clients(request: Request):
     """List all clients with their contexts for the current user."""
     try:
         return mem.db_list_clients(_require_user(request))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -1344,6 +1392,7 @@ async def api_update_client(client_id: str, request: Request, body: ClientUpdate
     """Pin a client as active/inactive, rename it, and/or toggle crossClient flag."""
     try:
         user_id = _require_user(request)
+        _require_owner(user_id, client_id)
         result = {"id": client_id}
         if body.active is not None:
             found = await mem.db_set_client_active(client_id, body.active, user_id)
@@ -1364,6 +1413,8 @@ async def api_update_client(client_id: str, request: Request, body: ClientUpdate
                 raise HTTPException(status_code=404, detail="Client not found or access denied.")
             result["crossClient"] = body.crossClient
         return result
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -1376,13 +1427,17 @@ class ContextUpdate(BaseModel):
 async def api_rename_context(context_id: str, request: Request, body: ContextUpdate):
     """Rename a project (Context node) within its client."""
     try:
+        user_id = _require_user(request)
+        _require_owner(user_id, context_id)
         try:
-            renamed = await mem.db_rename_context(context_id, body.name, _require_user(request))
+            renamed = await mem.db_rename_context(context_id, body.name, user_id)
         except ValueError as e:
             raise _conflict(e)
         if not renamed:
             raise HTTPException(status_code=404, detail="Project not found or access denied.")
         return {"id": context_id, "name": body.name.strip()}
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -1405,6 +1460,8 @@ async def api_create_client(request: Request, body: ClientCreate):
             raise HTTPException(status_code=400, detail="Client name must not be empty.")
         client_id = await mem.db_create_client(name, _require_user(request))
         return {"id": client_id, "name": name}
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -1426,6 +1483,8 @@ async def api_create_context(request: Request, body: ContextCreate):
             raise HTTPException(status_code=404, detail="Client not found or access denied.")
         context_id = await mem.db_create_context(name, body.clientId, user_id)
         return {"id": context_id, "name": name, "clientId": body.clientId}
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -1438,6 +1497,8 @@ async def api_client_items(client_id: str, request: Request):
         if items is None:
             raise HTTPException(status_code=404, detail="Client not found or access denied.")
         return {"id": client_id, **items}
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -1450,6 +1511,8 @@ async def api_context_items(context_id: str, request: Request):
         if items is None:
             raise HTTPException(status_code=404, detail="Project not found or access denied.")
         return {"id": context_id, **items}
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -1458,10 +1521,14 @@ async def api_context_items(context_id: str, request: Request):
 async def api_delete_client(client_id: str, request: Request):
     """Delete a client with all its projects. Facts/diary entries keep existing (unlinked)."""
     try:
-        deleted = await mem.db_delete_client(client_id, _require_user(request))
+        user_id = _require_user(request)
+        _require_owner(user_id, client_id)
+        deleted = await mem.db_delete_client(client_id, user_id)
         if not deleted:
             raise HTTPException(status_code=404, detail="Client not found or access denied.")
         return {"id": client_id, "deleted": True}
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -1470,10 +1537,14 @@ async def api_delete_client(client_id: str, request: Request):
 async def api_delete_context(context_id: str, request: Request):
     """Delete a project. Linked facts/diary entries keep existing (unlinked)."""
     try:
-        deleted = await mem.db_delete_context(context_id, _require_user(request))
+        user_id = _require_user(request)
+        _require_owner(user_id, context_id)
+        deleted = await mem.db_delete_context(context_id, user_id)
         if not deleted:
             raise HTTPException(status_code=404, detail="Project not found or access denied.")
         return {"id": context_id, "deleted": True}
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -1489,6 +1560,8 @@ async def api_set_memory_scope(memory_id: str, request: Request, body: ScopeUpda
         if scope is None:
             raise HTTPException(status_code=404, detail="Memory not found or access denied.")
         return {"id": memory_id, **scope}
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -1504,6 +1577,8 @@ async def api_set_diary_scope(entry_id: str, request: Request, body: ScopeUpdate
         if scope is None:
             raise HTTPException(status_code=404, detail="Diary entry not found or access denied.")
         return {"id": entry_id, **scope}
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -1521,6 +1596,8 @@ async def api_start_reclassify(request: Request):
         return result["job"]
     except HTTPException:
         raise
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -1530,6 +1607,8 @@ async def api_reclassify_status(request: Request):
     """Return the current (or last) reclassification job status."""
     try:
         return get_reclassify_status(_require_admin(request))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -1566,6 +1645,8 @@ async def api_run_backup(request: Request):
         return result["job"]
     except HTTPException:
         raise
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -1585,6 +1666,8 @@ async def api_run_restore(savepoint_id: str, request: Request):
         raise
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -1594,6 +1677,8 @@ async def api_backup_status(request: Request):
     """Current (or last) backup/restore job status."""
     try:
         return get_backup_status(_require_admin(request))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -1602,6 +1687,8 @@ async def api_backup_status(request: Request):
 async def api_list_diary(request: Request):
     try:
         return mem.db_list_diary(_require_user(request))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -1610,6 +1697,8 @@ async def api_list_diary(request: Request):
 async def api_get_insights(request: Request):
     try:
         return mem.db_find_patterns(_require_user(request))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -1631,6 +1720,8 @@ async def api_get_graph(request: Request, clientId: str = "", contextId: str = "
             limit=limit,
             unassigned=bool(unassigned),
         )
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -1649,6 +1740,8 @@ async def api_get_neighbors(request: Request, fact_id: str, clientId: str = "", 
             fact_id, depth=1, rel_types=None, user_id=_require_user(request),
             client_id=clientId, context_id=contextId, unassigned=bool(unassigned),
         )
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -1701,6 +1794,8 @@ async def api_focus_graph(request: Request, fact_id: str, clientId: str = "", co
         }
     except HTTPException:
         raise
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -1709,6 +1804,8 @@ async def api_focus_graph(request: Request, fact_id: str, clientId: str = "", co
 async def api_get_connections(request: Request, fact_id: str):
     try:
         return mem.db_get_connections_by_type(fact_id, _require_user(request))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -1736,6 +1833,8 @@ async def api_save_diary(request: Request, body: DiaryCreate):
 
         entry_ts = await mem.db_save_diary(body.content, user_id, body.timestamp, body.name, linked_facts=body.linked_facts, metadata=body.metadata, client_id=client_id, context_id=context_id)
         return {"timestamp": entry_ts, "content": body.content, "name": body.name, "metadata": body.metadata}
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:
         raise _service_unavailable(e)
 
@@ -2177,6 +2276,66 @@ def _permission_of(name: str) -> str:
             status_code=400,
             detail=f"permission must be one of {list(audit.VALID_PERMISSIONS)!r}")
     return name
+
+
+def _require_owner(user_id: str, target_id: str) -> str:
+    """Owner-only gate: target must be owned by user_id, else 404.
+
+    A non-owner gets the same answer as an unknown target, so the endpoint
+    cannot be walked to learn which ids exist (or who owns them).
+    """
+    owner = mem.db_owner_of_target(target_id)
+    if owner != user_id:
+        raise HTTPException(status_code=404, detail="No such target")
+    return owner
+
+
+def _require_target_access(user_id: str, target_type: str, target_id: str,
+                           level: str = "read") -> str:
+    """Return the owner userId of target_id, or raise 403/404.
+
+    Owner always passes at any level. A grantee passes only through a grant
+    of at least ``level`` on that target (or, for a context, through a grant
+    on its parent client). An unknown target answers 404 so existence cannot
+    be probed; a known-but-unauthorised target answers 403 naming the level
+    that was missing.
+    """
+    if level not in ("read", "write"):
+        raise HTTPException(status_code=400, detail="level must be read or write")
+    owner = mem.db_owner_of_target(target_id)
+    if owner is None:
+        raise HTTPException(status_code=404, detail="No such target")
+    if owner == user_id:
+        # Owner audit: a shared read by the owner themselves is still the
+        # owner's own vault, so no shared row is written unless explicitly
+        # enabled via MEM_AUDIT_LOG_OWN.
+        return owner
+    parent = None
+    if target_type == "context":
+        # resolve parent client from the owner's client list
+        for client in mem.db_list_clients(owner):
+            for context in (client.get("contexts") or []):
+                if context.get("id") == target_id:
+                    parent = client.get("id")
+                    break
+            if parent:
+                break
+    if not sharing.has_access(user_id, owner, target_type, target_id,
+                              level=level, parent_target_id=parent):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Write access required" if level == "write"
+            else "Read access required")
+    audit.log_shared(actor=user_id, owner=owner, target_type=target_type,
+                    target_id=target_id, action=level, permission=level,
+                    shared=True)
+    return owner
+
+
+def _target_type_of_id(target_id: str) -> str:
+    """Best-effort target type from a target id. Defaults to 'client'."""
+    # target ids carry no type marker; callers that know the type pass it.
+    return "client"
 
 
 @web_app.post("/api/share/links", response_class=JSONResponse)

@@ -324,6 +324,27 @@ def _effective_active(props: dict) -> bool:
         return True
 
 
+def db_owner_of_target(target_id: str) -> Optional[str]:
+    """Return the userId that owns a target node, or None if it does not exist.
+
+    Covers Client, Context, Fact and DiaryEntry in one lookup: the id space is
+    not partitioned by type in practice (a target id names one node), and the
+    gate needs the owner before it knows which store the target lives in. An
+    unknown id answers None so the caller can map it to a 404 rather than a 403.
+    """
+    neo4j_driver = get_neo4j()
+    if not neo4j_driver:
+        raise RuntimeError("Neo4j not connected.")
+    with neo4j_driver.session() as s:
+        result = s.run(
+            "MATCH (n) WHERE n.id = $id AND (n:Client OR n:Context OR n:Fact OR n:DiaryEntry) "
+            "RETURN n.userId AS userId",
+            id=target_id,
+        )
+        record = result.single()
+        return record["userId"] if record else None
+
+
 def db_get_client_status_map(user_id: str) -> dict:
     """Return {lower_client_name: effectiveActive} for all clients of a user.
 
@@ -533,6 +554,30 @@ async def db_set_fact_scope(fact_id: str, client_id: Optional[str], context_id: 
     neo4j_driver = get_neo4j()
     if not neo4j_driver:
         raise RuntimeError("Neo4j not connected.")
+
+    # Phase 4: write gate on the fact's current scope.
+    actor = user_id
+    owner = db_owner_of_target(fact_id)
+    if owner is None:
+        return None
+    if owner != user_id:
+        with neo4j_driver.session() as s:
+            res = s.run(
+                "MATCH (f:Fact {id: $id})-[:FOR_CLIENT]->(c:Client) RETURN c.id as cid",
+                id=fact_id)
+            fc = [r["cid"] for r in res if r.get("cid")]
+            res = s.run(
+                "MATCH (f:Fact {id: $id})-[:IN_CONTEXT]->(cx:Context) RETURN cx.id as xid",
+                id=fact_id)
+            fx = [r["xid"] for r in res if r.get("xid")]
+            owners = (sharing.accessible_owner_scope(user_id) or {}).get("owners")
+            if not (any(sharing.has_access(user_id, owner, "client", cid,
+                                          level="write") for cid in fc)
+                    or any(sharing.has_access(user_id, owner, "context", xid,
+                                             level="write") for xid in fx)):
+                raise PermissionError("write access required")
+        user_id = owner
+
     client = _resolve_client_by_id(client_id, user_id) if client_id else None
     if client_id and not client:
         raise ValueError(f"Unknown client '{client_id}'.")
@@ -1081,6 +1126,30 @@ async def db_set_diary_scope(entry_id: str, client_id: Optional[str], context_id
     neo4j_driver = get_neo4j()
     if not neo4j_driver:
         raise RuntimeError("Neo4j not connected.")
+
+    # Phase 4: write gate on the entry's current scope.
+    actor = user_id
+    owner = db_owner_of_target(entry_id)
+    if owner is None:
+        return None
+    if owner != user_id:
+        with neo4j_driver.session() as s:
+            res = s.run(
+                "MATCH (d:DiaryEntry {id: $id})-[:FOR_CLIENT]->(c:Client) RETURN c.id as cid",
+                id=entry_id)
+            fc = [r["cid"] for r in res if r.get("cid")]
+            res = s.run(
+                "MATCH (d:DiaryEntry {id: $id})-[:IN_CONTEXT]->(cx:Context) RETURN cx.id as xid",
+                id=entry_id)
+            fx = [r["xid"] for r in res if r.get("xid")]
+            owners = (sharing.accessible_owner_scope(user_id) or {}).get("owners")
+            if not (any(sharing.has_access(user_id, owner, "client", cid,
+                                          level="write") for cid in fc)
+                    or any(sharing.has_access(user_id, owner, "context", xid,
+                                             level="write") for xid in fx)):
+                raise PermissionError("write access required")
+        user_id = owner
+
     client = _resolve_client_by_id(client_id, user_id) if client_id else None
     if client_id and not client:
         raise ValueError(f"Unknown client '{client_id}'.")

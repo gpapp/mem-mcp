@@ -24,6 +24,7 @@ from client_manager import (
     link_fact_to_client, link_fact_to_context,
     _resolve_client_by_id, _resolve_context_by_id,
     infer_scope_from_text, db_get_client_status_map, db_plan_search_scope,
+    db_owner_of_target,
     INFERRED_SCOPE_BOOST, INACTIVE_PENALTY
 )
 from matching_utils import (
@@ -293,6 +294,25 @@ async def db_update_memory(memory_id: str, name: Optional[str], text: Optional[s
 
     logger.info(f"[db_update_memory] Updating {memory_id}: name={name}, text={'Yes' if text else 'No'}, category={category}")
 
+    # Phase 4: a grantee with a write grant edits the record under the
+    # owner's userId; a read-only grant (or no grant) is refused.
+    actor = user_id
+    owner = db_owner_of_target(memory_id)
+    if owner is None:
+        return False
+    if owner != user_id:
+        with neo4j_driver.session() as s:
+            clients, contexts = _record_scope_ids(s, [memory_id])
+            fc = clients.get(memory_id, ())
+            fx = contexts.get(memory_id, ())
+            owners = (sharing.accessible_owner_scope(user_id) or {}).get("owners")
+            if not (any(sharing.has_access(user_id, owner, "client", cid,
+                                          level="write") for cid in fc)
+                    or any(sharing.has_access(user_id, owner, "context", xid,
+                                             level="write") for xid in fx)):
+                raise PermissionError("write access required")
+        user_id = owner
+
     # Get current to see what's changing
     with neo4j_driver.session() as s:
         res = s.run("MATCH (f:Fact {id: $id, userId: $userId}) RETURN f", id=memory_id, userId=user_id)
@@ -388,6 +408,24 @@ async def db_delete_memory(memory_id: str, user_id: str) -> bool:
     neo4j_driver = get_neo4j()
     if not qdrant or not neo4j_driver:
         raise RuntimeError("Database connections not established.")
+
+    # Phase 4: write gate.
+    actor = user_id
+    owner = db_owner_of_target(memory_id)
+    if owner is None:
+        return False
+    if owner != user_id:
+        with neo4j_driver.session() as s:
+            clients, contexts = _record_scope_ids(s, [memory_id])
+            fc = clients.get(memory_id, ())
+            fx = contexts.get(memory_id, ())
+            owners = (sharing.accessible_owner_scope(user_id) or {}).get("owners")
+            if not (any(sharing.has_access(user_id, owner, "client", cid,
+                                          level="write") for cid in fc)
+                    or any(sharing.has_access(user_id, owner, "context", xid,
+                                             level="write") for xid in fx)):
+                raise PermissionError("write access required")
+        user_id = owner
 
     await _delete_fact_chunks(qdrant, memory_id)
     with neo4j_driver.session() as s:
