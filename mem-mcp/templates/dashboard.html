@@ -4910,6 +4910,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
         </div>
       </div>
       <div style="display:flex; gap:.5rem; justify-content:flex-end; margin-top:1rem; padding-top:.75rem; border-top:1px solid var(--border);">
+        ${entry.ownerUserId ? `<span style="font-size:.8rem;color:var(--muted);align-self:center;">🔗 shared by ${escHtml(entry.ownerUserId)}</span>` : ''}
         <button class="btn btn-ghost" onclick="selectDiaryEntry('${entry.id}')">Cancel</button>
         <button class="btn btn-primary" onclick="saveDiaryEdit('${entry.id}', this)">💾 Save</button>
       </div>`;

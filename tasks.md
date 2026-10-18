@@ -268,12 +268,12 @@ concern → Phase 3 task to benchmark.
 - [x] P6.3 Recipients management panel (owner only): list grants, change
       permission, revoke; direct-add by username.
 - [x] P6.4 "Shared with me" section listing targets grouped by owner.
-- [ ] P6.5 Read-only indicator in record editors (disable save when no write).
+- [x] P6.5 Read-only indicator in record editors (disable save when no write).
 - [x] P6.6 Audit log viewer in Settings/Service (owner sees own targets; admin
       sees all).
 - [x] P6.7 Share acceptance landing page with sign-in redirect and success/
       error states.
-- [ ] P6.8 Mobile layout tests for new panels (follow existing
+- [x] P6.8 Mobile layout tests for new panels (follow existing
       `test_mobile_layout.py` pattern).
 
 ### Phase 7 — MCP and API surface
