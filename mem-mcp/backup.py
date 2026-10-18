@@ -614,6 +614,20 @@ async def run_backup(reason: str = "manual") -> dict:
         manifest["graph"] = graph
         manifest["counts"] = graph["counts"]
         manifest["bytes"] += graph["bytes"]
+
+        # audit.db snapshot (best-effort; sharing may be disabled)
+        try:
+            import audit as _audit
+            import shutil as _shutil
+            _src = _audit.db_path()
+            if os.path.isfile(_src):
+                _dst = os.path.join(dest, "audit.db")
+                await asyncio.to_thread(_shutil.copy2, _src, _dst)
+                manifest.setdefault("audit", {})["file"] = "audit.db"
+                manifest["bytes"] += os.path.getsize(_dst)
+        except Exception as _exc:
+            logger.warning(f"backup: audit.db snapshot skipped: {_exc}")
+
         manifest["status"] = "complete"
         manifest["duration_s"] = round(time.perf_counter() - started, 2)
         _flush()
@@ -674,6 +688,17 @@ async def run_restore(entry_id: str, include_vectors: bool = True) -> dict:
     summary["graph"] = await asyncio.to_thread(_restore_graph, neo4j_driver, graph_path)
     logger.warning(f"backup: restored {summary['graph']['nodes']} nodes and "
                    f"{summary['graph']['relationships']} relationships")
+
+    # restore audit.db if present in savepoint
+    try:
+        import audit as _audit
+        import shutil as _shutil
+        _src = os.path.join(entry_dir, "audit.db")
+        if os.path.isfile(_src):
+            await asyncio.to_thread(_shutil.copy2, _src, _audit.db_path())
+            logger.warning("backup: restored audit.db")
+    except Exception as _exc:
+        logger.warning(f"backup: audit.db restore skipped: {_exc}")
 
     await _reconcile_after_restore()
     return summary

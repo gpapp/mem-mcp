@@ -208,41 +208,41 @@ concern → Phase 3 task to benchmark.
 
 ### Phase 3 — Access control in read paths
 
-- [ ] P3.1 `db_list_clients` / `db_list_contexts`: include shared clients/
+- [x] P3.1 `db_list_clients` / `db_list_contexts`: include shared clients/
       contexts for the current user, flagged `shared: true`, `owner`,
       `permission`. Distinguish owned vs shared in the payload.
-- [ ] P3.2 Fact search (`db_search_memories`, `db_search_diary`): widen Qdrant
+- [x] P3.2 Fact search (`db_search_memories`, `db_search_diary`): widen Qdrant
       filter to accessible owners; post-filter by accessible record ids.
       Benchmark; if too slow, add a `sharedOwnerIds` payload index or resolve
       accessible ids first.
-- [ ] P3.3 `db_get_graph`, `db_get_neighborhood`, `db_focus`: include shared
+- [x] P3.3 `db_get_graph`, `db_get_neighborhood`, `db_focus`: include shared
       records when their client/context is in accessible set. Respect category
       and scope filters.
-- [ ] P3.4 Diary list / calendar: include shared diary entries under shared
+- [x] P3.4 Diary list / calendar: include shared diary entries under shared
       contexts. Attribute owner.
-- [ ] P3.5 Memory list (`db_list_memories`): include shared facts.
-- [ ] P3.6 Client/context items endpoints: allow grantee read for shared
+- [x] P3.5 Memory list (`db_list_memories`): include shared facts.
+- [x] P3.6 Client/context items endpoints: allow grantee read for shared
       targets; 404 otherwise (no existence leak).
-- [ ] P3.7 MCP tools (`mcp_tools.py`): every read tool resolves accessible
+- [x] P3.7 MCP tools (`mcp_tools.py`): every read tool resolves accessible
       targets through the same helpers; no separate code path.
 
 ### Phase 4 — Write paths and permission enforcement
 
-- [ ] P4.1 Central permission gate helper `_require_target_access(request,
+- [x] P4.1 Central permission gate helper `_require_target_access(request,
       target_type, target_id, level='read'|'write')` used by all endpoints and
       MCP tools. Returns owner userId (for storage) or raises 403.
-- [ ] P4.2 Create fact/diary under a shared target: permission write; store
+- [x] P4.2 Create fact/diary under a shared target: permission write; store
       with owner's userId (per decision 1); set `createdBy`/`updatedBy`.
-- [ ] P4.3 Update/delete fact/diary: permission write on the record's target;
+- [x] P4.3 Update/delete fact/diary: permission write on the record's target;
       owner can always; grantee only if write grant exists and not revoked.
-- [ ] P4.4 Scope changes (`db_set_*_scope`) on shared records: write permission
+- [x] P4.4 Scope changes (`db_set_*_scope`) on shared records: write permission
       on both old and new target.
-- [ ] P4.5 Link/unlink between records: write permission on both endpoints'
+- [x] P4.5 Link/unlink between records: write permission on both endpoints'
       targets (or both owned by same user).
-- [ ] P4.6 Client/context metadata edits (rename, active toggle, crossClient):
+- [x] P4.6 Client/context metadata edits (rename, active toggle, crossClient):
       owner only. Grantees cannot rename shared targets.
-- [ ] P4.7 Delete client/context: owner only.
-- [ ] P4.8 MCP write tools: same gates; read-only grants yield a clear error
+- [x] P4.7 Delete client/context: owner only.
+- [x] P4.8 MCP write tools: same gates; read-only grants yield a clear error
       message naming the permission.
 
 ### Phase 5 — Audit logging
@@ -278,10 +278,10 @@ concern → Phase 3 task to benchmark.
 
 ### Phase 7 — MCP and API surface
 
-- [ ] P7.1 Document new endpoints in README.
-- [ ] P7.2 MCP tools: `list_shared_with_me`, `accept_share_link` (if token
+- [x] P7.1 Document new endpoints in README.
+- [x] P7.2 MCP tools: `list_shared_with_me`, `accept_share_link` (if token
       passed), `list_share_grants` (owner), and permission-aware existing tools.
-- [ ] P7.3 OpenAPI disabled (already) — no schema leak.
+- [x] P7.3 OpenAPI disabled (already) — no schema leak.
 
 ### Phase 8 — Tests
 
@@ -299,9 +299,9 @@ concern → Phase 3 task to benchmark.
 
 - [ ] P9.1 Backfill: no data migration needed (grants are new). Ensure old
       vaults unaffected.
-- [ ] P9.2 Backup/restore: include `audit.db` in savepoint as an additional
+- [x] P9.2 Backup/restore: include `audit.db` in savepoint as an additional
       file in the savepoint directory. Update `backup.py`.
-- [ ] P9.3 Update AGENTS.md with sharing section and new env vars.
+- [x] P9.3 Update AGENTS.md with sharing section and new env vars.
 - [ ] P9.4 Update README with user-facing sharing docs.
 - [ ] P9.5 Staged rollout: feature flag `MEM_SHARING_ENABLED` (default 0)
       initially, like registration. Start with read-only sharing only, then add

@@ -4,6 +4,8 @@ from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_http_headers
 from typing import Optional, List
 import memory as mem
+import sharing
+import audit
 from mcp_logging import monitor_mcp_tool
 from matching_utils import execute_merge
 
@@ -846,6 +848,61 @@ async def get_skill_workflow(skillName: str):
         return f"Skill '{skillName}' not found."
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
+
+
+# ---------------------------------------------------------------------------
+# Project/context sharing (Phase 7)
+# ---------------------------------------------------------------------------
+@mcp.tool()
+@monitor_mcp_tool("list_shared_with_me", context_provider=_current_user)
+async def list_shared_with_me():
+    """List clients/contexts shared with the current user by other owners."""
+    if not sharing.sharing_enabled():
+        return "Sharing is disabled on this server."
+    user = _current_user()
+    grants = sharing.accessible_grants(user)
+    if not grants:
+        return "_Nothing is shared with you._"
+    lines = ["## Shared with me\n"]
+    for g in grants:
+        lines.append(f"- **{g.get('targetType')}** `{g.get('targetId')}` — "
+                    f"owner `{g.get('owner_user_id')}`, permission `{g.get('permission')}`")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+@monitor_mcp_tool("accept_share_link", context_provider=_current_user)
+async def accept_share_link(token: str):
+    """Accept a share link token and create a grant for the current user."""
+    if not sharing.sharing_enabled():
+        return "Sharing is disabled on this server."
+    user = _current_user()
+    try:
+        accepted = audit.accept_share_link(token, user)
+    except audit.ShareLimitError as e:
+        return f"Error: {e}"
+    except ValueError as e:
+        return f"Error: {e}"
+    return (f"Accepted share: {accepted.get('targetType')} `{accepted.get('targetId')}` "
+            f"from `{accepted.get('owner_user_id')}` with `{accepted.get('permission')}` access"
+            + (" (already had access)" if accepted.get("already_had_access") else "") + ".")
+
+
+@mcp.tool()
+@monitor_mcp_tool("list_share_grants", context_provider=_current_user)
+async def list_share_grants(targetType: str, targetId: str):
+    """List recipients of a shared client/context (owner only)."""
+    if not sharing.sharing_enabled():
+        return "Sharing is disabled on this server."
+    user = _current_user()
+    rows = audit.list_grants_for_target(user, targetType.strip(), targetId.strip())
+    if not rows:
+        return "_No recipients._"
+    lines = [f"## Recipients of {targetType} `{targetId}`\n"]
+    for r in rows:
+        lines.append(f"- `{r.get('grantee_user_id')}` — {r.get('permission')} "
+                    f"({'revoked' if r.get('revoked_at') else 'active'})")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
