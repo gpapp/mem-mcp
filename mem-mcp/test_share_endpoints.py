@@ -869,5 +869,116 @@ class ExecutableScriptTests(unittest.TestCase):
                  + ", ".join(_describe(attrs) for attrs, _ in _script_blocks(self.src))))
 
 
+class SharingAffordanceGatingTests(unittest.TestCase):
+    """With sharing off, nothing in the dashboard offers sharing.
+
+    ``MEM_SHARING_ENABLED`` defaults to 0, so on a stock deployment every share
+    route answers 404. The UI used to render anyway: the "Shared with me" card
+    called ``/api/share/mine`` on every page load and rendered "Could not load"
+    forever, and every client card carried a Share button that opened a dialog
+    whose every action failed. That is the same principle the registration
+    section in AGENTS.md states for signup -- a disabled route answers 404
+    rather than 403 so the feature is not advertised -- applied to the page
+    that advertises it.
+
+    Both halves are needed and neither is sufficient. Rendering the card behind
+    the flag is useless if ``get_gui`` never sets it (Jinja then renders the
+    undefined name as falsy and the card vanishes for *everyone*, including on
+    a deployment that enabled the feature), and setting the flag in the server
+    is useless if the template ignores it.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = _read("mem-mcp/templates/dashboard.html")
+        cls.gui = _read("mem-mcp/gui.py")
+
+    def _render(self, sharing_enabled):
+        """Render the dashboard both ways and return the two results.
+
+        Rendering rather than grepping is the point: the card can be absent
+        because it is gated, or because the selector never matched anything in
+        the first place, and a substring test cannot tell those apart.
+        """
+        import jinja2
+        env = jinja2.Environment()
+        tpl = env.from_string(self.src)
+        return {
+            flag: tpl.render(SHARING_ENABLED=flag, IS_ADMIN=False, BASE_URL="",
+                             MERGE_MAX_CLUSTER=12, SESSION_MAX_AGE_DAYS=30)
+            for flag in (True, False)
+        }
+
+    def test_the_shared_with_me_card_is_absent_when_sharing_is_off(self):
+        rendered = self._render(sharing_enabled=None)
+        # assertTrue/assertFalse, not assertIn/assertNotIn: the rendered page is
+        # ~200 KB and assertNotIn echoes the whole thing into the failure
+        # output, which buries the message this test exists to deliver.
+        self.assertTrue('id="shared-with-me"' in rendered[True],
+                        msg="the card is missing with sharing ON — the gate is inverted "
+                            "or the selector no longer matches the markup")
+        self.assertFalse('id="shared-with-me"' in rendered[False],
+                         msg="with sharing off the card still renders, calls a 404 route "
+                             "on every page load and shows 'Could not load' forever")
+
+    def test_the_gate_is_a_rendered_flag_not_a_literal(self):
+        """Both outcomes must come from one variable, or one is hard-coded.
+
+        A template that renders the card unconditionally fails the test above;
+        one that omits it unconditionally fails it too. What is worth pinning is
+        that the difference is *caused by the flag*, which is only true if the
+        markup is wrapped in a conditional over that name.
+
+        Every such conditional is checked, not just the first: <body> also
+        carries a `{% if SHARING_ENABLED %}` attribute, and a search that took
+        only the first match would report that one and conclude the card is
+        ungated — the same order-dependence that made a `find` answer the wrong
+        question once already.
+        """
+        gates = list(re.finditer(r'{%\s*if\s+SHARING_ENABLED\s*%}((?:(?!{%\s*(?:if|endif)\b).)*?)'
+                                 r'{%\s*endif\s*%}', self.src, re.S))
+        self.assertTrue(gates, msg="no `{% if SHARING_ENABLED %}` block exists at all")
+        self.assertTrue(any('id="shared-with-me"' in g.group(1) for g in gates),
+                        msg="no conditional over the flag wraps the shared-with-me card; "
+                            "the card's presence is not controlled by the flag")
+
+    def test_the_server_actually_sets_the_flag(self):
+        """The seam: get_gui must put the value in the context.
+
+        Jinja renders an undefined name as falsy, so a template gating on
+        SHARING_ENABLED with no producer silently hides the feature from every
+        user on every deployment -- which is not a failing feature, it is a
+        missing one. Nothing else in this suite can see that gap.
+        """
+        self.assertTrue(
+            re.search(r'ctx\["SHARING_ENABLED"\]\s*=\s*sharing\.sharing_enabled\(\)', self.gui),
+            msg=('gui.py never sets ctx["SHARING_ENABLED"], so the template gates on an '
+                 'undefined name and the feature is hidden from everyone regardless of '
+                 'MEM_SHARING_ENABLED'))
+
+    def test_the_share_buttons_are_gated_on_the_rendered_flag(self):
+        """The 🔗 Share buttons are JS, so they cannot use a Jinja block.
+
+        They read the flag off a conditional <body data-sharing-enabled>
+        attribute instead, which is why that attribute carries the value
+        rather than an interpolated one: an interpolated value inside the
+        inline app script would leave it unparseable by node --check, the only
+        JS validation available in this repo, and an inline-if expression
+        between doubled braces is refused outright by the template lint.
+        """
+        self.assertTrue(
+            re.search(r"<body[^>]*\{%\s*if\s+SHARING_ENABLED\s*%\}"
+                      r"[^>]*data-sharing-enabled=\"true\"", self.src),
+            msg="<body> does not carry a conditional data-sharing-enabled attribute, so "
+                "the JS Share buttons cannot know whether sharing is on")
+        self.assertTrue(
+            re.search(r"SHARING_ENABLED\s*=\s*document\.body\.dataset\.sharingEnabled",
+                      _executable_js(self.src)),
+            msg="the executable script does not read the flag off <body>")
+        for call in ("openShareDialog('context'", "openShareDialog('client'"):
+            self.assertIn(call, self.src, msg=f"{call} is not rendered at all — re-check "
+                                              f"that the button still exists behind the gate")
+
+
 if __name__ == "__main__":
     unittest.main()

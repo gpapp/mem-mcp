@@ -2974,5 +2974,9 @@ async def get_gui(request: Request):
     # omitted for a non-admin rather than shown and refused, so the option is
     # not advertised to someone who cannot use it.
     ctx["IS_ADMIN"] = mem.is_admin_user(creds)
+    # Same reasoning as IS_ADMIN, for the same reason: with sharing off, every
+    # share route answers 404 and "Shared with me" renders "⚠️ Could not load."
+    # on every page load — a card advertising a feature that is not deployed.
+    ctx["SHARING_ENABLED"] = sharing.sharing_enabled()
     html = _render("dashboard", **ctx)
     return HTMLResponse(content=html)

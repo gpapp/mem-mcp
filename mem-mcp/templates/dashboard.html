@@ -762,7 +762,16 @@
     }
   </style>
 </head>
-<body onload="init()">
+<!-- data-sharing-enabled gates every share affordance. Sharing is off by
+     default (MEM_SHARING_ENABLED) and with it off every share route answers
+     404, so the buttons are omitted rather than rendered dead — an operator
+     who has not enabled the feature should not see it offered at all. The
+     flag lives here rather than as a Jinja expression inside the inline app
+     script, so that script stays plain JS and can be syntax-checked. It is a
+     conditional attribute rather than an interpolated value because only a
+     bare identifier is allowed inside the doubled braces -- Jinja evaluates
+     every one of them, comment or not. -->
+<body onload="init()"{% if SHARING_ENABLED %} data-sharing-enabled="true"{% endif %}>
 
 <nav>
   <h1><a href="{{BASE_URL}}/">🧠 Memory Vault</a></h1>
@@ -966,10 +975,12 @@
     </div>
     <div id="client-list"><p class="empty">Loading…</p></div>
   </div>
+{% if SHARING_ENABLED %}
   <div class="card" style="margin-top:.75rem;">
     <h2 style="margin-top:0;">🔗 Shared with me</h2>
     <div id="shared-with-me"><p class="empty">Loading…</p></div>
   </div>
+{% endif %}
 </div>
 
 <div id="page-projects" class="page">
@@ -1373,6 +1384,10 @@ npm install @modelcontextprotocol/sdk</code></pre>
   let contextFilter = null;  // null | <contextId> — only active when clientFilter is a clientId
   let clientActiveMap = {};
   let clientListCache = [];
+  // Sharing is off by default (MEM_SHARING_ENABLED), and with it off every share
+  // route answers 404. The 🔗 Share buttons are omitted rather than rendered
+  // dead: an operator who has not enabled the feature should not see it at all.
+  const SHARING_ENABLED = document.body.dataset.sharingEnabled === 'true';
 
   // Shared scope predicate used by renderMemories / renderCategorySidebar.
   function memPassesScope(m) {
@@ -2284,7 +2299,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
       const xactions = x.shared ? '' : `
           <button class="btn btn-sm btn-ghost" onclick="renameContext('${x.id}')">✏️ Rename</button>
           <button class="btn btn-sm btn-danger" onclick="deleteContext('${x.id}')">🗑️</button>`;
-      const xshare = x.shared ? '' : `<button class="btn btn-sm btn-ghost" onclick="openShareDialog('context','${x.id}','${escHtml(x.name)}')">🔗 Share</button>`;
+      const xshare = (x.shared || !SHARING_ENABLED) ? '' : `<button class="btn btn-sm btn-ghost" onclick="openShareDialog('context','${x.id}','${escHtml(x.name)}')">🔗 Share</button>`;
       return `
       <div class="scope-card" style="margin:.3rem 0 0 1.2rem;">
         <div class="scope-card-header" onclick="toggleScopeItems('ctx-${x.id}', 'context', '${x.id}')">
@@ -2301,7 +2316,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
           <button class="btn btn-sm btn-ghost" onclick="toggleCrossClient('${c.id}', ${c.crossClient ? 'false' : 'true'})" title="Toggle cross-client flag">${c.crossClient ? 'Un-cross' : 'Cross-client'}</button>
           <button class="btn btn-sm btn-ghost" onclick="renameClient('${c.id}')">✏️ Rename</button>
           <button class="btn btn-sm btn-danger" onclick="deleteClient('${c.id}')">🗑️</button>
-          <button class="btn btn-sm btn-ghost" onclick="openShareDialog('client','${c.id}','${escHtml(c.name)}')">🔗 Share</button>`;
+          ${SHARING_ENABLED ? `<button class="btn btn-sm btn-ghost" onclick="openShareDialog('client','${c.id}','${escHtml(c.name)}')">🔗 Share</button>` : ''}`;
     return `<div class="scope-card">
       <div class="scope-card-header" onclick="toggleScopeItems('cli-${c.id}', 'client', '${c.id}')">
         <span class="scope-card-name">${on ? '🟢' : '⚪'} ${escHtml(c.name)}${pinned}${c.crossClient ? ' <span title="Cross-client" style="font-size:.75rem;color:var(--muted);">[cross]</span>' : ''}${sharedBadge}</span>
