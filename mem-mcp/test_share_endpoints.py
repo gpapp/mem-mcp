@@ -30,6 +30,7 @@ What is pinned here, and why no other file can see it:
 import asyncio
 import json
 import os
+import re
 import shutil
 import ast as pyast
 import sys
@@ -53,6 +54,37 @@ def _read(relative: str) -> str:
 
 
 _GUI_SOURCE = _read("mem-mcp/gui.py")
+
+# A <script> element that carries a src= attribute has its inline content
+# DISCARDED by the parser -- the element is a bare fetch of the external file,
+# and any text between the tags is inert (it is only legal when empty). That is
+# invisible to every text-based check: the code is still readable, still parses
+# under `node --check` if you extract it, and still contains every string an
+# assertion looks for. It is simply never executed, so every button wired to it
+# fails with "X is not defined" and the console shows a ReferenceError with no
+# other symptom.
+_EXTERNAL_SRC = re.compile(r'\bsrc\s*=')
+
+
+def _script_blocks(html: str):
+    """(attrs, inline_body) for every <script> element, in source order."""
+    return [
+        (m.group(1), m.group(2))
+        for m in re.finditer(r'<script([^>]*)>(.*?)</script>', html, re.S)
+    ]
+
+
+def _executable_js(html: str) -> str:
+    """Every inline <script> body the browser will actually run."""
+    return "\n".join(
+        body for attrs, body in _script_blocks(html) if not _EXTERNAL_SRC.search(attrs)
+    )
+
+
+def _describe(attrs: str) -> str:
+    """A short, quotable name for a script element, for failure messages."""
+    src = re.search(r'\bsrc\s*=\s*"([^"]*)"', attrs)
+    return f"<script src={src.group(1)[:40]}...>" if src else "<script> (inline)"
 
 
 def _function_source(node_name: str, source=_GUI_SOURCE) -> str:
@@ -698,8 +730,18 @@ class ShareDialogTests(unittest.TestCase):
         cls.src = _read("mem-mcp/templates/dashboard.html")
 
     def _dialog_js(self) -> str:
-        start = self.src.index("let _shareTarget")
-        return self.src[start:self.src.index("</script>", start)]
+        """The dialog code, read from the block that actually executes.
+
+        Slicing to the next "</script>" was how this defect stayed invisible:
+        the code had been spliced into a <script src=...> element, so that slice
+        returned the dead copy and every assertion below passed on code the
+        browser never ran. The block is selected by the same attribute test the
+        handler check uses, so "what I am asserting about" and "what runs" are
+        the same object by construction.
+        """
+        code = _executable_js(self.src)
+        start = code.index("let _shareTarget")
+        return code[start:]
 
     def test_no_handler_calls_a_method_the_api_object_does_not_have(self):
         # api defines get/post/put/delete only. `api.del` was a TypeError on
@@ -751,6 +793,80 @@ class ShareDialogTests(unittest.TestCase):
         js = self._dialog_js()
         self.assertIn("neverExpires", js)
         self.assertIn("expiresInDays", js)
+
+
+class ExecutableScriptTests(unittest.TestCase):
+    """The template's JS must be in a block the browser will actually run.
+
+    Every other test in this file reads the template as *text*. That is the
+    whole problem: code inside a ``<script src=...>`` element is readable,
+    greppable, parseable and correct, and the browser discards it without a
+    word. A splice anchored on the vis-network ``<script>`` tag put 8 KB of
+    share-dialog JS there, and the result was a dashboard whose Share buttons
+    all raised ``openShareDialog is not defined`` while the share-dialog suite
+    stayed green -- it was asserting against the dead copy.
+
+    ``test_graph_scope._app_script`` did not catch it either, and the reason is
+    worth recording: it selects inline blocks with a ``(?![^>]*\\bsrc=)``
+    lookahead, so the broken element was *skipped* rather than counted. The
+    suite still saw exactly one app script, so the count held and the missing
+    functions went unnoticed. A filter that excludes the broken thing also
+    excludes the evidence that it is broken.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = _read("mem-mcp/templates/dashboard.html")
+
+    def test_no_script_element_hides_inline_code_behind_a_src_attribute(self):
+        dead = [
+            _describe(attrs)
+            for attrs, body in _script_blocks(self.src)
+            if _EXTERNAL_SRC.search(attrs) and body.strip()
+        ]
+        self.assertEqual(
+            dead, [],
+            msg=("these elements carry inline JS behind a src= attribute, which the "
+                 "browser discards: " + ", ".join(dead)))
+
+    def test_every_function_called_from_an_inline_handler_is_defined(self):
+        """`onclick="openShareDialog(...)"` needs openShareDialog to exist.
+
+        Checked against the *executable* blocks only, so moving a definition
+        into a dead element is a failure rather than a silent no-op. Member
+        calls (`e.preventDefault()`, `this.find(...)`) are excluded by
+        requiring the callee not to follow a dot -- they resolve against an
+        object, not the global scope.
+        """
+        code = _executable_js(self.src)
+        defined = set(re.findall(r'(?:async\s+)?function\s+([A-Za-z_$][\w$]*)', code))
+        defined |= set(re.findall(r'(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=', code))
+
+        callee = re.compile(r'(?<![.\w$])([A-Za-z_$][\w$]*)\s*\(')
+        keywords = {"if", "for", "while", "switch", "catch", "return",
+                    "typeof", "await", "function", "new"}
+        missing = {}
+        for handler in re.findall(r'\bon\w+\s*=\s*"([^"]*)"', self.src):
+            for name in callee.findall(handler):
+                if name not in defined and name not in keywords:
+                    missing.setdefault(name, handler.strip()[:100])
+
+        self.assertEqual(
+            sorted(missing), [],
+            msg=("these inline handlers call functions that are not defined in any "
+                 "executable script block (each button wired to one raises "
+                 "`X is not defined`):\n"
+                 + "\n".join(f"  {n}()  <- {h}" for n, h in sorted(missing.items()))))
+
+    def test_the_share_dialog_lives_in_an_executable_block(self):
+        """The specific regression, named, so the failure is unmistakable."""
+        code = _executable_js(self.src)
+        self.assertTrue(
+            "function openShareDialog" in code,
+            msg=("openShareDialog is not in any executable <script> block, so every "
+                 "🔗 Share button raises `openShareDialog is not defined`; the "
+                 "executable blocks are: "
+                 + ", ".join(_describe(attrs) for attrs, _ in _script_blocks(self.src))))
 
 
 if __name__ == "__main__":

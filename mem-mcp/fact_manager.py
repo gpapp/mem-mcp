@@ -1768,6 +1768,7 @@ def db_list_memories(user_id: str) -> list:
     # so nothing extra has to be threaded through the WITH chain.
     scope_map = sharing.accessible_owner_scope(user_id)
     owners = scope_map["owners"] if scope_map else None
+    owner_ids = sharing.readable_owner_ids(user_id) or [user_id]
 
     with neo4j_driver.session() as s:
         result = s.run(

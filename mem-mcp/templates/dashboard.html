@@ -8,188 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-  <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js">  /* ---- sharing dialog ---------------------------------------------------
-     Every call goes through shareRun(): apiFail REJECTS on a non-2xx, so an
-     unwrapped await here produced a silent no-op -- a button that appeared
-     dead rather than one that reported why it failed. Errors are surfaced in
-     the footer status line and as a toast, never swallowed. */
-  let _shareTarget = null;
-  const SHARE_PERM_LABEL = { read: 'Read only', write: 'Read & write' };
-
-  function shareStatus(msg, kind) {
-    const el = document.getElementById('share-status');
-    if (!el) return;
-    el.textContent = msg || '';
-    el.className = 'share-status' + (kind ? ' ' + kind : '');
-  }
-
-  async function shareRun(btn, fn, okMsg) {
-    const label = btn ? btn.textContent : '';
-    if (btn) { btn.disabled = true; }
-    shareStatus('Working\u2026');
-    try {
-      await fn();
-      shareStatus(okMsg || '', 'ok');
-    } catch (e) {
-      const why = (e && (e.detail || e.message)) || 'Request failed';
-      shareStatus(why, 'err');
-      toast('\u26a0\ufe0f ' + why);
-      console.error('[share]', e);
-    } finally {
-      if (btn) { btn.disabled = false; btn.textContent = label; }
-    }
-  }
-
-  function openShareDialog(type, id, name) {
-    _shareTarget = { type: type, id: id, name: name };
-    document.getElementById('share-title').textContent =
-      'Share ' + (type === 'context' ? 'project' : 'client') + ': ' + (name || '');
-    document.getElementById('share-result').hidden = true;
-    document.getElementById('share-add-user').value = '';
-    shareStatus('');
-    const ov = document.getElementById('share-overlay');
-    ov.hidden = false;
-    loadShareGrants();
-    loadShareLinks();
-    const first = document.getElementById('share-add-user');
-    if (first) first.focus();
-  }
-
-  function closeShareDialog() {
-    document.getElementById('share-overlay').hidden = true;
-    _shareTarget = null;
-  }
-
-  document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && !document.getElementById('share-overlay').hidden)
-      closeShareDialog();
-  });
-
-  async function createShareLink() {
-    if (!_shareTarget) return;
-    const btn = document.getElementById('share-create-btn');
-    const body = {
-      targetType: _shareTarget.type,
-      targetId: _shareTarget.id,
-      permission: document.getElementById('share-perm').value
-    };
-    const days = document.getElementById('share-days').value.trim();
-    const uses = document.getElementById('share-uses').value.trim();
-    if (days) body.expiresInDays = parseInt(days, 10);
-    else body.neverExpires = true;
-    if (uses) body.maxUses = parseInt(uses, 10);
-
-    await shareRun(btn, async () => {
-      const r = await api.post('share/links', body);
-      const box = document.getElementById('share-result');
-      const url = r.acceptUrl || (location.origin + '/share/' + r.token);
-      box.hidden = false;
-      box.innerHTML = '<strong>Share link</strong> (shown once):<br><code>' + escHtml(url) + '</code> ' +
-        '<button class="btn btn-sm" onclick="copyShareLink(\'' + escHtml(url) + '\')">Copy</button>';
-      loadShareLinks();
-    }, 'Link created');
-  }
-
-  function copyShareLink(url) {
-    const done = () => toast('\ud83d\udccb Link copied');
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(url).then(done, () => toast('Copy failed \u2014 select the link instead', 'err'));
-    } else {
-      const ta = document.createElement('textarea');
-      ta.value = url; document.body.appendChild(ta); ta.select();
-      try { document.execCommand('copy'); done(); } catch (_) { toast('Copy failed', 'err'); }
-      ta.remove();
-    }
-  }
-
-  async function loadShareLinks() {
-    if (!_shareTarget) return;
-    const el = document.getElementById('share-links-list');
-    try {
-      const r = await api.get('share/links', { targetType: _shareTarget.type, targetId: _shareTarget.id });
-      const links = (r && r.links) ? r.links : [];
-      if (!links.length) { el.innerHTML = '<div class="share-empty">No links yet.</div>'; return; }
-      el.innerHTML = links.map(function (l) {
-        const uses = l.max_uses ? (l.use_count + '/' + l.max_uses) : (l.use_count + ' use(s)');
-        const dead = l.status !== 'active';
-        const exp = l.expires_at ? (' \u00b7 expires ' + new Date(l.expires_at * 1000).toLocaleDateString()) : ' \u00b7 never expires';
-        return '<div class="share-rowline"' + (dead ? ' style="opacity:.55;"' : '') + '>' +
-          '<span class="share-name">' + escHtml(l.token_prefix || '???') + ' \u00b7 ' +
-            escHtml(SHARE_PERM_LABEL[l.permission] || l.permission) + exp + '</span>' +
-          '<span class="share-empty">' + escHtml(l.status) + ' \u00b7 ' + escHtml(uses) + '</span>' +
-          (dead ? '' : '<button class="btn btn-sm btn-danger" onclick="revokeShareLink(\'' + l.id + '\', this)">Revoke</button>') +
-          '</div>';
-      }).join('');
-    } catch (e) {
-      el.innerHTML = '<div class="share-empty">\u26a0\ufe0f ' + escHtml((e && (e.detail || e.message)) || 'could not load') + '</div>';
-    }
-  }
-
-  async function revokeShareLink(id, btn) {
-    await shareRun(btn, async () => {
-      await api.delete('share/links/' + id);
-      await loadShareLinks();
-    }, 'Link revoked');
-  }
-
-  async function loadShareGrants() {
-    if (!_shareTarget) return;
-    const el = document.getElementById('share-grants-list');
-    try {
-      const r = await api.get('share/grants', { targetType: _shareTarget.type, targetId: _shareTarget.id });
-      const grants = (r && r.grants) ? r.grants : [];
-      if (!grants.length) { el.innerHTML = '<div class="share-empty">Nobody has access.</div>'; return; }
-      el.innerHTML = grants.map(function (g) {
-        const dead = g.status !== 'active';
-        const permSel = '<select onchange="changeShareGrant(\'' + g.id + '\', this.value, this)">' +
-          '<option value="read"' + (g.permission === 'read' ? ' selected' : '') + '>Read only</option>' +
-          '<option value="write"' + (g.permission === 'write' ? ' selected' : '') + '>Read &amp; write</option></select>';
-        return '<div class="share-rowline"' + (dead ? ' style="opacity:.55;"' : '') + '>' +
-          '<span class="share-name">\ud83d\udc65 ' + escHtml(g.grantee_user_id || '') +
-            (dead ? ' <em>(revoked)</em>' : '') + '</span>' +
-          (dead ? '' : permSel) +
-          (dead ? '' : '<button class="btn btn-sm btn-danger" onclick="revokeShareGrant(\'' + g.id + '\', this)">Revoke</button>') +
-          '</div>';
-      }).join('');
-    } catch (e) {
-      el.innerHTML = '<div class="share-empty">\u26a0\ufe0f ' + escHtml((e && (e.detail || e.message)) || 'could not load') + '</div>';
-    }
-  }
-
-  async function addShareGrant() {
-    if (!_shareTarget) return;
-    const input = document.getElementById('share-add-user');
-    const btn = document.getElementById('share-add-btn');
-    const username = input.value.trim();
-    if (!username) { shareStatus('Enter an account name first', 'err'); return; }
-    await shareRun(btn, async () => {
-      await api.post('share/grants', {
-        targetType: _shareTarget.type,
-        targetId: _shareTarget.id,
-        username: username,
-        permission: document.getElementById('share-add-perm').value
-      });
-      input.value = '';
-      await loadShareGrants();
-    }, 'Recipient added');
-  }
-
-  async function changeShareGrant(id, permission, sel) {
-    // The select already shows the new value; on a failure the server's value
-    // is the truth, so reload rather than guess what to restore.
-    await shareRun(null, async () => {
-      await api.put('share/grants/' + id, { permission: permission });
-      await loadShareGrants();
-    }, 'Permission updated');
-  }
-
-  async function revokeShareGrant(id, btn) {
-    await shareRun(btn, async () => {
-      await api.delete('share/grants/' + id);
-      await loadShareGrants();
-    }, 'Access revoked');
-  }
-</script>
+  <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
   <style>
     :root {
       --primary: #4f46e5; --primary-light: #eef2ff; --primary-dark: #3730a3;
@@ -6391,6 +6210,187 @@ let contextMenu = null;
     try { const info = await api.get('whoami'); document.getElementById('user-badge').textContent = '👤 ' + info.user; } catch(_) {}
     loadMemories();
   })();
+  /* ---- sharing dialog ---------------------------------------------------
+     Every call goes through shareRun(): apiFail REJECTS on a non-2xx, so an
+     unwrapped await here produced a silent no-op -- a button that appeared
+     dead rather than one that reported why it failed. Errors are surfaced in
+     the footer status line and as a toast, never swallowed. */
+  let _shareTarget = null;
+  const SHARE_PERM_LABEL = { read: 'Read only', write: 'Read & write' };
+
+  function shareStatus(msg, kind) {
+    const el = document.getElementById('share-status');
+    if (!el) return;
+    el.textContent = msg || '';
+    el.className = 'share-status' + (kind ? ' ' + kind : '');
+  }
+
+  async function shareRun(btn, fn, okMsg) {
+    const label = btn ? btn.textContent : '';
+    if (btn) { btn.disabled = true; }
+    shareStatus('Working\u2026');
+    try {
+      await fn();
+      shareStatus(okMsg || '', 'ok');
+    } catch (e) {
+      const why = (e && (e.detail || e.message)) || 'Request failed';
+      shareStatus(why, 'err');
+      toast('\u26a0\ufe0f ' + why);
+      console.error('[share]', e);
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = label; }
+    }
+  }
+
+  function openShareDialog(type, id, name) {
+    _shareTarget = { type: type, id: id, name: name };
+    document.getElementById('share-title').textContent =
+      'Share ' + (type === 'context' ? 'project' : 'client') + ': ' + (name || '');
+    document.getElementById('share-result').hidden = true;
+    document.getElementById('share-add-user').value = '';
+    shareStatus('');
+    const ov = document.getElementById('share-overlay');
+    ov.hidden = false;
+    loadShareGrants();
+    loadShareLinks();
+    const first = document.getElementById('share-add-user');
+    if (first) first.focus();
+  }
+
+  function closeShareDialog() {
+    document.getElementById('share-overlay').hidden = true;
+    _shareTarget = null;
+  }
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !document.getElementById('share-overlay').hidden)
+      closeShareDialog();
+  });
+
+  async function createShareLink() {
+    if (!_shareTarget) return;
+    const btn = document.getElementById('share-create-btn');
+    const body = {
+      targetType: _shareTarget.type,
+      targetId: _shareTarget.id,
+      permission: document.getElementById('share-perm').value
+    };
+    const days = document.getElementById('share-days').value.trim();
+    const uses = document.getElementById('share-uses').value.trim();
+    if (days) body.expiresInDays = parseInt(days, 10);
+    else body.neverExpires = true;
+    if (uses) body.maxUses = parseInt(uses, 10);
+
+    await shareRun(btn, async () => {
+      const r = await api.post('share/links', body);
+      const box = document.getElementById('share-result');
+      const url = r.acceptUrl || (location.origin + '/share/' + r.token);
+      box.hidden = false;
+      box.innerHTML = '<strong>Share link</strong> (shown once):<br><code>' + escHtml(url) + '</code> ' +
+        '<button class="btn btn-sm" onclick="copyShareLink(\'' + escHtml(url) + '\')">Copy</button>';
+      loadShareLinks();
+    }, 'Link created');
+  }
+
+  function copyShareLink(url) {
+    const done = () => toast('\ud83d\udccb Link copied');
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(url).then(done, () => toast('Copy failed \u2014 select the link instead', 'err'));
+    } else {
+      const ta = document.createElement('textarea');
+      ta.value = url; document.body.appendChild(ta); ta.select();
+      try { document.execCommand('copy'); done(); } catch (_) { toast('Copy failed', 'err'); }
+      ta.remove();
+    }
+  }
+
+  async function loadShareLinks() {
+    if (!_shareTarget) return;
+    const el = document.getElementById('share-links-list');
+    try {
+      const r = await api.get('share/links', { targetType: _shareTarget.type, targetId: _shareTarget.id });
+      const links = (r && r.links) ? r.links : [];
+      if (!links.length) { el.innerHTML = '<div class="share-empty">No links yet.</div>'; return; }
+      el.innerHTML = links.map(function (l) {
+        const uses = l.max_uses ? (l.use_count + '/' + l.max_uses) : (l.use_count + ' use(s)');
+        const dead = l.status !== 'active';
+        const exp = l.expires_at ? (' \u00b7 expires ' + new Date(l.expires_at * 1000).toLocaleDateString()) : ' \u00b7 never expires';
+        return '<div class="share-rowline"' + (dead ? ' style="opacity:.55;"' : '') + '>' +
+          '<span class="share-name">' + escHtml(l.token_prefix || '???') + ' \u00b7 ' +
+            escHtml(SHARE_PERM_LABEL[l.permission] || l.permission) + exp + '</span>' +
+          '<span class="share-empty">' + escHtml(l.status) + ' \u00b7 ' + escHtml(uses) + '</span>' +
+          (dead ? '' : '<button class="btn btn-sm btn-danger" onclick="revokeShareLink(\'' + l.id + '\', this)">Revoke</button>') +
+          '</div>';
+      }).join('');
+    } catch (e) {
+      el.innerHTML = '<div class="share-empty">\u26a0\ufe0f ' + escHtml((e && (e.detail || e.message)) || 'could not load') + '</div>';
+    }
+  }
+
+  async function revokeShareLink(id, btn) {
+    await shareRun(btn, async () => {
+      await api.delete('share/links/' + id);
+      await loadShareLinks();
+    }, 'Link revoked');
+  }
+
+  async function loadShareGrants() {
+    if (!_shareTarget) return;
+    const el = document.getElementById('share-grants-list');
+    try {
+      const r = await api.get('share/grants', { targetType: _shareTarget.type, targetId: _shareTarget.id });
+      const grants = (r && r.grants) ? r.grants : [];
+      if (!grants.length) { el.innerHTML = '<div class="share-empty">Nobody has access.</div>'; return; }
+      el.innerHTML = grants.map(function (g) {
+        const dead = g.status !== 'active';
+        const permSel = '<select onchange="changeShareGrant(\'' + g.id + '\', this.value, this)">' +
+          '<option value="read"' + (g.permission === 'read' ? ' selected' : '') + '>Read only</option>' +
+          '<option value="write"' + (g.permission === 'write' ? ' selected' : '') + '>Read &amp; write</option></select>';
+        return '<div class="share-rowline"' + (dead ? ' style="opacity:.55;"' : '') + '>' +
+          '<span class="share-name">\ud83d\udc65 ' + escHtml(g.grantee_user_id || '') +
+            (dead ? ' <em>(revoked)</em>' : '') + '</span>' +
+          (dead ? '' : permSel) +
+          (dead ? '' : '<button class="btn btn-sm btn-danger" onclick="revokeShareGrant(\'' + g.id + '\', this)">Revoke</button>') +
+          '</div>';
+      }).join('');
+    } catch (e) {
+      el.innerHTML = '<div class="share-empty">\u26a0\ufe0f ' + escHtml((e && (e.detail || e.message)) || 'could not load') + '</div>';
+    }
+  }
+
+  async function addShareGrant() {
+    if (!_shareTarget) return;
+    const input = document.getElementById('share-add-user');
+    const btn = document.getElementById('share-add-btn');
+    const username = input.value.trim();
+    if (!username) { shareStatus('Enter an account name first', 'err'); return; }
+    await shareRun(btn, async () => {
+      await api.post('share/grants', {
+        targetType: _shareTarget.type,
+        targetId: _shareTarget.id,
+        username: username,
+        permission: document.getElementById('share-add-perm').value
+      });
+      input.value = '';
+      await loadShareGrants();
+    }, 'Recipient added');
+  }
+
+  async function changeShareGrant(id, permission, sel) {
+    // The select already shows the new value; on a failure the server's value
+    // is the truth, so reload rather than guess what to restore.
+    await shareRun(null, async () => {
+      await api.put('share/grants/' + id, { permission: permission });
+      await loadShareGrants();
+    }, 'Permission updated');
+  }
+
+  async function revokeShareGrant(id, btn) {
+    await shareRun(btn, async () => {
+      await api.delete('share/grants/' + id);
+      await loadShareGrants();
+    }, 'Access revoked');
+  }
 </script>
 <div id="share-overlay" class="share-overlay" hidden>
   <div class="share-modal" role="dialog" aria-modal="true" aria-labelledby="share-title">
