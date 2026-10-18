@@ -247,17 +247,17 @@ concern → Phase 3 task to benchmark.
 
 ### Phase 5 — Audit logging
 
-- [ ] P5.1 `log_access(actor, owner, target_type, target_id, action, permission,
+- [x] P5.1 `log_access(actor, owner, target_type, target_id, action, permission,
       shared, detail)` called from every shared read and write. Own-vault actions
       optionally logged (config `MEM_AUDIT_LOG_OWN`, default false) to keep
       volume manageable.
-- [ ] P5.2 Audit writes are fire-and-forget (async, swallowed on failure, logged
+- [x] P5.2 Audit writes are fire-and-forget (async, swallowed on failure, logged
       at WARNING) so they never break the request.
-- [ ] P5.3 Retention purge: `purge_audit_log(older_than_days)` in the
+- [x] P5.3 Retention purge: `purge_audit_log(older_than_days)` in the
       scheduled backup loop or a separate daily task.
-- [ ] P5.4 `GET /api/audit?targetType=&targetId=&actor=&since=&limit=` owner
+- [x] P5.4 `GET /api/audit?targetType=&targetId=&actor=&since=&limit=` owner
       only, paginated, for the settings UI.
-- [ ] P5.5 Ensure no secrets/tokens in `detail` (prefix only, never full token).
+- [x] P5.5 Ensure no secrets/tokens in `detail` (prefix only, never full token).
 
 ### Phase 6 — UI
 

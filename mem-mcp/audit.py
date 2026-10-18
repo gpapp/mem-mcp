@@ -55,6 +55,7 @@ DB_NAME = "audit.db"
 # as a share token rather than a random string. The plaintext token never
 # carries this prefix — it is for the stored ``token_prefix`` and any list UI.
 LINK_PREFIX = "shs_"
+_TRUTHY = {"1", "true", "yes", "on"}
 
 VALID_TARGET_TYPES = ("client", "context")
 VALID_PERMISSIONS = ("read", "write")
@@ -839,6 +840,39 @@ def log_access(actor_user_id: str, owner_user_id=None, target_type=None,
             type(exc).__name__, exc,
         )
         return None
+
+
+def _truthy(name: str) -> bool:
+    return (os.getenv(name) or "").strip().lower() in _TRUTHY
+
+
+def own_audit_logging_enabled() -> bool:
+    """Whether an owner's actions in their OWN vault reach the audit feed.
+
+    Off by default, deliberately: a feed with one row per personal search is
+    volume without information, and the shared-read rows are the reason this
+    log exists. An operator who wants everything can turn it on.
+    """
+    return _truthy("MEM_AUDIT_LOG_OWN")
+
+
+def log_shared(actor_user_id: str, owner_user_id: str, target_type: str = None,
+               target_id: str = None, action: str = "read",
+               permission: str = None, detail: dict = None,
+               now: float = None):
+    """Audit one interaction with SHARED data, silently skipping own-vault use.
+
+    This is the call site Phase 3/4 read and write paths use. Difference from
+    log_access: `shared` is always True, and an owner touching their own
+    target produces no row unless MEM_AUDIT_LOG_OWN=1 — the store cannot know
+    whether an action was shared, so the policy lives beside the call. Same
+    swallow contract as log_access: a failed write never breaks the request.
+    """
+    if is_owner(actor_user_id, owner_user_id) and not own_audit_logging_enabled():
+        return None
+    return log_access(actor_user_id, owner_user_id, target_type, target_id,
+                      action=action, permission=permission, shared=True,
+                      detail=detail, now=now)
 
 
 def query_audit_log(owner_user_id=None, actor_user_id=None,

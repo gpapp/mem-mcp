@@ -21,6 +21,7 @@ from mcp_tools import mcp
 from gui import web_app, McpAuthGuard
 from fastapi.middleware.cors import CORSMiddleware
 import sessions as vault_sessions
+import audit
 from memory import SESSION_MAX_AGE
 from starlette.middleware import Middleware as StarletteMiddleware
 mcp_cors = StarletteMiddleware(
@@ -78,6 +79,25 @@ web_app.add_middleware(
 # ---------------------------------------------------------------------------
 # Merge MCP into the Web GUI app
 # ---------------------------------------------------------------------------
+
+async def _audit_purge_loop():
+    """Drop audit rows past MEM_AUDIT_KEEP_DAYS, hourly.
+
+    A retention purifier that only ran inside the backup scheduler would die
+    the day an operator set MEM_BACKUP_ENABLED=0 — the backup task is谁的
+    process it started as. So it is the process's own hourly task, next to
+    the session GC, and cheap when there is nothing to delete.
+    """
+    while True:
+        await asyncio.sleep(3600)
+        try:
+            removed = await asyncio.to_thread(audit.purge_audit_log)
+            if removed:
+                print(f"Audit: dropped {removed} row(s) past "
+                      f"{audit.audit_keep_days()} day retention", flush=True)
+        except Exception as exc:
+            print(f"Audit: hourly purge failed: {exc}", flush=True)
+
 
 async def _session_gc_loop():
     """Drop expired sessions hourly, off the request path.
@@ -152,10 +172,12 @@ async def lifespan(app):
             status_monitor.broadcast_loop(mem.fetch_ollama_status, mem.STATUS_POLL_SECONDS)
         )
         session_gc_task = asyncio.create_task(_session_gc_loop())
+        audit_purge_task = asyncio.create_task(_audit_purge_loop())
         try:
             yield
         finally:
-            for task in (backup_task, rechunk_task, status_task, session_gc_task):
+            for task in (backup_task, rechunk_task, status_task, session_gc_task,
+                         audit_purge_task):
                 if task:
                     task.cancel()
                     with suppress(asyncio.CancelledError):

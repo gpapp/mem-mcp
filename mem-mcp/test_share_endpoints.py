@@ -157,7 +157,7 @@ class ShareRoutesCase(unittest.TestCase):
                      "api_share_accept", "api_share_add_grant",
                      "api_share_update_grant", "api_share_revoke_grant",
                      "api_share_list_grants", "api_share_mine",
-                     "share_landing"):
+                     "share_landing", "api_list_audit"):
             _lift(name, ns)
         return ns
 
@@ -461,8 +461,60 @@ class DirectGrantTests(ShareRoutesCase):
         self.assertEqual(details, {"No such share grant"})
 
 
+class AuditFeedTests(ShareRoutesCase):
+    """GET /api/audit — the owner reads their targets, the admin reads all."""
+
+    def setUp(self):
+        super().setUp()
+        self.admin = False
+        import types as _t
+        self.namespace["mem"].is_admin_user = lambda user: self.admin
+
+    def _seed_activity(self):
+        audit.grant_access("alice", "bob", "client", "cid-1", "read", now=10.0)
+        audit.log_access("bob", "alice", "client", "cid-1", action="read",
+                         permission="read", shared=True, now=20.0)
+        audit.log_access("bob", "dave", "client", "d-target", action="read",
+                         shared=True, now=30.0)
+
+    def test_the_owner_sees_only_rows_about_their_own_targets(self):
+        self._seed_activity()
+        rows = self._call(self.namespace["api_list_audit"](self._request()))["audit"]
+        self.assertEqual(
+            {r["owner_user_id"] for r in rows}, {"alice"},
+            msg="the feed is the same privacy promise as the feature: no "
+                "foreign target shows its other readers")
+
+    def test_actor_target_and_since_filters_pass_through(self):
+        self._seed_activity()
+        feed = self.namespace["api_list_audit"]
+        self.assertEqual(
+            len(self._call(feed(self._request(), actor="bob"))["audit"]), 1)
+        self.assertEqual(
+            len(self._call(feed(self._request(), since=25.0))["audit"]), 0,
+            msg="nothing newer than now — since cuts the feed from the front")
+        rows = self._call(feed(self._request(
+        ), targetType="client", targetId="cid-1"))["audit"]
+        self.assertEqual(len(rows), 1)
+
+    def test_admin_reads_everything(self):
+        self._seed_activity()
+        self.admin = True
+        rows = self._call(self.namespace["api_list_audit"](
+            self._request()))["audit"]
+        self.assertEqual(
+            {r["owner_user_id"] for r in rows}, {"alice", "dave"})
+
+    def test_a_foreign_target_query_is_not_probeable(self):
+        with self.assertRaises(_HTTPException) as caught:
+            self._call(self.namespace["api_list_audit"](
+                self._request(), targetType="client",
+                targetId="somebody-elses"))
+        self.assertEqual(caught.exception.status_code, 404)
+
+
 class SharedWithMeTests(ShareRoutesCase):
-    """"""  # noqa: D419
+    """GET /api/share/mine and the owner's recipients view."""
 
     def test_mine_lists_only_the_grants_and_owner_names(self):
         audit.grant_access("alice", "bob", "client", "cid-1", "read")
@@ -485,7 +537,7 @@ class SharedWithMeTests(ShareRoutesCase):
 
 
 class ShareLandingTests(ShareRoutesCase):
-    """"""  # noqa: D419
+    """GET /share/{token} — anonymous visitors learn nothing but how to sign in."""
 
     def _landing(self):
         return self._call(self.namespace["share_landing"](self._request(),

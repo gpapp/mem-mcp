@@ -374,6 +374,51 @@ class AuditLogTests(SharingStoreTestCase):
             audit.purge_audit_log(older_than_days=0)
 
 
+class SharedActionLoggingTests(SharingStoreTestCase):
+    """`log_shared` — the policy boundary between shared and own-vault data."""
+
+    def setUp(self):
+        super().setUp()
+        self._own = os.environ.get("MEM_AUDIT_LOG_OWN")
+        os.environ.pop("MEM_AUDIT_LOG_OWN", None)
+        self.addCleanup(self._restore_own)
+
+    def _restore_own(self):
+        if self._own is None:
+            os.environ.pop("MEM_AUDIT_LOG_OWN", None)
+        else:
+            os.environ["MEM_AUDIT_LOG_OWN"] = self._own
+
+    def test_an_owner_s_own_action_is_silent_by_default(self):
+        row = audit.log_shared("alice", "alice", "client", "cid",
+                               action="read", now=1.0)
+        self.assertIsNone(row, "own-vault traffic does not fill the feed")
+        self.assertEqual(audit.query_audit_log(actor_user_id="alice"), [])
+
+    def test_own_actions_are_kept_when_the_operator_asks_for_them(self):
+        os.environ["MEM_AUDIT_LOG_OWN"] = "1"
+        audit.log_shared("alice", "alice", "client", "cid", action="read",
+                         now=1.0)
+        rows = audit.query_audit_log(actor_user_id="alice")
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0]["shared"])
+
+    def test_a_grantees_read_is_always_a_shared_row(self):
+        audit.log_shared("bob", "alice", "client", "cid", action="read",
+                         permission="read", now=1.0)
+        rows = audit.query_audit_log(owner_user_id="alice")
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0]["shared"])
+        self.assertEqual(rows[0]["action"], "read")
+
+    def test_case_blind_skipping_uses_strict_owner_compare(self):
+        # "ALICE" is a different vault user, not the owner — their read is
+        # shared data access and lands in the feed.
+        audit.log_shared("ALICE", "alice", "client", "cid", action="read",
+                         now=1.0)
+        self.assertEqual(len(audit.query_audit_log(owner_user_id="alice")), 1)
+
+
 class KnobTests(SharingStoreTestCase):
     """The env contract is behavioural: an empty value behaves like absent."""
 

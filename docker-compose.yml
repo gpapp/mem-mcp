@@ -149,6 +149,9 @@ services:
       - MEM_AUDIT_KEEP_DAYS=${MEM_AUDIT_KEEP_DAYS:-90}
       # Empty default: audit.db lives next to the session store by default.
       - MEM_AUDIT_DB=${MEM_AUDIT_DB:-}
+      # Owner's own-vault actions in the audit feed: off by default so the
+      # feed carries shared interactions only, not one row per personal search.
+      - MEM_AUDIT_LOG_OWN=${MEM_AUDIT_LOG_OWN:-0}
 
       # Merge-draft budget. The only LLM call whose prompt is uncapped: it
       # json.dumps the full text of every selected record, so it is sized

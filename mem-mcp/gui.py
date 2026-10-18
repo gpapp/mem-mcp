@@ -2418,6 +2418,42 @@ async def api_share_mine(request: Request):
             "owners": sharing.shared_owners(user_id)}
 
 
+@web_app.get("/api/audit", response_class=JSONResponse)
+async def api_list_audit(request: Request,
+                         targetType: Optional[str] = None,
+                         targetId: Optional[str] = None,
+                         actor: Optional[str] = None,
+                         since: Optional[float] = None,
+                         limit: int = 200):
+    """The audit feed for the settings UI: your shared targets' activity.
+
+    An owner sees the rows about THEIR shared targets only — the feed is the
+    same privacy promise as the feature: no target another owner shared with
+    them shows its other readers. The admin (MEM_ADMIN_USER) reads everything,
+    because the Service tab owns the server, not one vault.
+    """
+    user_id = _require_user(request)
+    _require_sharing_enabled()
+    try:
+        if targetType:
+            _share_target_owner(user_id, targetType, targetId or "")
+            target_type, target_id = targetType, targetId
+        else:
+            target_type = target_id = None
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if mem.is_admin_user(user_id):
+        rows = audit.query_audit_log(
+            actor_user_id=actor, target_type=target_type, target_id=target_id,
+            since=since, limit=limit)
+    else:
+        rows = audit.query_audit_log(
+            owner_user_id=user_id, actor_user_id=actor,
+            target_type=target_type, target_id=target_id,
+            since=since, limit=limit)
+    return {"audit": rows}
+
+
 @web_app.get("/share/{token}", response_class=HTMLResponse)
 async def share_landing(request: Request, token: str):
     """The page a share link opens.
