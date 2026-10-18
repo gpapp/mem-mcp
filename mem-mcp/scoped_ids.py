@@ -31,6 +31,18 @@ re-deriving it would change the record's primary key, and chunk 0 of a Qdrant
 family *is* that key. Rewriting it means re-embedding every chunk of every entry
 to keep the vector store attached to the graph, which is a large, lossy-risk
 operation bought for nothing. See ``migrate_vault_user.py``.
+
+Sharing and scope ids
+---------------------
+Project/context sharing (``audit.py`` / ``sharing.py``) introduces a second
+access axis but deliberately introduces **no third id space**: a shared
+target is the OWNER's Client or Context node, referenced by the owner's id,
+and the owner's ``userId`` stays the partition key of every record filed
+under it. A share grant must never be written with a grantee-derived id —
+``context_id_for(grantee, ...)`` for a shared context would mint a node in
+the grantee's own vault, and the vault would hold two same-named Clients
+where a search resolves only one of them. Grants are access metadata keyed
+by owner + target id; they never re-derive ids.
 """
 
 import uuid

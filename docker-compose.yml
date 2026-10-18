@@ -138,6 +138,18 @@ services:
       # Empty default: no Service tab until an operator names the admin account.
       - MEM_ADMIN_USER=${MEM_ADMIN_USER:-}
 
+      # Project/context sharing and the access audit log. Sharing is off until
+      # an operator turns it on (same deliberate default as registration): it
+      # opens share-link endpoints granting another account read or write
+      # access to one client/context. Grants and links are new rows in
+      # audit.db, so turning it on does not rewrite anything existing.
+      - MEM_SHARING_ENABLED=${MEM_SHARING_ENABLED:-0}
+      - MEM_SHARE_LINK_TTL_DAYS=${MEM_SHARE_LINK_TTL_DAYS:-30}
+      - MEM_SHARE_MAX_RECIPIENTS=${MEM_SHARE_MAX_RECIPIENTS:-50}
+      - MEM_AUDIT_KEEP_DAYS=${MEM_AUDIT_KEEP_DAYS:-90}
+      # Empty default: audit.db lives next to the session store by default.
+      - MEM_AUDIT_DB=${MEM_AUDIT_DB:-}
+
       # Merge-draft budget. The only LLM call whose prompt is uncapped: it
       # json.dumps the full text of every selected record, so it is sized
       # against the context window rather than a window. There is no
