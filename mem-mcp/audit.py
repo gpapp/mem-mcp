@@ -623,6 +623,34 @@ def revoke_all_grants_for_user(owner_user_id: str, grantee_user_id: str,
         conn.close()
 
 
+def list_grants_owned_by(owner_user_id: str, now=None) -> list:
+    """Every grant this owner ever gave, across all targets.
+
+    The owner's cross-target management view needs one listing, and it
+    deliberately includes revoked rows with ``status: revoked`` for the same
+    reason list_share_links does: a recipient that vanishes from the view is
+    indistinguishable from one that was never added.
+    """
+    owner_user_id = (owner_user_id or "").strip()
+    if not owner_user_id:
+        return []
+    init_db()
+    now = _now(now)
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT id, owner_user_id, grantee_user_id, target_type, target_id,"
+            " permission, granted_at, revoked_at, via_link_id"
+            " FROM share_grants WHERE owner_user_id = ?"
+            " ORDER BY granted_at DESC, id DESC",
+            (owner_user_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(row, status="revoked" if row["revoked_at"] is not None
+                 else "active", expires_at=None) for row in rows]
+
+
 def list_grants_for_target(owner_user_id: str, target_type: str,
                            target_id: str, now=None) -> list:
     """Every grant held on one target (active and revoked), for owner management UI."""

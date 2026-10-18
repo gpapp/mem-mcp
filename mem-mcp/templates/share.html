@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Memory Vault | Shared project</title>
+  <link rel="icon" type="image/svg+xml" href="{{BASE_URL}}/favicon.svg">
+  <style>
+    :root {
+      --primary: #4f46e5; --bg: #f8fafc; --surface: #ffffff;
+      --border: #e5e7eb; --text: #111827; --muted: #6b7280;
+      --radius: 12px;
+    }
+    body { margin: 0; font-family: 'Inter', system-ui, sans-serif; background: var(--bg); color: var(--text); line-height: 1.6; }
+    .container { max-width: 560px; margin: 0 auto; padding: 4rem 1.5rem; }
+    header { text-align: center; margin-bottom: 2rem; }
+    h1 { font-size: 1.6rem; font-weight: 800; margin: .5rem 0; }
+    .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 2rem; box-shadow: 0 4px 12px rgba(0,0,0,.03); }
+    .btn { display: inline-block; background: var(--primary); color: #fff; padding: .7rem 1.6rem; border-radius: 8px; text-decoration: none; font-weight: 600; cursor: pointer; border: none; font-size: 1rem; }
+    .btn:disabled { opacity: .5; cursor: wait; }
+    .note { font-size: .9rem; color: var(--muted); }
+    .result { margin-top: 1rem; font-weight: 600; }
+    .result.ok { color: #065f46; }
+    .result.bad { color: #b91c1c; }
+    p { margin: 0 0 1rem; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>🧠 Memory Vault</h1>
+      <p class="note">A project has been shared with you.</p>
+    </header>
+
+    <div class="card">
+    {% if not SIGNED_IN %}
+      {# Identical for a real token and a made-up one: nothing here resolves
+         the token, so an anonymous visitor cannot learn whether a link is
+         valid from this page alone. #}
+      <p>This share link needs you to be <strong>signed in</strong> first.</p>
+      <p>
+        <a class="btn" href="{{BASE_URL}}/">Sign in</a>
+      </p>
+      <p class="note">Open that link, sign in, then open the share link you
+      were given again.</p>
+    {% else %}
+      <p>Accept the access you were given? You can revoke it from the owner's
+      side at any time, and this is recorded in the vault's audit log.</p>
+      <p>
+        <button type="button" class="btn" id="accept">Accept access</button>
+        <a class="btn" style="background:var(--surface); color:var(--primary); border:1px solid var(--primary)" href="{{BASE_URL}}/gui">Open dashboard</a>
+      </p>
+      <p class="result" id="result"></p>
+    {% endif %}
+    </div>
+  </div>
+{% if SIGNED_IN %}
+<script>
+  async function acceptShare() {
+    const btn = document.getElementById("accept");
+    const out = document.getElementById("result");
+    btn.disabled = true;
+    let r;
+    try {
+      r = await fetch("{{ACCEPT_URL}}", {method: "POST", credentials: "same-origin"});
+    } catch (err) {
+      out.textContent = "The request failed. Is this still the server that gave you the link?";
+      out.className = "result bad";
+      return;
+    }
+    // A proxy error page must not be able to replace the status — clone, then
+    // parse (same reasoning as apiFail in dashboard.html).
+    let data;
+    if (r) {
+      try { data = await r.clone().json(); }
+      catch (err) { data = {}; }
+    }
+    if (r && r.ok) {
+      out.textContent = "✓ You now have access. Open your dashboard to see the shared project.";
+      out.className = "result ok";
+      return;
+    }
+    if (r && r.status === 401) {
+      out.textContent = "Your session has expired. Sign in, then open this link again.";
+    } else if (r && r.status === 404) {
+      out.textContent = "This share link is not valid. Ask for a fresh one.";
+    } else {
+      out.textContent = (data && (data.detail || data.error)) || "Accepting failed. Try again later.";
+    }
+    out.className = "result bad";
+    btn.disabled = false;
+  }
+  document.getElementById("accept").addEventListener("click", acceptShare);
+</script>
+{% endif %}
+</body>
+</html>

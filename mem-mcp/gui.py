@@ -59,6 +59,8 @@ from sessions import (VaultSession, VaultSessionMiddleware, create_session,
                       verify_email_token, verification_email, send_mail,
                       registration_enabled, allow_registration_attempt)
 import google_auth
+import audit
+import sharing
 from matching_utils import (MergeDraftTooLarge, execute_merge,
                              format_people_merge_text, merge_draft_output_budget)
 from jinja2 import Environment, FileSystemLoader, select_autoescape
@@ -2085,6 +2087,360 @@ async def api_revoke_psk(psk_id: str, request: Request):
         f"psk revoked: id={psk_id[:8]} user={user_id}"
     )
     return {"ok": True, "id": psk_id}
+
+
+# ---------------------------------------------------------------------------
+# Project.context sharing — share links and grants
+#
+# Off until MEM_SHARING_ENABLED=1, and a disabled route answers 404 (not 403)
+# for the same reason registration does: it should be indistinguishable from
+# one that was never mounted, so turning the flag off does not advertise it.
+#
+# Everything under /api/share is covered by auth_guard (`/api*`), so no extra
+# "is this public?" reasoning is needed — accept/links/grants are all
+# authenticated by construction, and the one page that has to answer an
+# anonymous visitor, GET /share/{token}, lives outside the /api prefix on
+# purpose: it must prompt for sign-in and resolve nothing while nobody is
+# signed in.
+#
+# Token handling in audit.py mirrors the PSK model: sha256 digest, display
+# prefix, plaintext returned exactly once. These handlers add the pieces the
+# store cannot know: which targets actually belong to the caller, whether the
+# grantee's account exists, and the audit rows. audit.log_access is called
+# from here rather than silently inside the store, because the action names
+# are response-shape decisions ("share.link.created" vs "share.accept" for a
+# token forged with someone else's id) and the P8 tests pin them here.
+# ---------------------------------------------------------------------------
+
+
+class ShareLinkCreateRequest(BaseModel):
+    targetType: str
+    targetId: str
+    permission: str
+    # Absent takes MEM_SHARE_LINK_TTL_DAYS. "Never" must be chosen explicitly
+    # via neverExpires=true — a bare null cannot distinguish "I did not
+    # think about this" from "I want this link never to expire".
+    expiresInDays: Optional[int] = None
+    neverExpires: bool = False
+    maxUses: Optional[int] = None
+
+
+class ShareGrantRequest(BaseModel):
+    targetType: str
+    targetId: str
+    username: str
+    permission: str
+
+
+def _require_sharing_enabled() -> None:
+    if not sharing.sharing_enabled():
+        raise HTTPException(status_code=404, detail="Not found")
+
+
+def _share_target_owner(user_id: str, target_type: str, target_id: str) -> str:
+    """Verify the caller owns the target; return the parent client id.
+
+    Raises 400 for a malformed request and 404 for a target the caller does
+    not own: an owner-only endpoint saying "someone else owns that" would be
+    an enumeration surface, and 404 is what a target that does not exist at
+    all would also answer. The parent client id lets a context grant carry
+    the same linkage the permission check needs later.
+    """
+    target_type = (target_type or "").strip()
+    target_id = (target_id or "").strip()
+    if target_type not in ("client", "context"):
+        raise HTTPException(status_code=400,
+                            detail="targetType must be 'client' or 'context'")
+    if not target_id:
+        raise HTTPException(status_code=400, detail="A share needs a target")
+    clients = mem.db_list_clients(user_id)
+    if target_type == "client":
+        for client in clients:
+            if dict(client).get("id") == target_id:
+                return target_id
+        raise HTTPException(status_code=404,
+                            detail="No such client among yours")
+    for client in clients:
+        for context in client.get("contexts", []):
+            if context.get("id") == target_id:
+                return dict(client).get("id")
+    # Same generic detail for "no such project" and "not yours": a caller
+    # cannot probe for the existence of somebody else's context by name.
+    raise HTTPException(status_code=404,
+                        detail="No such project among yours")
+
+
+def _permission_of(name: str) -> str:
+    name = (name or "").strip().lower()
+    if name not in audit.VALID_PERMISSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"permission must be one of {list(audit.VALID_PERMISSIONS)!r}")
+    return name
+
+
+@web_app.post("/api/share/links", response_class=JSONResponse)
+async def api_share_create_link(request: Request, body: ShareLinkCreateRequest):
+    """Mint a share token for one owned target. The plaintext is in this
+    response and nowhere else, ever — the store keeps only the digest and a
+    display prefix, exactly like an access key."""
+    user_id = _require_user(request)
+    _require_sharing_enabled()
+    parent_client_id = _share_target_owner(user_id, body.targetType, body.targetId)
+    permission = _permission_of(body.permission)
+    if body.neverExpires and body.expiresInDays is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="Choose either expiresInDays or neverExpires, not both")
+    if body.neverExpires:
+        days = None
+    elif body.expiresInDays is None:
+        days = audit.share_ttl_days()
+    else:
+        days = body.expiresInDays
+    try:
+        link = audit.mint_share_link(user_id, body.targetType.strip(),
+                                     body.targetId.strip(), permission,
+                                     expires_in_days=days, max_uses=body.maxUses)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    audit.log_access(
+        user_id, user_id, link["target_type"], link["target_id"],
+        action="share.link.created", permission=link["permission"],
+        shared=True,
+        detail={"link_id": link["id"], "link_prefix": link["prefix"],
+                "parent_client_id": parent_client_id,
+                "expires_at": link["expires_at"], "max_uses": link["max_uses"]},
+    )
+    logging.getLogger("memory-vault").info(
+        f"share link minted: id={link['id'][:8]} owner={user_id}"
+        f" target={link['target_type']}:{link['target_id'][:8]}"
+        f" permission={link['permission']}"
+    )
+    return {
+        "id": link["id"],
+        "token": link["token"],
+        "prefix": link["prefix"],
+        "targetType": link["target_type"],
+        "targetId": link["target_id"],
+        "permission": link["permission"],
+        "expiresAt": link["expires_at"],
+        "maxUses": link["max_uses"],
+        "acceptUrl": f"{(_base_url() or '')}/share/{link['token']}",
+    }
+
+
+@web_app.get("/api/share/links", response_class=JSONResponse)
+async def api_share_list_links(request: Request,
+                               targetType: Optional[str] = None,
+                               targetId: Optional[str] = None):
+    """Every link the caller minted, for the owner management UI."""
+    user_id = _require_user(request)
+    _require_sharing_enabled()
+    try:
+        links = audit.list_share_links(user_id, target_type=targetType,
+                                       target_id=targetId)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"links": links}
+
+
+@web_app.delete("/api/share/links/{link_id}", response_class=JSONResponse)
+async def api_share_revoke_link(link_id: str, request: Request):
+    """Revoke one owned share link immediately. One 404 answer for unknown,
+    not-yours or already-revoked — the same enumeration-safety rule as
+    access-key revocation."""
+    user_id = _require_user(request)
+    _require_sharing_enabled()
+    if not audit.revoke_share_link(link_id, user_id):
+        raise HTTPException(status_code=404, detail="No such share link")
+    audit.log_access(user_id, user_id, None, None, action="share.link.revoked",
+                     shared=True, detail={"link_id": str(link_id)})
+    return {"ok": True, "id": link_id}
+
+
+@web_app.post("/api/share/accept/{token}", response_class=JSONResponse)
+async def api_share_accept(token: str, request: Request):
+    """Accept a presented share token and gain the grant it offers.
+
+    Refusal is one generic 404 because a differentiated answer to an
+    expired/revoked/unknown token is an existence oracle ("expired" proves
+    the token was valid once). The recipient cap answers 409: it is about a
+    full share roster, not a bad request shape.
+    """
+    user_id = _require_user(request)
+    _require_sharing_enabled()
+    token = str(token or "").strip()
+        # ShareLimitError is a ValueError subclass, so the handlers must be in
+        # THIS order: putting ValueError first would swallow every full-roster
+        # refusal into a 400 that reads as a bad request shape, when the remedy
+        # is "ask the owner to revoke someone first". The 409 goes through
+        # _conflict so the logged reason reaches the access log beside the
+        # status, like every other maintenance refusal in this file.
+    try:
+        accepted = audit.accept_share_link(token, user_id)
+    except audit.ShareLimitError as e:
+        raise _conflict(e)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if accepted is None:
+        raise HTTPException(status_code=404,
+                            detail="This share link is not valid")
+    return {
+        "targetType": accepted["target_type"],
+        "targetId": accepted["target_id"],
+        "owner": accepted["owner_user_id"],
+        "permission": accepted["permission"],
+        "alreadyHadAccess": accepted["already_had_access"],
+    }
+
+
+class ShareGrantCreateRequest(BaseModel):
+    targetType: str
+    targetId: str
+    username: str
+    permission: str
+
+
+class ShareGrantUpdateRequest(BaseModel):
+    permission: str
+
+
+@web_app.post("/api/share/grants", response_class=JSONResponse)
+async def api_share_add_grant(request: Request, body: ShareGrantCreateRequest):
+    """Direct-add a recipient by name, without a link, for users the owner
+    already knows by account name. Same ownership and permission rules as
+    the link path, so both arrive into the same store bounded by the same
+    recipient cap."""
+    user_id = _require_user(request)
+    _require_sharing_enabled()
+    parent_client_id = _share_target_owner(user_id, body.targetType, body.targetId)
+    permission = _permission_of(body.permission)
+    grantee = (body.username or "").strip()
+    if not grantee:
+        raise HTTPException(status_code=400, detail="A recipient needs an account name")
+    if not vault_sessions.user_id_taken(grantee):
+        # 400, not 404: the route itself exists — the request named a person
+        # with no vault here. A 404 would read as if the endpoint were gone.
+        raise HTTPException(
+            status_code=400,
+            detail="No account named that in this vault")
+    try:
+        grant = audit.grant_access(user_id, grantee, body.targetType.strip(),
+                                   body.targetId.strip(), permission)
+    except audit.ShareLimitError as e:
+        raise _conflict(e)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    audit.log_access(
+        user_id, user_id, body.targetType, body.targetId,
+        action="share.grant.added", permission=permission, shared=True,
+        detail={"grant_id": grant["id"], "grantee": grantee,
+                "parent_client_id": parent_client_id},
+    )
+    return {"grant": grant}
+
+
+@web_app.put("/api/share/grants/{grant_id}", response_class=JSONResponse)
+async def api_share_update_grant(grant_id: str, request: Request,
+                                 body: ShareGrantUpdateRequest):
+    """Change a grant's permission. Owner-only and scoped exactly like a
+    revoke — an UPDATE whose WHERE carries the owner is what makes the check
+    atomic rather than a read-then-decide race."""
+    user_id = _require_user(request)
+    _require_sharing_enabled()
+    permission = _permission_of(body.permission)
+    # Read the row the caller is asking about FIRST and scope the lookup by
+    # owner; updating a revoked row is refused rather than resurrected,
+    # because a PUT on a row the owner saw as revoked would silently
+    # re-grant access.
+    db_row = None
+    for row in audit.list_grants_owned_by(user_id):
+        if row["id"] == grant_id and row["status"] == "active":
+            db_row = row
+            break
+    if db_row is None:
+        raise HTTPException(status_code=404, detail="No such share grant")
+    try:
+        # One atomic upsert: the permission is the only thing that changes.
+        audit.grant_access(db_row["owner_user_id"], db_row["grantee_user_id"],
+                           db_row["target_type"], db_row["target_id"],
+                           permission, via_link_id=db_row.get("via_link_id"))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    audit.log_access(
+        user_id, db_row["owner_user_id"], db_row["target_type"],
+        db_row["target_id"], action="share.grant.permission",
+        permission=permission, shared=True,
+        detail={"grant_id": grant_id, "grantee": db_row["grantee_user_id"]},
+    )
+    return {"ok": True}
+
+
+@web_app.delete("/api/share/grants/{grant_id}", response_class=JSONResponse)
+async def api_share_revoke_grant(grant_id: str, request: Request):
+    """Revoke one grant. One 404 answer for unknown / not-yours /
+    already-revoked, the same enumeration-safety rule everywhere here."""
+    user_id = _require_user(request)
+    _require_sharing_enabled()
+    if not audit.revoke_grant(grant_id, user_id):
+        raise HTTPException(status_code=404, detail="No such share grant")
+    audit.log_access(user_id, user_id, None, None, action="share.grant.revoked",
+                     shared=True, detail={"grant_id": str(grant_id)})
+    return {"ok": True}
+
+
+@web_app.get("/api/share/grants", response_class=JSONResponse)
+async def api_share_list_grants(request: Request,
+                                targetType: Optional[str] = None,
+                                targetId: Optional[str] = None):
+    """Recipients of the caller's owned targets, for the owner management
+    UI. Filtered by target when given, all targets otherwise."""
+    user_id = _require_user(request)
+    _require_sharing_enabled()
+    try:
+        if targetType:
+            _share_target_owner(user_id, targetType, targetId)
+            rows = audit.list_grants_for_target(user_id, targetType, targetId or "")
+        else:
+            rows = audit.list_grants_owned_by(user_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"grants": rows}
+
+
+@web_app.get("/api/share/mine", response_class=JSONResponse)
+async def api_share_mine(request: Request):
+    """Targets shared WITH the current user — their half of the sharing view."""
+    user_id = _require_user(request)
+    _require_sharing_enabled()
+    return {"grants": sharing.accessible_grants(user_id),
+            "owners": sharing.shared_owners(user_id)}
+
+
+@web_app.get("/share/{token}", response_class=HTMLResponse)
+async def share_landing(request: Request, token: str):
+    """The page a share link opens.
+
+    One HTML, two shapes: anonymous visitors get the sign-in prompt and
+    NOTHING else — the handler resolves no token and builds no accept URL,
+    so the page is byte-identical whether the token is real, which is what
+    P2.5 pins. Signed-in visitors get an Accept button that POSTs the token
+    to /api/share/accept, where the access decision is made by the same
+    code path the other accept routes use.
+    """
+    token = str(token or "")
+    _require_sharing_enabled()
+    user = _user(request)
+    signed_in = bool(user) and user != "anonymous"
+    accept_url = None
+    if signed_in:
+        # The token reaches the page only via the accept URL — the
+        # anonymous branch receives nothing to echo it back with.
+        accept_url = f"{(_base_url() or '')}/api/share/accept/{token}"
+    html = _render("share", BASE_URL=mem.BASE_URL or "/",
+                   SIGNED_IN=signed_in, ACCEPT_URL=accept_url)
+    return HTMLResponse(content=html)
 
 
 @web_app.get("/api/events")
