@@ -37,7 +37,9 @@ import types
 import typing
 import unittest
 
+import ast
 import audit
+import builtins
 import sharing
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -66,6 +68,94 @@ def _segment(source, name):
     if m:
         return source[start:start + len(marker) + m.start()]
     return source[start:]
+
+
+def _bound_in(func_node):
+    """Every name this function can name: assignments, parameters, builtins.
+
+    Builtins are in scope or the lint flags `list(owner_ids or [user_id])` for
+    calling `list`, which is the same class of self-inflicted failure as
+    `assertNotIn` over a selector that does not exist.
+    """
+    names = set(dir(builtins))
+    for node in ast.walk(func_node):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            names.add(node.id)
+        elif isinstance(node, ast.arg):
+            names.add(node.arg)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                names.add(alias.asname or alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                names.add(alias.asname or alias.name)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            names.update(node.names)
+    return names
+
+
+def _param_value_names(func_node, param):
+    """Names *read* in the value of every `param=` argument in this function.
+
+    The keyword's own name is the store-side parameter (`ownerIds`), which is
+    arbitrary and is never a Python variable — so it is the value that has to
+    be resolved, and it is usually a compound expression (`owner_ids or
+    [user_id]`). Collecting only bare `ast.Name` values would miss exactly the
+    shape that shipped the 500.
+    """
+    reads = set()
+    found = False
+    for node in ast.walk(func_node):
+        if not isinstance(node, ast.Call):
+            continue
+        for kw in node.keywords:
+            if kw.arg != param:
+                continue
+            found = True
+            reads.update(read.id for read in ast.walk(kw.value)
+                         if isinstance(read, ast.Name) and isinstance(read.ctx, ast.Load))
+    return found, reads
+
+
+def _func_node(source, name):
+    """The parsed top-level function, or fail loudly."""
+    tree = ast.parse(source)
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            return node
+    raise AssertionError(f"{name} not found")
+
+
+def _assert_widening(case, source, func_name, param, expected_read):
+    """The call passes `param`, and everything it reads is bound in the function.
+
+    This replaces the needle `"ownerIds=owner_ids or [user_id]"`, which was
+    present — and green — while `owner_ids` was never assigned, making every
+    call to the main list endpoint a NameError. The substring pinned the
+    *spelling*; this pins the two properties that actually matter (the
+    parameter is passed at all, and its value resolves) and derives both.
+    """
+    node = _func_node(source, func_name)
+    passed, reads = _param_value_names(node, param)
+    case.assertTrue(
+        passed,
+        f"{func_name}() never passes {param!r} to any call — the query is "
+        f"not widened to other owners' records",
+    )
+    case.assertTrue(
+        reads & expected_read,
+        f"{func_name}() passes {param}={reads or '{}'} — expected the value to "
+        f"read {sorted(expected_read)}",
+    )
+    bound = _bound_in(node)
+    unbound = reads - bound
+    case.assertFalse(
+        unbound,
+        f"{func_name}() passes {param} built from {sorted(unbound)}, which "
+        f"nothing in the function assigns — NameError on every call",
+    )
 
 
 def _lift(source, name, **namespace):
@@ -515,12 +605,13 @@ class ReadPathCallSiteTests(unittest.TestCase):
         self._assert(
             seg,
             "sharing.accessible_owner_scope(user_id)",
-            "owner_ids=owner_ids",              # vector call site
             "WHERE f.userId IN $ownerIds",      # exact-match query
             "sharing.record_visible(",
             '"ownerUserId"',
         )
         self._refute(seg, "{userId: $userId}")
+        _assert_widening(self, self.fact, "db_search_memories",
+                         "owner_ids", {"owner_ids"})
 
     def test__single_vector_search_carries_the_widening(self):
         seg = self._fact_seg("_single_vector_search")
@@ -528,7 +619,9 @@ class ReadPathCallSiteTests(unittest.TestCase):
 
     def test__db_relevant_scope_widens_the_record_match(self):
         seg = self._fact_seg("_db_relevant_scope")
-        self._assert(seg, "n.userId IN $ownerIds", "ownerIds=list(owner_ids or [user_id])")
+        self._assert(seg, "n.userId IN $ownerIds")
+        _assert_widening(self, self.fact, "_db_relevant_scope",
+                         "ownerIds", {"owner_ids"})
 
     def test_db_list_memories_widens_and_scopes_links_to_the_records_vault(self):
         seg = self._fact_seg("db_list_memories")
@@ -538,9 +631,10 @@ class ReadPathCallSiteTests(unittest.TestCase):
             "other.userId = f.userId",          # links belong to the record's vault
             "sharing.record_visible(owner",
             '"ownerUserId"',
-            "ownerIds=owner_ids or [user_id]",
         )
         self._refute(seg, "{userId: $userId}")
+        _assert_widening(self, self.fact, "db_list_memories",
+                         "ownerIds", {"owner_ids"})
 
     def test_db_get_fact_by_id_hides_uncovered_ids_as_unknown(self):
         seg = self._fact_seg("db_get_fact_by_id")
@@ -597,8 +691,9 @@ class ReadPathCallSiteTests(unittest.TestCase):
             "WHERE d.userId IN $ownerIds",
             "sharing.record_visible(",
             '"ownerUserId"',
-            "ownerIds=owner_ids or [user_id]",
         )
+        _assert_widening(self, self.diary, "db_list_diary_entries",
+                         "ownerIds", {"owner_ids"})
 
     def test_db_list_diary_widens_without_touching_the_row_shape(self):
         seg = self._diary_seg("db_list_diary")

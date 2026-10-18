@@ -13,6 +13,7 @@ This catches that class of error. It is not a substitute for running the query.
 
 import ast
 import asyncio
+import builtins
 import os
 import re
 import sys
@@ -1773,6 +1774,162 @@ class ScopeIsRankedNotFilteredTests(unittest.TestCase):
             msg=f"expected exactly one batched RELEVANT_TO read, found {len(queries)}",
         )
         return queries[0]
+
+
+# ---------------------------------------------------------------------------
+# A query parameter is a name, and a name can be unbound.
+# ---------------------------------------------------------------------------
+#
+# `db_list_memories` widened its match to every owner the caller can read and
+# passed `ownerIds=owner_ids or [user_id]` — but only ever bound `owners`, not
+# `owner_ids`. The call site was *textually* correct, the parameter name was
+# right, and the guard that pinned it (`assertIn("ownerIds=owner_ids or
+# [user_id]")`) went green: it asserted a token, not the property. The result
+# was a NameError on every single call, i.e. a 500 on the main list endpoint.
+#
+# This lint derives the binding instead. For every `.run(...)` it collects the
+# names *read* in each keyword's value expression and resolves them against the
+# lexical scopes in play, so a missing assignment is a failure rather than a
+# substring that happens to be present.
+#
+# Two details earn their keep, because both made an earlier draft of this
+# silently useless:
+#
+#   * The keyword's NAME is the Cypher parameter (`ownerIds=`), which is
+#     arbitrary and never a Python variable. It is the keyword's VALUE that has
+#     to resolve — and the value is usually a compound expression
+#     (`owner_ids or [user_id]`), so only collecting bare `ast.Name` values
+#     walks straight past the bug.
+#   * Bindings must not be collected with a bare `ast.walk` over the module or
+#     the function. `ast.walk` descends into nested function bodies, so an
+#     assignment anywhere in the file becomes a module global and the lint
+#     reports nothing at all while appearing to run.
+
+
+def _shallow_walk(node):
+    """Walk `node` without descending into a nested function/class body.
+
+    A binding inside a def belongs to that def's scope, not to the one that
+    encloses it textually.
+    """
+    out = [node]
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            out.append(child)  # the def itself binds its own name
+        else:
+            out.extend(_shallow_walk(child))
+    return out
+
+
+def _bound_names(node, descend):
+    """Names bound by `node`; `descend=False` stops at nested scopes."""
+    names = set()
+    for n in (ast.walk(node) if descend else _shallow_walk(node)):
+        if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
+            names.add(n.id)
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(n.name)
+        elif isinstance(n, ast.arg):
+            names.add(n.arg)
+        elif isinstance(n, ast.Import):
+            for a in n.names:
+                names.add(a.asname or a.name.split(".")[0])
+        elif isinstance(n, ast.ImportFrom):
+            for a in n.names:
+                names.add(a.asname or a.name)
+        elif isinstance(n, (ast.Global, ast.Nonlocal)):
+            names.update(n.names)
+    return names
+
+
+def _function_scopes(tree):
+    """function node -> list of enclosing functions, outermost first."""
+    out = {}
+
+    def walk(node, stack):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                out[child] = list(stack)
+                walk(child, stack + [child])
+            else:
+                walk(child, stack)
+
+    walk(tree, [])
+    return out
+
+
+def _unbound_query_params(path):
+    """(lineno, function, names) per ``.run(...)`` — `names` are unresolved.
+
+    Yields one entry per query call *including the well-formed ones*, because
+    a linter that can only yield on failure cannot distinguish "clean" from
+    "never ran". An empty `names` is the pass case.
+    """
+    with open(path, "r", encoding="utf-8") as handle:
+        source = handle.read()
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:  # pragma: no cover - py_compile is the gate for this
+        return
+    module_names = _bound_names(tree, descend=False)
+    for func, stack in _function_scopes(tree).items():
+        visible = set(module_names) | set(dir(builtins))
+        for ancestor in reversed(stack + [func]):
+            visible |= _bound_names(ancestor, descend=True)
+        for node in ast.walk(func):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "run"):
+                continue
+            unbound = sorted({
+                read.id
+                for kw in node.keywords
+                for read in ast.walk(kw.value)
+                if (isinstance(read, ast.Name) and isinstance(read.ctx, ast.Load)
+                    and read.id not in visible)
+            })
+            yield node.lineno, func.name, unbound
+
+
+class QueryParameterBindingTests(unittest.TestCase):
+    """A query parameter that names a variable nothing ever assigned.
+
+    This is the `MATCH (n {id: $ids})` lesson one level up. That guard exists
+    because `assertIn("$ids", query)` passes on the broken query: the
+    parameter was present, and it was in the wrong place. Here the parameter is
+    present and spelled right, and the *name it refers to* does not exist --
+    which no amount of substring matching over the source can see, because the
+    substring and the runtime NameError are about different things.
+    """
+
+    def test_no_query_call_passes_a_name_the_enclosing_function_never_binds(self):
+        checked = 0
+        for path in _python_sources():
+            for lineno, func, unbound in _unbound_query_params(path):
+                checked += 1
+                for name in unbound:
+                    with self.subTest(file=os.path.basename(path), function=func, name=name):
+                        self.fail(
+                            f"{os.path.basename(path)}:{lineno} — {func}() passes "
+                            f"`{name}` to a query, but nothing in it (or in an "
+                            f"enclosing scope) ever assigns that name. This raises "
+                            f"NameError at call time, not import time."
+                        )
+        self.assertGreater(checked, 0, "the lint found no query calls at all; it is not running")
+
+    def test_the_lint_reads_the_whole_module_rather_than_one_function(self):
+        """A resolver that stops at the first def reports nothing.
+
+        `ast.walk(tree)` over the module body descends into every function, so
+        a name assigned in one function satisfies the check in another. Pinned
+        because that is the failure mode that makes the lint above look like it
+        is running while being structurally incapable of failing.
+        """
+        scoped = _bound_names(ast.parse("def a():\n    x = 1\n\ndef b():\n    pass\n"),
+                              descend=False)
+        self.assertNotIn(
+            "x", scoped,
+            "module-level bindings leaked a name assigned inside a function",
+        )
 
 
 if __name__ == "__main__":
