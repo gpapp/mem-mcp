@@ -980,5 +980,147 @@ class SharingAffordanceGatingTests(unittest.TestCase):
                                               f"that the button still exists behind the gate")
 
 
+class ShareDialogContentsTests(unittest.TestCase):
+    """The dialog has to render its four sections, and nothing may hide them.
+
+    A report that the share dialog "only shows Close" is not diagnosable from
+    the markup: the four sections are present in the source, the stylesheet
+    defines every custom property they use, and the page renders. The failure
+    is always a *rendering* one, so every guard written against the source text
+    passes while the dialog is empty on screen.
+
+    That is why these tests derive the property rather than pinning a token.
+    ``assertIn('class="share-section"', src)`` would be true for a section
+    carrying ``hidden``, for a section buried outside ``.share-modal-body``,
+    and for a section the stylesheet sets to ``display: none`` -- three
+    different ways to ship exactly the reported symptom, all green.
+
+    The stylesheet half matters as much as the markup half, because the one
+    rule that would cause this is a plausible-looking "collapse the dialog
+    until opened" edit, and it is the kind of line that reads as intentional.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = _read("mem-mcp/templates/dashboard.html")
+
+    def _rendered(self):
+        import jinja2
+        env = jinja2.Environment()
+        return env.from_string(self.src).render(
+            SHARING_ENABLED=True, IS_ADMIN=False, BASE_URL="",
+            MERGE_MAX_CLUSTER=12, SESSION_MAX_AGE_DAYS=30)
+
+    @staticmethod
+    def _css():
+        return "\n".join(re.findall(r"<style[^>]*>(.*?)</style>", _read(
+            "mem-mcp/templates/dashboard.html"), re.S))
+
+    @staticmethod
+    def _rules_naming(css, selector_fragment):
+        """Every declaration block whose selector mentions ``selector_fragment``.
+
+        Deliberately not a real CSS parser. It only has to see the rules that
+        could hide an element, and a regex over the whole stylesheet finds
+        those whether they sit at the top level or inside a media block -- which
+        is where a mobile override would put one, and a media-scoped hide is
+        the variant that only reproduces on a phone.
+        """
+        out = []
+        for match in re.finditer(r"([^{}]*)\{([^{}]*)\}", css):
+            selector, body = match.group(1), match.group(2)
+            if selector_fragment in selector:
+                out.append((selector.strip(), body.strip()))
+        return out
+
+    def test_every_section_reaches_the_rendered_page(self):
+        rendered = self._rendered()
+        found = rendered.count('class="share-section"')
+        self.assertEqual(
+            4, found,
+            msg=f"expected the dialog's four sections in the rendered page, "
+                f"found {found}. The dialog cannot be repaired when only the "
+                f"title and Close button arrive.")
+
+    def test_every_control_the_dialog_needs_reaches_the_rendered_page(self):
+        rendered = self._rendered()
+        for element_id in ("share-title", "share-perm", "share-days",
+                           "share-uses", "share-create-btn", "share-result",
+                           "share-add-user", "share-add-perm", "share-add-btn",
+                           "share-grants-list", "share-links-list", "share-status"):
+            self.assertTrue(
+                f'id="{element_id}"' in rendered,
+                msg=f"#{element_id} is not in the rendered page — the dialog "
+                    f"cannot create a link, list recipients or report status")
+
+    def test_the_sections_are_inside_the_scrollable_body(self):
+        """A section outside ``.share-modal-body`` renders but out of the panel.
+
+        The body is the only element with ``overflow-y: auto``, and it is a
+        flex child, so a section that lands beside it rather than inside it is
+        laid out in the wrong box entirely. Ordering is compared by index: a
+        substring test cannot tell "inside the body" from "after the footer",
+        and slicing to a closing ``</div>`` cannot either -- the first one after
+        an opening tag belongs to the element *inside* it, so it silently
+        measures the wrong region. Indices do not have that problem.
+        """
+        src = self.src
+        overlay = src.find('<div id="share-overlay"')
+        body = src.find('<div class="share-modal-body">')
+        foot = src.find('<div class="share-modal-foot">')
+        for name, index in (("overlay", overlay), ("body", body), ("foot", foot)):
+            self.assertTrue(index != -1, msg=f"the dialog has no .{name} container")
+        self.assertTrue(
+            overlay < body < foot,
+            msg="the dialog's head/body/footer must nest in that order — a "
+                "footer before the body puts Close above the content")
+
+        sections = [m.start() for m in re.finditer(r'class="share-section"', src)]
+        self.assertEqual(4, len(sections), msg="expected four sections in the source")
+        for index in sections:
+            self.assertTrue(
+                body < index < foot,
+                msg="a .share-section sits outside .share-modal-body, so it is "
+                    "laid out outside the scrolling panel")
+
+    def test_nothing_in_the_markup_hides_a_section(self):
+        """No section may carry ``hidden`` or an inline ``display: none``.
+
+        Both render as an empty dialog with a working Close button, and both
+        are invisible to a plain ``assertIn('class="share-section"', src)``.
+        """
+        for match in re.finditer(r"<[^>]*share-section[^>]*>", self.src):
+            tag = match.group(0)
+            # assertIsNone/IsNotNone rather than assertFalse(re.search(...)):
+            # a Match object is falsy, so assertFalse would interpolate the
+            # Match into the failure message ahead of the reason that matters.
+            self.assertIsNone(
+                re.search(r"\bhidden\b", tag),
+                msg=f"a .share-section element is marked hidden: {tag}")
+            self.assertIsNone(
+                re.search(r"display\s*:\s*none", tag),
+                msg=f"a .share-section element is hidden inline: {tag}")
+
+    def test_the_stylesheet_never_hides_a_section(self):
+        """The one plausible cause, checked against the actual declarations.
+
+        This is the rule the browser reported and the repository has never
+        contained. Pinning the absence here is what makes that report
+        actionable rather than a contradiction: if a future edit adds it, this
+        fails and names the selector instead of leaving the next person to
+        argue with a screenshot.
+        """
+        hidden = re.compile(r"display\s*:\s*(none|hidden)\b")
+        for fragment, subject in ((".share-section", "a dialog section"),
+                                  (".share-modal-body", "the dialog body"),
+                                  (".share-modal", "the dialog itself")):
+            for selector, body in self._rules_naming(self._css(), fragment):
+                self.assertFalse(
+                    bool(hidden.search(body)),
+                    msg=f"{selector} hides {subject}: {{{body}}} — every rule in "
+                        f"that selector is visible on the same screen, so check "
+                        f"for an !important added elsewhere in this stylesheet")
+
+
 if __name__ == "__main__":
     unittest.main()
