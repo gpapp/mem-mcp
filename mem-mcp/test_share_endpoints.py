@@ -33,6 +33,7 @@ import os
 import re
 import shutil
 import ast as pyast
+import subprocess
 import sys
 import tempfile
 import time
@@ -1273,6 +1274,290 @@ class ShareDialogClosePathTests(unittest.TestCase):
             any("share-overlay" in l for l in kept),
             msg="a comment line was counted as code, so the counts above "
                 "include prose and cannot fail on the real defect")
+
+
+_NODE_HARNESS = r"""
+// A fake DOM just rich enough for the dashboard's render functions.
+// Everything absorbs: the point is to read the HTML they produce, so a
+// listener that does nothing is correct and a listener that ran would be
+// noise.
+function _fakeEl(id) {
+  return {
+    id: id, innerHTML: '', textContent: '', value: '', hidden: false,
+    style: {}, dataset: {}, children: [],
+    classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } },
+    focus() {}, blur() {}, click() {}, remove() {}, appendChild() {},
+    setAttribute() {}, getAttribute() { return null; },
+    querySelector() { return null; }, querySelectorAll() { return []; },
+    addEventListener() {}, removeEventListener() {},
+    scrollTop: 0, scrollHeight: 0, offsetHeight: 0, clientHeight: 0,
+    insertAdjacentHTML() {}, closest() { return null; }, contains() { return false; },
+  };
+}
+const _els = new Map();
+function _getEl(id) { if (!_els.has(id)) _els.set(id, _fakeEl(id)); return _els.get(id); }
+global.document = {
+  getElementById: _getEl, querySelector: () => null, querySelectorAll: () => [],
+  createElement: (t) => _fakeEl('new-' + t),
+  addEventListener() {}, removeEventListener() {},
+  body: _fakeEl('body'), documentElement: _fakeEl('html'), cookie: '',
+};
+global.window = global;
+global.window.location = { origin: 'http://x', href: 'http://x/', pathname: '/' };
+global.window.addEventListener = () => {};
+global.window.matchMedia = () => ({ matches: false, addEventListener() {} });
+global.localStorage = { getItem: () => null, setItem() {}, removeItem() {} };
+global.navigator = { userAgent: 'node', clipboard: { writeText: async () => {} } };
+global.fetch = async () => ({ ok: false, status: 404, json: async () => ({}), text: async () => '' });
+global.marked = { parse: (s) => s, use() {}, setOptions() {} };
+global.vis = { Network: function () {}, DataSet: function () { return { add() {}, get() { return null; }, clear() {} }; } };
+global.mermaid = { initialize() {} };
+
+__APP_JS__
+
+const out = {};
+(async () => {
+__CASES__
+  // An async case resolves to a promise; await them all before printing.
+  for (const k of Object.keys(out)) {
+    if (out[k] && typeof out[k].then === 'function') out[k] = await out[k];
+  }
+  process.stdout.write(JSON.stringify(out));
+})().catch((e) => { process.stdout.write(JSON.stringify({ fatal: String(e && e.message || e) })); });
+"""
+
+
+class ReadOnlyGatingTests(unittest.TestCase):
+    """A read-only grant must hide the controls it cannot honour.
+
+    Every one of these handlers already answers 403 when the record belongs to
+    another owner who shared it read-only, so the buttons "work" in the sense
+    that nothing is corrupted -- they just cost a click, a toast and the
+    impression that the vault is broken. Hiding them is the same principle as a
+    disabled route answering 404 rather than 403: do not offer an action the
+    caller cannot perform.
+
+    These tests *execute* the render functions rather than reading their
+    source, because the property is what comes out, not what is written. A
+    source guard is satisfied by a gated button whose onclick still names the
+    handler, by a handler hidden behind a style the CSS later overrides, and by
+    a fragment that is built and then discarded -- three ways to ship the
+    original report with a green suite. Driving the functions through a fake
+    DOM and reading the HTML they produce has none of those blind spots.
+    """
+
+    # Every one of these is a write. `clearFactPane`, `selectFact`,
+    # `selectDiaryEntry` and `switchTab` are deliberately absent: closing a
+    # pane and navigating are reads, and a grantee must still be able to look
+    # at the record they were given.
+    MUTATING = (
+        "saveFactEdit", "saveDiaryEdit", "saveDiaryLink", "savePaneLink",
+        "deleteLink", "showLinkEdit", "deleteDiaryLinkFromFact",
+        "deleteDiaryLink", "_factPickClient", "_factPickProject",
+        "_factRemoveRelevant", "_factAddRelevant", "_showFactMenu",
+        "togglePaneLinkForm", "toggleDiaryLinkForm",
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        cls.node = shutil.which("node")
+        if not cls.node:
+            raise unittest.SkipTest("node is not installed; the JS is not executable here")
+
+    def _render(self, cases):
+        """Run ``cases`` in node and return the captured HTML.
+
+        Each case is (name, js-expression). The harness loads the dashboard's
+        own inline script into a fake DOM and evaluates each expression with
+        the render functions in scope, so what is asserted is the output of the
+        shipping code rather than a copy of it.
+        """
+        source = _read("mem-mcp/templates/dashboard.html")
+        blocks = re.findall(r"<script[^>]*>(.*?)</script>", source, re.S)
+        # The first two are the external vis-network fetches, which carry no
+        # inline body. Selecting by position rather than by a src= filter keeps
+        # the harness honest about what it is loading -- a filter that excludes
+        # an element also excludes the evidence of what it contained.
+        app_js = "\n".join(blocks[2:])
+        payload = "".join(
+            f"  try {{ out[{name!r}] = ({expr}); }} "
+            f"catch (e) {{ out[{name!r}] = 'THREW: ' + e.message; }}\n"
+            for name, expr in cases
+        )
+        harness = _NODE_HARNESS.replace("__APP_JS__", app_js).replace("__CASES__", payload)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "render.js")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(harness)
+            proc = subprocess.run([self.node, path], capture_output=True, text=True, timeout=120)
+        if proc.returncode != 0:
+            self.fail(f"the dashboard script did not load under the fake DOM: "
+                      f"{proc.stderr.strip()[:400]}")
+        return json.loads(proc.stdout)
+
+    def _owned_fact(self):
+        return ("{ id: 'f1', name: 'A fact', text: 'body text', category: 'People', "
+                "clientId: null, contextId: null, clientName: '', contextName: '', "
+                "relevantClients: [], links: [], metadata: {} }")
+
+    def _shared_fact(self):
+        return ("{ id: 'f1', readOnly: true, name: 'A fact', text: 'body text', "
+                "category: 'People', clientId: null, contextId: null, clientName: '', "
+                "contextName: '', relevantClients: [{ id: 'c1', name: 'ACME', kind: 'client' }], "
+                "links: [{ target_id: 'f2', target_label: 'Fact', rel: 'KNOWS', "
+                "target_name: 'Bob', direction: 'out' }, "
+                "{ target_id: 'd1', target_label: 'DiaryEntry', rel: 'MENTIONS', "
+                "target_name: 'Note', direction: 'in' }], metadata: {} }")
+
+    def test_a_read_only_record_offers_no_mutating_control(self):
+        """The reported bug, asserted on the output of both render paths."""
+        out = self._render([
+            ("factPane", f"renderFactPane({self._shared_fact()}, false), "
+                         f"document.getElementById('fact-pane').innerHTML"),
+            ("linkSection", f"renderLinkSection({self._shared_fact()})"),
+        ])
+        for name, html in out.items():
+            self.assertNotIn("THREW", html, msg=f"{name} could not be rendered")
+            for handler in self.MUTATING:
+                self.assertFalse(
+                    handler + "(" in html,
+                    msg=f"a read-only record still renders a control calling "
+                        f"{handler}() in {name} -- it is refused with a 403, so "
+                        f"offering it costs the user a click to learn nothing")
+
+    def test_an_owned_record_still_offers_every_mutating_control(self):
+        """The other half, and the reason this is not just a blanket removal.
+
+        Over-gating is the failure mode of a fix written by deleting buttons:
+        the owner loses their own editor and the vault becomes read-only for
+        everybody. Presence is asserted before the negative above, so a guard
+        that removes everything passes.
+        """
+        out = self._render([
+            ("view", f"renderFactPane({self._owned_fact()}, false), "
+                     f"document.getElementById('fact-pane').innerHTML"),
+            ("edit", f"renderFactPane({self._owned_fact()}, true), "
+                     f"document.getElementById('fact-pane').innerHTML"),
+        ])
+        # The save button lives in the edit branch and the scope and menu
+        # controls in the view branch, so both have to be driven: asserting
+        # only one passes while the other is over-gated.
+        for handler, where in (("saveFactEdit", "edit"), ("_factPickClient", "view"),
+                               ("_factPickProject", "view"), ("_factAddRelevant", "view"),
+                               ("_showFactMenu", "view"), ("togglePaneLinkForm", "view")):
+            self.assertTrue(
+                handler + "(" in out[where],
+                msg=f"an owned record no longer offers {handler}() in {where} mode "
+                    f"-- the read-only gate has removed a control the owner needs")
+
+    def _owned_entry(self):
+        return ("[{ id: 'e1', readOnly: false, name: 'An entry', content: 'the body', "
+                "timestamp: '2026-01-01T10:00', clientName: 'ACME', contextName: '', "
+                "mentions: [{ id: 'f2', rel: 'KNOWS', target_name: 'Bob', "
+                "target_label: 'Fact' }] }]")
+
+    def _diary(self, read_only):
+        entry = ("{ id: 'e1', readOnly: %s, name: 'An entry', content: 'the body', "
+                 "timestamp: '2026-01-01T10:00', clientName: 'ACME', contextName: '', "
+                 "mentions: [{ id: 'f2', rel: 'KNOWS', target_name: 'Bob', "
+                 "target_label: 'Fact' }] }" % ("true" if read_only else "false"))
+        return ("(async () => { diaryEntries = [" + entry + "]; "
+                "await renderDiaryEditMode('e1'); "
+                "return document.getElementById('diary-view-content').innerHTML; })()")
+
+    def test_an_owned_diary_entry_still_offers_save_and_link(self):
+        """The diary half of the over-gating guard.
+
+        Without this the diary editor is only ever asserted read-only, so
+        removing its Save button for *everybody* passes -- the exact failure a
+        fix written by deleting buttons produces. Verified by re-injection:
+        flipping the diary gate to a constant true leaves every other test in
+        this class green.
+        """
+        out = self._render([("diary", self._diary(False))])
+        html = out["diary"]
+        self.assertNotIn("THREW", html, msg="the owned diary entry could not be rendered")
+        for handler in ("saveDiaryEdit", "toggleDiaryLinkForm", "deleteDiaryLink"):
+            self.assertTrue(
+                handler + "(" in html,
+                msg=f"an owned diary entry no longer offers {handler}() -- the "
+                    f"read-only gate has removed a control the owner needs")
+
+    def test_the_diary_editor_hides_save_and_link_controls(self):
+        """The third render path, driven the same way.
+
+        The diary editor is the widest surface: five inputs, the mentions
+        badges, the link picker and the save button. A source guard on the
+        button alone passes while the inputs stay editable.
+        """
+        out = self._render([
+            ("diary", self._diary(True)),
+        ])
+        html = out["diary"]
+        if "THREW" in html:
+            self.skipTest(f"the diary editor could not be driven headless: {html[:200]}")
+        for handler in self.MUTATING:
+            self.assertFalse(
+                handler + "(" in html,
+                msg=f"a read-only diary entry still renders a control calling "
+                    f"{handler}() -- it is refused with a 403")
+        # Cancel stays: leaving an editor is not a mutation, and trapping a
+        # grantee in a pane they cannot save is worse than the 403 was.
+        self.assertTrue("selectDiaryEntry('e1')" in html,
+                        msg="Cancel is gone, so a grantee cannot leave the editor")
+
+    def test_the_link_picker_offers_both_kinds(self):
+        """Linking a diary entry to a fact must offer facts.
+
+        This is the picker that could not complete the link it exists to
+        create: it returned memories only, with no kind to tell them apart, so
+        the two directions of the same feature disagreed about what could be
+        linked. Both arrays, both kinds, same helpers as the fact pane.
+        """
+        out = self._render([
+            ("kinds", "(memories = [{ id: 'f1', name: 'A fact', text: 'body', "
+                      "category: 'People' }], "
+                      "diaryEntries = [{ id: 'e1', name: 'An entry', content: 'the body', "
+                      "date: '2026-01-01', timestamp: '2026-01-01T10:00', mentions: [] }, "
+                      "{ id: 'e2', name: 'Another entry', content: 'more body', "
+                      "date: '2026-01-02', timestamp: '2026-01-02T10:00', mentions: [] }], "
+                      "dlinkCandidates('e1', '').map(c => c.kind).sort().join(','))"),
+            ("titles", "(memories = [{ id: 'f1', name: 'A fact', text: 'body', "
+                       "category: 'People' }], "
+                       "diaryEntries = [{ id: 'e1', name: 'An entry', content: 'the body', "
+                       "date: '2026-01-01', timestamp: '2026-01-01T10:00', mentions: [] }, "
+                       "{ id: 'e2', name: 'Another entry', content: 'more body', "
+                       "date: '2026-01-02', timestamp: '2026-01-02T10:00', mentions: [] }], "
+                       "dlinkCandidates('e1', '').map(c => _paneLinkTitle(c)).join('|'))"),
+        ])
+        self.assertEqual("diary,fact", out["kinds"],
+                         msg="the diary picker does not offer both kinds, so one "
+                             "direction of the link cannot be completed")
+        self.assertIn("A fact", out["titles"],
+                      msg="a fact is offered by the diary picker but its title is "
+                          "not rendered, so the user cannot tell what it is")
+
+    def test_the_link_picker_still_excludes_what_is_already_linked(self):
+        """Widening must not turn the picker into a duplicate-edge factory.
+
+        A second edge of the same type is a duplicate, and the old
+        implementation excluded linked records for a reason. The widening is a
+        superset of that behaviour, not a replacement for it.
+        """
+        out = self._render([
+            ("ids", "(memories = [{ id: 'f1', name: 'A fact', text: 'body', category: 'People' }, "
+                    "{ id: 'f2', name: 'Another', text: 'text', category: 'People' }], "
+                    "diaryEntries = [{ id: 'e1', name: 'An entry', content: 'the body', "
+                    "date: '2026-01-01', timestamp: '2026-01-01T10:00', "
+                    "mentions: [{ id: 'f1' }] }, "
+                    "{ id: 'e2', name: 'Another entry', content: 'more body', "
+                    "date: '2026-01-02', timestamp: '2026-01-02T10:00', mentions: [] }], "
+                    "dlinkCandidates('e1', '').map(c => c.rec.id).join(','))"),
+        ])
+        self.assertNotIn("f1,", out["ids"],
+                         msg="a record already linked to this entry is still offered")
+        self.assertIn("f2", out["ids"],
+                      msg="an unlinked fact was dropped by the widening")
 
 
 if __name__ == "__main__":
