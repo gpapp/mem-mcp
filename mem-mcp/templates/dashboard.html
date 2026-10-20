@@ -6277,9 +6277,23 @@ let contextMenu = null;
     _shareTarget = null;
   }
 
+  // Escape closes the dialog only when the keypress came from inside it.
+  //
+  // This listener sits on `document` at module scope, which makes it live for
+  // every keydown in the application -- so the share dialog was the one thing a
+  // stray Escape could dismiss from any focused control anywhere on the page,
+  // and it was the only non-explicit close path the dialog had. A dialog that
+  // vanishes is indistinguishable, to the person using it, from a crash.
+  //
+  // The target check is what does the work; the listener cannot simply move
+  // onto the overlay instead, because this script block is parsed before the
+  // overlay's markup and a module-scope getElementById would resolve to null.
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && !document.getElementById('share-overlay').hidden)
-      closeShareDialog();
+    if (e.key !== 'Escape') return;
+    const ov = document.getElementById('share-overlay');
+    if (!ov || ov.hidden) return;
+    if (!ov.contains(e.target)) return;
+    closeShareDialog();
   });
 
   async function createShareLink() {

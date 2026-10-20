@@ -87,6 +87,35 @@ def _describe(attrs: str) -> str:
     return f"<script src={src.group(1)[:40]}...>" if src else "<script> (inline)"
 
 
+# The JavaScript counterpart of the docstring trap AGENTS.md warns about for
+# Python: a guard that greps a source file is satisfied by the word appearing
+# in the comment that explains why it must not be used. This feature has been
+# bitten by exactly that twice -- once for Cypher, once for the share dialog --
+# so anything counted in JS is counted only on lines that are code.
+#
+# This is deliberately a line filter and not a lexer. A single left-to-right
+# scanner was tried first and abandoned: it has to know what a JS regex literal
+# is, because a `'` inside a character class (`str.replace(/['"]/g, '')`) is not
+# a string delimiter, and one unhandled regex opens a "string" that runs to the
+# next apostrophe in the file and silently swallows everything between. Getting
+# that right is a project of its own, and a half-right lexer is worse than a
+# simple rule because it looks authoritative.
+#
+# The filter therefore drops whole-line comments and leaves trailing ones. That
+# is a known limit, stated rather than hidden: a comment that mentions
+# `.hidden = true` on a line of real code will trip the count below. That is a
+# loud, cheap failure a human resolves in seconds, which is the right trade
+# against a scanner that can go quietly blind.
+def _code_lines(js: str) -> list:
+    out = []
+    for line in js.split("\n"):
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("//", "*", "/*")):
+            continue
+        out.append(line)
+    return out
+
+
 def _function_source(node_name: str, source=_GUI_SOURCE) -> str:
     tree = pyast.parse(source)
     for node in tree.body:
@@ -1120,6 +1149,130 @@ class ShareDialogContentsTests(unittest.TestCase):
                     msg=f"{selector} hides {subject}: {{{body}}} — every rule in "
                         f"that selector is visible on the same screen, so check "
                         f"for an !important added elsewhere in this stylesheet")
+
+
+class ShareDialogClosePathTests(unittest.TestCase):
+    """The dialog may be closed from exactly one place in the application.
+
+    The reported symptom was a dialog that "shows up fine then suddenly
+    disappears". That is only diagnosable if the set of things that close it is
+    small and known, so these tests derive the set from the executable
+    JavaScript instead of trusting that nobody adds a fourth path.
+
+    The invariant is deliberately narrow: exactly one line of code hides the
+    overlay, and it is inside ``closeShareDialog``. Anything that closes the
+    dialog any other way -- an inline ``onclick``, a blur handler, a timer, a
+    "close all modals" sweep -- has to go through that function to be visible
+    here, and a second direct assignment fails the count.
+
+    The counts are taken over ``_code_lines``, so a comment naming the
+    construct cannot satisfy them. See the note on that helper for why it is a
+    line filter rather than a lexer.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.js = _executable_js(_read("mem-mcp/templates/dashboard.html"))
+        cls.lines = _code_lines(cls.js)
+
+    def _hiding_lines(self):
+        return [l for l in self.lines
+                if "share-overlay" in l and re.search(r"\.hidden\s*=\s*true", l)]
+
+    def test_exactly_one_line_hides_the_overlay(self):
+        hiding = self._hiding_lines()
+        self.assertEqual(
+            1, len(hiding),
+            msg=f"expected exactly one line of code hiding #share-overlay, "
+                f"found {len(hiding)}: {hiding}. Each additional one is an "
+                f"undocumented way for the dialog to vanish -- which is the "
+                f"reported symptom, and it is not diagnosable from a UI that "
+                f"has several.")
+
+    def test_that_line_is_inside_closeShareDialog(self):
+        """One hiding line is not enough on its own.
+
+        The two ways to get there are a named function everybody calls and a
+        single stray line in a random handler. Only the first is reviewable, so
+        the location is pinned too.
+        """
+        hiding = self._hiding_lines()
+        self.assertEqual(1, len(hiding), msg=f"expected one hiding line, got {hiding}")
+        body = "\n".join(self.lines)
+        start = body.find("function closeShareDialog")
+        self.assertTrue(start != -1,
+                        msg="closeShareDialog is not defined in the executable "
+                            "script -- nothing can close the dialog")
+        end = body.find("\n  function ", start + 10)
+        scope = body[start:end if end != -1 else len(body)]
+        self.assertTrue(
+            hiding[0] in scope,
+            msg="the line that hides #share-overlay is not inside "
+                "closeShareDialog(), so the dialog can be closed from code "
+                "that does not look like a close handler")
+
+    def test_nothing_closes_the_dialog_automatically(self):
+        """No timer, blur or sweep may close it.
+
+        An explicit click is a close; anything else is a close the user did not
+        ask for. Matched by name so the failure points at the construct that
+        was added.
+        """
+        code = "\n".join(self.lines)
+        for construct, why in (
+            # Bounded by `;` rather than by `)`, because the callback's own
+            # closing parenthesis comes after the call it makes: in
+            # `setTimeout(() => closeShareDialog(), 1000)` a `[^)]*` stops at the
+            # arrow function's `)` and never reaches closeShareDialog, which is
+            # how a timer guard passes on a timer that closes the dialog.
+            (r"setTimeout\s*\([^;]{0,240}?closeShareDialog", "a timer closes the dialog"),
+            (r"setInterval\s*\([^;]{0,240}?closeShareDialog", "an interval closes the dialog"),
+            (r"addEventListener\s*\(\s*['\"]blur['\"]", "a blur handler can close it"),
+            (r"closeAll\w*\s*\(", "a close-all sweep would take the dialog with it"),
+        ):
+            found = re.search(construct, code)
+            self.assertIsNone(
+                found,
+                msg=f"{why}: {code[found.start():found.start() + 80] if found else ''}")
+
+    def test_escape_only_closes_a_dialog_the_keypress_came_from_inside(self):
+        """The one automatic close path must not be global.
+
+        The Escape listener has to stay on ``document``: this script block is
+        parsed before the overlay's markup, so moving the listener onto the
+        overlay would resolve to null at module scope. The target check is what
+        scopes it instead, and it has to survive -- without it the share dialog
+        is the one element a stray Escape can dismiss from any focused control
+        anywhere in the application.
+        """
+        code = "\n".join(self.lines)
+        listener = re.search(r"addEventListener\s*\(\s*['\"]keydown['\"]", code)
+        self.assertTrue(listener,
+                        msg="no keydown listener -- the dialog cannot be "
+                            "dismissed with Escape at all")
+        window = code[listener.start():listener.start() + 400]
+        self.assertTrue(
+            "share-overlay" in window and ".contains(" in window,
+            msg="the keydown listener does not check the event came from inside "
+                "#share-overlay, so an Escape anywhere in the app closes it")
+
+    def test_the_helper_ignores_prose(self):
+        """The self-check that keeps the four tests above honest.
+
+        A comment line naming the construct must not count, or the counts
+        above are measuring documentation rather than behaviour. Feeds the
+        helper the exact text it forbids on a comment line and requires it to
+        disappear.
+        """
+        decoy = ("  // document.getElementById('share-overlay').hidden = true;\n"
+                 "  * closeShareDialog() hides the overlay from here\n"
+                 "  const real = 1;\n")
+        kept = _code_lines(decoy)
+        self.assertEqual(1, len(kept), msg=f"comment lines survived: {kept}")
+        self.assertFalse(
+            any("share-overlay" in l for l in kept),
+            msg="a comment line was counted as code, so the counts above "
+                "include prose and cannot fail on the real defect")
 
 
 if __name__ == "__main__":
