@@ -77,6 +77,9 @@ def _lift(name, **overrides):
                      accessible_owner_scope=lambda uid: None,
                      readable_owner_ids=lambda uid: None,
                      record_visible=lambda *a, **k: True,
+                     # Sharing off: nothing is read-only, so a lifted read path
+                     # emits no readOnly key and the pre-sharing row shape holds.
+                     record_read_only=lambda *a, **k: False,
                  )}
     namespace.update(overrides)
     exec(segment, namespace)  # noqa: S102 - executing our own source

@@ -1242,6 +1242,9 @@ def db_list_diary_entries(user_id: str, from_ts: Optional[str] = None, to_ts: Op
                 "context": r.get("contextName") or None,
                 "ownerUserId": owner if owner != user_id else None,
             })
+            if sharing.record_read_only(user_id, owner, r.get("clientId"),
+                                        r.get("contextId"), owners):
+                entries[-1]["readOnly"] = True
         return entries
 
 
@@ -1346,6 +1349,12 @@ def db_list_diary(user_id: str) -> list:
                     for el in (r.get("entryLinks") or []) if el.get("id")
                 ],
             })
+            # Same contract as fact_manager: the key exists only on a read-only
+            # grant, so an unshared vault and a write grant both keep their
+            # original row shape and the edit controls stay.
+            if sharing.record_read_only(user_id, owner, r.get("clientId"),
+                                        r.get("contextId"), owners):
+                entries[-1]["readOnly"] = True
         return entries
 
 

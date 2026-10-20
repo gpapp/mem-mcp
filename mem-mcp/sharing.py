@@ -179,6 +179,54 @@ def record_visible(owner_user_id: str, client_id, context_id, owners: dict) -> b
     return False
 
 
+def record_permission(owner_user_id: str, client_id, context_id, owners: dict):
+    """'write' | 'read' | None — the caller's permission on ONE record.
+
+    ``owners`` is the map from ``accessible_owner_scope``. None means the
+    record is not visible through any grant, which is the same answer
+    ``record_visible`` gives; the two are deliberately built from the same
+    structure so a caller that already filtered can ask what it filtered for
+    without a second trip to SQLite.
+
+    A record carrying both a granted client and a granted context takes the
+    weaker of the two. Downgrading is the safe direction: a read grant on the
+    client and a write grant on the project means the caller may edit records
+    filed under that project, and this record is filed under that client too.
+    """
+    entry = owners.get(owner_user_id) if owners else None
+    if not entry:
+        return None
+    found = []
+    if client_id and client_id in entry["clients"]:
+        found.append(entry["clients"][client_id])
+    if context_id and context_id in entry["contexts"]:
+        found.append(entry["contexts"][context_id])
+    if not found:
+        return None
+    return "write" if "write" in found else "read"
+
+
+def record_read_only(user_id: str, owner_user_id, client_id, context_id,
+                     owners: dict) -> bool:
+    """True when the caller may SEE this record but must not CHANGE it.
+
+    The UI half of the sharing feature. The read paths widen to include other
+    owners' records, and those records were being rendered by exactly the same
+    code as the caller's own — so a grantee holding a read-only grant was
+    offered Edit, Delete and link controls that answer 403. Offering an action
+    that cannot succeed is worse than hiding it: the person cannot tell a
+    permissions problem from a broken button, and a read-only share is the
+    first thing anyone tries.
+
+    Own records are never read-only. ``None`` owner means the record is the
+    caller's own (the read paths emit ``None`` rather than the caller's id for
+    their own rows, so the JSON does not grow on an unshared vault).
+    """
+    if not owner_user_id or owner_user_id == user_id:
+        return False
+    return record_permission(owner_user_id, client_id, context_id, owners) == "read"
+
+
 def accessible_owner_scope(user_id: str, now=None) -> dict | None:
     """The widened scope map for read paths, or ``None`` for the fast path.
 

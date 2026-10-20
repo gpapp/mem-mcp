@@ -1562,6 +1562,12 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
                 "ownerUserId": owner if owner != user_id else None,
                 "metadata": r.payload.get("metadata", {})
             }
+            # Only ever set on a read-only grant: an unshared vault and the
+            # caller's own records must not grow a key, and a write grant must
+            # not either, because the key is what hides the edit controls.
+            if sharing.record_read_only(user_id, owner, r.payload.get("clientId"),
+                                        r.payload.get("contextId"), owners):
+                result_entry["readOnly"] = True
 
             # Keep the best version of each result
             if record_id not in all_vector_results or weighted_score > all_vector_results[record_id]["score"]:
@@ -1838,6 +1844,8 @@ def db_list_memories(user_id: str) -> list:
                 "links":     links
             })
             memories[-1]["ownerUserId"] = owner if owner != user_id else None
+            if sharing.record_read_only(user_id, owner, r["clientId"], r["contextId"], owners):
+                memories[-1]["readOnly"] = True
         return memories
 
 

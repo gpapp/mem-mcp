@@ -3334,6 +3334,48 @@ npm install @modelcontextprotocol/sdk</code></pre>
       fillEpProjects(m.clientId, m.contextId);
       renderMetaEditor(m);
     } else {
+      // A record another owner shared with this user. Every mutation below is
+      // refused by the server with a 403, so on a read-only share these
+      // controls can only ever produce an error toast — and read-only is the
+      // first thing anyone tries, so "the buttons are broken" is the report it
+      // earns. The client cards already gate on `shared`; these gate on
+      // `readOnly`, which the widened read paths stamp on the record itself.
+      //
+      // The gated pieces are built as plain single-quoted strings BEFORE the
+      // template below, so every interpolation in it is a bare variable name.
+      // Nesting a template literal inside a ${} is legal JS, but it made this
+      // block unreadable and one unbalanced backtick in it takes down the
+      // entire dashboard script — which is exactly what happened the first
+      // time this was written.
+      const ro = !!m.readOnly;
+      const q = (s) => "'" + String(s).replace(/'/g, "\\'") + "'";
+      const cross = (clientListCache.find(c => c.id === m.clientId) || {}).crossClient ? ' [cross]' : '';
+      const chip = (cls, title, handler, label) => ro
+        ? '<span class="scope-chip ' + cls + '">' + label + '</span>'
+        : '<button class="scope-chip ' + cls + '" onclick="' + handler + '(this,' + q(m.id) + ')" title="' + title + '">' + label + '</button>';
+      const relevant = (m.relevantClients || [])
+        .filter(rc => rc.id !== m.clientId && rc.id !== m.contextId)
+        .map(rc => '<span class="scope-chip scope-chip--relevant">' + (rc.kind === 'context' ? '📁 ' : '') + escHtml(rc.name)
+          + (ro ? '' : '<button class="scope-chip-remove" onclick="_factRemoveRelevant(' + q(m.id) + ',' + q(rc.id) + ')" title="Remove">×</button>')
+          + '</span>').join('');
+      const addRelevant = ro ? '' : '<button class="scope-chip scope-chip--add" onclick="_factAddRelevant(this,' + q(m.id) + ')" title="Add related client or project">＋</button>';
+      const actionsMenu = ro ? '' : '<button class="item-menu-btn" title="Actions" onclick="_showFactMenu(this)">☰</button>';
+      const linkActions = ro ? '' : '<div class="fact-detail-actions"><button class="btn btn-ghost btn-sm" onclick="togglePaneLinkForm(' + q(m.id) + ')">🔗 Link</button></div>';
+      const linkForm = ro ? '' : '<div id="pane-link-form-' + m.id + '" style="display:none; flex-direction:column; gap:.5rem; padding:.75rem; background:var(--bg); border-radius:6px; border:1px solid var(--border);">'
+        + '<div style="font-size:.8rem; font-weight:600; color:var(--muted);">Link to a memory or diary entry</div>'
+        + '<input type="search" id="pane-link-q-' + m.id + '" placeholder="Search memories &amp; diary…" autocomplete="off"'
+        + ' oninput="paneLinkSearch(' + q(m.id) + ')" onkeydown="paneLinkKeys(' + q(m.id) + ', event)">'
+        + '<div id="pane-link-results-' + m.id + '" class="pane-link-results"></div>'
+        + '<div id="pane-link-chosen-' + m.id + '" class="pane-link-chosen" style="display:none;">'
+        + '<span id="pane-link-chosen-name-' + m.id + '" style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"></span>'
+        + '<button class="btn btn-ghost btn-sm" onclick="paneLinkClear(' + q(m.id) + ')">Change</button>'
+        + '</div>'
+        + '<input id="pane-link-rel-' + m.id + '" placeholder="Relationship type (e.g. KNOWS)">'
+        + '<div id="pane-link-relnote-' + m.id + '" class="result-snippet" style="display:none;">📓 Diary entries are linked with <code>MENTIONS</code> — the entry points at this fact, so no relationship type is needed.</div>'
+        + '<div style="display:flex; gap:.5rem; justify-content:flex-end;">'
+        + '<button class="btn btn-ghost btn-sm" onclick="document.getElementById(' + q('pane-link-form-' + m.id) + ').style.display=\'none\'">Cancel</button>'
+        + '<button class="btn btn-primary btn-sm" onclick="savePaneLink(' + q(m.id) + ')">Link</button>'
+        + '</div></div>';
       pane.innerHTML = `
         <div>
           <div class="fact-detail-header">
@@ -3341,43 +3383,26 @@ npm install @modelcontextprotocol/sdk</code></pre>
               <div class="fact-detail-name">${escHtml(m.name || 'Unnamed')}</div>
               <span class="fact-detail-cat">${escHtml(m.category)}</span>
               <div class="fact-detail-scope diary-scope-row" style="display:flex; flex-wrap:wrap; gap:.4rem; margin-top:.35rem; align-items:center;">
-                <button class="scope-chip scope-chip--client" onclick="_factPickClient(this,'${m.id}')" title="Click to change client">🏢 ${m.clientName ? escHtml(m.clientName) + ((clientListCache.find(c=>c.id===m.clientId)||{}).crossClient ? ' [cross]' : '') : '—'}</button>
-                <button class="scope-chip scope-chip--project" onclick="_factPickProject(this,'${m.id}')" title="Click to change project">📁 ${m.contextName ? escHtml(m.contextName) : '—'}</button>
-                ${(m.relevantClients || []).filter(rc => rc.id !== m.clientId && rc.id !== m.contextId).map(rc => `<span class="scope-chip scope-chip--relevant">${rc.kind === 'context' ? '📁 ' : ''}${escHtml(rc.name)}<button class="scope-chip-remove" onclick="_factRemoveRelevant('${m.id}','${rc.id}')" title="Remove">×</button></span>`).join('')}
-                <button class="scope-chip scope-chip--add" onclick="_factAddRelevant(this,'${m.id}')" title="Add related client or project">＋</button>
+                ${chip('scope-chip--client', 'Click to change client', '_factPickClient', '🏢 ' + (m.clientName ? escHtml(m.clientName) + cross : '—'))}
+                ${chip('scope-chip--project', 'Click to change project', '_factPickProject', '📁 ' + (m.contextName ? escHtml(m.contextName) : '—'))}
+                ${relevant}
+                ${addRelevant}
               </div>
             </div>
             <div style="display:flex; gap:.25rem; align-items:center; flex-shrink:0;">
-              <button class="item-menu-btn" title="Actions" onclick="_showFactMenu(this)">☰</button>
+              ${actionsMenu}
               <button class="btn btn-ghost btn-sm" onclick="clearFactPane()" style="flex-shrink:0;" name="Close">✕</button>
             </div>
           </div>
           <div class="fact-detail-body markdown-body" style="margin:.75rem 0;">${marked.parse(m.text)}</div>
           ${tags.length ? `<div class="memory-meta" style="margin-bottom:.75rem;">${tags.map(t => `<span class="tag-badge">#${escHtml(t)}</span>`).join('')}</div>` : ''}
           <div id="fact-detail-meta" style="margin-bottom:.75rem;"></div>
-          <div class="fact-detail-actions">
-            <button class="btn btn-ghost btn-sm" onclick="togglePaneLinkForm('${m.id}')">🔗 Link</button>
-          </div>
+          ${linkActions}
         </div>
         <div id="ep-link-section">
           ${renderLinkSection(m)}
         </div>
-        <div id="pane-link-form-${m.id}" style="display:none; flex-direction:column; gap:.5rem; padding:.75rem; background:var(--bg); border-radius:6px; border:1px solid var(--border);">
-          <div style="font-size:.8rem; font-weight:600; color:var(--muted);">Link to a memory or diary entry</div>
-          <input type="search" id="pane-link-q-${m.id}" placeholder="Search memories &amp; diary…" autocomplete="off"
-                 oninput="paneLinkSearch('${m.id}')" onkeydown="paneLinkKeys('${m.id}', event)">
-          <div id="pane-link-results-${m.id}" class="pane-link-results"></div>
-          <div id="pane-link-chosen-${m.id}" class="pane-link-chosen" style="display:none;">
-            <span id="pane-link-chosen-name-${m.id}" style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"></span>
-            <button class="btn btn-ghost btn-sm" onclick="paneLinkClear('${m.id}')">Change</button>
-          </div>
-          <input id="pane-link-rel-${m.id}" placeholder="Relationship type (e.g. KNOWS)">
-          <div id="pane-link-relnote-${m.id}" class="result-snippet" style="display:none;">📓 Diary entries are linked with <code>MENTIONS</code> — the entry points at this fact, so no relationship type is needed.</div>
-          <div style="display:flex; gap:.5rem; justify-content:flex-end;">
-            <button class="btn btn-ghost btn-sm" onclick="document.getElementById('pane-link-form-${m.id}').style.display='none'">Cancel</button>
-            <button class="btn btn-primary btn-sm" onclick="savePaneLink('${m.id}')">Link</button>
-          </div>
-        </div>`;
+        ${linkForm}`;
       renderMetaDisplay(m);
     }
   }
@@ -3459,6 +3484,12 @@ npm install @modelcontextprotocol/sdk</code></pre>
   function renderLinkSection(m) {
     if (!m.links || !m.links.length) return '';
     const isFact = (l) => l.target_label === 'Fact' || !l.target_label;
+    // A link between two records is a write, whichever end of it you are
+    // looking at: editing the relationship type, or deleting it, is refused
+    // with a 403 when this record belongs to another owner who shared it
+    // read-only. So the buttons go rather than stay and fail. Client cards
+    // gate on `shared`; records carry `readOnly` from the widened read paths.
+    const ro = !!m.readOnly;
     return `<div style="margin-top:.5rem;">
       <div style="font-size:.75rem; font-weight:700; text-transform:uppercase; color:var(--muted); letter-spacing:.5px; margin-bottom:.4rem;">Links</div>
       <div>
@@ -3470,11 +3501,13 @@ npm install @modelcontextprotocol/sdk</code></pre>
           const label = isIncoming
             ? `${icon} ${displayName} ← ${displayRel}`
             : `${icon} ${displayRel} → ${displayName}`;
+          // Plain strings, not nested template literals -- see renderFactPane.
+          const q = (s) => "'" + String(s).replace(/'/g, "\\'") + "'";
 
           if (!isFact(l)) {
             return `<span class="link-badge" id="link-badge-${m.id}-${l.target_id}">
               <span class="link-content" style="cursor:pointer;" onclick="switchTab('diary');selectDiaryEntry('${l.target_id}')">${label}</span>
-              <button class="link-action-btn" onclick="deleteDiaryLinkFromFact('${l.target_id}', '${m.id}')" name="Delete">🗑️</button>
+              ${ro ? '' : '<button class="link-action-btn" onclick="deleteDiaryLinkFromFact(' + q(l.target_id) + ', ' + q(m.id) + ')" name="Delete">🗑️</button>'}
             </span>`;
           }
 
@@ -3482,8 +3515,8 @@ npm install @modelcontextprotocol/sdk</code></pre>
           const apiTarget = isIncoming ? m.id : l.target_id;
           return `<span class="link-badge" id="link-badge-${m.id}-${l.target_id}">
             <span class="link-content" onclick="selectFact('${l.target_id}')" style="cursor:pointer;">${label}</span>
-            <button class="link-action-btn" onclick="showLinkEdit('${m.id}','${l.target_id}','${displayRel}','${displayName}','${apiSource}','${apiTarget}')" name="Edit">✏️</button>
-            <button class="link-action-btn" onclick="deleteLink('${apiSource}','${apiTarget}','${l.rel}')" name="Delete">🗑️</button>
+            ${ro ? '' : '<button class="link-action-btn" onclick="showLinkEdit(' + q(m.id) + ',' + q(l.target_id) + ',' + q(displayRel) + ',' + q(displayName) + ',' + q(apiSource) + ',' + q(apiTarget) + ')" name="Edit">✏️</button>'
+              + '<button class="link-action-btn" onclick="deleteLink(' + q(apiSource) + ',' + q(apiTarget) + ',' + q(l.rel) + ')" name="Delete">🗑️</button>'}
           </span>`;
         }).join('')}
       </div>
@@ -4690,7 +4723,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
           <button class="btn btn-ghost btn-sm" onclick="toggleDiaryLinkForm('${entry.id}')">🔗 Link to fact</button>
         </div>
         <div id="dlink-form-${entry.id}" style="display:none; margin-top:.5rem; padding:.5rem; background:var(--bg); border-radius:6px; border:1px solid var(--border);">
-          <input type="search" id="dlink-q-${entry.id}" placeholder="Search memories…" autocomplete="off"
+          <input type="search" id="dlink-q-${entry.id}" placeholder="Search memories and diary entries…" autocomplete="off"
                  style="width:100%; padding:.3rem .5rem; border:1px solid var(--border); border-radius:4px; font-size:.8rem; margin-bottom:.3rem;"
                  oninput="dlinkSearch('${entry.id}')" onkeydown="dlinkKeys('${entry.id}', event)">
           <div id="dlink-results-${entry.id}" class="pane-link-results"></div>
@@ -4928,39 +4961,61 @@ npm install @modelcontextprotocol/sdk</code></pre>
     const viewEl = document.getElementById('diary-view-content');
     viewEl.classList.remove('empty');
 
+    // A read-only grant hides every control that would 403. The server already
+    // refuses these; offering them costs a click and an error toast to learn
+    // what the badge in the footer already says.
+    const dro = !!entry.readOnly;
+    const roAttr = dro ? ' disabled' : '';
+
     const mentions = (entry.mentions || []).map(m =>
       `<span class="link-badge" id="dlink-badge-${entry.id}-${m.id}">
         <span class="link-content" onclick="jumpToMemory('${m.id}')" style="cursor:pointer;">👤 ${escHtml(m.name || (m.text||'').substring(0,30))}</span>
-        <button class="link-action-btn" onclick="deleteDiaryLink('${entry.id}', '${m.id}', true)" name="Delete">🗑️</button>
+        ${dro ? '' : `<button class="link-action-btn" onclick="deleteDiaryLink('${entry.id}', '${m.id}', true)" name="Delete">🗑️</button>`}
       </span>`
     ).join('');
+
+    const dlinkBlock = dro ? '' :
+      '<div id="dlink-form-' + entry.id + '" style="display:none; margin-top:.5rem; padding:.5rem; background:var(--bg); border-radius:6px; border:1px solid var(--border);">' +
+        '<input type="search" id="dlink-q-' + entry.id + '" placeholder="Search memories and facts…" autocomplete="off" ' +
+               'style="width:100%; padding:.3rem .5rem; border:1px solid var(--border); border-radius:4px; font-size:.8rem; margin-bottom:.3rem;" ' +
+               'oninput="dlinkSearch(\'' + entry.id + '\')" onkeydown="dlinkKeys(\'' + entry.id + '\', event)">' +
+        '<div id="dlink-results-' + entry.id + '" class="pane-link-results"></div>' +
+        '<div id="dlink-chosen-' + entry.id + '" class="pane-link-chosen" style="display:none; margin-bottom:.3rem;">' +
+          '<span id="dlink-chosen-name-' + entry.id + '" style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:.8rem;"></span>' +
+          '<button class="btn btn-ghost btn-sm" onclick="dlinkClear(\'' + entry.id + '\')">Change</button>' +
+        '</div>' +
+        '<div style="display:flex; gap:.3rem;">' +
+          '<button class="btn btn-primary btn-sm" onclick="saveDiaryLink(\'' + entry.id + '\')">Link</button>' +
+          '<button class="btn btn-ghost btn-sm" onclick="toggleDiaryLinkForm(\'' + entry.id + '\')">Cancel</button>' +
+        '</div>' +
+      '</div>';
 
     viewEl.innerHTML = `
       <div style="border-bottom: 2px solid var(--primary-light); padding-bottom: .75rem; margin-bottom:1rem;">
         <div style="font-size:.75rem;font-weight:700;text-transform:uppercase;color:var(--muted);letter-spacing:.5px;margin-bottom:.5rem;">✏️ Editing Entry</div>
         <div style="margin-bottom:.5rem;">
           <label style="font-size:.75rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;display:block;margin-bottom:.2rem;">Title</label>
-          <input id="de-name" value="${escHtml(entry.name || '')}" style="width:100%;padding:.4rem .5rem;border:1px solid var(--border);border-radius:6px;font-size:.85rem;">
+          <input id="de-name" value="${escHtml(entry.name || '')}"${roAttr} style="width:100%;padding:.4rem .5rem;border:1px solid var(--border);border-radius:6px;font-size:.85rem;">
         </div>
         <div style="margin-bottom:.5rem;">
           <label style="font-size:.75rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;display:block;margin-bottom:.2rem;">Date & Time</label>
-          <input type="datetime-local" id="de-timestamp" value="${entry.timestamp || ''}" style="width:100%;padding:.4rem .5rem;border:1px solid var(--border);border-radius:6px;font-size:.85rem;">
+          <input type="datetime-local" id="de-timestamp" value="${entry.timestamp || ''}"${roAttr} style="width:100%;padding:.4rem .5rem;border:1px solid var(--border);border-radius:6px;font-size:.85rem;">
         </div>
         <div style="margin-bottom:.5rem;">
           <label style="font-size:.75rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;display:block;margin-bottom:.2rem;">Content</label>
-          <textarea id="de-content" style="width:100%;min-height:200px;padding:.4rem .5rem;border:1px solid var(--border);border-radius:6px;font-size:.85rem;font-family:inherit;">${escHtml(entry.content || '')}</textarea>
+          <textarea id="de-content"${roAttr} style="width:100%;min-height:200px;padding:.4rem .5rem;border:1px solid var(--border);border-radius:6px;font-size:.85rem;font-family:inherit;">${escHtml(entry.content || '')}</textarea>
         </div>
         <div style="margin-bottom:.5rem;display:flex;gap:.75rem;flex-wrap:wrap;">
           <div style="flex:1;min-width:120px;">
             <label for="de-client" style="font-size:.75rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;display:block;margin-bottom:.2rem;">Client</label>
-            <select id="de-client" onchange="onDeClientChange()" style="width:100%;padding:.35rem .5rem;border:1px solid var(--border);border-radius:6px;font-size:.85rem;">
+            <select id="de-client"${roAttr} onchange="onDeClientChange()" style="width:100%;padding:.35rem .5rem;border:1px solid var(--border);border-radius:6px;font-size:.85rem;">
               <option value="">— No client —</option>
               ${(clientListCache||[]).map(c=>`<option value="${c.id}"${c.id===(entry.clientId||'')?'  selected':''}>${escHtml(c.name)}${c.crossClient?' [cross]':''}</option>`).join('')}
             </select>
           </div>
           <div style="flex:1;min-width:120px;">
             <label for="de-project" style="font-size:.75rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;display:block;margin-bottom:.2rem;">Project</label>
-            <select id="de-project" style="width:100%;padding:.35rem .5rem;border:1px solid var(--border);border-radius:6px;font-size:.85rem;"></select>
+            <select id="de-project"${roAttr} style="width:100%;padding:.35rem .5rem;border:1px solid var(--border);border-radius:6px;font-size:.85rem;"></select>
           </div>
         </div>
         <div id="de-meta-section"></div>
@@ -4969,27 +5024,15 @@ npm install @modelcontextprotocol/sdk</code></pre>
         <div style="font-size:.75rem;font-weight:700;text-transform:uppercase;color:var(--muted);letter-spacing:.5px;margin-bottom:.4rem;">Linked Facts</div>
         ${mentions || '<span style="font-size:.85rem;color:var(--muted);">No linked facts.</span>'}
         <div style="margin-top:.5rem; display:flex; gap:.5rem; flex-wrap:wrap;">
-          <button class="btn btn-ghost btn-sm" onclick="toggleDiaryLinkForm('${entry.id}')">🔗 Link to fact</button>
+          ${dro ? '' : `<button class="btn btn-ghost btn-sm" onclick="toggleDiaryLinkForm('${entry.id}')">🔗 Link to fact</button>`}
         </div>
-        <div id="dlink-form-${entry.id}" style="display:none; margin-top:.5rem; padding:.5rem; background:var(--bg); border-radius:6px; border:1px solid var(--border);">
-          <input type="search" id="dlink-q-${entry.id}" placeholder="Search memories…" autocomplete="off"
-                 style="width:100%; padding:.3rem .5rem; border:1px solid var(--border); border-radius:4px; font-size:.8rem; margin-bottom:.3rem;"
-                 oninput="dlinkSearch('${entry.id}')" onkeydown="dlinkKeys('${entry.id}', event)">
-          <div id="dlink-results-${entry.id}" class="pane-link-results"></div>
-          <div id="dlink-chosen-${entry.id}" class="pane-link-chosen" style="display:none; margin-bottom:.3rem;">
-            <span id="dlink-chosen-name-${entry.id}" style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:.8rem;"></span>
-            <button class="btn btn-ghost btn-sm" onclick="dlinkClear('${entry.id}')">Change</button>
-          </div>
-          <div style="display:flex; gap:.3rem;">
-            <button class="btn btn-primary btn-sm" onclick="saveDiaryLink('${entry.id}')">Link</button>
-            <button class="btn btn-ghost btn-sm" onclick="toggleDiaryLinkForm('${entry.id}')">Cancel</button>
-          </div>
-        </div>
+        ${dlinkBlock}
       </div>
       <div style="display:flex; gap:.5rem; justify-content:flex-end; margin-top:1rem; padding-top:.75rem; border-top:1px solid var(--border);">
         ${entry.ownerUserId ? `<span style="font-size:.8rem;color:var(--muted);align-self:center;">🔗 shared by ${escHtml(entry.ownerUserId)}</span>` : ''}
+        ${dro ? `<span style="font-size:.8rem;color:var(--muted);align-self:center;">🔒 read-only</span>` : ''}
         <button class="btn btn-ghost" onclick="selectDiaryEntry('${entry.id}')">Cancel</button>
-        <button class="btn btn-primary" onclick="saveDiaryEdit('${entry.id}', this)">💾 Save</button>
+        ${dro ? '' : `<button class="btn btn-primary" onclick="saveDiaryEdit('${entry.id}', this)">💾 Save</button>`}
       </div>`;
     renderDiaryMetaEditor(entry);
     fillDeProjects(entry.clientId, entry.contextId);
@@ -5140,6 +5183,12 @@ npm install @modelcontextprotocol/sdk</code></pre>
     return _dLink[entryId];
   }
 
+  // Linking a diary entry to a fact must offer facts, and the fact pane's
+  // picker must offer diary entries — the two directions are one feature, and
+  // a picker that only knows about one side is a picker that cannot complete
+  // the link it exists to create. So this mirrors paneLinkCandidates exactly
+  // and reuses its helpers, rather than keeping a second, narrower
+  // implementation of "what can be linked".
   function dlinkCandidates(entryId, q) {
     const needle = (q || '').trim().toLowerCase();
     const entry = diaryEntries.find(e => e.id === entryId);
@@ -5150,11 +5199,16 @@ npm install @modelcontextprotocol/sdk</code></pre>
       const name = (m.name || '').toLowerCase();
       if (needle && !m.text.toLowerCase().includes(needle) && !name.includes(needle)
           && !String(m.category || '').toLowerCase().includes(needle)) continue;
-      out.push(m);
+      out.push({ kind: 'fact', rec: m });
       if (out.length >= 200) break;
     }
-    out.sort((a, b) => ((a.name || a.text || '') + ' ' + (a.name || ''))
-                      .toLowerCase().localeCompare(((b.name || b.text || '') + ' ' + (b.name || '')).toLowerCase()));
+    for (const e of diaryEntries) {
+      if (linked.has(e.id) || e.id === entryId) continue;
+      if (needle && !_paneLinkDiaryHaystack(e).includes(needle)) continue;
+      out.push({ kind: 'diary', rec: e });
+      if (out.length >= 400) break;
+    }
+    out.sort((a, b) => _paneLinkSortKey(a).localeCompare(_paneLinkSortKey(b)));
     return out.slice(0, _DLINK_LIMIT);
   }
 
@@ -5175,24 +5229,28 @@ npm install @modelcontextprotocol/sdk</code></pre>
     if (chosen) {
       chosen.style.display = st.targetId ? 'flex' : 'none';
       if (st.targetId && chosenName) {
-        const t = memories.find(x => x.id === st.targetId);
-        chosenName.textContent = t ? (t.name || (t.text || '').substring(0, 60)) : st.targetId;
+        const t = memories.find(x => x.id === st.targetId)
+          || diaryEntries.find(x => x.id === st.targetId);
+        chosenName.textContent = t ? (t.name || (t.text || t.content || '').substring(0, 60)) : st.targetId;
       }
     }
     if (!box) return;
     if (st.targetId) { box.innerHTML = ''; return; }
     if (!st.results.length) {
       box.innerHTML = st.q.trim()
-        ? '<p class="empty" style="padding:.5rem .6rem; font-size:.8rem;">No matching memories.</p>'
+        ? '<p class="empty" style="padding:.5rem .6rem; font-size:.8rem;">No matching memories or diary entries.</p>'
         : '';
       return;
     }
-    box.innerHTML = st.results.map((m, i) => {
-      const name = m.name || (m.text || '').substring(0, 60);
-      const snippet = m.name ? (m.text || '').replace(/\s+/g, ' ').trim().substring(0, 70) : '';
-      return `<div class="pane-link-result${i === st.active ? ' active' : ''}" onclick="dlinkPick('${entryId}', '${m.id}')">
-        <div>${escHtml(name)}</div>
-        ${snippet ? `<div class="result-snippet">${escHtml(snippet)}…</div>` : ''}
+    box.innerHTML = st.results.map((c, i) => {
+      const title = _paneLinkTitle(c) || c.rec.id;
+      const body = _paneLinkBody(c).replace(/\s+/g, ' ').trim();
+      const kindLine = c.kind === 'diary'
+        ? `📓 Diary${c.rec.date ? ' · ' + c.rec.date : (c.rec.timestamp ? ' · ' + String(c.rec.timestamp).slice(0, 10) : '')}`
+        : `🗂️ Memory${c.rec.category ? ' · ' + c.rec.category : ''}`;
+      return `<div class="pane-link-result${i === st.active ? ' active' : ''}" onclick="dlinkPick('${entryId}', '${c.rec.id}')">
+        <div>${escHtml(title)}</div>
+        ${body ? `<div class="result-snippet">${escHtml(kindLine)} — ${escHtml(body.substring(0, 70))}…</div>` : `<div class="result-snippet">${escHtml(kindLine)}</div>`}
       </div>`;
     }).join('');
   }
@@ -5226,7 +5284,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
       dlinkRender(entryId);
     } else if (ev.key === 'Enter') {
       const pick = st.results[st.active];
-      if (pick) { ev.preventDefault(); dlinkPick(entryId, pick.id); }
+      if (pick) { ev.preventDefault(); dlinkPick(entryId, pick.rec.id); }
     } else if (ev.key === 'Escape') {
       const input = document.getElementById('dlink-q-' + entryId);
       if (input && input.value) { input.value = ''; dlinkSearch(entryId); }

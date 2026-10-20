@@ -1231,20 +1231,28 @@ class DiarySaveWiringTests(unittest.TestCase):
             self.assertIn(call, SOURCE, "%r does not pass the button" % call)
 
 
+# The form is rendered twice: once inside a template literal (view mode) and
+# once built by `+` concatenation (edit mode, because a gated fragment cannot be
+# a template literal nested inside another one -- see the note in
+# renderDiaryEditMode). Both spell the same opening tag, so the marker has to
+# match both. A literal-only marker finds one copy and reports the other as
+# missing, which reads as a regression in code that is correct.
+_FORM_OPEN = re.compile(
+    r'<div id="dlink-form-(?:\$\{entry\.id\}"|\' \+ entry\.id \+ \'")')
+
+
 def _diary_link_forms(source):
-    """The body of each `dlink-form-${entry.id}` block, as rendered."""
-    # Bounded by the form's own Cancel button, not by the next `</div>`: the
-    # form nests two divs, so a closing-tag scan truncates it mid-way and every
-    # assertion below silently reads a body that stops early.
+    """The body of each `dlink-form-${entry.id}` block, as rendered.
+
+    Bounded by the form's own Cancel button, not by the next `</div>`: the
+    form nests two divs, so a closing-tag scan truncates it mid-way and every
+    assertion below silently reads a body that stops early.
+    """
     out = []
-    marker = '<div id="dlink-form-${entry.id}"'
-    tail = 'toggleDiaryLinkForm(\'${entry.id}\')\">Cancel</button>\n'
-    idx = source.find(marker)
-    while idx != -1:
-        end = source.find(tail, idx)
-        end = end + len(tail) if end != -1 else -1
-        out.append(source[idx:end if end != -1 else len(source)])
-        idx = source.find(marker, end if end != -1 else len(source))
+    for match in _FORM_OPEN.finditer(source):
+        end = source.find(">Cancel</button>", match.end())
+        out.append(source[match.start():end + len(">Cancel</button>")
+                          if end != -1 else len(source)])
     return out
 
 
@@ -1306,10 +1314,15 @@ class DiaryLinkPickerTests(unittest.TestCase):
         forms = _diary_link_forms(SOURCE)
         self.assertEqual(len(forms), 2, "the form is rendered twice: view and edit mode")
         for form in forms:
+            # Fold the edit-mode concatenation spelling onto the template one,
+            # so the needles below describe ONE shape instead of two. Without
+            # this every needle containing an id has to be written twice, and
+            # the copy built by concatenation fails all of them.
+            folded = form.replace("' + entry.id + '", "${entry.id}")
             for needle in ('<input type="search"', 'id="dlink-q-${entry.id}"',
                            "dlinkSearch(", "dlinkKeys(", 'class="pane-link-results"',
                            'id="dlink-chosen-${entry.id}"'):
-                self.assertTrue(needle in form,
+                self.assertTrue(needle in folded,
                                 "a dlink-form copy is missing %r" % needle)
             self.assertFalse("list=" in form,
                              "a dlink-form copy still binds to a datalist")

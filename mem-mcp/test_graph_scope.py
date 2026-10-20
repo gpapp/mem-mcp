@@ -841,7 +841,8 @@ class ScopePrioritySearchTests(unittest.TestCase):
             "log_search_stats": lambda **kwargs: None,
             # Phase 3 stub: sharing off → the pre-sharing shape, unchanged sets.
             "sharing": types.SimpleNamespace(accessible_owner_scope=lambda uid: None,
-                                             record_visible=lambda *a, **k: True),
+                                             record_visible=lambda *a, **k: True,
+                                             record_read_only=lambda *a, **k: False),
         }
         fn = _lift_into("db_search_memories", namespace)
         loop = asyncio.new_event_loop()
