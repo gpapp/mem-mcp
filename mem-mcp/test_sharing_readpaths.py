@@ -166,6 +166,150 @@ def _lift(source, name, **namespace):
     return scope[name]
 
 
+# ---------------------------------------------------------------------------
+# Unbound-global lint
+#
+# The read paths above are LIFTED: their helpers are injected into the exec
+# namespace, so a helper the shipping module never imports is satisfied by the
+# test harness and nothing fails. That is exactly how `db_list_diary` shipped
+# calling `_shared_record_visible` with no import of it anywhere in
+# diary_manager.py — every sharing test was green, and `/api/diary` raised
+# NameError on the first request, so the diary tab came back empty.
+#
+# A helper tested in isolation is not a test of its call site, and this is the
+# same lesson in its purest form: the test supplied the binding production
+# lacked. The lint resolves every name a function READS against what the
+# module and the function actually bind, so a missing import fails here rather
+# than in the browser.
+# ---------------------------------------------------------------------------
+
+_DUNDERS = {"__name__", "__file__", "__doc__", "__package__", "__spec__",
+            "__loader__", "__builtins__", "__debug__", "__all__"}
+
+
+def _imported_names(node):
+    out = set()
+    for alias in node.names:
+        out.add((alias.asname or alias.name).split(".")[0])
+    return out
+
+
+def _module_bindings(source):
+    """Every name a module-level statement binds."""
+    names = set(dir(builtins)) | _DUNDERS
+    tree = ast.parse(source)
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                names.update(n.id for n in ast.walk(target)
+                             if isinstance(n, ast.Name))
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            if isinstance(node.target, ast.Name):
+                names.add(node.target.id)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            names |= _imported_names(node)
+        else:
+            # if / try / with / for at module level: take every name it stores
+            # anywhere inside. A superset, which only ever makes the lint
+            # quieter — never a false positive.
+            names.update(n.id for n in ast.walk(node)
+                         if isinstance(n, ast.Name)
+                         and isinstance(n.ctx, (ast.Store, ast.Del)))
+    return names
+
+
+def _function_bindings(func_node):
+    """Every name bound anywhere inside one function, nested defs included."""
+    names = set()
+    for node in ast.walk(func_node):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            names.add(node.id)
+        elif isinstance(node, ast.arg):
+            names.add(node.arg)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            names |= _imported_names(node)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            names.update(node.names)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            names.add(node.name)
+    return names
+
+
+def _unbound_reads(source, func_name):
+    """Names ``func_name`` reads that nothing in scope binds.
+
+    Empty for correct code. A name here is a NameError on the first call —
+    which for a read path means the endpoint 500s and the UI shows nothing,
+    with nothing in the logs to say why.
+    """
+    node = _func_node(source, func_name)
+    bound = _module_bindings(source) | _function_bindings(node)
+    return sorted({n.id for n in ast.walk(node)
+                   if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
+                   and n.id not in bound})
+
+
+class UnboundGlobalTests(unittest.TestCase):
+    """No read path may call a helper its module never imports.
+
+    Table-driven over every function the sharing feature touched, because the
+    defect was not in one function: it was in the two I edited, and the third
+    one I edited next would have had it too.
+    """
+
+    TARGETS = (
+        (FACT_MANAGER, "db_search_memories"),
+        (FACT_MANAGER, "db_list_memories"),
+        (FACT_MANAGER, "db_get_fact_by_id"),
+        (FACT_MANAGER, "db_get_connections_by_type"),
+        (FACT_MANAGER, "db_get_graph"),
+        (FACT_MANAGER, "db_get_neighborhood"),
+        (FACT_MANAGER, "_shared_records_visible"),
+        (FACT_MANAGER, "_shared_records_visible_by_ids"),
+        (FACT_MANAGER, "_record_related_ids"),
+        (FACT_MANAGER, "_record_related_ids_sync"),
+        (FACT_MANAGER, "_shared_record_visible"),
+        (DIARY_MANAGER, "db_search_diary"),
+        (DIARY_MANAGER, "db_list_diary"),
+        (DIARY_MANAGER, "db_list_diary_entries"),
+    )
+
+    def test_every_target_read_path_resolves_every_name_it_calls(self):
+        for path, func in self.TARGETS:
+            with self.subTest(module=os.path.basename(path), func=func):
+                unbound = _unbound_reads(_source(path), func)
+                self.assertEqual(
+                    [], unbound,
+                    msg=f"{func}() reads {unbound}, which nothing in "
+                        f"{os.path.basename(path)} binds — a NameError on the "
+                        f"first call, invisible to every lifted test because "
+                        f"the harness injects the missing name itself")
+
+    def test_the_lint_sees_a_missing_import(self):
+        """The self-check: without it the test above is an assertion about
+        nothing, which is the failure mode this whole file exists to avoid.
+
+        Both diary read paths are checked, because both shipped the defect —
+        the import was added to one and not the other, and the lift-based
+        suites were green on both.
+        """
+        line = ("from fact_manager import _shared_record_visible, "
+                "_record_related_ids_sync\n")
+        broken = _source(DIARY_MANAGER).replace(line, "", 1)
+        self.assertNotIn(broken, "")
+        for func in ("db_list_diary", "db_list_diary_entries"):
+            with self.subTest(func=func):
+                self.assertIn(
+                    "_shared_record_visible", _unbound_reads(broken, func),
+                    msg=f"removing the import does not make {func}() read an "
+                        f"unbound name, so the lint above cannot see the "
+                        f"defect it exists to catch")
+
+
 class _Row(dict):
     """A Neo4j record: key and attribute access, like the real Record."""
 
@@ -739,6 +883,137 @@ class DiaryListAccessTests(ReadPathStoreCase):
         fn, _ = self._runner(rows)
         entries = fn("bob", None, None)
         self.assertEqual([e["id"] for e in entries], ["cx"])
+
+
+class SharedClientListTests(ReadPathStoreCase):
+    """`_shared_client_entries`: where a shared project appears in the list.
+
+    The reported defect was a granted project showing up as a *separate
+    top-level entry* rather than nested under its client. The cause was one
+    line reading `if ctx["id"] not in entries` — which looks like "this
+    context has no parent to nest under" and is always true, because a Context
+    id is never a key of `entries` unless that very line put it there. Every
+    granted project therefore appeared twice.
+
+    `client_manager.py` imports `common`, so the function is lifted and driven
+    against a fake session that dispatches on the query's shape.
+    """
+
+    def _entries(self, owners, *, client_rows=None, context_rows=None,
+                 parent_rows=None):
+        source = _source(os.path.join(HERE, "client_manager.py"))
+        fn = _lift(source, "_shared_client_entries",
+                   _shared_stamp=lambda owner, perm: {"shared": True,
+                                                      "owner": owner,
+                                                      "permission": perm},
+                   _effective_active=lambda node: True,
+                   # The row shape. Lifted separately from the real source
+                   # rather than stubbed, so the keys asserted below are the
+                   # ones the shipping function produces.
+                   _shared_client_node=_lift(source, "_shared_client_node",
+                                             _shared_stamp=lambda owner, perm: {
+                                                 "shared": True,
+                                                 "owner": owner,
+                                                 "permission": perm},
+                                             _effective_active=lambda node: True))
+
+        class _Session:
+            def __init__(self):
+                self.queries = []
+
+            def run(self, query, **params):
+                self.queries.append((query, params))
+                # Order matters: the Pass 2 query ALSO contains
+                # `HAS_CONTEXT]->(ctx)` (it walks up from the context to its
+                # parent), so the specific RETURN has to be tested first or
+                # Pass 2 is answered with Pass 1's rows.
+                if "RETURN ctx, parent.id AS parentId" in query:
+                    return _Result(context_rows or [])
+                if "collect(ctx) as contexts" in query:
+                    return _Result(client_rows or [])
+                if "WHERE c.id IN $parentIds" in query:
+                    return _Result(parent_rows or [])
+                return _Result([])
+
+        session = _Session()
+        return fn(session, owners), session
+
+    def test_a_granted_project_nests_under_its_client_and_nowhere_else(self):
+        owners = {"alice": {"clients": {}, "contexts": {"x1": "read"}}}
+        rows, _ = self._entries(
+            owners,
+            context_rows=[_Row({"ctx": _Row({"id": "x1", "name": "Secret Project",
+                                             "active": True}),
+                                "parentId": "c1", "parentName": "ACME"})],
+            parent_rows=[_Row({"c": _Row({"id": "c1", "name": "ACME"})})],
+        )
+        by_id = {e["id"]: e for e in rows}
+        # The client is a navigation entry carrying the one granted project.
+        self.assertIn("c1", by_id)
+        self.assertEqual([x["id"] for x in by_id["c1"]["contexts"]], ["x1"])
+        self.assertEqual(by_id["c1"]["contexts"][0]["name"], "Secret Project")
+        # And the project is NOT also a top-level row. This is the defect: it
+        # read as "not under the shared project, but a separate entry".
+        self.assertNotIn("x1", by_id,
+                         msg="a granted project appears as its own top-level "
+                             "entry as well as nested under its client")
+        self.assertEqual(len(rows), 1)
+
+    def test_a_granted_project_next_to_a_granted_client_appears_once(self):
+        # Both halves granted: Pass 1 already put every context under the
+        # client, so the context pass must not add a second row for it.
+        owners = {"alice": {"clients": {"c1": "read"}, "contexts": {"x1": "read"}}}
+        rows, _ = self._entries(
+            owners,
+            client_rows=[_Row({"c": _Row({"id": "c1", "name": "ACME"}),
+                               "contexts": [_Row({"id": "x1", "name": "Secret",
+                                                  "active": True}),
+                                            _Row({"id": "x2", "name": "Other",
+                                                  "active": True})]})],
+            context_rows=[_Row({"ctx": _Row({"id": "x1", "name": "Secret",
+                                             "active": True}),
+                                "parentId": "c1", "parentName": "ACME"})],
+        )
+        by_id = {e["id"]: e for e in rows}
+        self.assertEqual([x["id"] for x in by_id["c1"]["contexts"]], ["x1", "x2"])
+        self.assertNotIn("x1", by_id,
+                         msg="a granted project appears as its own top-level "
+                             "entry as well as nested under its client")
+        self.assertEqual(len(rows), 1)
+
+    def test_an_orphaned_project_still_gets_an_entry(self):
+        # A context with no parent has nowhere to nest. Dropping it would make
+        # it unreachable, so it keeps an entry of its own — the one case the
+        # `nested` flag is false for.
+        owners = {"alice": {"clients": {}, "contexts": {"x9": "read"}}}
+        rows, _ = self._entries(
+            owners,
+            context_rows=[_Row({"ctx": _Row({"id": "x9", "name": "Orphan",
+                                             "active": True}),
+                                "parentId": None, "parentName": None})],
+        )
+        by_id = {e["id"]: e for e in rows}
+        self.assertIn("x9", by_id)
+        self.assertEqual(by_id["x9"]["name"], "Orphan")
+        self.assertTrue(by_id["x9"]["shared"])
+
+    def test_a_sibling_project_never_rides_along(self):
+        # The whole point of the three-pass shape: sharing one project must not
+        # share its siblings.
+        owners = {"alice": {"clients": {}, "contexts": {"x1": "read"}}}
+        rows, _ = self._entries(
+            owners,
+            context_rows=[_Row({"ctx": _Row({"id": "x1", "name": "Secret",
+                                             "active": True}),
+                                "parentId": "c1", "parentName": "ACME"})],
+            parent_rows=[_Row({"c": _Row({"id": "c1", "name": "ACME"})})],
+        )
+        by_id = {e["id"]: e for e in rows}
+        self.assertEqual([x["id"] for x in by_id["c1"]["contexts"]], ["x1"])
+        # The parent's own permission stays navigation-only: a context grant
+        # covers the context and its records, never the client node.
+        self.assertEqual(by_id["c1"]["permission"], "read")
+        self.assertEqual(by_id["c1"]["contexts"][0]["permission"], "read")
 
 
 class ReadPathCallSiteTests(unittest.TestCase):

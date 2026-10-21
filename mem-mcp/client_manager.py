@@ -265,16 +265,27 @@ def _shared_client_entries(neo4j_session, owners: dict) -> list:
                 parent_pid = parents.get(ctx["id"], (None,))[0]
                 xentry = {"id": ctx["id"], "name": ctx["name"],
                           "active": ctx.get("active", True), **_shared_stamp(owner, perm)}
+                # The parent's permission stays navigation-only ("read")
+                # unless a real client grant says otherwise: a context
+                # grant covers the context and its records, never the
+                # client node — audit.grant_permits refuses exactly that,
+                # so the list must not advertise what a check will 404.
+                nested = False
                 if parent_pid and parent_pid in entries:
                     clist = entries[parent_pid]["contexts"]
                     if not any(x["id"] == ctx["id"] for x in clist):
                         clist.append(xentry)
-                    # The parent's permission stays navigation-only ("read")
-                    # unless a real client grant says otherwise: a context
-                    # grant covers the context and its records, never the
-                    # client node — audit.grant_permits refuses exactly that,
-                    # so the list must not advertise what a check will 404.
-                if ctx["id"] not in entries:
+                    nested = True
+                # A context with NO parent client has nowhere to nest, so it
+                # gets an entry of its own or it is unreachable. This is the
+                # ONLY case that reaches here: testing `ctx["id"] not in
+                # entries` instead — which reads like the same thing — is
+                # always true, because a Context id is never a key of
+                # `entries` unless this line put it there. Every granted
+                # context therefore appeared TWICE: nested under its client
+                # where it belongs, and again as a top-level row sorted in
+                # among the clients.
+                if not nested:
                     entries[ctx["id"]] = xentry
 
     return list(entries.values())

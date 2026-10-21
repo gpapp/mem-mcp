@@ -41,6 +41,13 @@ from client_manager import (
 )
 
 import sharing  # Phase 3: shared-vault read access policy layer
+# The visibility rule and the RELEVANT_TO id pass live in fact_manager, which
+# imports this module only lazily (function-local, to avoid a cycle) — so a
+# module-level import here is safe and is deliberately NOT another function-local
+# one. A `from fact_manager import ...` inside a read path runs a REAL import on
+# every call, which is both a per-request cost and invisible to the lift-based
+# test suites until it raises ModuleNotFoundError on a box with no qdrant_client.
+from fact_manager import _shared_record_visible, _record_related_ids_sync
 
 # ---------------------------------------------------------------------------
 # Diary helpers
@@ -586,7 +593,7 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
     nothing at all and the search came back empty), and it deleted the very
     entries ``scopeStrength`` needs in order to rank the rest.
     """
-    from fact_manager import rewrite_search_query, _db_relevant_scope, _record_scope_ids, _record_related_ids_sync, _shared_record_visible
+    from fact_manager import rewrite_search_query, _db_relevant_scope, _record_scope_ids
 
     qdrant = await get_qdrant()
     neo4j_driver = get_neo4j()
@@ -1258,8 +1265,15 @@ def db_list_diary_entries(user_id: str, from_ts: Optional[str] = None, to_ts: Op
         # RELEVANT_TO target ids, one batched pass over the candidate set. An
         # entry whose only scope evidence is a related link is reachable through
         # that link's target, and the ids are not on this query's RETURN.
-        rel_ids = _record_related_ids_sync(neo4j_driver, [r["id"] for r in result])
-        for r in result:
+        #
+        # The result is materialised FIRST. A Neo4j ``Result`` is a lazy
+        # iterator, so building the id list from it and then looping over it
+        # again yields nothing the second time — the whole list comes back
+        # empty, which reads as "sharing hid my diary" rather than as a bug in
+        # the pass. `list()` is the fix and costs one list.
+        rows = list(result)
+        rel_ids = _record_related_ids_sync(neo4j_driver, [r["id"] for r in rows])
+        for r in rows:
             # Phase 3: visibility — own rows always pass; an owner's rows only
             # through a grant on one of the scope ids the entry is filed under,
             # or on a target the entry is RELEVANT_TO.

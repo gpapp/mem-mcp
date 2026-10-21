@@ -2347,16 +2347,42 @@ npm install @modelcontextprotocol/sdk</code></pre>
     } catch(e) { el.innerHTML = '<p class="empty">⚠️ Could not load.</p>'; }
   }
 
+  // The grant rows are the raw `audit` store rows, which are snake_case
+  // (`target_type`, `target_id`, `owner_user_id`, `permission`). Reading them
+  // as `targetType`/`targetId` rendered "undefined undefined" for every row,
+  // which is a panel that looks empty — the exact complaint this replaces.
+  // Names come from clientListCache, which already carries the shared entries
+  // with their nested contexts, so a grantee sees "ACME / Secret Project"
+  // rather than a uuid they cannot act on.
+  function _sharedTargetName(targetType, targetId) {
+    for (const c of (clientListCache || [])) {
+      if (targetType === 'client' && c.id === targetId) return c.name || targetId;
+      for (const x of (c.contexts || [])) {
+        if (targetType === 'context' && x.id === targetId) return (c.name || '') + ' / ' + (x.name || targetId);
+      }
+    }
+    return targetId;
+  }
+
   async function loadSharedWithMe() {
     const el = document.getElementById('shared-with-me');
     if (!el) return;
     try {
+      // The names come from clientListCache, and init() fires this alongside
+      // loadClients() — so without this the panel can resolve first and fall
+      // back to raw ids for every row. One extra await, and a failed client
+      // load degrades to ids rather than to an empty panel.
+      if (!clientListCache.length) await loadClients();
       const r = await api.get('share/mine');
       const grants = (r && r.grants) ? r.grants : (Array.isArray(r) ? r : []);
       if (!grants.length) { el.innerHTML = '<p class="empty">Nothing shared with you.</p>'; return; }
-      el.innerHTML = grants.map(g => `<div class="scope-card" style="margin:.3rem 0;">
-        <span>${escHtml(g.targetType||'')} <code>${escHtml(g.targetId||'')}</code> — by ${escHtml(g.owner_user_id||g.owner||'')} (${escHtml(g.permission||'read')})</span>
-      </div>`).join('');
+      el.innerHTML = grants.map(g => {
+        const name = _sharedTargetName(g.target_type, g.target_id);
+        const perm = g.permission === 'write' ? 'read &amp; write' : 'read only';
+        return `<div class="scope-card" style="margin:.3rem 0;">
+          <span>${g.target_type === 'context' ? '📁' : '🏢'} ${escHtml(name)} — shared by ${escHtml(g.owner_user_id || '')} (${perm})</span>
+        </div>`;
+      }).join('');
     } catch(e) { el.innerHTML = '<p class="empty">⚠️ Could not load.</p>'; }
   }
 
