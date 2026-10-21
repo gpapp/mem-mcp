@@ -33,6 +33,10 @@ __all__ = [
     "shared_owners",
     "accessible_scope",
     "record_visible",
+    "record_visible_related",
+    "record_permission",
+    "record_permission_related",
+    "record_read_only",
     "accessible_owner_scope",
     "readable_owner_ids",
 ]
@@ -179,6 +183,62 @@ def record_visible(owner_user_id: str, client_id, context_id, owners: dict) -> b
     return False
 
 
+def record_visible_related(owner_user_id: str, related_ids, owners: dict) -> bool:
+    """Whether a record is visible because a ``RELEVANT_TO`` target is granted.
+
+    ``RELEVANT_TO`` is the secondary-association edge the scope classifier
+    writes *before* it gives up on a primary client — so for a null-primary
+    record it is the only scope evidence there is. Reading only the record's own
+    ``FOR_CLIENT`` / ``IN_CONTEXT`` edges (which is all ``record_visible`` does)
+    made exactly those records invisible: an entry that discusses a shared
+    project without being filed under it was unreachable, and nothing in the
+    logs said why.
+
+    The edge type is the same for a Client and a Context target, so ``related_ids``
+    is one flat set and is checked against both buckets. A record whose primary
+    scope IS granted does not need this — the caller asks here only when the
+    primary check failed, and the two are deliberately separate so that "visible
+    through a related project" and "visible because it is filed there" stay
+    distinguishable (see ``primary_scope_hidden``).
+    """
+    if not owners or not related_ids:
+        return False
+    entry = owners.get(owner_user_id)
+    if not entry:
+        return False
+    for target_id in related_ids:
+        if target_id in entry["clients"] or target_id in entry["contexts"]:
+            return True
+    return False
+
+
+def primary_scope_hidden(owner_user_id: str, client_id, context_id,
+                         related_ids, owners: dict) -> bool:
+    """True when a record is visible ONLY through a related target.
+
+    The privacy half of ``record_visible_related``. A record that is reachable
+    only because it mentions a shared project is still filed under the owner's
+    OWN client and project — names the caller has no grant for. Rendering them
+    would leak the owner's unshared scope on every such record, which is the
+    whole thing a context grant is meant to withhold. So the read paths answer
+    this and blank the display names; the ids stay, because scope ranking and
+    the ``readOnly`` decision both need them.
+
+    A record the caller cannot see at all is NOT "hidden" — the caller never
+    renders it, and a flag on an invisible record is noise.
+    """
+    if not owners:
+        return False
+    entry = owners.get(owner_user_id)
+    if not entry:
+        return False
+    if client_id and client_id in entry["clients"]:
+        return False
+    if context_id and context_id in entry["contexts"]:
+        return False
+    return record_visible_related(owner_user_id, related_ids, owners)
+
+
 def record_permission(owner_user_id: str, client_id, context_id, owners: dict):
     """'write' | 'read' | None — the caller's permission on ONE record.
 
@@ -206,8 +266,36 @@ def record_permission(owner_user_id: str, client_id, context_id, owners: dict):
     return "write" if "write" in found else "read"
 
 
+def record_permission_related(owner_user_id: str, related_ids, owners: dict):
+    """The permission a record earns from its ``RELEVANT_TO`` targets alone.
+
+    Same rule as ``record_permission``: a write grant on any one of the targets
+    wins. That is deliberately the *permissive* direction here, because a
+    ``RELEVANT_TO`` edge is an association the owner chose to draw — a record
+    cross-referenced to a project the caller may edit is a record about that
+    project, and the write grant is the stronger statement of the two.
+
+    This is what makes a related-only record read-only in the UI rather than
+    editable: without it ``record_permission`` finds no granted primary and
+    returns ``None``, ``record_read_only`` reads that as "own record", and the
+    grantee is offered Edit on a record the server will refuse with a 403.
+    """
+    entry = owners.get(owner_user_id) if owners else None
+    if not entry or not related_ids:
+        return None
+    found = []
+    for target_id in related_ids:
+        if target_id in entry["clients"]:
+            found.append(entry["clients"][target_id])
+        elif target_id in entry["contexts"]:
+            found.append(entry["contexts"][target_id])
+    if not found:
+        return None
+    return "write" if "write" in found else "read"
+
+
 def record_read_only(user_id: str, owner_user_id, client_id, context_id,
-                     owners: dict) -> bool:
+                     owners: dict, related_ids=None) -> bool:
     """True when the caller may SEE this record but must not CHANGE it.
 
     The UI half of the sharing feature. The read paths widen to include other
@@ -221,10 +309,16 @@ def record_read_only(user_id: str, owner_user_id, client_id, context_id,
     Own records are never read-only. ``None`` owner means the record is the
     caller's own (the read paths emit ``None`` rather than the caller's id for
     their own rows, so the JSON does not grow on an unshared vault).
+
+    ``related_ids`` are the record's ``RELEVANT_TO`` target ids. They matter
+    only for a record whose primary scope is NOT granted: such a record is
+    reachable at all only through them, so its permission comes from them too.
     """
     if not owner_user_id or owner_user_id == user_id:
         return False
-    return record_permission(owner_user_id, client_id, context_id, owners) == "read"
+    if record_permission(owner_user_id, client_id, context_id, owners) is not None:
+        return record_permission(owner_user_id, client_id, context_id, owners) == "read"
+    return record_permission_related(owner_user_id, related_ids, owners) == "read"
 
 
 def accessible_owner_scope(user_id: str, now=None) -> dict | None:

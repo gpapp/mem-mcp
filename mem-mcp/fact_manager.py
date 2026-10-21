@@ -733,24 +733,122 @@ def _record_scope_ids(session, record_ids):
     return clients, contexts
 
 
+def _record_related_ids(session, record_ids):
+    """``{record_id: set(target_id)}`` from each record's RELEVANT_TO edges.
+
+    The secondary-association edge. A record whose only scope evidence is a
+    RELEVANT_TO link — the classifier writes those before it gives up on a
+    primary client, so every null-primary record has one — was invisible to a
+    grantee holding the target's project: ``_record_scope_ids`` reads the
+    primary edges only, and nothing else in the read path looked here.
+
+    Both halves of the query are load-bearing and neither is guessable:
+
+    - ``(n:Fact OR n:DiaryEntry)``. A plain ``MATCH (n:Fact ...)`` returns
+      nothing for a diary entry, which would silently drop the RELEVANT_TO
+      signal for exactly the records whose only scope evidence it is.
+    - the target id, not the name. ``sharing.record_visible_related`` matches
+      against the grant's stored target id; ``_db_relevant_scope`` collects
+      names because it feeds a ranking tier, and the two cannot share a query.
+
+    A failure here degrades to "no related links" — a weaker grant match and
+    never a lost result — so the caller's except must not turn it into one.
+    """
+    out = {}
+    if not record_ids:
+        return out
+    try:
+        for row in session.run(
+            """
+            MATCH (n)
+            WHERE n.id IN $ids AND (n:Fact OR n:DiaryEntry)
+            OPTIONAL MATCH (n)-[:RELEVANT_TO]->(rc)
+            RETURN n.id as id, collect(DISTINCT rc.id) as rids
+            """,
+            ids=list(record_ids),
+        ):
+            out[row["id"]] = {rid for rid in (row["rids"] or []) if rid}
+    except Exception as exc:
+        logger.warning(f"RELEVANT_TO id lookup failed, grant match without it: {exc}")
+    return out
+
+
+def _shared_record_visible(owner, client_ids, context_ids, related_ids, owners):
+    """Whether one of ANOTHER owner's records is reachable through a grant.
+
+    The single place the rule is stated, because it was previously spelled out
+    at six call sites and one of them had already drifted. Any ONE granted id
+    covers the record: a fact filed under several clients is reachable through
+    whichever of them the caller can see, and a record that only *mentions* a
+    shared project is reachable through that mention.
+
+    Own records never reach this — callers branch on ``owner == user_id`` first.
+    """
+    if not owners:
+        return False
+    if any(sharing.record_visible(owner, cid, None, owners) for cid in client_ids):
+        return True
+    if any(sharing.record_visible(owner, None, xid, owners) for xid in context_ids):
+        return True
+    return sharing.record_visible_related(owner, related_ids, owners)
+
+
 def _shared_records_visible(session, pairs, owners):
     """Filter ``pairs`` [(record_id, owner), ...] down to the visible shared ones.
 
     A record is visible through any ONE granted scope id: a fact filed under
-    several clients is reachable through whichever the caller can see. Own
-    records never reach this function — callers branch on owner == user first.
+    several clients is reachable through whichever the caller can see, and a
+    record whose only scope evidence is a RELEVANT_TO link is reachable through
+    that link's target. Own records never reach this function — callers branch
+    on owner == user first.
     """
     if not pairs or not owners:
         return set()
-    clients, contexts = _record_scope_ids(session, [rid for rid, _ in pairs])
+    record_ids = [rid for rid, _ in pairs]
+    clients, contexts = _record_scope_ids(session, record_ids)
+    related = _record_related_ids(session, record_ids)
     visible = set()
     for rid, owner in pairs:
-        fc = clients.get(rid, set())
-        fx = contexts.get(rid, set())
-        if any(sharing.record_visible(owner, cid, None, owners) for cid in fc) \
-                or any(sharing.record_visible(owner, None, xid, owners) for xid in fx):
+        if _shared_record_visible(owner, clients.get(rid, ()),
+                                  contexts.get(rid, ()),
+                                  related.get(rid, ()), owners):
             visible.add(rid)
     return visible
+
+
+def _shared_records_visible_by_ids(neo4j_driver, pairs, owners):
+    """``_shared_records_visible`` over a driver rather than a live session.
+
+    The Qdrant-shaped read paths (search, list) decide visibility from payload
+    ids, and the related ids they also need are not in the payload — so they
+    collect their candidates first and ask here once, rather than opening a
+    session per record.
+    """
+    if not pairs or not owners:
+        return set()
+    try:
+        with neo4j_driver.session() as s:
+            return _shared_records_visible(s, pairs, owners)
+    except Exception as exc:
+        logger.warning(f"shared-record visibility pass failed: {exc}")
+        return set()
+
+
+def _record_related_ids_sync(neo4j_driver, record_ids):
+    """``_record_related_ids`` over a driver, for the async read paths.
+
+    Same rule and same query; the search and list paths are ``async`` and hold
+    no Neo4j session open across their Qdrant work, so they hand the driver in
+    and get the map back.
+    """
+    if not record_ids:
+        return {}
+    try:
+        with neo4j_driver.session() as s:
+            return _record_related_ids(s, record_ids)
+    except Exception as exc:
+        logger.warning(f"RELEVANT_TO id lookup failed, grant match without it: {exc}")
+        return {}
 
 
 def db_get_neighborhood(fact_id: str, depth: int, rel_types: List[str], user_id: str,
@@ -918,13 +1016,8 @@ def db_get_fact_by_id(fact_id: str, user_id: str) -> Optional[dict]:
             # An owner's record must be readable through a grant; scope ids come
             # from the edges, one batched pass shared with the caller's check.
             owners = (sharing.accessible_owner_scope(user_id) or {}).get("owners")
-            if owners:
-                clients, contexts = _record_scope_ids(s, [fact_id])
-                visible = any(sharing.record_visible(owner, cid, None, owners) for cid in clients.get(fact_id, ())) \
-                    or any(sharing.record_visible(owner, None, xid, owners) for xid in contexts.get(fact_id, ()))
-            else:
-                visible = False
-            if not visible:
+            visible = _shared_records_visible(s, [(fact_id, owner)], owners) if owners else set()
+            if fact_id not in visible:
                 return None
         return dict(f)
 
@@ -959,10 +1052,7 @@ def db_get_connections_by_type(fact_id: str, user_id: str) -> dict:
             f_owner = (owner_rec["uid"] if owner_rec else None) or user_id
             if f_owner != user_id:
                 owners = (sharing.accessible_owner_scope(user_id) or {}).get("owners")
-                clients, contexts = _record_scope_ids(s, [fact_id])
-                visible = any(sharing.record_visible(f_owner, cid, None, owners) for cid in clients.get(fact_id, ())) \
-                    or any(sharing.record_visible(f_owner, None, xid, owners) for xid in contexts.get(fact_id, ()))
-                if not visible:
+                if fact_id not in _shared_records_visible(s, [(fact_id, f_owner)], owners):
                     return {}
 
         connections = {}
@@ -1442,7 +1532,22 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
             params["category"] = category.strip()
 
         neo_result = s.run(cypher, **params)
-        for r in neo_result:
+        raw_rows = list(neo_result)
+        # A record whose primary scope is NOT granted can still be visible
+        # through a RELEVANT_TO target, and those ids are not in this query's
+        # RETURN — so the candidates are collected first and the related pass
+        # runs once over all of them, rather than a query per row.
+        if owners:
+            flat = [r["f"]["id"] for r in raw_rows
+                    if (r["f"].get("userId") or user_id) != user_id
+                    and not sharing.record_visible(
+                        r["f"].get("userId") or user_id,
+                        r["clientId"], r["contextId"], owners)]
+            related_ids = _record_related_ids(s, flat) if flat else {}
+        else:
+            related_ids = {}
+
+        for r in raw_rows:
             f = r["f"]
             # A shared record is visible only through a grant the caller
             # actually holds. The id sets above widened the *match*; this is
@@ -1450,7 +1555,9 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
             # through a grant check.
             owner = f.get("userId") or user_id
             if owner != user_id and not sharing.record_visible(
-                    owner, r["clientId"], r["contextId"], owners):
+                    owner, r["clientId"], r["contextId"], owners) \
+                    and not sharing.record_visible_related(
+                        owner, related_ids.get(f["id"], ()), owners):
                 continue
             # Construct a result matching Qdrant format
             meta = {k: v for k, v in f.items() if k not in {"id", "text", "name", "category", "timestamp", "userId"}}
@@ -1529,6 +1636,13 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
 
     # Collect all results from all query variants
     all_vector_results = {}  # record id -> best result across all variants
+    # Points whose owner is not the caller and whose primary scope is not
+    # granted. They are NOT dropped here: a record whose only scope evidence is
+    # a RELEVANT_TO link is reachable through that link's target, and those ids
+    # are not in the Qdrant payload. They are held aside, resolved by ONE
+    # batched pass after the loop, and only then kept or dropped — otherwise
+    # the first variant to see a record would decide it before the ids exist.
+    pending = {}  # record_id -> (weighted_score, payload)
 
     for variant_query, weight in query_variants:
         raw_points = await _single_vector_search(qdrant, variant_query, user_id, category,
@@ -1546,10 +1660,14 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
             record_id = parent_of(r.id, r.payload)
 
             owner = r.payload.get("userId") or user_id
-            if owner != user_id:
-                if not sharing.record_visible(owner, r.payload.get("clientId"),
-                                              r.payload.get("contextId"), owners):
-                    continue
+            if owner != user_id and not sharing.record_visible(
+                    owner, r.payload.get("clientId"),
+                    r.payload.get("contextId"), owners):
+                # Keep the best-scoring chunk of the family, as the kept branch
+                # below does, so a long record does not inflate the pending set.
+                if record_id not in pending or weighted_score > pending[record_id][0]:
+                    pending[record_id] = (weighted_score, r.payload)
+                continue
             result_entry = {
                 "id": record_id,
                 "text": r.payload.get("text"),
@@ -1566,12 +1684,52 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
             # caller's own records must not grow a key, and a write grant must
             # not either, because the key is what hides the edit controls.
             if sharing.record_read_only(user_id, owner, r.payload.get("clientId"),
-                                        r.payload.get("contextId"), owners):
+                                        r.payload.get("contextId"), owners,
+                                        related_ids.get(record_id)):
                 result_entry["readOnly"] = True
+            # A record reachable only through a related project is filed under
+            # the owner's OWN client and project — names this caller has no
+            # grant for. Showing them would leak the scope the grant exists to
+            # withhold, so the display names go and a flag says why. The ids
+            # stay: scope ranking below needs them.
+            if sharing.primary_scope_hidden(owner, r.payload.get("clientId"),
+                                            r.payload.get("contextId"),
+                                            related_ids.get(record_id, ()), owners):
+                result_entry["clientName"] = None
+                result_entry["contextName"] = None
+                result_entry["primaryScopeHidden"] = True
 
             # Keep the best version of each result
             if record_id not in all_vector_results or weighted_score > all_vector_results[record_id]["score"]:
                 all_vector_results[record_id] = result_entry
+
+    # Resolve the held-aside points: one batched RELEVANT_TO pass, then keep the
+    # ones a grant actually covers and drop the rest.
+    related_ids = {}
+    if owners and pending:
+        related_ids = _record_related_ids_sync(neo4j_driver, list(pending))
+    for record_id, (weighted_score, payload) in pending.items():
+        owner = payload.get("userId") or user_id
+        rel = related_ids.get(record_id, set())
+        if not sharing.record_visible_related(owner, rel, owners):
+            continue
+        all_vector_results[record_id] = {
+            "id": record_id,
+            "text": payload.get("text"),
+            "name": payload.get("name"),
+            "category": payload.get("category"),
+            "score": weighted_score,
+            "raw_score": None,
+            "clientName": None,
+            "contextName": None,
+            "ownerUserId": owner if owner != user_id else None,
+            "metadata": payload.get("metadata", {}),
+            "readOnly": sharing.record_read_only(user_id, owner,
+                                                 payload.get("clientId"),
+                                                 payload.get("contextId"),
+                                                 owners, rel),
+            "primaryScopeHidden": True,
+        }
 
     results = list(all_vector_results.values())
     await _hydrate_chunk_texts(qdrant, results)
@@ -1814,7 +1972,13 @@ def db_list_memories(user_id: str) -> list:
         for r in result:
             f_node = r["f"]
             owner = f_node.get("userId") or user_id
-            if owner != user_id and not sharing.record_visible(owner, r["clientId"], r["contextId"], owners):
+            # A record whose primary scope is not granted can still be visible
+            # through a RELEVANT_TO target — this query already returns those
+            # ids as `relevantClients`, so no second pass is needed here.
+            rel_ids = {rc["id"] for rc in (r["relevantClients"] or []) if rc.get("id")}
+            if owner != user_id and not _shared_record_visible(
+                    owner, (r["clientId"],) if r["clientId"] else (),
+                    (r["contextId"],) if r["contextId"] else (), rel_ids, owners):
                 continue
             # Extract metadata (all properties except core ones)
             core_keys = {"id", "text", "name", "category", "timestamp", "userId"}
@@ -1844,8 +2008,16 @@ def db_list_memories(user_id: str) -> list:
                 "links":     links
             })
             memories[-1]["ownerUserId"] = owner if owner != user_id else None
-            if sharing.record_read_only(user_id, owner, r["clientId"], r["contextId"], owners):
+            if sharing.record_read_only(user_id, owner, r["clientId"], r["contextId"],
+                                        owners, rel_ids):
                 memories[-1]["readOnly"] = True
+            # Visible only through a related project: the owner's own client and
+            # project names are not this caller's to see.
+            if sharing.primary_scope_hidden(owner, r["clientId"], r["contextId"],
+                                            rel_ids, owners):
+                memories[-1]["clientName"] = None
+                memories[-1]["contextName"] = None
+                memories[-1]["primaryScopeHidden"] = True
         return memories
 
 
@@ -2672,6 +2844,11 @@ def db_get_graph(user_id: str, client_id: str = "", context_id: str = "", limit:
         # `kept` nor in `dropped`.
         if owners:
             hidden = set()
+            # RELEVANT_TO is read once for the whole record set rather than per
+            # node: a record whose only scope evidence is a related link is
+            # reachable through that link's target, and the edge is not in
+            # fact_clients / fact_contexts at all.
+            related = _record_related_ids(s, list(node_map.keys()))
             for nid, n in node_map.items():
                 label = n["label"]
                 if label not in ("Fact", "DiaryEntry"):
@@ -2685,13 +2862,13 @@ def db_get_graph(user_id: str, client_id: str = "", context_id: str = "", limit:
                     # them the caller can see.
                     fc = fact_clients.get(nid, ())
                     fx = fact_contexts.get(nid, ())
-                    visible = (
-                        any(sharing.record_visible(owner, cid, None, owners) for cid in fc)
-                        or any(sharing.record_visible(owner, None, xid, owners) for xid in fx)
-                    )
+                    visible = _shared_record_visible(owner, fc, fx,
+                                                     related.get(nid, ()), owners)
                 else:
                     d_client, d_context = diary_scope.get(nid, ("", ""))
-                    visible = sharing.record_visible(owner, d_client, d_context, owners)
+                    visible = _shared_record_visible(owner, (d_client,) if d_client else (),
+                                                     (d_context,) if d_context else (),
+                                                     related.get(nid, ()), owners)
                 if not visible:
                     hidden.add(nid)
             if hidden:

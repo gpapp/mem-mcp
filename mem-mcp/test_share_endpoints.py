@@ -1313,7 +1313,18 @@ global.marked = { parse: (s) => s, use() {}, setOptions() {} };
 global.vis = { Network: function () {}, DataSet: function () { return { add() {}, get() { return null; }, clear() {} }; } };
 global.mermaid = { initialize() {} };
 
+// Captured by the wrapper installed below: a render function that hands a
+// menu to showItemMenu is asserting on that array, so it is recorded rather
+// than drawn. Plain module-scope bindings, NOT global.* — node wraps this file
+// in a function, so the dashboard's own `function showItemMenu` is
+// module-scoped and a global property would be a second, never-called copy.
+var __menuItems = [];
+
 __APP_JS__
+
+// Rebind the dashboard's own declaration so a menu builder's items are
+// observable without a real DOM.
+showItemMenu = function (anchorEl, items) { __menuItems = items || []; };
 
 const out = {};
 (async () => {
@@ -1558,6 +1569,150 @@ class ReadOnlyGatingTests(unittest.TestCase):
                          msg="a record already linked to this entry is still offered")
         self.assertIn("f2", out["ids"],
                       msg="an unlinked fact was dropped by the widening")
+
+    # ------------------------------------------------------------------
+    # The diary VIEW mode, and the hamburger menu that sits in its header.
+    #
+    # The editor above was gated first and the view mode was assumed to be
+    # covered by it. It is not: the view mode is what a grantee sees on open,
+    # and it carried the scope chips, the mention delete buttons, the add
+    # relevant button and the link form -- four mutating surfaces the editor
+    # gate never touched.
+    # ------------------------------------------------------------------
+
+    def _diary_view(self, read_only, primary_hidden=False):
+        entry = ("{ id: 'e1', readOnly: %s, primaryScopeHidden: %s, name: 'An entry', "
+                 "content: 'the body', date: '2026-01-01', "
+                 "timestamp: '2026-01-01T10:00', clientName: 'ACME', clientId: 'c1', "
+                 "contextName: 'Secret Project', contextId: 'x1', "
+                 "relevantClients: [{ id: 'x9', name: 'Shared Project', kind: 'context' }], "
+                 "mentions: [{ id: 'f2', name: 'Bob', text: 'a fact', "
+                 "target_label: 'Fact' }] }"
+                 % ("true" if read_only else "false", "true" if primary_hidden else "false"))
+        return ("(async () => { diaryEntries = [" + entry + "]; "
+                "clientListCache = [{ id: 'c1', name: 'ACME', contexts: [] }]; "
+                "return renderDiaryViewMode(" + entry + "); })()")
+
+    def test_the_diary_view_mode_hides_every_mutating_control(self):
+        """The view mode is the surface a grantee actually lands on.
+
+        The editor gate above is not this: it only runs after the Edit action,
+        which is itself one of the controls hidden here. Four surfaces were
+        ungated — scope chips, mention deletes, the ＋ add-relevant button and
+        the link form — and each of them answers 403.
+
+        ``_showDiaryMenu`` is deliberately NOT in this list. Opening a menu is
+        a read, so the button stays and the *items* are filtered — that pair is
+        asserted by ``test_the_diary_menu_offers_no_write_action_on_a_read_only_entry``
+        below, and hiding the button here would pass while the menu still
+        offered every write.
+        """
+        out = self._render([("view", self._diary_view(True))])
+        html = out["view"]
+        if "THREW" in html:
+            self.skipTest(f"the diary view could not be driven headless: {html[:200]}")
+        for handler in ("_diaryPickClient", "_diaryPickProject", "_diaryAddRelevant",
+                        "_diaryRemoveRelevant", "deleteDiaryLink",
+                        "toggleDiaryLinkForm", "saveDiaryLink"):
+            self.assertFalse(
+                handler + "(" in html,
+                msg=f"a read-only diary entry still renders a control calling "
+                    f"{handler}() in the VIEW mode -- it is refused with a 403")
+        # Reads stay: the body, the date, the linked facts and the badge that
+        # says why the controls are gone. A grantee must still be able to read
+        # what they were given.
+        for needle in ("the body", "Linked Facts", "Bob", "read-only"):
+            self.assertIn(needle, html,
+                          msg=f"the read-only diary view dropped {needle!r}, so the "
+                              f"grantee cannot read the record they were given")
+
+    def test_the_diary_view_mode_still_offers_its_controls_to_the_owner(self):
+        """The over-gating half, for the view mode.
+
+        Without this the whole view could be gated for everybody and the test
+        above would pass — the exact failure a fix written by deleting
+        markup produces. Verified by re-injection: making the diary view gate a
+        constant true leaves every other test in this class green.
+        """
+        out = self._render([("view", self._diary_view(False))])
+        html = out["view"]
+        self.assertNotIn("THREW", html, msg="the owned diary entry could not be rendered")
+        for handler in ("_diaryPickClient", "_diaryPickProject", "_diaryAddRelevant",
+                        "_diaryRemoveRelevant", "deleteDiaryLink",
+                        "toggleDiaryLinkForm", "_showDiaryMenu"):
+            self.assertTrue(
+                handler + "(" in html,
+                msg=f"an owned diary entry no longer offers {handler}() in the view "
+                    f"mode -- the read-only gate has removed a control the owner needs")
+
+    def test_a_record_reachable_only_through_a_related_project_shows_no_scope(self):
+        """The privacy half of a related-only grant.
+
+        The record is visible because it mentions a shared project, but it is
+        FILED UNDER the owner's own client and project — names this caller
+        holds no grant for. Rendering them would leak exactly the scope a
+        context grant exists to withhold, so the server blanks them and the UI
+        says so rather than showing an empty chip that reads as "unscoped".
+        """
+        out = self._render([
+            ("hidden", self._diary_view(False, primary_hidden=True)),
+            ("plain", self._diary_view(False, primary_hidden=False)),
+        ])
+        for name, html in out.items():
+            self.assertNotIn("THREW", html, msg=f"{name} could not be rendered")
+        self.assertIn("(private)", out["hidden"],
+                      msg="a related-only record does not say its scope is private")
+        self.assertNotIn("Secret Project", out["hidden"],
+                         msg="the owner's own project name is rendered on a record "
+                             "the caller has no grant for")
+        self.assertNotIn("ACME", out["hidden"],
+                         msg="the owner's own client name is rendered on a record "
+                             "the caller has no grant for")
+        # And the shared project it IS reachable through still shows, as a
+        # related chip -- otherwise the record reads as having no scope at all.
+        self.assertIn("Shared Project", out["hidden"],
+                      msg="the shared project the record is reachable through is "
+                          "not shown, so the record reads as unscoped")
+        self.assertIn("Secret Project", out["plain"],
+                      msg="an owned record lost its project name")
+
+    def test_the_diary_menu_offers_no_write_action_on_a_read_only_entry(self):
+        """The hamburger menu, asserted on what it hands the menu builder.
+
+        Edit, Reclassify scope, Extract participants and Delete all write --
+        each is refused with a 403 on a read-only grant, so offering them costs
+        a click and an error toast. Copy MD, Show in Graph and Reload are reads
+        and must survive, or the grantee cannot copy the record they were given
+        or pick up a scope change the owner just made.
+        """
+        out = self._render([
+            ("readOnly", "(diaryEntries = [{ id: 'e1', readOnly: true, name: 'x' }], "
+                         "_showDiaryMenu({ getBoundingClientRect: () => ({ top: 0, left: 0, "
+                         "bottom: 0, right: 0, width: 0, height: 0 }) }, 'e1'), "
+                         "__menuItems.map(i => i.label + ':' + (i.action || 'sep')).join(','))"),
+            ("owned", "(diaryEntries = [{ id: 'e1', readOnly: false, name: 'x' }], "
+                      "_showDiaryMenu({ getBoundingClientRect: () => ({ top: 0, left: 0, "
+                      "bottom: 0, right: 0, width: 0, height: 0 }) }, 'e1'), "
+                      "__menuItems.map(i => i.label + ':' + (i.action || 'sep')).join(','))"),
+        ])
+        for name, html in out.items():
+            self.assertNotIn("THREW", html, msg=f"{name} could not be driven")
+        for action in ("_diaryMenuEdit", "_diaryMenuReclassify",
+                       "_diaryMenuExtractPeople", "_diaryMenuDelete"):
+            self.assertNotIn(
+                action, out["readOnly"],
+                msg=f"a read-only diary entry still offers {action}() in its menu")
+        for action in ("_diaryMenuCopyMd", "_diaryMenuGraph", "_diaryMenuReload"):
+            self.assertIn(
+                action, out["readOnly"],
+                msg=f"a read-only diary entry lost the read action {action}() -- a "
+                    f"grantee must still be able to copy and reload the record")
+        # The owner's menu is unchanged: every item, in the original order.
+        for action in ("_diaryMenuEdit", "_diaryMenuReclassify",
+                       "_diaryMenuExtractPeople", "_diaryMenuDelete",
+                       "_diaryMenuCopyMd", "_diaryMenuGraph", "_diaryMenuReload"):
+            self.assertIn(action, out["owned"],
+                          msg=f"an owned diary entry lost {action}() from its menu")
 
 
 if __name__ == "__main__":

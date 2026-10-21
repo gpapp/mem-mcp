@@ -176,6 +176,24 @@ class _Row(dict):
             raise AttributeError(key) from exc
 
 
+class _NullLogger:
+    """A logger that records nothing.
+
+    The lifted helpers log a warning before degrading — a failure that is
+    swallowed silently is the absence-of-a-log-line bug this repo has already
+    been bitten by, so the log call stays and the test supplies the sink.
+    """
+
+    def warning(self, *args, **kwargs):
+        pass
+
+    def info(self, *args, **kwargs):
+        pass
+
+    def error(self, *args, **kwargs):
+        pass
+
+
 class _Result:
     """Minimal Neo4j result: iterable, list(), and .single()."""
 
@@ -196,12 +214,13 @@ class _DispatchSession:
     """Records queries; answers each by a marker in the query text."""
 
     def __init__(self, fact_rows=None, conn_rows=None, uid=None,
-                 client_rows=None, context_rows=None):
+                 client_rows=None, context_rows=None, related_rows=None):
         self.fact_rows = fact_rows or []
         self.conn_rows = conn_rows or []
         self.uid = uid
         self.client_rows = client_rows or []
         self.context_rows = context_rows or []
+        self.related_rows = related_rows or []
         self.queries = []
 
     def run(self, query, **params):
@@ -210,6 +229,8 @@ class _DispatchSession:
             return _Result(self.conn_rows)
         if "RETURN f.userId as uid" in query:
             return _Result([_Row({"uid": self.uid})] if self.uid else [])
+        if "as rids" in query:
+            return _Result(self.related_rows)
         if "as cid" in query:
             return _Result(self.client_rows)
         if "as cxid" in query:
@@ -294,6 +315,33 @@ class ReadPathStoreCase(unittest.TestCase):
         return audit.grant_access(owner, grantee, target_type, target_id,
                                   permission)
 
+    def _read_helpers(self):
+        """Every fact_manager helper the read paths under test now name.
+
+        The visibility rule moved into ``_shared_record_visible`` so it is
+        stated once rather than at six call sites; lifting a read path without
+        it in scope is a NameError that reads exactly like a defect in the
+        shipping code.
+        """
+        source = _source(FACT_MANAGER)
+        scope_ids = _lift(source, "_record_scope_ids")
+        related_ids = _lift(source, "_record_related_ids", logger=_NullLogger())
+        one_visible = _lift(source, "_shared_record_visible", sharing=sharing)
+        return {
+            "sharing": sharing,
+            "_record_scope_ids": scope_ids,
+            "_record_related_ids": related_ids,
+            "_shared_record_visible": one_visible,
+            "_shared_records_visible": _lift(
+                source, "_shared_records_visible",
+                sharing=sharing, _record_scope_ids=scope_ids,
+                _record_related_ids=related_ids,
+                _shared_record_visible=one_visible),
+            "_record_related_ids_sync": _lift(
+                source, "_record_related_ids_sync",
+                logger=_NullLogger(), _record_related_ids=related_ids),
+        }
+
 
 class SingleVectorSearchWideningTests(ReadPathStoreCase):
     """`_single_vector_search` translates the owner set into the Qdrant filter.
@@ -357,16 +405,21 @@ _USER = "bob"
 class ScopeHelperTests(ReadPathStoreCase):
     """`_record_scope_ids` + `_shared_records_visible`: the visibility check.
 
-    A record is visible through any ONE granted scope id; own records never
+    A record is visible through any ONE granted scope id — its own
+    FOR_CLIENT / IN_CONTEXT edges, or a RELEVANT_TO target. Own records never
     reach this function.
     """
 
     def _lift_helpers(self, session):
         source = _source(FACT_MANAGER)
         scope_ids = _lift(source, "_record_scope_ids")
+        related_ids = _lift(source, "_record_related_ids", logger=_NullLogger())
+        one_visible = _lift(source, "_shared_record_visible", sharing=sharing)
         visible = _lift(source, "_shared_records_visible",
-                       sharing=sharing, _record_scope_ids=scope_ids)
-        return scope_ids, visible
+                        sharing=sharing, _record_scope_ids=scope_ids,
+                        _record_related_ids=related_ids,
+                        _shared_record_visible=one_visible)
+        return scope_ids, related_ids, visible
 
     def test_scope_ids_comes_back_per_record_from_both_edge_types(self):
         session = _DispatchSession(
@@ -374,35 +427,154 @@ class ScopeHelperTests(ReadPathStoreCase):
                          _Row({"id": "f1", "cid": "c2"})],
             context_rows=[_Row({"id": "f1", "cxid": "x1"})],
         )
-        scope_ids, _ = self._lift_helpers(session)
+        scope_ids, _, _ = self._lift_helpers(session)
         clients, contexts = scope_ids(session, ["f1"])
         self.assertEqual(clients.get("f1"), {"c1", "c2"})
         self.assertEqual(contexts.get("f1"), {"x1"})
+
+    def test_related_ids_are_read_from_both_label_kinds(self):
+        # RELEVANT_TO targets a Client or a Context and the edge type is the
+        # same for both, so the query must not pin a label — a `(rc:Client)`
+        # match would silently drop every project target.
+        session = _DispatchSession(
+            related_rows=[_Row({"id": "f1", "rids": ["c9", "x9"]}),
+                          _Row({"id": "f2", "rids": [None]})],
+        )
+        _, related_ids, _ = self._lift_helpers(session)
+        out = related_ids(session, ["f1", "f2"])
+        self.assertEqual(out.get("f1"), {"c9", "x9"})
+        self.assertEqual(out.get("f2"), set())
+        query = session.queries[0][0]
+        self.assertIn("(n:Fact OR n:DiaryEntry)", query)
+        self.assertNotIn("(rc:Client)", query)
+
+    def test_related_ids_survive_a_failed_query_as_no_links(self):
+        # Degrading to "no related links" is a weaker grant match and never a
+        # lost result; raising would take the whole read path down with it.
+        class _Boom:
+            def run(self, query, **params):
+                raise RuntimeError("neo4j is down")
+
+        _, related_ids, _ = self._lift_helpers(None)
+        self.assertEqual(related_ids(_Boom(), ["f1"]), {})
 
     def test_a_record_covered_by_any_one_granted_scope_is_visible(self):
         session = _DispatchSession(
             client_rows=[_Row({"id": "f1", "cid": "c9"})],
             context_rows=[_Row({"id": "f1", "cxid": "x1"})],
         )
-        _, visible = self._lift_helpers(session)
+        _, _, visible = self._lift_helpers(session)
         owners = {"alice": {"clients": {}, "contexts": {"x1": "read"}}}
         self.assertEqual(visible(session, [("f1", "alice")], owners), {"f1"})
+
+    def test_a_record_whose_only_evidence_is_a_related_target_is_visible(self):
+        # The defect this closes: a null-primary record's ONLY scope evidence
+        # is a RELEVANT_TO link, so reading the primary edges alone made it
+        # unreachable through the very grant that covers the project it names.
+        session = _DispatchSession(
+            client_rows=[_Row({"id": "f1", "cid": "c9"})],
+            context_rows=[],
+            related_rows=[_Row({"id": "f1", "rids": ["x9"]})],
+        )
+        _, _, visible = self._lift_helpers(session)
+        owners = {"alice": {"clients": {}, "contexts": {"x9": "read"}}}
+        self.assertEqual(visible(session, [("f1", "alice")], owners), {"f1"})
+
+    def test_a_related_target_in_another_owners_vault_does_not_cover_it(self):
+        session = _DispatchSession(
+            client_rows=[_Row({"id": "f1", "cid": "c9"})],
+            context_rows=[],
+            related_rows=[_Row({"id": "f1", "rids": ["x9"]})],
+        )
+        _, _, visible = self._lift_helpers(session)
+        owners = {"bob": {"clients": {}, "contexts": {"x9": "read"}}}
+        self.assertEqual(visible(session, [("f1", "alice")], owners), set())
 
     def test_an_uncovered_record_stays_invisible(self):
         session = _DispatchSession(
             client_rows=[_Row({"id": "f1", "cid": "c9"})],
             context_rows=[],
+            related_rows=[],
         )
-        _, visible = self._lift_helpers(session)
+        _, _, visible = self._lift_helpers(session)
         owners = {"alice": {"clients": {"c1": "read"}, "contexts": {}}}
         self.assertEqual(visible(session, [("f1", "alice")], owners), set())
 
     def test_empty_input_or_no_owners_is_an_empty_answer_not_a_crash(self):
         session = _DispatchSession()
-        _, visible = self._lift_helpers(session)
+        _, _, visible = self._lift_helpers(session)
         self.assertEqual(visible(session, [], {"alice": {}}), set())
         owners = {"alice": {"clients": {"c1": "read"}, "contexts": {}}}
         self.assertEqual(visible(session, [("f1", "alice")], owners), set())
+
+
+class RelatedGrantPolicyTests(ReadPathStoreCase):
+    """`sharing`'s related-target rules, imported and called directly.
+
+    These are pure and stdlib-only, so unlike the read paths above they are
+    driven for real rather than lifted. What they pin is the pair of properties
+    that make a related-only record safe to show at all: it is visible, and the
+    owner's own scope on it is not.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.enable_sharing()
+        self.grant("alice", "bob", "context", "x9", "read")
+        self.owners = sharing.accessible_owner_scope("bob")["owners"]
+
+    def test_a_related_target_grants_visibility(self):
+        self.assertTrue(sharing.record_visible_related("alice", {"x9"}, self.owners))
+        self.assertFalse(sharing.record_visible_related("alice", {"x8"}, self.owners))
+        # An empty set is not a grant, and a foreign owner's map is not this one.
+        self.assertFalse(sharing.record_visible_related("alice", set(), self.owners))
+        self.assertFalse(sharing.record_visible_related("carol", {"x9"}, self.owners))
+
+    def test_a_client_target_counts_as_well_as_a_context_one(self):
+        self.grant("alice", "bob", "client", "c9", "read")
+        owners = sharing.accessible_owner_scope("bob")["owners"]
+        self.assertTrue(sharing.record_visible_related("alice", {"c9"}, owners))
+
+    def test_primary_scope_is_hidden_only_when_the_related_target_is_what_shows_it(self):
+        # Visible through the primary: nothing is hidden, the names are the
+        # caller's own to see.
+        self.grant("alice", "bob", "client", "c9", "read")
+        owners = sharing.accessible_owner_scope("bob")["owners"]
+        self.assertFalse(sharing.primary_scope_hidden("alice", "c9", None, {"x9"}, owners))
+        # Visible only through the related target: the primary names are the
+        # owner's unshared scope and must not be rendered.
+        self.assertTrue(sharing.primary_scope_hidden("alice", "c9", None, {"x9"}, self.owners))
+        # Not visible at all is NOT "hidden" — the caller never renders it.
+        self.assertFalse(sharing.primary_scope_hidden("alice", "c9", None, {"x8"}, self.owners))
+        self.assertFalse(sharing.primary_scope_hidden("carol", "c9", None, {"x9"}, self.owners))
+
+    def test_a_related_only_record_is_read_only_and_a_write_grant_is_not(self):
+        # Without the related argument this record's permission came back None,
+        # which record_read_only read as "own record" — and the grantee was
+        # offered Edit on a record the server refuses with a 403.
+        self.assertTrue(sharing.record_read_only("bob", "alice", "c9", None,
+                                                 self.owners, {"x9"}))
+        self.grant("alice", "bob", "context", "x9", "write")
+        owners = sharing.accessible_owner_scope("bob")["owners"]
+        self.assertFalse(sharing.record_read_only("bob", "alice", "c9", None,
+                                                  owners, {"x9"}))
+        # A granted primary still decides, and the weaker of the two wins.
+        self.grant("alice", "bob", "client", "c9", "read")
+        owners = sharing.accessible_owner_scope("bob")["owners"]
+        self.assertTrue(sharing.record_read_only("bob", "alice", "c9", None,
+                                                 owners, {"x9"}))
+
+    def test_permission_takes_a_write_grant_over_a_read_one(self):
+        # Same rule as record_permission: a write grant on any one target wins.
+        # A RELEVANT_TO edge is an association the owner chose to draw, so a
+        # record cross-referenced to an editable project is editable.
+        self.grant("alice", "bob", "context", "x8", "write")
+        owners = sharing.accessible_owner_scope("bob")["owners"]
+        self.assertEqual(sharing.record_permission_related("alice", {"x9", "x8"}, owners), "write")
+        self.assertEqual(sharing.record_permission_related("alice", {"x8"}, owners), "write")
+        self.assertEqual(sharing.record_permission_related("alice", {"x9"}, owners), "read")
+        self.assertIsNone(sharing.record_permission_related("alice", set(), owners))
+        self.assertIsNone(sharing.record_permission_related("carol", {"x9"}, owners))
 
 
 class FactItemAccessTests(ReadPathStoreCase):
@@ -422,23 +594,19 @@ class FactItemAccessTests(ReadPathStoreCase):
 
     def _fact_fn(self):
         source = _source(FACT_MANAGER)
-        scope_ids = _lift(source, "_record_scope_ids")
         return _lift(
             source, "db_get_fact_by_id",
             get_neo4j=lambda: self._driver,
-            sharing=sharing,
-            _record_scope_ids=scope_ids,
             Optional=typing.Optional,
+            **self._read_helpers(),
         )
 
     def _connections_fn(self):
         source = _source(FACT_MANAGER)
-        scope_ids = _lift(source, "_record_scope_ids")
         return _lift(
             source, "db_get_connections_by_type",
             get_neo4j=lambda: self._driver,
-            sharing=sharing,
-            _record_scope_ids=scope_ids,
+            **self._read_helpers(),
         )
 
     def _wire(self, *, facts=None, conns=None, uid="alice",
@@ -517,12 +685,12 @@ class DiaryListAccessTests(ReadPathStoreCase):
         fn = _lift(
             source, "db_list_diary_entries",
             get_neo4j=lambda: driver,
-            sharing=sharing,
             json=json,
             datetime=datetime.datetime,
             timezone=datetime.timezone,
             timedelta=datetime.timedelta,
             Optional=typing.Optional,
+            **self._read_helpers(),
         )
         return fn, driver._session
 
@@ -607,6 +775,8 @@ class ReadPathCallSiteTests(unittest.TestCase):
             "sharing.accessible_owner_scope(user_id)",
             "WHERE f.userId IN $ownerIds",      # exact-match query
             "sharing.record_visible(",
+            "sharing.record_visible_related(",
+            "sharing.primary_scope_hidden(",
             '"ownerUserId"',
         )
         self._refute(seg, "{userId: $userId}")
@@ -629,7 +799,8 @@ class ReadPathCallSiteTests(unittest.TestCase):
             seg,
             "WHERE f.userId IN $ownerIds",
             "other.userId = f.userId",          # links belong to the record's vault
-            "sharing.record_visible(owner",
+            "_shared_record_visible(",
+            "sharing.primary_scope_hidden(",
             '"ownerUserId"',
         )
         self._refute(seg, "{userId: $userId}")
@@ -642,7 +813,7 @@ class ReadPathCallSiteTests(unittest.TestCase):
             seg,
             "f.userId IN $ownerIds",
             "owner != user_id",
-            "sharing.record_visible(",
+            "_shared_records_visible(",
             "return None",
         )
 
@@ -652,6 +823,7 @@ class ReadPathCallSiteTests(unittest.TestCase):
             seg,
             "f.userId IN $ownerIds",
             "neighbor.userId = f.userId",       # neighbours from the fact's vault
+            "_shared_records_visible(",
             "return {}",
         )
 
@@ -663,7 +835,8 @@ class ReadPathCallSiteTests(unittest.TestCase):
             "d.userId IN $ownerIds",
             "c.userId IN $ownerIds",
             "ctx.userId IN $ownerIds",
-            "sharing.record_visible(owner",
+            "_record_related_ids(",
+            "_shared_record_visible(",
         )
 
     def test_db_get_neighborhood_gates_on_the_seed_being_visible(self):
@@ -680,6 +853,8 @@ class ReadPathCallSiteTests(unittest.TestCase):
             seg,
             "MatchAny(any_=owner_ids)",
             "sharing.record_visible(",
+            "sharing.record_visible_related(",
+            "sharing.primary_scope_hidden(",
             "d.userId IN $ownerIds",            # MENTIONS enrichment
             '"ownerUserId"',
         )
@@ -689,7 +864,8 @@ class ReadPathCallSiteTests(unittest.TestCase):
         self._assert(
             seg,
             "WHERE d.userId IN $ownerIds",
-            "sharing.record_visible(",
+            "_shared_record_visible(",
+            "sharing.primary_scope_hidden(",
             '"ownerUserId"',
         )
         _assert_widening(self, self.diary, "db_list_diary_entries",
@@ -700,7 +876,8 @@ class ReadPathCallSiteTests(unittest.TestCase):
         self._assert(
             seg,
             "WHERE d.userId IN $ownerIds",
-            "sharing.record_visible(",
+            "_shared_record_visible(",
+            "sharing.primary_scope_hidden(",
             '"ownerUserId"',
         )
         # The OPTIONAL MATCH chain is pinned by OneRowPerRecordTests; here the

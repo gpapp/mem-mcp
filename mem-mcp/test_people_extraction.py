@@ -77,9 +77,11 @@ def _lift(name, **overrides):
                      accessible_owner_scope=lambda uid: None,
                      readable_owner_ids=lambda uid: None,
                      record_visible=lambda *a, **k: True,
+                     record_visible_related=lambda *a, **k: True,
                      # Sharing off: nothing is read-only, so a lifted read path
                      # emits no readOnly key and the pre-sharing row shape holds.
                      record_read_only=lambda *a, **k: False,
+                     primary_scope_hidden=lambda *a, **k: False,
                  )}
     namespace.update(overrides)
     exec(segment, namespace)  # noqa: S102 - executing our own source
@@ -866,7 +868,11 @@ def _list_entries_runner(rows):
                datetime=datetime.datetime,
                timezone=datetime.timezone,
                timedelta=datetime.timedelta,
-               Optional=typing.Optional)
+               Optional=typing.Optional,
+               # Phase 3: the RELEVANT_TO pass, which degrades to {} when the
+               # driver is not wired for it. Sharing is off in these tests, so
+               # the map is never consulted — but the name must resolve.
+               _record_related_ids_sync=lambda driver, ids: {})
 
     def run(from_ts=None, to_ts=None):
         return fn("alice", from_ts, to_ts)

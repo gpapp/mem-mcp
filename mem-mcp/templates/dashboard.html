@@ -989,7 +989,7 @@
     <p style="font-size:.85rem;color:var(--muted);margin-bottom:.75rem;">
       Projects are scoped under a client. Select a client to create a new project.
     </p>
-    <div style="display:flex;gap:.5rem;margin-bottom:.75rem;">
+    <div id="new-project-row" style="display:flex;gap:.5rem;margin-bottom:.75rem;">
       <select id="new-project-client" style="max-width:180px;width:auto;flex:1;"></select>
       <input id="new-project-name" type="text" placeholder="New project name…" style="max-width:240px;width:auto;flex:1;" onkeydown="if(event.key==='Enter') createContext()">
       <button class="btn btn-primary btn-sm" onclick="createContext()">＋ Add Project</button>
@@ -2277,11 +2277,18 @@ npm install @modelcontextprotocol/sdk</code></pre>
       clients.forEach(c => { clientActiveMap[c.id] = c.effectiveActive !== false; });
       clientListCache = clients;
       renderClientFilterSelect();
-      // also repopulate the project-client selector
+      // The project picker offers OWN clients only. A shared client is somebody
+      // else's — creating a project under it would write into their vault, and
+      // the server refuses it, so the option is not offered. With no owned
+      // client at all the whole add form goes: a grantee has nothing to file a
+      // project under.
+      const owned = clients.filter(c => !c.shared);
       const sel = document.getElementById('new-project-client');
       if (sel) {
-        sel.innerHTML = clients.map(c => `<option value="${c.id}">${escHtml(c.name)}</option>`).join('');
+        sel.innerHTML = owned.map(c => `<option value="${c.id}">${escHtml(c.name)}</option>`).join('');
       }
+      const addRow = document.getElementById('new-project-row');
+      if (addRow) addRow.style.display = owned.length ? '' : 'none';
       if (!clients.length) {
         el.innerHTML = '<p class="empty">No clients yet — add one above or they are created automatically from meeting transcriptions.</p>';
         return;
@@ -3350,6 +3357,12 @@ npm install @modelcontextprotocol/sdk</code></pre>
       const ro = !!m.readOnly;
       const q = (s) => "'" + String(s).replace(/'/g, "\\'") + "'";
       const cross = (clientListCache.find(c => c.id === m.clientId) || {}).crossClient ? ' [cross]' : '';
+      // Visible only through a related project: the owner's own client and
+      // project names are not this caller's to see, so the chips read as the
+      // private values they are rather than leaking them.
+      const hidden = !!m.primaryScopeHidden;
+      const clientLabel = hidden ? '🏢 (private)' : '🏢 ' + (m.clientName ? escHtml(m.clientName) + cross : '—');
+      const projectLabel = hidden ? '📁 (private)' : '📁 ' + (m.contextName ? escHtml(m.contextName) : '—');
       const chip = (cls, title, handler, label) => ro
         ? '<span class="scope-chip ' + cls + '">' + label + '</span>'
         : '<button class="scope-chip ' + cls + '" onclick="' + handler + '(this,' + q(m.id) + ')" title="' + title + '">' + label + '</button>';
@@ -3383,8 +3396,8 @@ npm install @modelcontextprotocol/sdk</code></pre>
               <div class="fact-detail-name">${escHtml(m.name || 'Unnamed')}</div>
               <span class="fact-detail-cat">${escHtml(m.category)}</span>
               <div class="fact-detail-scope diary-scope-row" style="display:flex; flex-wrap:wrap; gap:.4rem; margin-top:.35rem; align-items:center;">
-                ${chip('scope-chip--client', 'Click to change client', '_factPickClient', '🏢 ' + (m.clientName ? escHtml(m.clientName) + cross : '—'))}
-                ${chip('scope-chip--project', 'Click to change project', '_factPickProject', '📁 ' + (m.contextName ? escHtml(m.contextName) : '—'))}
+                ${chip('scope-chip--client', 'Click to change client', '_factPickClient', clientLabel)}
+                ${chip('scope-chip--project', 'Click to change project', '_factPickProject', projectLabel)}
                 ${relevant}
                 ${addRelevant}
               </div>
@@ -3574,9 +3587,15 @@ npm install @modelcontextprotocol/sdk</code></pre>
 
   // Hamburger menu for the fact detail pane
   let _factMenuId = null;
+  // Same rule as _DIARY_MENU_WRITERS: a read-only record offers no action that
+  // would 403. Edit, Reclassify scope and Delete write; Show in Graph, Show on
+  // Map, Copy MD and Reload are reads and stay.
+  const _FACT_MENU_WRITERS = ['_factMenuEdit', '_factMenuReclassify', '_factMenuDelete'];
   function _showFactMenu(anchorEl) {
     if (!selectedFactId) return;
     _factMenuId = selectedFactId;
+    const m = memories.find(x => x.id === _factMenuId);
+    const ro = !!(m && m.readOnly);
     showItemMenu(anchorEl, [
       { icon: '✏️', label: 'Edit',            action: '_factMenuEdit' },
       { icon: '🕸️', label: 'Show in Graph',   action: '_factMenuGraph' },
@@ -3587,7 +3606,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
       { icon: '🔀', label: 'Reclassify scope', action: '_factMenuReclassify' },
       { separator: true },
       { icon: '🗑️', label: 'Delete',          action: '_factMenuDelete', danger: true },
-    ]);
+    ].filter(it => !ro || it.separator || _FACT_MENU_WRITERS.indexOf(it.action) === -1));
   }
   function _factMenuEdit()       { if (_factMenuId) startFactEdit(_factMenuId); }
   function _factMenuGraph()      { if (_factMenuId) openInGraph(_factMenuId); }
@@ -3620,9 +3639,19 @@ npm install @modelcontextprotocol/sdk</code></pre>
 
   // --- Diary entry hamburger menu ---
   let _diaryMenuId = null;
+  // Actions that WRITE. A read-only grant (an entry stamped readOnly by the
+  // widened read paths) must not offer them at all — the server refuses each
+  // one with a 403, so a button that only ever produces an error toast is
+  // worse than no button. Non-mutating actions stay: Copy MD, Show in Graph
+  // and Reload are all reads, and Reload is how a grantee picks up a scope
+  // change the owner just made.
+  const _DIARY_MENU_WRITERS = ['_diaryMenuEdit', '_diaryMenuExtractPeople',
+                               '_diaryMenuReclassify', '_diaryMenuDelete'];
   function _showDiaryMenu(anchorEl, entryId) {
     _diaryMenuId = entryId || activeDiaryId;
     if (!_diaryMenuId) return;
+    const entry = diaryEntries.find(x => x.id === _diaryMenuId);
+    const ro = !!(entry && entry.readOnly);
     showItemMenu(anchorEl, [
       { icon: '✏️', label: 'Edit',                  action: '_diaryMenuEdit' },
       { icon: '📋', label: 'Copy MD',               action: '_diaryMenuCopyMd' },
@@ -3633,7 +3662,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
       { icon: '🔀', label: 'Reclassify scope',      action: '_diaryMenuReclassify' },
       { separator: true },
       { icon: '🗑️', label: 'Delete',                action: '_diaryMenuDelete', danger: true },
-    ]);
+    ].filter(it => !ro || it.separator || _DIARY_MENU_WRITERS.indexOf(it.action) === -1));
   }
   function _diaryMenuEdit()   { if (_diaryMenuId) renderDiaryEditMode(_diaryMenuId); }
   function _diaryMenuCopyMd() { if (_diaryMenuId) { const e = diaryEntries.find(x=>x.id===_diaryMenuId); if (e) copyDiaryMd(e); } }
@@ -4011,6 +4040,9 @@ npm install @modelcontextprotocol/sdk</code></pre>
     lines.push('# ' + (m.name || 'Unnamed'));
     lines.push('');
     if (m.category) lines.push('**Category:** ' + m.category);
+    // A record visible only through a related project carries no client or
+    // project name at all — the server blanked them — so nothing leaks into
+    // the clipboard either.
     if (m.clientName) lines.push('**Client:** ' + m.clientName);
     if (m.contextName) lines.push('**Project:** ' + m.contextName);
     if (m.category || m.clientName || m.contextName) lines.push('');
@@ -4688,12 +4720,30 @@ npm install @modelcontextprotocol/sdk</code></pre>
 
   function renderDiaryViewMode(entry) {
     const time = entry.timestamp && entry.timestamp.includes('T') ? entry.timestamp.split('T')[1].substring(0, 5) : '';
+    // A read-only grant hides every control that would 403 — see the same note
+    // in renderDiaryEditMode. The server already refuses these; offering them
+    // costs a click and an error toast to learn what the badge already says.
+    const dro = !!entry.readOnly;
+    // Visible only through a related project: the owner's own client and
+    // project names are not this caller's to see.
+    const hidden = !!entry.primaryScopeHidden;
+    const clientLabel = hidden ? '🏢 (private)' : '🏢 ' + (entry.clientName ? escHtml(entry.clientName) + ((clientListCache.find(c=>c.id===entry.clientId)||{}).crossClient ? ' [cross]' : '') : '—');
+    const projectLabel = hidden ? '📁 (private)' : '📁 ' + (entry.contextName ? escHtml(entry.contextName) : '—');
     const mentions = (entry.mentions || []).map(m =>
       `<span class="link-badge" id="dlink-badge-${entry.id}-${m.id}">
         <span class="link-content" onclick="jumpToMemory('${m.id}')" style="cursor:pointer;">👤 ${escHtml(m.name || (m.text||'').substring(0,30))}</span>
-        <button class="link-action-btn" onclick="deleteDiaryLink('${entry.id}', '${m.id}')" name="Delete">🗑️</button>
+        ${dro ? '' : `<button class="link-action-btn" onclick="deleteDiaryLink('${entry.id}', '${m.id}')" name="Delete">🗑️</button>`}
       </span>`
     ).join('');
+    // Scope chips are editors on a read-only grant: they read as the current
+    // value and stay inert, rather than disappearing and leaving the record
+    // looking unscoped.
+    const clientChip = dro
+      ? `<span class="scope-chip scope-chip--client">${clientLabel}</span>`
+      : `<button class="scope-chip scope-chip--client" onclick="_diaryPickClient(this,'${entry.id}')" title="Click to change client">${clientLabel}</button>`;
+    const projectChip = dro
+      ? `<span class="scope-chip scope-chip--project">${projectLabel}</span>`
+      : `<button class="scope-chip scope-chip--project" onclick="_diaryPickProject(this,'${entry.id}')" title="Click to change project">${projectLabel}</button>`;
 
     return `
       <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:1.5rem; border-bottom: 2px solid var(--primary-light); padding-bottom: 0.75rem;">
@@ -4704,22 +4754,23 @@ npm install @modelcontextprotocol/sdk</code></pre>
           <h2 style="margin:0; font-size:1.15rem;">${escHtml(diaryEntryTitle(entry))}</h2>
         </div>
         <div style="display:flex; gap:0.5rem; align-items:center; flex-shrink:0; margin-left:1rem;">
+          ${dro ? '<span style="font-size:.8rem;color:var(--muted);white-space:nowrap;">🔒 read-only</span>' : ''}
           <button class="item-menu-btn" onclick="_showDiaryMenu(this, '${entry.id}')">☰</button>
         </div>
       </div>
       <div class="fact-detail-scope diary-scope-row" id="diary-scope-row-${entry.id}" style="margin-bottom:.75rem; display:flex; flex-wrap:wrap; gap:.4rem; align-items:center;">
-        <button class="scope-chip scope-chip--client" onclick="_diaryPickClient(this,'${entry.id}')" title="Click to change client">🏢 ${entry.clientName ? escHtml(entry.clientName) + ((clientListCache.find(c=>c.id===entry.clientId)||{}).crossClient ? ' [cross]' : '') : '—'}</button>
-        <button class="scope-chip scope-chip--project" onclick="_diaryPickProject(this,'${entry.id}')" title="Click to change project">📁 ${entry.contextName ? escHtml(entry.contextName) : '—'}</button>
+        ${clientChip}
+        ${projectChip}
         <span style="font-size:.75rem;color:var(--muted);margin-left:.25rem;">🔗</span>
-        ${(entry.relevantClients||[]).filter(rc=>rc.id!==entry.clientId && rc.id!==entry.contextId).map(rc=>`<span class="scope-chip scope-chip--relevant">${rc.kind === 'context' ? '📁 ' : ''}${escHtml(rc.name)}<button class="scope-chip-remove" onclick="_diaryRemoveRelevant('${entry.id}','${rc.id}')" title="Remove">×</button></span>`).join('')}
-        <button class="scope-chip scope-chip--add" onclick="_diaryAddRelevant(this,'${entry.id}')" title="Add relevant client">＋</button>
+        ${(entry.relevantClients||[]).filter(rc=>rc.id!==entry.clientId && rc.id!==entry.contextId).map(rc=>`<span class="scope-chip scope-chip--relevant">${rc.kind === 'context' ? '📁 ' : ''}${escHtml(rc.name)}${dro ? '' : `<button class="scope-chip-remove" onclick="_diaryRemoveRelevant('${entry.id}','${rc.id}')" title="Remove">×</button>`}</span>`).join('')}
+        ${dro ? '' : `<button class="scope-chip scope-chip--add" onclick="_diaryAddRelevant(this,'${entry.id}')" title="Add relevant client">＋</button>`}
       </div>
       <div class="markdown-body">${marked.parse(entry.content || '')}</div>
       <div id="diary-detail-meta" style="margin-top:1rem;"></div>
       <div style="margin-top:1.5rem; padding-top:1rem; border-top:1px solid var(--border);">
         <div style="font-size:.75rem; font-weight:700; text-transform:uppercase; color:var(--muted); letter-spacing:.5px; margin-bottom:.4rem;">Linked Facts ${mentions ? '(' + (entry.mentions||[]).length + ')' : ''}</div>
         ${mentions || '<span style="font-size:.85rem;color:var(--muted);">No linked facts.</span>'}
-        <div style="margin-top:.5rem; display:flex; gap:.5rem; flex-wrap:wrap;">
+        ${dro ? '' : `<div style="margin-top:.5rem; display:flex; gap:.5rem; flex-wrap:wrap;">
           <button class="btn btn-ghost btn-sm" onclick="toggleDiaryLinkForm('${entry.id}')">🔗 Link to fact</button>
         </div>
         <div id="dlink-form-${entry.id}" style="display:none; margin-top:.5rem; padding:.5rem; background:var(--bg); border-radius:6px; border:1px solid var(--border);">
@@ -4735,7 +4786,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
             <button class="btn btn-primary btn-sm" onclick="saveDiaryLink('${entry.id}')">Link</button>
             <button class="btn btn-ghost btn-sm" onclick="toggleDiaryLinkForm('${entry.id}')">Cancel</button>
           </div>
-        </div>
+        </div>`}
       </div>`;
   }
 

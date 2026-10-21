@@ -586,7 +586,7 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
     nothing at all and the search came back empty), and it deleted the very
     entries ``scopeStrength`` needs in order to rank the rest.
     """
-    from fact_manager import rewrite_search_query, _db_relevant_scope, _record_scope_ids
+    from fact_manager import rewrite_search_query, _db_relevant_scope, _record_scope_ids, _record_related_ids_sync, _shared_record_visible
 
     qdrant = await get_qdrant()
     neo4j_driver = get_neo4j()
@@ -623,6 +623,12 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
 
     # 2. Multi-variant vector search — merge by best score per entry
     all_results: dict = {}  # id -> {payload, score}
+    # Points whose owner is not the caller and whose primary scope is not
+    # granted. NOT dropped here: an entry whose only scope evidence is a
+    # RELEVANT_TO link is reachable through that link's target, and those ids
+    # are not in the payload. Held aside, resolved by one batched pass after the
+    # loop, and only then kept or dropped.
+    pending: dict = {}  # id -> {point, score}
     for variant_query, weight in query_variants:
         vec = await get_embedding(variant_query)
         result = await qdrant.query_points(
@@ -644,6 +650,9 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
                 (r.payload or {}).get("contextId"),
                 owners,
             ):
+                entry_id = parent_of(r.id, r.payload)
+                if entry_id not in pending or r.score * weight > pending[entry_id]["score"]:
+                    pending[entry_id] = {"point": r, "score": r.score * weight}
                 continue
             score = r.score * weight
 
@@ -680,6 +689,18 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
             entry_id = parent_of(r.id, r.payload)
             if entry_id not in all_results or score > all_results[entry_id]["score"]:
                 all_results[entry_id] = {"point": r, "score": score}
+
+    # Resolve the held-aside entries: one batched RELEVANT_TO pass, then keep the
+    # ones a grant actually covers and drop the rest.
+    if owners and pending:
+        rel_ids = _record_related_ids_sync(neo4j_driver, list(pending))
+        for rid, v in pending.items():
+            p = v["point"].payload or {}
+            owner = p.get("userId") or user_id
+            if not sharing.record_visible_related(owner, rel_ids.get(rid, ()), owners):
+                continue
+            v["relatedIds"] = rel_ids.get(rid, set())
+            all_results[rid] = v
 
     # 3. Scope ranking, before the top_p cut. Ordering has to happen first so the
     #    limit is spent on the entries the caller asked for; the threshold still
@@ -806,6 +827,23 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
         }
         if v.get("matchedChunk"):
             entry["matchedChunk"] = v["matchedChunk"]
+        # Only ever set on a read-only grant — the key is what hides the edit
+        # controls. A related-only entry earns its permission from the grant on
+        # the project it mentions, not from a primary scope it does not have.
+        if sharing.record_read_only(user_id, r.payload.get("userId"),
+                                    r.payload.get("clientId"),
+                                    r.payload.get("contextId"), owners,
+                                    v.get("relatedIds")):
+            entry["readOnly"] = True
+        # Visible only through a related project: the owner's own client and
+        # project names are not this caller's to see.
+        if sharing.primary_scope_hidden(r.payload.get("userId"),
+                                        r.payload.get("clientId"),
+                                        r.payload.get("contextId"),
+                                        v.get("relatedIds"), owners):
+            entry["clientName"] = None
+            entry["contextName"] = None
+            entry["primaryScopeHidden"] = True
         entries.append(entry)
 
     # Scope is the primary key and score the tiebreak within a scope tier, so the
@@ -1217,12 +1255,21 @@ def db_list_diary_entries(user_id: str, from_ts: Optional[str] = None, to_ts: Op
             toTs=to_clause,
         )
         entries = []
+        # RELEVANT_TO target ids, one batched pass over the candidate set. An
+        # entry whose only scope evidence is a related link is reachable through
+        # that link's target, and the ids are not on this query's RETURN.
+        rel_ids = _record_related_ids_sync(neo4j_driver, [r["id"] for r in result])
         for r in result:
             # Phase 3: visibility — own rows always pass; an owner's rows only
-            # through a grant on one of the scope ids the entry is filed under.
+            # through a grant on one of the scope ids the entry is filed under,
+            # or on a target the entry is RELEVANT_TO.
             owner = r.get("userId") or user_id
-            if owner != user_id and not sharing.record_visible(
-                owner, r.get("clientId"), r.get("contextId"), owners
+            rel = rel_ids.get(r["id"], set())
+            if owner != user_id and not _shared_record_visible(
+                owner,
+                (r.get("clientId"),) if r.get("clientId") else (),
+                (r.get("contextId"),) if r.get("contextId") else (),
+                rel, owners,
             ):
                 continue
             raw_meta = r.get("metadata")
@@ -1243,8 +1290,13 @@ def db_list_diary_entries(user_id: str, from_ts: Optional[str] = None, to_ts: Op
                 "ownerUserId": owner if owner != user_id else None,
             })
             if sharing.record_read_only(user_id, owner, r.get("clientId"),
-                                        r.get("contextId"), owners):
+                                        r.get("contextId"), owners, rel):
                 entries[-1]["readOnly"] = True
+            if sharing.primary_scope_hidden(owner, r.get("clientId"),
+                                            r.get("contextId"), rel, owners):
+                entries[-1]["client"] = None
+                entries[-1]["context"] = None
+                entries[-1]["primaryScopeHidden"] = True
         return entries
 
 
@@ -1323,9 +1375,15 @@ def db_list_diary(user_id: str) -> list:
         for r in result:
             # Phase 3: visibility — own rows always pass; an owner's rows only
             # through a grant on one of the scope ids the entry is filed under.
+            # `relevantClients` is already on this query's RETURN, so no second
+            # pass is needed here.
             owner = r.get("userId") or user_id
-            if owner != user_id and not sharing.record_visible(
-                owner, r.get("clientId"), r.get("contextId"), owners
+            rel = {rc["id"] for rc in (r.get("relevantClients") or []) if rc.get("id")}
+            if owner != user_id and not _shared_record_visible(
+                owner,
+                (r.get("clientId"),) if r.get("clientId") else (),
+                (r.get("contextId"),) if r.get("contextId") else (),
+                rel, owners,
             ):
                 continue
             entries.append({
@@ -1353,8 +1411,13 @@ def db_list_diary(user_id: str) -> list:
             # grant, so an unshared vault and a write grant both keep their
             # original row shape and the edit controls stay.
             if sharing.record_read_only(user_id, owner, r.get("clientId"),
-                                        r.get("contextId"), owners):
+                                        r.get("contextId"), owners, rel):
                 entries[-1]["readOnly"] = True
+            if sharing.primary_scope_hidden(owner, r.get("clientId"),
+                                            r.get("contextId"), rel, owners):
+                entries[-1]["clientName"] = None
+                entries[-1]["contextName"] = None
+                entries[-1]["primaryScopeHidden"] = True
         return entries
 
 
