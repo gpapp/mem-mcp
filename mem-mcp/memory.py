@@ -38,6 +38,7 @@ from diary_manager import (
 from client_manager import (
     db_create_client, db_create_context, db_list_clients,
     db_resolve_client, db_resolve_context,
+    db_owner_of_target,
     link_fact_to_client, link_fact_to_context,
     link_diary_to_client, link_diary_to_context,
     db_set_client_active, db_set_client_cross, db_rename_client, db_rename_context,

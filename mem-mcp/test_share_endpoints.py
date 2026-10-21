@@ -28,6 +28,7 @@ What is pinned here, and why no other file can see it:
 """
 
 import asyncio
+import builtins
 import json
 import os
 import re
@@ -1781,6 +1782,79 @@ class ReadOnlyGatingTests(unittest.TestCase):
                        "_diaryMenuCopyMd", "_diaryMenuGraph", "_diaryMenuReload"):
             self.assertIn(action, out["owned"],
                           msg=f"an owned diary entry lost {action}() from its menu")
+
+
+class MemReexportTests(unittest.TestCase):
+    """Every ``mem.<name>`` the GUI and the MCP tools read must exist.
+
+    The defect this guards shipped a 500 with nothing in ``memory-vault.log``:
+    ``memory.py`` never re-exported ``db_owner_of_target``, so every owner gate
+    (``_require_owner``, ``_require_target_access``) raised ``AttributeError``
+    on the first call. Deactivate, cross-client, rename, delete — all of them
+    are behind that gate, and all of them failed for a client the caller owned.
+
+    Why it was invisible: an unhandled exception in a handler is a 500 whose
+    traceback uvicorn writes to *stderr*, which is ``docker logs`` and not the
+    app log. The user went looking in ``memory-vault.log``, found the Ollama
+    traffic and nothing else, and reasonably concluded the request never
+    arrived. **A silent 500 and a request that never arrived are
+    indistinguishable from the app log** — which is the whole argument for
+    pinning the re-export set here rather than trusting that it was wired.
+
+    A helper tested in isolation is not a test of its call site, and this is
+    the same lesson one layer out: ``db_owner_of_target`` is exercised by the
+    write-gate tests, and nothing checked that ``gui.py`` could reach it.
+    """
+
+    def _mem_attrs(self):
+        used = set()
+        for name in ("mem-mcp/gui.py", "mem-mcp/mcp_tools.py"):
+            tree = pyast.parse(_read(name))
+            for node in pyast.walk(tree):
+                if (isinstance(node, pyast.Attribute)
+                        and isinstance(node.value, pyast.Name)
+                        and node.value.id == "mem"):
+                    used.add(node.attr)
+        return used
+
+    def _mem_bindings(self, source):
+        bound = set(dir(builtins))
+        for node in pyast.parse(source).body:
+            if isinstance(node, (pyast.Import, pyast.ImportFrom)):
+                for alias in node.names:
+                    bound.add((alias.asname or alias.name).split(".")[0])
+            elif isinstance(node, (pyast.FunctionDef, pyast.AsyncFunctionDef,
+                                   pyast.ClassDef)):
+                bound.add(node.name)
+            elif isinstance(node, pyast.Assign):
+                for target in node.targets:
+                    if isinstance(target, pyast.Name):
+                        bound.add(target.id)
+        return bound
+
+    def test_every_mem_attribute_the_gui_reads_is_reexported(self):
+        missing = sorted(self._mem_attrs() - self._mem_bindings(_read("mem-mcp/memory.py")))
+        self.assertEqual(
+            [], missing,
+            msg=f"gui.py / mcp_tools.py read mem.{{{', '.join(missing)}}}, "
+                f"which memory.py does not bind — an AttributeError, a 500, "
+                f"and a traceback only uvicorn sees")
+
+    def test_the_guard_sees_the_missing_reexport(self):
+        """The self-check. Without it the test above is an assertion about
+        nothing, which is the failure mode this whole file exists to avoid.
+        """
+        source = _read("mem-mcp/memory.py")
+        self.assertIn("db_owner_of_target", source,
+                      "memory.py no longer re-exports db_owner_of_target; "
+                      "the self-check below has nothing to strip")
+        broken = source.replace("    db_owner_of_target,\n", "", 1)
+        self.assertNotIn("db_owner_of_target", broken)
+        self.assertIn(
+            "db_owner_of_target",
+            sorted(self._mem_attrs() - self._mem_bindings(broken)),
+            msg="removing the re-export does not make the guard report it "
+                "missing, so the guard cannot see the defect it exists to catch")
 
 
 if __name__ == "__main__":
