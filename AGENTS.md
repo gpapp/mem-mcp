@@ -78,7 +78,7 @@ own body and a namespace entry cannot reach that.
 
 ```bash
 cd mem-mcp
-python3 -m unittest -v test_matching_regressions.py test_embedding_reliability.py test_chunking.py test_cypher_safety.py test_backup_compression.py test_people_extraction.py test_graph_scope.py test_mobile_layout.py test_llm_reliability.py test_env_wiring.py test_status_monitor.py test_sessions.py test_auth_guard.py test_google_auth.py test_registration.py test_vault_migration.py
+python3 -m unittest -v test_matching_regressions.py test_embedding_reliability.py test_chunking.py test_cypher_safety.py test_backup_compression.py test_people_extraction.py test_graph_scope.py test_mobile_layout.py test_llm_reliability.py test_env_wiring.py test_status_monitor.py test_sessions.py test_auth_guard.py test_google_auth.py test_registration.py test_vault_migration.py test_sharing.py test_share_endpoints.py test_sharing_readpaths.py
 ```
 
 This was a Windows path (`C:/tools/miniconda3/python.exe`) with PowerShell `Push-Location`/`Pop-Location`, and it does not exist on the Linux host these files are edited from — every suite "failed" on an interpreter that is not there. Any `python`/`python3` on `PATH` runs all sixteen; none of them import a DB driver.
@@ -363,6 +363,161 @@ revoked" so the endpoint cannot be walked to enumerate real key ids, and it
 scopes by `user_id` in the UPDATE rather than reading a row and comparing in
 Python.
 
+## Project / Context Sharing
+
+`MEM_SHARING_ENABLED=0` by default, and it should stay 0 until an operator
+turns it on: with the flag off every share route answers 404 and every read
+path is byte-identical to its pre-sharing shape. The feature is a **single
+client or context** handed to another signed-in user, read-only or
+read-write. Whole-vault sharing, transitive re-share, anonymous recipients
+and per-record sharing are all deliberately out of scope.
+
+**SQLite is the only source of truth. There is no Neo4j `ShareLink` /
+`ShareGrant` mirror, and adding one is the wrong fix for anything below.**
+`audit.py` owns the link/grant/audit tables in `audit.db`; every read path
+computes the set of target ids it may reach and filters with it, so no Cypher
+knows grants exist. That is what keeps the two stores from disagreeing about
+who may read what — the failure mode a mirror node would make permanent.
+
+### The visibility rule is stated once
+
+`_shared_record_visible(owner, client_ids, context_ids, related_ids, owners)`
+in `fact_manager.py` is the single statement of it. It was previously spelled
+out at six call sites and one had already drifted. **A record is visible when
+ANY ONE of these is granted**: its `FOR_CLIENT` id, its `IN_CONTEXT` id, or a
+target of its `RELEVANT_TO` edges. The third is the one that is easy to miss
+and the one the scope classifier depends on — it writes `RELEVANT_TO` *before*
+it gives up on a primary client, so a null-primary record's only scope
+evidence is that edge.
+
+`sharing.py` holds the pure policy (`record_visible`, `record_visible_related`,
+`record_permission_related`, `primary_scope_hidden`, `record_read_only`) and is
+stdlib-only so it imports on a box with no DB drivers. `_shared_records_visible`
+/ `_shared_records_visible_by_ids` / `_record_related_ids` /
+`_record_related_ids_sync` are the batched graph passes.
+
+**Read paths widen the raw match, then filter per row.** `readable_owner_ids()`
+returns `None` for the fast path and `[user_id] + granted owners` otherwise;
+the record's own owner is compared against `user_id` and an owner's row only
+survives through a grant. A post-filter that is skipped leaks the owner's whole
+vault; one applied to the caller's own rows hides the grantee's own vault. Both
+are wrong in the same silent direction and neither raises.
+
+**A project's item panel resolves the scope node's owner first.** A shared
+`Context` belongs to its owner, so `_scope_items`' single-owner
+`{userId: $userId}` existence test answered 404 for every shared project — the
+grantee saw the row in the client list, clicked it, and got "could not load
+items". It now resolves the owner over `readable_owner_ids` (never a bare id
+lookup, which would read another user's node to decide) and filters the rows
+through `_shared_records_visible`. **No grants at all short-circuits**: the
+widened lookup would read the caller's own id back and find nothing, which is
+one wasted query per panel open on a path that is supposed to be unchanged.
+
+**The panel matches `RELEVANT_TO` as well as the primary edge.** A record that
+only *mentions* a project is linked to it, and the primary-only match never
+returned it — which is exactly the record a grant is most often worth having.
+Two queries rather than `-[:FOR_CLIENT|RELEVANT_TO]->` in one: a record that is
+both comes back twice, and de-duplicating that in Cypher means an aggregating
+`WITH` per `OPTIONAL MATCH` in a query that already has three.
+
+### A grant never widens to the owner's other records
+
+- **A context grant keeps its parent client visible with only the granted
+  context underneath.** `_shared_client_entries` runs three passes for this and
+  the third is gated on an explicit `nested` flag. The line it replaced read
+  `if ctx["id"] not in entries`, which looks like "this context has no parent
+  to nest under" and is always true, because a Context id is never a key of
+  `entries` unless that very line put it there. Every granted project appeared
+  twice: nested where it belongs and again as a top-level row sorted in among
+  the clients.
+- **The parent's permission stays navigation-only.** A context grant covers the
+  context and its records, never the client node — `audit.grant_permits`
+  refuses exactly that — so the list must not advertise what a check will 404.
+- **`primary_scope_hidden` blanks the owner's own client and project names** on
+  a record reachable only through a related target. Rendering them would leak
+  the owner's unshared scope on every such record, which is the whole thing a
+  context grant withholds. The ids stay, because scope ranking and the
+  `readOnly` decision both need them.
+
+### Link badges are filtered to what the caller can open
+
+A grantee reading an owner's record is offered MENTIONS / RELATED_TO badges for
+the owner's *other* records. Those are exactly the ones a grant may not cover,
+and clicking one fetched a fact the server then refused — an empty pane with
+nothing to say why. `db_list_diary` and `db_list_memories` now run one batched
+visibility pass over the page's link targets and **drop the badges the caller
+cannot open**, which is the same rule as hiding a control the caller cannot
+honour. Own rows are untouched: every target of an own record is in the
+caller's own vault.
+
+### The UI withholds what a read-only grant cannot honour
+
+Every one of these handlers already answers 403, so the buttons "work" in the
+sense that nothing is corrupted — they just cost a click, a toast and the
+impression the vault is broken. Hiding them is the same principle as a disabled
+route answering 404 rather than 403.
+
+- Diary and fact hamburger menus are filtered against
+  `_DIARY_MENU_WRITERS` / `_FACT_MENU_WRITERS`; navigating, copying and
+  reloading stay, because those are reads.
+- Diary VIEW mode gates the scope chips, mention deletes, add-relevant and the
+  link form, and shows a `🔒 read-only` badge.
+- **The Projects page is a second surface for the same rows the Clients page
+  renders, and it was missed.** `loadProjects()` now hides Rename/Delete on a
+  shared project; the client card had gated its actions from the start.
+- "Add project" offers **owned** clients only, and the whole row goes when the
+  caller owns none — creating a project under somebody else's client is a write
+  into their vault, and the server refuses it.
+
+**These are asserted by driving the render functions, not by reading their
+source.** `ReadOnlyGatingTests` loads the dashboard's own inline script into a
+node fake DOM and reads the HTML it produces. A source guard is satisfied by a
+gated button whose `onclick` still names the handler, by a handler hidden
+behind a style the CSS later overrides, and by a fragment that is built and
+then discarded — three ways to ship the original report with a green suite.
+The harness rebinds `showItemMenu` with a plain assignment, NOT `global.`:
+node wraps the file, so the dashboard's declaration is module-scoped.
+
+### Writes and the audit trail
+
+A write through a grant keeps the record under the **owner's** `userId` and
+stamps `createdBy` / `updatedBy` with the actor. `db_update_diary` /
+`db_delete_diary` gate on `has_access(..., level="write")` and raise
+`PermissionError`; the tool source must not reference `db_create_client` /
+`db_create_context` / `db_resolve_client` / `db_resolve_context` at all — the
+write-scope resolver (`resolve_write_scope`) resolves names through an evidence
+ladder and one LLM approximation, and **creates nothing**. Creating on a
+near-miss mints a second `Client` that the classifier will never link to.
+
+Every grant decision is written to `audit.db` (`log_access`, `log_shared`),
+retained `MEM_AUDIT_KEEP_DAYS` (90) and readable through `GET /api/audit`: an
+owner sees the rows about their own shared targets only, and the admin
+(`MEM_ADMIN_USER`) sees everything. **`audit.db` is copied into every
+savepoint** — a restore that leaves the grants behind restores a vault whose
+sharing has silently stopped working.
+
+### The two tests that exist because of this feature
+
+`test_sharing.py` and `test_share_endpoints.py` drive `audit.py` / `sharing.py`
+directly (both are stdlib-only) and lift the endpoints out of `gui.py` with
+`ast.get_source_segment`. `test_sharing_readpaths.py` covers the read paths,
+which cannot be imported here, and holds two guards worth knowing about:
+
+- **`UnboundGlobalTests`** resolves every name a read path READS against what
+  the module and function actually bind. It exists because `db_list_diary`
+  shipped calling `_shared_record_visible` with no import of it anywhere in
+  `diary_manager.py` — invisible to every sharing suite, because the lift
+  harness injects the helper into the exec namespace. **A test of a helper is
+  not a test of its call site**, and this is that lesson in its purest form.
+  Its self-check strips the import statement by locating it in the AST rather
+  than by matching its text, because a self-check that hardcodes the line rots
+  the moment the import is reformatted.
+- **`ScopeItemsAccessTests`** stubs `fact_manager` into `sys.modules` for the
+  function-local import. A namespace entry cannot reach a `from X import Y`
+  inside a function body; the import is function-local because `fact_manager`
+  imports `client_manager` at module level, so a module-level import here is a
+  cycle.
+
 ## Critical Config
 
 - `MEM_NEO4J_PASSWORD` (also mapped to `NEO_PASS` in docker-compose)
@@ -459,6 +614,7 @@ Python.
   "the stores agree" ” which would be the one thing it could say that is untrue.
 - Registration: `MEM_REGISTRATION_ENABLED` (default 0, and it should stay 0 — a route that creates accounts is something an operator turns on). The two methods have their own further requirements: email/password needs `MEM_SMTP_*`, Google needs `GOOGLE_CLIENT_ID` **and** `GOOGLE_CLIENT_SECRET`. Each is checked separately, so turning the flag on is not the same as having a usable form.
 - Outbound mail: `MEM_SMTP_HOST`, `MEM_SMTP_PORT` (587), `MEM_SMTP_USER`, `MEM_SMTP_PASSWORD`, `MEM_SMTP_FROM`, `MEM_SMTP_STARTTLS` (default 1) and `MEM_SMTP_TIMEOUT` (20s). `smtp_configured()` needs only host and From, because those are what a signup attempt must have to be worth offering a form at all.
+- Sharing: `MEM_SHARING_ENABLED` (default 0), `MEM_SHARE_LINK_TTL_DAYS` (30, blank/0 = never expires), `MEM_SHARE_MAX_RECIPIENTS` (50), `MEM_AUDIT_KEEP_DAYS` (90), `MEM_AUDIT_DB` (default `<dirname MEM_SESSION_DIR>/audit.db`) and `MEM_AUDIT_LOG_OWN` (default 0 — logging an owner's own reads is chatty and adds nothing an owner cannot see in the feed). See "Project / Context Sharing" above.
 - Google sign-in (OAuth 2.0 redirect): `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`, plus the callback `{BASE_URL}/api/auth/google/callback` registered in Google Cloud. **Both are required** — the secret is what makes the code redemption confidential. Note `test_env_wiring._DECL` had to grow a `GOOGLE_[A-Z0-9_]+` branch: without it a documented `GOOGLE_*` variable silently escapes the "every documented variable reaches the container" test, which is the same class of quiet as an unwired knob.
 - `BASE_URL` must include `/mcp` prefix when behind nginx
 

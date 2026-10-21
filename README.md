@@ -559,8 +559,11 @@ naming the access-key header it needs.)*
 A vault owner can share a single client or context with another signed-in user via a link or direct grant, with read or read-write permission.
 
 - Feature flag `MEM_SHARING_ENABLED` (default 0). Enable to turn on.
-- Endpoints: `POST /api/share/links`, `GET /api/share/links`, `DELETE /api/share/links/{id}`, `POST /api/share/accept/{token}`, `POST /api/share/grants`, `GET /api/share/grants`, `PUT /api/share/grants/{id}`, `DELETE /api/share/grants/{id}`, `GET /api/share/mine`, `GET /api/audit`.
+- Endpoints: `POST /api/share/links`, `GET /api/share/links`, `DELETE /api/share/links/{id}`, `POST /api/share/accept/{token}`, `POST /api/share/grants`, `GET /api/share/grants`, `PUT /api/share/grants/{id}`, `DELETE /api/share/grants/{id}`, `GET /api/share/mine`, `GET /api/audit`, plus `GET /share/{token}` (the landing page a link opens).
 - MCP tools: `list_shared_with_me`, `accept_share_link`, `list_share_grants`.
 - Records created under a shared target are stored under the owner's userId with `createdBy`/`updatedBy` set.
-- Audit log in a separate SQLite DB (`MEM_AUDIT_DB`), 90-day retention (`MEM_AUDIT_KEEP_DAYS`).
+- Audit log in a separate SQLite DB (`MEM_AUDIT_DB`), 90-day retention (`MEM_AUDIT_KEEP_DAYS`). The grants are the sole source of truth — there is no Neo4j mirror, so `audit.db` is copied into every savepoint.
 - Link TTL default 30 days (`MEM_SHARE_LINK_TTL_DAYS`), max 50 recipients (`MEM_SHARE_MAX_RECIPIENTS`).
+- **What a grantee sees:** their own vault plus records under the granted client or project — including records that only *mention* it via `RELEVANT_TO`. A project grant keeps its parent client visible for navigation, but only that project underneath; sibling projects are never shared. A record reachable only through a related project shows `(private)` instead of the owner's own client/project names.
+- **What a grantee cannot do on read-only:** rename, delete, reclassify, extract participants, change scope, or link. The controls are hidden rather than offered and refused.
+- A link opens `/share/{token}`, which asks an anonymous visitor to sign in and offers a signed-in visitor an Accept button. The token is stored as a SHA-256 digest and its plaintext is shown once, at creation.
