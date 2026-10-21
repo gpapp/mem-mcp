@@ -1420,6 +1420,74 @@ class ReadOnlyGatingTests(unittest.TestCase):
                 "{ target_id: 'd1', target_label: 'DiaryEntry', rel: 'MENTIONS', "
                 "target_name: 'Note', direction: 'in' }], metadata: {} }")
 
+    def _projects_html(self, contexts):
+        """`loadProjects()` output for one client carrying these projects.
+
+        Driven rather than read: the shared row's actions are built by a
+        conditional in a template literal, and a source assertion cannot tell a
+        gated button from one whose onclick survived the gate.
+        """
+        cache = json.dumps([{"id": "c1", "name": "ACME", "contexts": contexts}])
+        return self._render([
+            ("projects", f"(clientListCache = {cache}, await loadProjects(), "
+                         f"document.getElementById('project-list').innerHTML)"),
+        ])["projects"]
+
+    def test_a_shared_project_offers_no_rename_or_delete(self):
+        """The reported defect: Rename was still visible on a shared project.
+
+        The Projects page is a second surface for the same rows the Clients
+        page renders, and it was missed — the client card had gated its actions
+        since the sharing work landed, this list had not.
+        """
+        html = self._projects_html([
+            {"id": "x1", "name": "Secret Project", "shared": True,
+             "owner": "alice", "permission": "read"},
+        ])
+        self.assertNotIn("THREW", html)
+        self.assertNotIn("renameContext(", html,
+                         msg="a shared project still renders a Rename button; "
+                             "the owner's node is not the grantee's to rename")
+        self.assertNotIn("deleteContext(", html,
+                         msg="a shared project still renders a Delete button")
+        # Presence before the negative: a guard that removed every action
+        # would pass the two assertions above.
+        self.assertIn("🔗 shared", html)
+        self.assertIn("Secret Project", html)
+
+    def test_an_owned_project_still_offers_rename_and_delete(self):
+        html = self._projects_html([{"id": "x2", "name": "Own Project"}])
+        self.assertIn("renameContext('x2')", html)
+        self.assertIn("deleteContext('x2')", html)
+
+    def test_a_shared_client_card_offers_no_mutating_control(self):
+        """The client card and its nested projects, both gated.
+
+        `_renderClientCard` is where the shared badge and the gated actions
+        are decided, so driving it covers the Clients page and the client
+        filter in one expression.
+        """
+        shared = {"id": "c1", "name": "ACME", "shared": True, "owner": "alice",
+                  "permission": "read",
+                  "contexts": [{"id": "x1", "name": "Secret", "shared": True,
+                                "owner": "alice", "permission": "read"}]}
+        html = self._render([("card", f"_renderClientCard({json.dumps(shared)})")])["card"]
+        self.assertNotIn("THREW", html)
+        for handler in ("renameClient(", "deleteClient(", "toggleClient(",
+                        "toggleCrossClient(", "renameContext(", "deleteContext("):
+            self.assertNotIn(handler, html,
+                             msg=f"a shared client card still renders {handler}")
+        self.assertIn("🔗 shared by alice", html)
+
+    def test_an_owned_client_card_still_offers_every_control(self):
+        owned = {"id": "c1", "name": "ACME", "effectiveActive": True,
+                 "contexts": [{"id": "x1", "name": "Own"}]}
+        html = self._render([("card", f"_renderClientCard({json.dumps(owned)})")])["card"]
+        for handler in ("renameClient(", "deleteClient(", "toggleClient(",
+                        "renameContext(", "deleteContext("):
+            self.assertIn(handler, html,
+                          msg=f"an owned client card no longer offers {handler}")
+
     def test_a_read_only_record_offers_no_mutating_control(self):
         """The reported bug, asserted on the output of both render paths."""
         out = self._render([

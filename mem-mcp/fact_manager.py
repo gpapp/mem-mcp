@@ -1969,7 +1969,28 @@ def db_list_memories(user_id: str) -> list:
             ownerIds=owner_ids or [user_id],
         )
         memories = []
-        for r in result:
+        # One batched visibility pass over every link target on the page, for
+        # the same reason `db_list_diary` filters its mentions: a grantee
+        # reading an owner's record is offered badges for the owner's OTHER
+        # records, and clicking one that the grant does not cover fetched a
+        # fact the server then refused — an empty pane with nothing to say
+        # why. Dropping the badge is the rule this repo already applies to a
+        # control the caller cannot honour.
+        #
+        # `list(result)` first: a Neo4j Result is a lazy iterator, and the
+        # visibility queries below would consume it.
+        rows = list(result)
+        link_pairs = []
+        for r in rows:
+            row_owner = r["f"].get("userId") or user_id
+            if row_owner == user_id:
+                continue
+            for link in (r["links"] or []):
+                if link and link.get("target_id"):
+                    link_pairs.append((link["target_id"], row_owner))
+        visible_links = (_shared_records_visible(s, link_pairs, owners)
+                         if (link_pairs and owners) else set())
+        for r in rows:
             f_node = r["f"]
             owner = f_node.get("userId") or user_id
             # A record whose primary scope is not granted can still be visible
@@ -1992,6 +2013,11 @@ def db_list_memories(user_id: str) -> list:
 
             # Clean up links (remove null entries from collect)
             links = [l for l in r["links"] if l and l.get("target_id")]
+            # A target the caller cannot read is dropped, not rendered: the
+            # pane it opens is empty, which reads as a broken record rather
+            # than as a record that was never shared.
+            if owner != user_id:
+                links = [l for l in links if l["target_id"] in visible_links]
 
             memories.append({
                 "id":        f_node["id"],

@@ -32,6 +32,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import tempfile
 import types
 import typing
@@ -45,6 +46,7 @@ import sharing
 HERE = os.path.dirname(os.path.abspath(__file__))
 FACT_MANAGER = os.path.join(HERE, "fact_manager.py")
 DIARY_MANAGER = os.path.join(HERE, "diary_manager.py")
+CLIENT_MANAGER = os.path.join(HERE, "client_manager.py")
 
 TRUTHY = {"1", "true", "yes", "on"}
 
@@ -276,6 +278,7 @@ class UnboundGlobalTests(unittest.TestCase):
         (DIARY_MANAGER, "db_search_diary"),
         (DIARY_MANAGER, "db_list_diary"),
         (DIARY_MANAGER, "db_list_diary_entries"),
+        (CLIENT_MANAGER, "_scope_items"),
     )
 
     def test_every_target_read_path_resolves_every_name_it_calls(self):
@@ -297,10 +300,20 @@ class UnboundGlobalTests(unittest.TestCase):
         the import was added to one and not the other, and the lift-based
         suites were green on both.
         """
-        line = ("from fact_manager import _shared_record_visible, "
-                "_record_related_ids_sync\n")
-        broken = _source(DIARY_MANAGER).replace(line, "", 1)
-        self.assertNotIn(broken, "")
+        # Strip the import statement by locating it in the AST rather than by
+        # matching its text: the self-check that hardcodes the line rots the
+        # moment the import is reformatted, and a self-check that silently
+        # strips nothing is an assertion about nothing.
+        diary_src = _source(DIARY_MANAGER)
+        stmt = next(n for n in ast.parse(diary_src).body
+                    if isinstance(n, ast.ImportFrom) and n.module == "fact_manager")
+        segment = ast.get_source_segment(diary_src, stmt)
+        self.assertTrue(segment, "diary_manager has no module-level "
+                                 "fact_manager import for the self-check to strip")
+        broken = diary_src.replace(segment, "", 1)
+        # NOT `assertNotIn(name, broken)`: the call sites are still there, so
+        # the name is still in the file. What the strip proves is that the
+        # import is what bound it, which is what the subTests below assert.
         for func in ("db_list_diary", "db_list_diary_entries"):
             with self.subTest(func=func):
                 self.assertIn(
@@ -1016,6 +1029,285 @@ class SharedClientListTests(ReadPathStoreCase):
         self.assertEqual(by_id["c1"]["contexts"][0]["permission"], "read")
 
 
+class _ScopeItemsSession:
+    """Answers `_scope_items`' four query shapes by marker.
+
+    The widened owner lookup is a *separate* query from the single-owner
+    existence check, so the two must be distinguishable or the test cannot
+    tell "the caller owns this project" from "the caller is granted it".
+    """
+
+    def __init__(self, *, own_exists=True, owner_row=None, fact_rows=None,
+                 diary_rows=None, client_rows=None, context_rows=None,
+                 related_rows=None, rel_fact_rows=None, rel_diary_rows=None):
+        self.own_exists = own_exists
+        self.owner_row = owner_row or []
+        self.fact_rows = fact_rows or []
+        self.diary_rows = diary_rows or []
+        self.client_rows = client_rows or []
+        self.context_rows = context_rows or []
+        self.related_rows = related_rows or []
+        self.rel_fact_rows = rel_fact_rows or []
+        self.rel_diary_rows = rel_diary_rows or []
+        self.queries = []
+
+    def run(self, query, **params):
+        self.queries.append((query, params))
+        if "RETURN count(scope) AS n" in query:
+            return _Result([_Row({"n": 1 if self.own_exists else 0})])
+        if "RETURN scope.userId AS ownerId" in query:
+            return _Result(self.owner_row)
+        if "as rids" in query:
+            return _Result(self.related_rows)
+        if "as cid" in query:
+            return _Result(self.client_rows)
+        if "as cxid" in query:
+            return _Result(self.context_rows)
+        # The RELEVANT_TO matches are separate queries, and they are tested
+        # before the primary ones because both carry the same RETURN shape.
+        if "RELEVANT_TO]->(scope" in query and "f.text AS text" in query:
+            return _Result(self.rel_fact_rows)
+        if "RELEVANT_TO]->(scope" in query and "d.date AS date" in query:
+            return _Result(self.rel_diary_rows)
+        if "d.date AS date" in query:
+            return _Result(self.diary_rows)
+        if "f.text AS text" in query:
+            return _Result(self.fact_rows)
+        return _Result([])
+
+    def ran(self, marker):
+        return any(marker in q for q, _p in self.queries)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class ScopeItemsAccessTests(ReadPathStoreCase):
+    """`_scope_items`: the item panel behind a shared project's row.
+
+    The reported defect was the Rename button still visible on a shared
+    project. Behind it sat the one that made the panel useless: the
+    single-owner `{userId: $userId}` existence test answered 404 for every
+    shared project, so a grantee who clicked a row they were legitimately
+    granted got "could not load items" — a panel that looks broken, on the
+    one surface the whole feature is judged from.
+
+    The owner is resolved over the grant's own owner set (never a bare
+    id lookup, which would read another user's node to decide), and the rows
+    are then filtered by the same visibility rule the search path uses, so a
+    grant never widens to the owner's unrelated records.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.enable_sharing()
+        self.grant("alice", "bob", "context", "x1", "read")
+
+    def _fn(self):
+        source = _source(os.path.join(HERE, "client_manager.py"))
+        return _lift(source, "_scope_items",
+                     get_neo4j=lambda: self._driver,
+                     sharing=sharing,
+                     _ts_str=lambda ts: ts,
+                     Optional=typing.Optional)
+
+    def _install_fact_manager(self):
+        """Stub `fact_manager` for the function-local import.
+
+        The import is inside the function because `fact_manager` imports this
+        module at module level — a module-level import here is a cycle. That
+        is also why the stub has to go in `sys.modules`: a namespace entry
+        cannot reach a `from X import Y` inside a function body. The stubbed
+        function is the REAL one, lifted, so the rule under test is shipping
+        code and not a stand-in.
+        """
+        helpers = self._read_helpers()
+        module = types.ModuleType("fact_manager")
+        module.__dict__.update(helpers)
+        self._old_fm = sys.modules.get("fact_manager")
+        sys.modules["fact_manager"] = module
+        self.addCleanup(self._restore_fact_manager)
+
+    def _restore_fact_manager(self):
+        if self._old_fm is None:
+            sys.modules.pop("fact_manager", None)
+        else:
+            sys.modules["fact_manager"] = self._old_fm
+
+    def _wire(self, **kwargs):
+        self._session = _ScopeItemsSession(**kwargs)
+        self._driver = _DispatchDriver(self._session)
+
+    # -- own panel is byte-identical to the pre-sharing shape ---------------
+
+    def test_an_own_panel_never_widens_and_carries_no_readonly(self):
+        self._wire(fact_rows=[_Row({"id": "f1", "name": "Mine", "text": "t",
+                                    "category": "People", "timestamp": "T",
+                                    "clientId": "c1", "clientName": "ACME",
+                                    "contextId": "x1", "contextName": "P"})],
+                   diary_rows=[_Row({"id": "d1", "date": "2026-01-01",
+                                     "name": "Entry", "timestamp": "T"})])
+        self._install_fact_manager()
+        out = self._fn()("bob", "", {"label": ":Context", "rel": ":IN_CONTEXT",
+                                     "scopeId": "x9"})
+        self.assertEqual(out["facts"][0]["id"], "f1")
+        self.assertNotIn("readOnly", out["facts"][0])
+        self.assertNotIn("readOnly", out["diary"][0])
+        self.assertFalse(self._session.ran("$ownerIds"),
+                         "an own panel runs the widened owner lookup, which "
+                         "is one query per open it never needed")
+        self.assertEqual(self._session.queries[0][1]["userId"], "bob")
+
+    # -- the shared panel the grantee was actually promised -----------------
+
+    def test_a_granted_project_opens_for_its_grantee(self):
+        self._wire(own_exists=False, owner_row=[_Row({"ownerId": "alice"})],
+                   fact_rows=[_Row({"id": "f1", "name": "Secret", "text": "t",
+                                    "category": "People", "timestamp": "T",
+                                    "clientId": "c1", "clientName": "ACME",
+                                    "contextId": "x1", "contextName": "P"})],
+                   diary_rows=[_Row({"id": "d1", "date": "2026-01-01",
+                                     "name": "Entry", "timestamp": "T"})],
+                   context_rows=[_Row({"id": "f1", "cxid": "x1"}),
+                                 _Row({"id": "d1", "cxid": "x1"})])
+        self._install_fact_manager()
+        out = self._fn()("bob", "", {"label": ":Context", "rel": ":IN_CONTEXT",
+                                     "scopeId": "x1"})
+        self.assertEqual([r["id"] for r in out["facts"]], ["f1"])
+        self.assertEqual([r["id"] for r in out["diary"]], ["d1"])
+        # The rows are read under the OWNER's id, not the caller's — that is
+        # the whole fix; a `{userId: $userId}` match returns nothing here.
+        for query, params in self._session.queries:
+            if "f.text AS text" in query or "d.date AS date" in query:
+                self.assertEqual(params["ownerId"], "alice")
+        self.assertNotIn("userId", self._session.queries[2][1])
+        # And the affordance flag the UI gates the inline ✏️ on.
+        self.assertTrue(out["facts"][0]["readOnly"])
+
+    def test_a_client_grant_opens_the_whole_client_panel(self):
+        self.grant("alice", "bob", "client", "c1", "read")
+        self._wire(own_exists=False, owner_row=[_Row({"ownerId": "alice"})],
+                   fact_rows=[_Row({"id": "f1", "name": "Secret", "text": "t",
+                                    "category": "People", "timestamp": "T",
+                                    "clientId": "c1", "clientName": "ACME",
+                                    "contextId": None, "contextName": None})],
+                   client_rows=[_Row({"id": "f1", "cid": "c1"})])
+        self._install_fact_manager()
+        out = self._fn()("bob", "", {"label": ":Client", "rel": ":FOR_CLIENT",
+                                     "scopeId": "c1"})
+        self.assertEqual([r["id"] for r in out["facts"]], ["f1"])
+        self.assertTrue(out["facts"][0]["readOnly"])
+
+    def test_rows_the_grant_does_not_cover_are_dropped_not_shown(self):
+        # The panel is opened through the grant, so the filter still applies:
+        # a sibling project of the same owner must not ride along.
+        self._wire(own_exists=False, owner_row=[_Row({"ownerId": "alice"})],
+                   fact_rows=[_Row({"id": "f1", "name": "Granted", "text": "t",
+                                    "category": "People", "timestamp": "T",
+                                    "clientId": "c1", "clientName": "ACME",
+                                    "contextId": "x1", "contextName": "P"}),
+                              _Row({"id": "f2", "name": "Sibling", "text": "t",
+                                    "category": "People", "timestamp": "T",
+                                    "clientId": "c1", "clientName": "ACME",
+                                    "contextId": "x2", "contextName": "Q"})],
+                   context_rows=[_Row({"id": "f1", "cxid": "x1"}),
+                                 _Row({"id": "f2", "cxid": "x2"})])
+        self._install_fact_manager()
+        out = self._fn()("bob", "", {"label": ":Context", "rel": ":IN_CONTEXT",
+                                     "scopeId": "x1"})
+        self.assertEqual([r["id"] for r in out["facts"]], ["f1"])
+
+    # -- the two refusals, each answering like an unknown id -----------------
+
+    def test_a_context_grant_does_not_open_the_parent_client(self):
+        # Sharing a project does not share its client node — the same thing
+        # audit.grant_permits refuses, so the panel must not offer it either.
+        self._wire(own_exists=False, owner_row=[_Row({"ownerId": "alice"})])
+        self._install_fact_manager()
+        out = self._fn()("bob", "", {"label": ":Client", "rel": ":FOR_CLIENT",
+                                     "scopeId": "c1"})
+        self.assertIsNone(out)
+        self.assertFalse(self._session.ran("f.text AS text"),
+                         "a refused panel runs the record query anyway")
+
+    def test_a_scope_id_of_a_stranger_answers_none(self):
+        # The widened lookup only ever reads owners the caller holds a grant
+        # from, so an id belonging to anybody else is invisible — and the
+        # record query never runs.
+        self._wire(own_exists=False, owner_row=[])
+        self._install_fact_manager()
+        out = self._fn()("bob", "", {"label": ":Context", "rel": ":IN_CONTEXT",
+                                     "scopeId": "zz9"})
+        self.assertIsNone(out)
+        self.assertFalse(self._session.ran("f.text AS text"))
+        # One existence check and one widened lookup: nothing else was read.
+        self.assertEqual(len(self._session.queries), 2)
+
+    def test_a_record_that_only_mentions_the_project_is_listed(self):
+        """RELEVANT_TO is a link too, and the primary match never saw it.
+
+        This is the reported defect: a fact associated with a project without
+        being *filed* under it was invisible in the project's own item panel —
+        and it is the record a grant is most often worth having, because the
+        scope classifier writes RELEVANT_TO before it gives up on a primary
+        client.
+        """
+        self._wire(
+            fact_rows=[_Row({"id": "f1", "name": "Filed here", "text": "t",
+                             "category": "People", "timestamp": "T",
+                             "clientId": "c1", "clientName": "ACME",
+                             "contextId": "x1", "contextName": "P"})],
+            rel_fact_rows=[_Row({"id": "f2", "name": "Only mentions it",
+                                 "text": "t", "category": "People",
+                                 "timestamp": "T", "clientId": "c9",
+                                 "clientName": "Other", "contextId": None,
+                                 "contextName": None})],
+            rel_diary_rows=[_Row({"id": "d2", "date": "2026-02-02",
+                                  "name": "Related entry", "timestamp": "T"})],
+            context_rows=[_Row({"id": "f1", "cxid": "x1"}),
+                          _Row({"id": "f2", "cxid": None}),
+                          _Row({"id": "d2", "cxid": None})],
+            related_rows=[_Row({"id": "f2", "rids": ["x1"]}),
+                          _Row({"id": "d2", "rids": ["x1"]})],
+        )
+        self._install_fact_manager()
+        out = self._fn()("bob", "", {"label": ":Context", "rel": ":IN_CONTEXT",
+                                     "scopeId": "x1"})
+        self.assertEqual([r["id"] for r in out["facts"]], ["f1", "f2"])
+        self.assertEqual([r["id"] for r in out["diary"]], ["d2"])
+        # A record that is BOTH is listed once, from the primary match — the
+        # second query is a merge, not an append.
+        self.assertTrue(self._session.ran("RELEVANT_TO]->(scope"))
+
+    def test_a_record_that_is_both_is_listed_once(self):
+        row = _Row({"id": "f1", "name": "Both", "text": "t",
+                    "category": "People", "timestamp": "T", "clientId": "c1",
+                    "clientName": "ACME", "contextId": "x1",
+                    "contextName": "P"})
+        self._wire(fact_rows=[row], rel_fact_rows=[row],
+                   context_rows=[_Row({"id": "f1", "cxid": "x1"})],
+                   related_rows=[_Row({"id": "f1", "rids": ["x1"]})])
+        self._install_fact_manager()
+        out = self._fn()("bob", "", {"label": ":Context", "rel": ":IN_CONTEXT",
+                                     "scopeId": "x1"})
+        self.assertEqual([r["id"] for r in out["facts"]], ["f1"])
+
+    def test_sharing_off_keeps_the_single_owner_shape(self):
+        self._old_env["MEM_SHARING_ENABLED"] = None
+        os.environ["MEM_SHARING_ENABLED"] = ""
+        self._wire(own_exists=False)
+        self._install_fact_manager()
+        out = self._fn()("bob", "", {"label": ":Context", "rel": ":IN_CONTEXT",
+                                     "scopeId": "x1"})
+        self.assertIsNone(out)
+        self.assertFalse(self._session.ran("$ownerIds"),
+                         "sharing off runs the widened owner lookup, which "
+                         "is a query per open for a caller with no grants")
+
+
 class ReadPathCallSiteTests(unittest.TestCase):
     """Pins on the lifted *source segments*: the helper's own tests above
     prove the policy; these prove each read path actually consults it.
@@ -1028,12 +1320,16 @@ class ReadPathCallSiteTests(unittest.TestCase):
     def setUpClass(cls):
         cls.fact = _source(FACT_MANAGER)
         cls.diary = _source(DIARY_MANAGER)
+        cls.client = _source(CLIENT_MANAGER)
 
     def _fact_seg(self, name):
         return _segment(self.fact, name)
 
     def _diary_seg(self, name):
         return _segment(self.diary, name)
+
+    def _client_seg(self, name):
+        return _segment(self.client, name)
 
     def _assert(self, segment, *needles):
         for needle in needles:
@@ -1067,6 +1363,68 @@ class ReadPathCallSiteTests(unittest.TestCase):
         self._assert(seg, "n.userId IN $ownerIds")
         _assert_widening(self, self.fact, "_db_relevant_scope",
                          "ownerIds", {"owner_ids"})
+
+    def test_scope_items_resolves_a_shared_scope_owner_and_filters_the_rows(self):
+        """The panel behind a shared project's row.
+
+        `ScopeItemsAccessTests` drives the behaviour; this pins the segment so
+        a refactor that hoists the owner lookup into a helper and drops the
+        post-filter there cannot pass. Both halves are load-bearing: the owner
+        resolution is what makes the panel open at all, and the filter is what
+        stops it opening the owner's whole vault.
+        """
+        seg = self._client_seg("_scope_items")
+        self._assert(
+            seg,
+            "sharing.accessible_owner_scope(user_id)",
+            "WHERE scope.userId IN $ownerIds",
+            "_shared_records_visible(",
+            '"readOnly": True',
+            # A record that only *mentions* this project is linked to it too,
+            # and the primary-only match never returned it.
+            "-[:RELEVANT_TO]->(scope",
+        )
+        # The records are read under the resolved owner, never under the
+        # caller's id — that single substitution is the fix. The own-node
+        # existence check KEEPS its single-owner form on purpose: it is the
+        # fast path, and it must not widen. Both record queries carry it.
+        self._assert(
+            seg,
+            "MATCH (f:Fact {{userId: $ownerId}})-[{params['rel']}]",
+            "MATCH (d:DiaryEntry {{userId: $ownerId}})-[{params['rel']}]",
+        )
+        self._refute(seg, "{{userId: $userId}})-[{params['rel']}]")
+        # And no grants means no widened query: the fast path is byte-shaped.
+        self._assert(seg, "if not owners:")
+
+    def test_db_list_clients_merges_the_shared_entries(self):
+        seg = self._client_seg("db_list_clients")
+        self._assert(seg, "_shared_client_entries(")
+
+    def test_link_badges_are_filtered_to_what_the_caller_can_open(self):
+        """A badge that navigates to an unreadable record is dropped.
+
+        The reported defect was the link still being navigable from the diary
+        and landing on an empty fact: the pane fetched a record the server then
+        refused, and nothing said why. Both list paths filter their link
+        targets through the same visibility pass their rows already use.
+        """
+        self._assert(
+            self._diary_seg("db_list_diary"),
+            "visible_links",
+            "_shared_records_visible(",
+            'if el.get("id") and (owner == user_id or el["id"] in visible_links)',
+        )
+        self._assert(
+            self._fact_seg("db_list_memories"),
+            "visible_links",
+            '_shared_records_visible(',
+            'links = [l for l in links if l["target_id"] in visible_links]',
+        )
+        # And the materialisation, without which the pass below consumes the
+        # lazy Result and the whole list comes back empty.
+        self._assert(self._diary_seg("db_list_diary"), "rows = list(result)")
+        self._assert(self._fact_seg("db_list_memories"), "rows = list(result)")
 
     def test_db_list_memories_widens_and_scopes_links_to_the_records_vault(self):
         seg = self._fact_seg("db_list_memories")

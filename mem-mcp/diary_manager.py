@@ -47,7 +47,8 @@ import sharing  # Phase 3: shared-vault read access policy layer
 # one. A `from fact_manager import ...` inside a read path runs a REAL import on
 # every call, which is both a per-request cost and invisible to the lift-based
 # test suites until it raises ModuleNotFoundError on a box with no qdrant_client.
-from fact_manager import _shared_record_visible, _record_related_ids_sync
+from fact_manager import (_shared_record_visible, _record_related_ids_sync,
+                          _shared_records_visible)
 
 # ---------------------------------------------------------------------------
 # Diary helpers
@@ -1386,7 +1387,33 @@ def db_list_diary(user_id: str) -> list:
             ownerIds=owner_ids or [user_id],
         )
         entries = []
-        for r in result:
+        # One batched visibility pass over every link target on the page. A
+        # grantee reading an owner's entry is shown MENTIONS and RELATED_TO
+        # badges for the owner's OTHER records, and those are exactly the ones
+        # a grant may not cover — clicking one fetched a fact the server then
+        # refused, and the pane came back empty with nothing to say why. The
+        # badge is dropped instead, which is the same rule as hiding a control
+        # the caller cannot honour. Own rows are untouched: every target of an
+        # own entry is in the caller's own vault.
+        #
+        # `list(result)` first, for the reason db_list_diary_entries documents:
+        # a Neo4j Result is a lazy iterator, and running the visibility queries
+        # below while it is still open would consume it.
+        rows = list(result)
+        link_pairs = []
+        for r in rows:
+            row_owner = r.get("userId") or user_id
+            if row_owner == user_id:
+                continue
+            for m in (r.get("mentions") or []):
+                if m.get("id"):
+                    link_pairs.append((m["id"], row_owner))
+            for el in (r.get("entryLinks") or []):
+                if el.get("id"):
+                    link_pairs.append((el["id"], row_owner))
+        visible_links = (_shared_records_visible(s, link_pairs, owners)
+                         if (link_pairs and owners) else set())
+        for r in rows:
             # Phase 3: visibility — own rows always pass; an owner's rows only
             # through a grant on one of the scope ids the entry is filed under.
             # `relevantClients` is already on this query's RETURN, so no second
@@ -1408,7 +1435,10 @@ def db_list_diary(user_id: str) -> list:
                 "name": r.get("name") or "Unnamed Entry",
                 "timestamp": format_ts_for_picker(r.get("timestamp")),
                 "metadata": (json.loads(r["metadata"]) if isinstance(r.get("metadata"), str) else (r.get("metadata") or {})),
-                "mentions": [m for m in r["mentions"] if m.get("id")],
+                "mentions": [
+                    m for m in r["mentions"]
+                    if m.get("id") and (owner == user_id or m["id"] in visible_links)
+                ],
                 "keywords": r.get("keywords") or [],
                 "clientName": r.get("clientName"),
                 "clientId": r.get("clientId"),
@@ -1418,7 +1448,8 @@ def db_list_diary(user_id: str) -> list:
                 "entryLinks": [
                     {"id": el["id"], "name": el.get("name"), "date": el.get("date"),
                      "timestamp": format_ts_for_picker(el.get("timestamp"))}
-                    for el in (r.get("entryLinks") or []) if el.get("id")
+                    for el in (r.get("entryLinks") or [])
+                    if el.get("id") and (owner == user_id or el["id"] in visible_links)
                 ],
             })
             # Same contract as fact_manager: the key exists only on a read-only

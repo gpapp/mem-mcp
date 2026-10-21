@@ -656,20 +656,65 @@ def _scope_items(user_id: str, match_clause: str, params: dict) -> Optional[dict
 
     match_clause binds (f)-[...]->(scope) and (d)-[...]->(scope); params supply
     the scope identity. Returns None when the scope node does not exist.
+
+    **A shared scope node belongs to its owner, not to the caller.** The
+    single-owner ``{userId: $userId}`` test therefore answered 404 for every
+    project somebody had shared: the grantee saw the row in the client list,
+    clicked it, and got "could not load items" — the panel looked broken and
+    the grant looked honoured. The owner is resolved first, over an id set the
+    caller already holds a grant from, so a scope node belonging to anybody
+    else is never read at all. When that owner is somebody else the rows are
+    then filtered through ``_shared_records_visible`` — the same rule the
+    search and list paths use — so a grant never widens to the owner's
+    unrelated records.
+
+    The filter import is function-local on purpose: ``fact_manager`` imports
+    this module at module level, so a module-level import here is a cycle.
     """
     neo4j_driver = get_neo4j()
     if not neo4j_driver:
         raise RuntimeError("Neo4j not connected.")
+
+    scope_map = sharing.accessible_owner_scope(user_id)
+    owners = (scope_map or {}).get("owners") or {}
+    owner_ids = [user_id] + sorted(owners)
+    target_key = "clients" if params["label"] == ":Client" else "contexts"
+
     with neo4j_driver.session() as s:
         exists = s.run(
             f"MATCH (scope {params['label']} {{id: $scopeId, userId: $userId}}) RETURN count(scope) AS n",
             scopeId=params["scopeId"], userId=user_id
         ).single()
-        if not exists or exists["n"] == 0:
-            return None
+        if exists and exists["n"]:
+            owner_id, shared = user_id, False
+        else:
+            # Not the caller's own node. It may still be one shared with them;
+            # the query only ever reads owners the caller already holds a grant
+            # from, and the exact target must be the one granted — a context
+            # grant does not carry its parent client, which is exactly what
+            # audit.grant_permits refuses, so the panel must not offer it.
+            # No grants at all (sharing off, or a caller holding none) short-
+            # circuits: the widened lookup would read the caller's own id back
+            # and find nothing, which is one wasted query per panel open on a
+            # path that is supposed to be byte-identical to its pre-sharing
+            # shape.
+            if not owners:
+                return None
+            hit = s.run(
+                f"MATCH (scope {params['label']} {{id: $scopeId}}) "
+                "WHERE scope.userId IN $ownerIds RETURN scope.userId AS ownerId",
+                scopeId=params["scopeId"], ownerIds=owner_ids,
+            ).single()
+            if not hit:
+                return None
+            owner_id = hit["ownerId"]
+            if params["scopeId"] not in (owners.get(owner_id) or {}).get(target_key, {}):
+                return None
+            shared = True
+
         fact_rows = list(s.run(
             f"""
-            MATCH (f:Fact {{userId: $userId}})-[{params['rel']}]->(scope {params['label']} {{id: $scopeId, userId: $userId}})
+            MATCH (f:Fact {{userId: $ownerId}})-[{params['rel']}]->(scope {params['label']} {{id: $scopeId, userId: $ownerId}})
             OPTIONAL MATCH (f)-[:IN_CATEGORY]->(cat:Category)
             OPTIONAL MATCH (f)-[:FOR_CLIENT]->(cl:Client)
             OPTIONAL MATCH (f)-[:IN_CONTEXT]->(ctx:Context)
@@ -678,27 +723,75 @@ def _scope_items(user_id: str, match_clause: str, params: dict) -> Optional[dict
                    ctx.id AS contextId, ctx.name AS contextName
             ORDER BY coalesce(f.name, f.text) ASC
             """,
-            scopeId=params["scopeId"], userId=user_id
+            scopeId=params["scopeId"], ownerId=owner_id
         ))
         diary_rows = list(s.run(
             f"""
-            MATCH (d:DiaryEntry {{userId: $userId}})-[{params['rel']}]->(scope {params['label']} {{id: $scopeId, userId: $userId}})
+            MATCH (d:DiaryEntry {{userId: $ownerId}})-[{params['rel']}]->(scope {params['label']} {{id: $scopeId, userId: $ownerId}})
             RETURN d.id AS id, d.date AS date, d.name AS name, d.timestamp AS timestamp
             ORDER BY d.date DESC, d.timestamp DESC
             """,
-            scopeId=params["scopeId"], userId=user_id
+            scopeId=params["scopeId"], ownerId=owner_id
         ))
+        # A record that only *mentions* this project — RELEVANT_TO rather than
+        # IN_CONTEXT — is linked to it too, and the match above never returned
+        # it. That is the record a grant is most often worth having: the scope
+        # classifier writes RELEVANT_TO before it gives up on a primary client,
+        # so a null-primary record's only scope evidence is this edge. A second
+        # match rather than `-[:{rel}|RELEVANT_TO]->` in the first, because a
+        # record that is both comes back twice and de-duplicating that in Cypher
+        # means an aggregating WITH per OPTIONAL MATCH in a query that already
+        # has three.
+        rel_fact_rows = list(s.run(
+            f"""
+            MATCH (f:Fact {{userId: $ownerId}})-[:RELEVANT_TO]->(scope {params['label']} {{id: $scopeId, userId: $ownerId}})
+            OPTIONAL MATCH (f)-[:IN_CATEGORY]->(cat:Category)
+            OPTIONAL MATCH (f)-[:FOR_CLIENT]->(cl:Client)
+            OPTIONAL MATCH (f)-[:IN_CONTEXT]->(ctx:Context)
+            RETURN f.id AS id, f.name AS name, f.text AS text, cat.name AS category,
+                   f.timestamp AS timestamp, cl.id AS clientId, cl.name AS clientName,
+                   ctx.id AS contextId, ctx.name AS contextName
+            ORDER BY coalesce(f.name, f.text) ASC
+            """,
+            scopeId=params["scopeId"], ownerId=owner_id
+        ))
+        rel_diary_rows = list(s.run(
+            f"""
+            MATCH (d:DiaryEntry {{userId: $ownerId}})-[:RELEVANT_TO]->(scope {params['label']} {{id: $scopeId, userId: $ownerId}})
+            RETURN d.id AS id, d.date AS date, d.name AS name, d.timestamp AS timestamp
+            ORDER BY d.date DESC, d.timestamp DESC
+            """,
+            scopeId=params["scopeId"], ownerId=owner_id
+        ))
+        # The primary match wins: its rows already carry the client and project
+        # names, and a related-only row would render the same record twice with
+        # two different scope captions.
+        seen = {r["id"] for r in fact_rows}
+        fact_rows += [r for r in rel_fact_rows if r["id"] not in seen]
+        seen = {r["id"] for r in diary_rows}
+        diary_rows += [r for r in rel_diary_rows if r["id"] not in seen]
+        if shared:
+            from fact_manager import _shared_records_visible  # local: import cycle
+            visible = _shared_records_visible(
+                s, [(r["id"], owner_id) for r in fact_rows + diary_rows], owners)
+            fact_rows = [r for r in fact_rows if r["id"] in visible]
+            diary_rows = [r for r in diary_rows if r["id"] in visible]
+    # `readOnly` is present only on a shared panel's rows, so an own panel's
+    # payload stays byte-identical to its pre-sharing shape. It is what lets
+    # the UI withhold the inline ✏️ on a record the caller may read but not
+    # write; the server enforces the same rule, this is the affordance half.
+    shared_flag = {"readOnly": True} if shared else {}
     return {
         "facts": [
             {"id": r["id"], "name": r["name"], "text": r["text"], "category": r["category"],
              "timestamp": _ts_str(r["timestamp"]), "clientId": r["clientId"],
              "clientName": r["clientName"], "contextId": r["contextId"],
-             "contextName": r["contextName"]}
+             "contextName": r["contextName"], **shared_flag}
             for r in fact_rows
         ],
         "diary": [
             {"id": r["id"], "date": r["date"], "name": r.get("name") or "Unnamed Entry",
-             "timestamp": _ts_str(r["timestamp"])}
+             "timestamp": _ts_str(r["timestamp"]), **shared_flag}
             for r in diary_rows
         ],
     }
