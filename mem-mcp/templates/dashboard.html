@@ -1402,18 +1402,30 @@ npm install @modelcontextprotocol/sdk</code></pre>
       // Generic facts (no client) always pass; only known-inactive clients are hidden.
       return !m.clientId || clientActiveMap[m.clientId] !== false;
     }
-    // Specific client selected — check primary client match first.
-    const clientMatch = m.clientId === clientFilter;
-    // RELEVANT_TO entries also pass when no contextFilter is set.
-    const relevantMatch = !contextFilter &&
-      Array.isArray(m.relevantClients) && m.relevantClients.some(rc => rc.id === clientFilter);
-    if (!clientMatch && !relevantMatch) return false;
-    // If a specific project (context) is selected, the fact matches on its own
-    // context or on a project it is merely RELEVANT_TO, since a related
-    // project is now possible and would otherwise be invisible under its filter.
+    // Specific client selected — the gate is "is this record anywhere in the
+    // selected scope", and there are three ways to be in it: filed under the
+    // client, filed under the project, or RELEVANT_TO either of them.
+    //
+    // The guard this replaces read `!contextFilter && ...`, which looks like
+    // "a related client only counts when no project is selected" and does the
+    // opposite of what it looks like: with a project selected, a record whose
+    // ONLY link to that project is a RELEVANT_TO edge — filed under the
+    // owner's own unshared client, which is what the classifier writes before
+    // it gives up on a primary — failed the client gate and never reached the
+    // project gate two lines below. Selecting a project whose records are all
+    // related-linked showed 0, and the only way to reach one of those facts
+    // was to navigate to it from a diary entry, where no scope predicate runs.
+    // That is also why the letter row went stale: it is rendered from the same
+    // predicate.
+    const rel = Array.isArray(m.relevantClients) ? m.relevantClients : [];
+    const inScope = m.clientId === clientFilter
+        || (!!contextFilter && m.contextId === contextFilter)
+        || rel.some(rc => rc.id === clientFilter || rc.id === contextFilter);
+    if (!inScope) return false;
+    // A project was named, so the project axis decides: filed under it, or
+    // related to it.
     if (contextFilter) {
-      if (m.contextId === contextFilter) return true;
-      return Array.isArray(m.relevantClients) && m.relevantClients.some(rc => rc.id === contextFilter);
+      return m.contextId === contextFilter || rel.some(rc => rc.id === contextFilter);
     }
     return true;
   }
@@ -2239,9 +2251,22 @@ npm install @modelcontextprotocol/sdk</code></pre>
     clientFilter   = newClientFilter;
     contextFilter  = newContextFilter || null;
     hideInactiveClients = clientFilter === 'active';  // back-compat
+    // A letter the new scope has no record for would filter the list to
+    // nothing. The user changed scope, not the letter, so an empty result is
+    // never what they asked for — and it is indistinguishable from the filter
+    // being broken.
+    if (activeLetterFilter !== null && !memories.some(m => memPassesScope(m) &&
+        ((m.name || m.text || '').trim()[0] || '').toUpperCase() === activeLetterFilter)) {
+      activeLetterFilter = null;
+    }
     _cfUpdateBtn();
     renderMemories();
     renderCategorySidebar();
+    // The alphabet row is derived from the same scope predicate as the list, so
+    // it has to be re-rendered here or it keeps advertising letters the new
+    // scope has no records for — and a letter that filters to nothing reads as
+    // a letter that does not work.
+    renderAlphabetFilter();
     renderDiaryMonthPager();
     renderDiarySidebar();
     // The graph is a separate fetch, and it used to be left alone here: pick a
@@ -2395,17 +2420,26 @@ npm install @modelcontextprotocol/sdk</code></pre>
       const allCtx = [];
       clients.forEach(c => (c.contexts || []).forEach(x => allCtx.push({...x, clientName: c.name, clientId: c.id})));
       if (!allCtx.length) { el.innerHTML = '<p class="empty">No projects yet.</p>'; return; }
-      el.innerHTML = allCtx.map(x => `
+      // A shared project is somebody else's: rename and delete are owner
+      // actions, so a grantee gets the row and nothing to press. The client
+      // page has gated this since the sharing work landed; this list was the
+      // second surface for the same data and was missed.
+      el.innerHTML = allCtx.map(x => {
+        const actions = x.shared ? '' : `
+              <button class="btn btn-sm btn-ghost" onclick="renameContext('${x.id}')">✏️ Rename</button>
+              <button class="btn btn-sm btn-danger" onclick="deleteContext('${x.id}')">🗑️</button>`;
+        const badge = x.shared ? ` <span title="Shared by ${escHtml(x.owner || '')}" style="font-size:.75rem;color:var(--muted);">🔗 shared (${escHtml(x.permission || 'read')})</span>` : '';
+        return `
         <div class="scope-card">
           <div class="scope-card-header" onclick="toggleScopeItems('ctx-${x.id}', 'context', '${x.id}')">
-            <span class="scope-card-name">📁 ${escHtml(x.name)} <span style="font-size:.75rem;color:var(--muted);font-weight:400;">/ ${escHtml(x.clientName)}</span></span>
+            <span class="scope-card-name">📁 ${escHtml(x.name)}${badge} <span style="font-size:.75rem;color:var(--muted);font-weight:400;">/ ${escHtml(x.clientName)}</span></span>
             <div class="scope-card-actions" onclick="event.stopPropagation()">
-              <button class="btn btn-sm btn-ghost" onclick="renameContext('${x.id}')">✏️ Rename</button>
-              <button class="btn btn-sm btn-danger" onclick="deleteContext('${x.id}')">🗑️</button>
+              ${actions}
             </div>
           </div>
           <div class="scope-items-panel" id="scope-items-ctx-${x.id}"></div>
-        </div>`).join('');
+        </div>`;
+      }).join('');
     } catch(e) { el.innerHTML = '<p class="empty">⚠️ Could not load projects.</p>'; }
   }
 
@@ -2427,10 +2461,14 @@ npm install @modelcontextprotocol/sdk</code></pre>
       if (!rows.length) { panel.innerHTML = '<p style="padding:.4rem;font-size:.8rem;color:var(--muted);">No items linked yet.</p>'; return; }
       panel.innerHTML = rows.map(r => {
         if (r.kind === 'fact') {
+          // The ✏️ is withheld on a record the caller may read but not write.
+          // The row carries `readOnly` only on a shared panel, so an own panel
+          // is unchanged; the server refuses the write either way.
+          const editBtn = r.readOnly ? '' : `<button class="btn btn-sm btn-ghost" style="padding:.1rem .4rem;font-size:.7rem;" onclick="event.stopPropagation(); startFactEditById('${r.id}')">✏️</button>`;
           return `<div class="scope-item-row" onclick="showFactInMemories('${r.id}')">
             <span class="scope-item-type">${escHtml(r.cat || 'Fact')}</span>
             <span class="scope-item-name">${escHtml(r.name || 'Unnamed')}</span>
-            <button class="btn btn-sm btn-ghost" style="padding:.1rem .4rem;font-size:.7rem;" onclick="event.stopPropagation(); startFactEditById('${r.id}')">✏️</button>
+            ${editBtn}
           </div>`;
         } else {
           const label = r.ts ? r.ts.slice(0,10) : '';
@@ -3124,7 +3162,12 @@ npm install @modelcontextprotocol/sdk</code></pre>
     const letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('');
 
     const usedLetters = new Set();
-    memories.forEach(m => {
+    // The letters come from the SCOPED set, not the whole vault. Rendering
+    // them from every memory left a row of enabled letters that filtered to
+    // nothing, which reads as "selecting a letter does not update" — the
+    // click runs, the list is empty, and the letter stays lit.
+    const scoped = memories.filter(memPassesScope);
+    scoped.forEach(m => {
       const name = m.name || m.text || '';
       const first = name.trim()[0];
       if (first) usedLetters.add(first.toUpperCase());

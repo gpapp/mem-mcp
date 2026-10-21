@@ -1857,5 +1857,136 @@ class MemReexportTests(unittest.TestCase):
                 "missing, so the guard cannot see the defect it exists to catch")
 
 
+class ScopePredicateTests(unittest.TestCase):
+    """`memPassesScope` is the whole client/project filter, and it is a predicate.
+
+    The reported defect: selecting a shared project showed **0** facts, while
+    navigating to one of those same facts from a diary entry — where no scope
+    predicate runs — opened it correctly. A record whose only link to the
+    selected project is a ``RELEVANT_TO`` edge, filed under the owner's own
+    unshared client, failed the *client* gate and never reached the project
+    gate two lines below. That is exactly the record a grant exists for, and it
+    is what the scope classifier writes before it gives up on a primary client.
+
+    Driven through the node harness, because the property is what the predicate
+    RETURNS and not what its source says: a source guard is satisfied by a gate
+    that looks right and threads the wrong id.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.node = shutil.which("node")
+        if not cls.node:
+            raise unittest.SkipTest("node is not installed; the JS is not executable here")
+
+    def _passes(self, client_filter, context_filter, memory):
+        """Run the real predicate against the real filter globals."""
+        source = _read("mem-mcp/templates/dashboard.html")
+        blocks = re.findall(r"<script[^>]*>(.*?)</script>", source, re.S)
+        harness = _NODE_HARNESS.replace("__APP_JS__", "\n".join(blocks[2:]))
+        setup = (f"clientFilter = {json.dumps(client_filter)}; "
+                 f"contextFilter = {json.dumps(context_filter)}; "
+                 f"clientActiveMap = {{}}; ")
+        payload = (f"{setup} out['r'] = memPassesScope({json.dumps(memory)});")
+        harness = harness.replace("__CASES__", payload)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "scope.js")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(harness)
+            proc = subprocess.run([self.node, path], capture_output=True, text=True, timeout=120)
+        if proc.returncode != 0:
+            self.fail(f"the dashboard script did not load: {proc.stderr.strip()[:400]}")
+        return json.loads(proc.stdout)["r"]
+
+    FILED = {"id": "f1", "clientId": "c1", "contextId": "x1", "relevantClients": []}
+    # Filed under the project but with no FOR_CLIENT edge at all — the server
+    # says a context grant covers it, so the filter must not disagree.
+    NO_CLIENT_EDGE = {"id": "f2", "clientId": None, "contextId": "x1",
+                      "relevantClients": []}
+    # The one that broke: only a RELEVANT_TO edge to the project, filed under
+    # the owner's own unshared client.
+    RELATED_ONLY = {"id": "f3", "clientId": "c9", "contextId": "x9",
+                    "relevantClients": [{"id": "x1", "name": "P", "kind": "context"}]}
+    SIBLING = {"id": "f4", "clientId": "c1", "contextId": "x2",
+               "relevantClients": []}
+    # Related to the client but filed under a DIFFERENT project: the client
+    # gate may pass, the project gate must not.
+    OTHER_PROJECT_RELATED_CLIENT = {"id": "f5", "clientId": "c1", "contextId": "x2",
+                                    "relevantClients": [{"id": "c1", "name": "ACME",
+                                                         "kind": "client"}]}
+
+    def test_a_record_filed_under_the_selected_project_passes(self):
+        self.assertTrue(self._passes("c1", "x1", self.FILED))
+
+    def test_a_record_filed_under_the_project_with_no_client_edge_passes(self):
+        self.assertTrue(self._passes("c1", "x1", self.NO_CLIENT_EDGE))
+
+    def test_a_record_related_only_to_the_selected_project_passes(self):
+        """The reported defect, asserted on the predicate's answer."""
+        self.assertTrue(
+            self._passes("c1", "x1", self.RELATED_ONLY),
+            msg="a record whose only link to the selected project is a "
+                "RELEVANT_TO edge is dropped by the client gate — selecting "
+                "that project shows 0, and the only route to one of its facts "
+                "is to navigate to it from a diary entry")
+
+    def test_a_sibling_project_does_not_pass(self):
+        self.assertFalse(self._passes("c1", "x1", self.SIBLING))
+
+    def test_a_related_client_under_another_project_does_not_pass(self):
+        self.assertFalse(self._passes("c1", "x1", self.OTHER_PROJECT_RELATED_CLIENT))
+
+    def test_a_client_only_filter_still_accepts_a_related_client(self):
+        """The pre-existing behaviour the fix must not regress: with no project
+        named, a RELEVANT_TO client is enough.
+
+        And the narrowing it must keep: a record related only to a *project*
+        does not leak out from under a client-only filter, because the client
+        filter is the client's, not its subtree's.
+        """
+        self.assertTrue(self._passes("c1", None, self.OTHER_PROJECT_RELATED_CLIENT))
+        self.assertFalse(self._passes("c1", None, self.RELATED_ONLY))
+
+    def _render_alphabet(self, records, client_filter="c1", context_filter="x1"):
+        source = _read("mem-mcp/templates/dashboard.html")
+        blocks = re.findall(r"<script[^>]*>(.*?)</script>", source, re.S)
+        harness = _NODE_HARNESS.replace("__APP_JS__", "\n".join(blocks[2:]))
+        setup = (f"clientFilter = {json.dumps(client_filter)}; "
+                 f"contextFilter = {json.dumps(context_filter)}; "
+                 f"clientActiveMap = {{}}; activeCategory = null; "
+                 f"memories = {json.dumps(records)}; ")
+        payload = (f"{setup} renderAlphabetFilter(); "
+                   f"out['r'] = document.getElementById('alphabet-filter').innerHTML;")
+        harness = harness.replace("__CASES__", payload)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "alpha.js")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(harness)
+            proc = subprocess.run([self.node, path], capture_output=True, text=True, timeout=120)
+        if proc.returncode != 0:
+            self.fail(f"the dashboard script did not load: {proc.stderr.strip()[:400]}")
+        return json.loads(proc.stdout)["r"]
+
+    def test_the_alphabet_row_is_rendered_from_the_scoped_set(self):
+        """A letter with no record in the current scope must not be clickable.
+
+        Rendering the row from the whole vault left every letter enabled, so
+        clicking one filtered the list to nothing and the letter stayed lit —
+        which reads as "selecting a letter does not update". The letter is
+        still DRAWN, greyed, with no handler: a row that vanishes reads as a
+        broken widget, and a letter that cannot match anything must not be
+        clickable.
+        """
+        out = self._render_alphabet([
+            {"id": "f1", "name": "Zeta fact", "clientId": "c1", "contextId": "x1",
+             "category": "People", "relevantClients": []},
+        ])
+        self.assertNotIn("THREW", out)
+        self.assertIn("setLetterFilter('Z')", out)
+        self.assertNotIn("setLetterFilter('A')", out,
+                         msg="a letter no scoped record starts with is still "
+                             "clickable, so selecting it filters to nothing")
+
+
 if __name__ == "__main__":
     unittest.main()
