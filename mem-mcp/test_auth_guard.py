@@ -621,13 +621,6 @@ class WiringTests(unittest.TestCase):
             self.assertNotIn("AUTH_BASE64", source,
                              f"{name}.html still renders a base64 Basic credential")
 
-    def test_the_bridge_takes_its_key_from_the_environment(self):
-        # A downloaded script with a key baked in is a plain-text credential
-        # that lands in backups, screen shares and every copy of the file.
-        bridge = _read("templates", "mcp-bridge.mjs")
-        self.assertIn("MEM_VAULT_PSK", bridge)
-        self.assertNotIn("Basic {{", bridge)
-
     def test_access_keys_are_managed_inside_the_setup_page(self):
         setup = self.dashboard.split('<div id="page-setup"')[1]
         graph = self.dashboard.split('<div id="page-graph"')[0]
@@ -702,7 +695,7 @@ class SetupPageAuthGuidanceTests(unittest.TestCase):
         # message must land on the paragraph that explains it, and it must say
         # the cause is a missing header rather than blaming OAuth.
         block = self._between("When a client refuses to connect",
-                              "</div>\n\n    <div style=\"margin-top: 2.5rem")
+                              "{% if IS_ADMIN %}")
         lower = block.lower()
         self.assertIn("dynamic client registration", lower)
         self.assertIn("missing header", lower)
@@ -728,7 +721,7 @@ class SetupPageAuthGuidanceTests(unittest.TestCase):
     def test_the_page_warns_about_a_proxy_challenge(self):
         # The failure this section was written for: nginx answers auth_basic
         # itself and never forwards the key, so the app is never even asked.
-        block = self._between("When a client refuses to connect", "Local Proxy Bridge")
+        block = self._between("When a client refuses to connect", "{% if IS_ADMIN %}")
         self.assertIn("auth_basic", block)
         # And the tell the user can actually observe, not just the mechanism.
         self.assertIn("Basic", block)
@@ -740,7 +733,7 @@ class SetupPageAuthGuidanceTests(unittest.TestCase):
         # The paragraph explaining what to read in the response sits after the
         # snippet, so the block runs to the end of the section rather than to
         # the first </pre>.
-        block = self._between("Check it by hand", "Local Proxy Bridge")
+        block = self._between("Check it by hand", "{% if IS_ADMIN %}")
         self.assertIn("curl", block)
         self.assertIn("-X POST", block)
         # -i is not decoration. The block tells the user to read the

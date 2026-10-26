@@ -2946,17 +2946,6 @@ async def get_landing(request: Request):
     return HTMLResponse(content=html)
 
 
-@web_app.get("/api/download/mcp-bridge.mjs", response_class=Response)
-async def download_mcp_bridge(request: Request):
-    ctx = _get_auth_context(request)
-    ctx["BASE_URL"] = mem.BASE_URL or "/"
-    js_content = templates.get_template("mcp-bridge.mjs").render(**ctx)
-    return Response(
-        content=js_content,
-        media_type="application/javascript",
-        headers={"Content-Disposition": 'attachment; filename="mcp-bridge.mjs"'}
-    )
-
 @web_app.get("/gui", response_class=HTMLResponse)
 async def get_gui(request: Request):
     creds = _check_session_auth(request)

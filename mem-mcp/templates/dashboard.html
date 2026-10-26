@@ -1163,39 +1163,6 @@
       </div>
     </div>
 
-    <div style="margin-top: 2.5rem; padding-top: 1.5rem; border-top: 1px solid var(--border);">
-      <h3 style="margin-top:0;">🚀 Local Proxy Bridge (Alternative: stdio transport)</h3>
-      <p style="font-size: 0.9rem; color: var(--muted); margin-bottom: 1rem;">
-        If you prefer a <code>stdio</code> connection instead of SSE, you can use a local Node.js bridge script.
-      </p>
-
-      <ol style="font-size: 0.9rem; padding-left: 1.5rem; margin-bottom: 1.5rem;">
-        <li style="margin-bottom: 0.75rem;">
-          <a href="{{BASE_URL}}/api/download/mcp-bridge.mjs" class="btn btn-primary btn-sm" style="display:inline-block; text-decoration:none; margin-bottom:.5rem;">
-            ⬇️ Download mcp-bridge.mjs
-          </a><br>
-          <em>The server URL is already filled in. It reads your access key from the
-          <code>MEM_VAULT_PSK</code> environment variable rather than baking a credential into the
-          file — a downloaded script that carries a live key ends up in backups and
-          screen shares.</em>
-        </li>
-        <li style="margin-bottom: 0.75rem;">
-          <strong>Install dependencies</strong> in the folder where you saved the script:<br>
-          <pre style="margin-top: 0.5rem;"><code>npm init -y
-npm install @modelcontextprotocol/sdk</code></pre>
-        </li>
-        <li style="margin-bottom: 0.75rem;">
-          <strong>Give the bridge a key</strong> (create one above first):<br>
-          <pre style="margin-top: 0.5rem;"><code>export MEM_VAULT_PSK='{{PSK_PREFIX}}&lt;paste-your-key&gt;'
-# or put it in ~/.claude/mcp-bridge.env and source it from here</code></pre>
-        </li>
-        <li>
-          <strong>Connect Claude Code</strong> to your local bridge:<br>
-          <pre style="margin-top: 0.5rem;"><code>claude mcp add memory-vault-local node mcp-bridge.mjs</code></pre>
-        </li>
-      </ol>
-    </div>
-
   </div>
 </div>
 {% if IS_ADMIN %}
