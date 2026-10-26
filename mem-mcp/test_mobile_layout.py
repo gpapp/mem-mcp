@@ -423,6 +423,7 @@ class LayoutInlineStyleTests(unittest.TestCase):
         (r'class="graph-sidebar"', ".graph-sidebar"),
         (r'class="graph-main"', ".graph-main"),
         (r'id="graph-container"', "#graph-container"),
+        (r'class="graph-detail-pane"', ".graph-detail-pane"),
     )
 
     # One test covers the group: "this container carries an inline style" is a
@@ -463,6 +464,110 @@ class LayoutInlineStyleTests(unittest.TestCase):
                 )
 
 
+class GraphDetailPaneTests(unittest.TestCase):
+    """The graph's read-only detail panel for the selected Fact / DiaryEntry.
+
+    - The pane is a flex sibling between the category rail and the canvas, so
+      revealing it narrows the canvas — which is why openInGraph defers its
+      focus until the width-only ResizeObserver refit has landed.
+    - A definite flex basis, not `flex: 1`: a zero basis in an auto-height
+      column resolves against no available space and the pane renders empty
+      (the mobile-pane trap, desktop edition).
+    - `hidden` on a styled element loses to any `display` declaration, so the
+      stylesheet must carry the explicit `[hidden]` rule.
+    - The panel renders the *record* (from the Memories/Diary stores), not the
+      vis node — the node only carries a truncated name.
+    """
+
+    def setUp(self):
+        self.desktop = _declarations(_base_css())
+        self.tablet = _declarations(_media_block(900))
+
+    def _panel_segment(self):
+        start = SOURCE.index("function showGraphItemPanel(")
+        end = SOURCE.index("async function saveEdit", start)
+        return SOURCE[start:end]
+
+    def _function(self, name):
+        # Bounded by the NEAREST top-level declaration, async or not: a plain
+        # `\n  function ` marker runs past an intervening `async function`
+        # and pulls the next function's body into the slice.
+        start = SOURCE.index("function %s(" % name)
+        ends = []
+        for marker in ("\n  function ", "\n  async function "):
+            try:
+                ends.append(SOURCE.index(marker, start + 1))
+            except ValueError:
+                pass
+        return SOURCE[start:min(ends)]
+
+    def test_the_pane_sits_between_the_sidebar_and_the_canvas(self):
+        m = re.search(
+            r'class="graph-sidebar".*?class="graph-detail-pane".*?class="graph-main"',
+            SOURCE, re.S)
+        self.assertIsNotNone(
+            m, "the detail pane is not a flex sibling between the graph "
+               "sidebar and the canvas")
+        self.assertRegex(m.group(0), r'<aside[^>]*\bhidden',
+                         "the pane must ship hidden")
+
+    def test_the_pane_has_a_definite_basis_and_scroll_of_its_own(self):
+        _assert_declares(
+            self, self.desktop, ".graph-detail-pane", "flex: 0 0 auto",
+            "a zero flex basis in an auto-height column renders the pane empty")
+        _assert_declares(
+            self, self.desktop, ".graph-detail-pane", "overflow-y: auto",
+            "a long record must scroll inside the pane, not the page")
+
+    def test_the_hidden_attribute_beats_the_display_declaration(self):
+        hidden = _decls(self.desktop, ".graph-detail-pane[hidden]")
+        self.assertIn(
+            "display: none", hidden,
+            "`hidden` loses to any other display declaration; without the "
+            "explicit rule the pane can never be closed")
+
+    def test_a_click_on_a_record_opens_the_panel(self):
+        init = self._function("initNetwork")
+        self.assertRegex(
+            init, r'(?s)network\.on\("click".*?showGraphItemPanel\(params\.nodes\[0\]\)',
+            "a plain node click must open the detail panel")
+        self.assertRegex(
+            init,
+            r'(?s)network\.on\("click".*?params\.nodes\.length === 0.*?hideGraphItemPanel\(\)',
+            "an empty-canvas click must close it")
+
+    def test_open_in_graph_shows_the_panel_before_the_focus_animation(self):
+        seg = self._function("openInGraph")
+        self.assertIn("showGraphItemPanel(id);", seg)
+        self.assertLess(
+            seg.index("showGraphItemPanel(id);"), seg.index("network.focus("),
+            "the pane reveal — and the ResizeObserver refit it triggers — must "
+            "land before the animated focus, or the refit overrides the focus")
+
+    def test_show_on_map_opens_the_panel_in_both_branches(self):
+        seg = self._function("showOnMap")
+        self.assertEqual(
+            seg.count("showGraphItemPanel(id);"), 2,
+            "both the already-on-map and the just-added branches must open "
+            "the panel")
+
+    def test_the_panel_renders_the_record_not_the_node(self):
+        seg = self._panel_segment()
+        self.assertIn("memories.find", seg)
+        self.assertIn("api.get('memories/'", seg,
+            "a fact missing from the loaded list must be fetched, not skipped")
+        self.assertIn("ensureDiaryEntries()", seg)
+        self.assertIn("api.get('diary/'", seg,
+            "a diary entry missing from the cached list must be fetched")
+        self.assertIn("_graphPanelToken", seg,
+            "a stale fetch must not overwrite a newer click's pane")
+
+    def test_the_footer_open_button_routes_by_record_kind(self):
+        seg = self._function("openGraphPanelRecord")
+        self.assertRegex(seg, r"if \(r\.isDiary\).*?selectDiaryEntry\(r\.id\)")
+        self.assertIn("jumpToMemory(r.id)", seg)
+
+
 class MobileBreakpointTests(unittest.TestCase):
     def setUp(self):
         self.tablet = _declarations(_media_block(900))
@@ -475,7 +580,7 @@ class MobileBreakpointTests(unittest.TestCase):
         # two rails are 590px on their own.
         for selector in (
             ".memories-sidebar", ".memories-list-col", ".diary-sidebar",
-            ".diary-list-col", ".graph-sidebar",
+            ".diary-list-col", ".graph-sidebar", ".graph-detail-pane",
         ):
             with self.subTest(selector=selector):
                 _assert_declares(

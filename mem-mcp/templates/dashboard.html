@@ -606,6 +606,20 @@
        so whatever this says is exactly what the user has to pan around in. */
     .graph-sidebar { width: 200px; flex-shrink: 0; border-right: 1px solid var(--border); padding-right: 1rem; }
     .graph-main { flex: 1; display: flex; flex-direction: column; gap: .5rem; min-width: 0; }
+    /* A definite flex basis, not `flex: 1`: in an auto-height column a zero
+       basis resolves against no available space and the pane renders empty
+       (the same trap as the mobile panes below). The [hidden] rule is
+       explicit because `hidden` on a styled element loses to any display
+       declaration otherwise. */
+    .graph-detail-pane { flex: 0 0 auto; width: 340px; align-self: flex-start;
+      max-height: 70vh; overflow-y: auto;
+      border: 1px solid var(--border); border-radius: 8px; padding: 1rem;
+      background: var(--bg, #fff); font-size: .88rem; }
+    .graph-detail-pane[hidden] { display: none; }
+    .graph-detail-pane h4 { margin: 0 0 .4rem 0; font-size: .95rem; line-height: 1.3; }
+    .graph-detail-pane .gdp-meta { color: var(--muted); font-size: .78rem; margin-bottom: .5rem; }
+    .graph-detail-pane .markdown-body { font-size: .84rem; margin-top: .5rem; }
+    .graph-detail-pane .gdp-footer { display: flex; gap: .5rem; margin-top: .75rem; }
     /* `flex: 0 0 auto`, not `flex: 1`: the height has to be definite. With a
        zero flex basis in an auto-height column the container's height comes
        from its content -- the vis canvas -- and vis's own autoResize
@@ -732,6 +746,7 @@
          stacked auto-height column resolves against nothing -- the same trap
          as the zero-basis scroll panes, so the height has to be stated. */
       .graph-sidebar { max-height: 28vh; overflow-y: auto; }
+      .graph-detail-pane { width: auto; max-height: 45vh; }
       #graph-container { flex: 0 0 auto; height: 62vh; min-height: 420px; }
 
       /* A submenu anchored at left:100% lands off the right edge of a
@@ -954,6 +969,7 @@
         <div style="font-size:.7rem; font-weight:700; text-transform:uppercase; letter-spacing:.5px; color:var(--muted); padding-bottom:.6rem;">Categories</div>
         <div id="graph-categories-sidebar" class="chips-container" style="flex-direction: column;"></div>
       </div>
+      <aside id="graph-detail-pane" class="graph-detail-pane" hidden></aside>
       <div class="graph-main">
         <div id="graph-truncation-note" style="display: none; font-size: .78rem; color: var(--muted); background: var(--bg-subtle, #f8fafc); border: 1px solid var(--border); border-radius: 6px; padding: .5rem .7rem;"></div>
         <div id="graph-container"></div>
@@ -1449,6 +1465,10 @@ npm install @modelcontextprotocol/sdk</code></pre>
   let memVisible = [], memRendered = 0, memObserver = null;
   let diaryVisible = [], diaryRendered = 0, diaryObserver = null;
   let graphData = { nodes: null, edges: null };
+  // node id -> raw type label ('Fact' | 'DiaryEntry' | 'Client' | ...), stashed
+  // by loadGraph. The vis DataSet keeps only the display label, so this is how
+  // the detail panel tells a record from a scope node without re-fetching.
+  let graphRawLabelById = {};
   let isBuildMode = false;
   let buildGraphNodes = new Set();
   let buildGraphEdges = new Set();
@@ -4280,8 +4300,126 @@ npm install @modelcontextprotocol/sdk</code></pre>
       toast('⚠️ Not in the current graph — it is outside the selected client / project / categories');
       return;
     }
-    network.focus(id, { scale: 1.5, offset: graphLeftFocusOffset(), animation: { duration: 1000, easingFunction: 'easeInOutQuad' } });
-    network.selectNodes([id]);
+    // The detail pane is a flex sibling: revealing it narrows the canvas, the
+    // width-only ResizeObserver refits, and a fit() that lands while the focus
+    // animation runs overrides it. Show the pane first, then let the refit
+    // settle before the animated focus starts.
+    showGraphItemPanel(id);
+    setTimeout(function () {
+      network.focus(id, { scale: 1.5, offset: graphLeftFocusOffset(), animation: { duration: 1000, easingFunction: 'easeInOutQuad' } });
+      network.selectNodes([id]);
+    }, 120);
+  }
+
+  // ---- Graph detail panel ------------------------------------------------
+  // A read-only preview of the selected Fact / DiaryEntry, rendered from the
+  // record (not the node): the vis node only carries a truncated name.
+
+  let _graphPanelToken = 0;
+  let _graphPanelRecord = null;   // { id, isDiary } for the footer Open button
+
+  function hideGraphItemPanel() {
+    _graphPanelToken++;             // a fetch in flight must not resurrect it
+    _graphPanelRecord = null;
+    const pane = document.getElementById('graph-detail-pane');
+    if (pane) pane.hidden = true;
+  }
+
+  function openGraphPanelRecord() {
+    const r = _graphPanelRecord;
+    if (!r) return;
+    if (r.isDiary) { switchTab('diary'); selectDiaryEntry(r.id); }
+    else jumpToMemory(r.id);
+  }
+
+  async function showGraphItemPanel(id) {
+    const pane = document.getElementById('graph-detail-pane');
+    if (!pane) return;
+    const token = ++_graphPanelToken;
+    _graphPanelRecord = null;
+
+    // Scope / category nodes have no record behind them — hide, don't error.
+    const nodeType = graphRawLabelById[id];
+    if (nodeType && nodeType !== 'Fact' && nodeType !== 'DiaryEntry') {
+      pane.hidden = true;
+      return;
+    }
+
+    let isDiary = (nodeType === 'DiaryEntry');
+    let rec = null;
+    if (!isDiary) rec = memories.find(m => m.id === id) || null;
+    if (!rec && nodeType !== 'Fact') {
+      await ensureDiaryEntries();   // cached; covers diary nodes the loaded graph never saw
+      rec = diaryEntries.find(e => e.id === id) || null;
+      if (rec) isDiary = true;
+    }
+    if (!rec && nodeType !== 'DiaryEntry') {
+      try { rec = await api.get('memories/' + id); } catch (e) {}
+    }
+    if (!rec) {
+      try { rec = await api.get('diary/' + id); if (rec) isDiary = true; } catch (e) {}
+    }
+    if (token !== _graphPanelToken) return;   // a newer click owns the pane
+
+    if (!rec) {
+      const visNode = graphData && graphData.nodes ? graphData.nodes.get(id) : null;
+      if (!nodeType && visNode) { pane.hidden = true; return; }   // build-mode scope node
+      pane.hidden = false;
+      pane.innerHTML = '<p class="empty" style="padding:.4rem 0;">Could not load this record.</p>';
+      return;
+    }
+
+    pane.hidden = false;
+    _graphPanelRecord = { id: id, isDiary: isDiary };
+    const title = isDiary ? diaryEntryTitle(rec) : (rec.name || 'Untitled');
+    let html = '<div style="display:flex; align-items:center; justify-content:space-between; gap:.5rem;">'
+      + '<span style="font-size:.72rem; font-weight:700; letter-spacing:.4px; color:var(--muted);">'
+      + (isDiary ? '📓 DIARY ENTRY' : '📌 MEMORY') + '</span>'
+      + '<button class="btn btn-ghost btn-sm" onclick="hideGraphItemPanel()" title="Close panel">✕</button></div>';
+    html += '<h4>' + escHtml(title) + '</h4>';
+
+    if (isDiary && rec.timestamp) {
+      const parts = String(rec.timestamp).split('T');
+      html += '<div class="gdp-meta">' + escHtml(parts[0])
+        + (parts[1] ? ' · ' + escHtml(parts[1].substring(0, 5)) : '') + '</div>';
+    }
+    if (!isDiary && rec.category) {
+      html += '<div class="gdp-meta">' + escHtml(rec.category) + '</div>';
+    }
+
+    // Scope chips, read-only. A shared record reachable only through a related
+    // target must not render the owner's private scope names — same rule as
+    // the Memories/Diary panes.
+    if (rec.primaryScopeHidden) {
+      html += '<div style="margin-bottom:.4rem;"><span class="chip">🏢 (private)</span>'
+        + (rec.contextName ? ' <span class="chip">📁 (private)</span>' : '') + '</div>';
+    } else if (rec.clientName || rec.contextName) {
+      html += '<div style="margin-bottom:.4rem;">'
+        + (rec.clientName ? '<span class="chip">🏢 ' + escHtml(rec.clientName) + '</span> ' : '')
+        + (rec.contextName ? '<span class="chip">📁 ' + escHtml(rec.contextName) + '</span>' : '')
+        + '</div>';
+    }
+
+    if (!isDiary && rec.metadata && rec.metadata.tags && rec.metadata.tags.length) {
+      html += '<div style="margin-bottom:.4rem;">'
+        + rec.metadata.tags.map(t => '<span class="chip">🏷️ ' + escHtml(t) + '</span>').join(' ')
+        + '</div>';
+    }
+
+    const body = isDiary ? (rec.content || '') : (rec.text || '');
+    if (body) html += '<div class="markdown-body">' + marked.parse(body) + '</div>';
+
+    if (isDiary && rec.mentions && rec.mentions.length) {
+      html += '<div class="gdp-meta" style="margin-top:.6rem;">Linked memories</div><div>'
+        + rec.mentions.map(m =>
+          '<span class="chip" style="cursor:pointer;" onclick="jumpToMemory(\'' + escHtml(m.id) + '\')">📌 '
+          + escHtml(m.name || 'Untitled') + '</span>').join(' ')
+        + '</div>';
+    }
+
+    html += '<div class="gdp-footer"><button class="btn btn-sm" onclick="openGraphPanelRecord()">Open ↗</button></div>';
+    pane.innerHTML = html;
+    pane.scrollTop = 0;
   }
 
   async function saveEdit(id) {
@@ -5756,6 +5894,7 @@ function nodeInCategory(n) {
       const wantedContexts = new Set(contextFilter ? [contextFilter] : []);
       const labelById = {};
       for (const n of data.nodes) labelById[n.id] = n.label;
+      graphRawLabelById = labelById;
       const scopeMembers = new Map();   // scope node id -> Set of record ids
       if (wantedClients.size || wantedContexts.size) {
         for (const e of data.edges) {
@@ -5893,6 +6032,14 @@ function nodeInCategory(n) {
     // Wait for physics to stabilize before allowing focus operations
     network.once('stabilizationIterationsDone', function() {
       network._stabilized = true;
+    });
+
+    // A plain click shows the read-only detail panel for the selected record.
+    // No camera move here — that is focus()'s job (openInGraph / showOnMap);
+    // double-click still navigates to the record.
+    network.on("click", function (params) {
+      if (params.nodes.length === 0) { hideGraphItemPanel(); return; }
+      showGraphItemPanel(params.nodes[0]);
     });
 
     network.on("doubleClick", function (params) {
@@ -6240,6 +6387,7 @@ let contextMenu = null;
         network.focus(id, { scale: 1.5, offset: graphLeftFocusOffset(), animation: { duration: 1000, easingFunction: 'easeInOutQuad' } });
         network.selectNodes([id]);
       }
+      showGraphItemPanel(id);
       toast('Node already on map');
       return;
     }
@@ -6299,6 +6447,7 @@ let contextMenu = null;
           network.focus(id, { scale: 1.5, offset: graphLeftFocusOffset(), animation: { duration: 1000, easingFunction: 'easeInOutQuad' } });
           network.selectNodes([id]);
         }
+        showGraphItemPanel(id);
       }, 300);
 
       toast('📍 Added to map'
