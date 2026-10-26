@@ -2255,6 +2255,11 @@
     _cfUpdateBtn();
     renderMemories();
     renderCategorySidebar();
+    // The graph rail's chip counts are scoped through the same predicate; a
+    // scope change must re-render it or the chips keep advertising totals the
+    // new scope cannot reach -- the same staleness the canvas reload below
+    // fixes for the nodes themselves.
+    renderGraphCategorySidebar();
     // The alphabet row is derived from the same scope predicate as the list, so
     // it has to be re-rendered here or it keeps advertising letters the new
     // scope has no records for — and a letter that filters to nothing reads as
@@ -3102,37 +3107,49 @@
     const el = document.getElementById('graph-categories-sidebar');
     if (!el) return;
 
+    // The chip list stays vault-wide on purpose: it seeds the first-visit
+    // init below, and a list scoped to the current client would leave every
+    // later scope switch unable to show the other clients' categories at
+    // all — the chips would never reappear to be re-enabled. Only the
+    // counts are scoped: they say what the current canvas holds, and a chip
+    // advertising a total the scope cannot reach reads as the filter being
+    // broken.
+    const categories = new Set();
     const counts = {};
-    memories.forEach(m => { counts[m.category] = (counts[m.category] || 0) + 1; });
-    const categories = Object.keys(counts).sort();
+    memories.forEach(m => {
+        categories.add(m.category);
+        if (memPassesScope(m)) counts[m.category] = (counts[m.category] || 0) + 1;
+    });
     if (diaryEntries && diaryEntries.length > 0) {
-        categories.push('Diary');
-        counts['Diary'] = diaryEntries.length;
+        categories.add('Diary');
+        counts['Diary'] = diaryEntries.filter(memPassesScope).length;
     }
     // The graph also carries Client and Context nodes, grouped under those
     // names. They were never added to the list, so the default init below
     // selected 'Client' -- a value no chip ever had, and never displayed.
     // A chip you cannot see is a filter that silently hides its nodes.
+    // Their counts stay gross on purpose: both node kinds are always kept
+    // under a scope filter, so the canvas really does hold every one of them.
     for (const extra of ['Client', 'Context']) {
-      if (!categories.includes(extra)) {
-        categories.push(extra);
+      if (!categories.has(extra)) {
+        categories.add(extra);
         counts[extra] = (clientListCache || []).filter(c => extra === 'Context' ? c.isContext : !c.isContext).length;
       }
     }
-    categories.sort();
+    const categoryList = Array.from(categories).sort();
 
     if (!activeGraphCategories.hasInit) {
       // Everything on, not a hardcoded pair. Pre-selecting People + Client was
       // written before the graph was scoped, and left a first-time visitor
       // looking at an almost empty canvas with no indication why.
-      categories.forEach(c => activeGraphCategories.add(c));
+      categoryList.forEach(c => activeGraphCategories.add(c));
       activeGraphCategories.hasInit = true;
     }
 
-    const chipsHtml = categories.map(cat => {
+    const chipsHtml = categoryList.map(cat => {
         const isActive = activeGraphCategories.has(cat);
         const className = 'chip' + (isActive ? ' active' : '');
-        return `<div class="${className}" onclick="toggleGraphCategory('${cat.replace(/'/g, "\\'")}')">${cat} <span class="count">${counts[cat]}</span></div>`;
+        return `<div class="${className}" onclick="toggleGraphCategory('${cat.replace(/'/g, "\\'")}')">${cat} <span class="count">${counts[cat] || 0}</span></div>`;
     }).join('');
 
     const allActive = activeGraphCategories.size === 0;

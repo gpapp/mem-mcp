@@ -584,6 +584,61 @@ class GraphDetailPaneTests(unittest.TestCase):
         self.assertIn("jumpToMemory(r.id)", seg)
 
 
+class GraphCategoryScopeTests(unittest.TestCase):
+    """The graph rail's category chips must count the current scope.
+
+    The chips mirror the memories rail's counts, which are scoped through
+    memPassesScope; the graph rail counted the whole vault, so a scoped
+    session saw totals it could not reach. The defect had two halves: the
+    render function counted gross AND _cfApply never re-rendered the rail,
+    so fixing only the counter would have left the chips stale on every
+    scope change — a helper tested in isolation is not a test of its call
+    site. One subtlety the first test pins: the chip LIST stays vault-wide
+    (it seeds the first-visit init, and a scoped list would leave later
+    scope switches no chip to re-enable) while the counts are scoped.
+    """
+
+    def _render_fn(self):
+        start = SOURCE.index("function renderGraphCategorySidebar(")
+        end = SOURCE.index("function setCategory(", start)
+        return SOURCE[start:end]
+
+    def _cf_apply(self):
+        start = SOURCE.index("async function _cfApply(")
+        end = SOURCE.index("async function onClientFilterChange(", start)
+        return SOURCE[start:end]
+
+    def test_fact_counts_run_through_the_scope_predicate(self):
+        seg = self._render_fn()
+        # One regex on purpose: the list takes EVERY memory
+        # (categories.add) while the count takes only the scoped ones
+        # (memPassesScope). Asserting them separately could pass on a
+        # version that scoped the list too — the silent-chip regression.
+        self.assertRegex(
+            seg,
+            r"memories\.forEach\(m => \{\s*categories\.add\(m\.category\);\s*"
+            r"if \(memPassesScope\(m\)\) counts\[m\.category\]")
+        self.assertFalse(
+            "counts[m.category] = (counts[m.category] || 0) + 1; });" in seg,
+            msg="the unscoped forEach must not return")
+
+    def test_diary_counts_run_through_the_scope_predicate(self):
+        seg = self._render_fn()
+        self.assertIn("diaryEntries.filter(memPassesScope)", seg)
+        self.assertFalse("counts['Diary'] = diaryEntries.length;" in seg,
+                         msg="the gross diary count must not return")
+
+    def test_the_chip_list_stays_vault_wide(self):
+        seg = self._render_fn()
+        self.assertIn("categories.add(m.category);", seg)
+        self.assertIn("diaryEntries && diaryEntries.length > 0", seg)
+        self.assertIn("categories.add('Diary');", seg)
+
+    def test_a_scope_change_re_renders_the_graph_chips(self):
+        seg = self._cf_apply()
+        self.assertIn("renderGraphCategorySidebar();", seg)
+
+
 class MobileBreakpointTests(unittest.TestCase):
     def setUp(self):
         self.tablet = _declarations(_media_block(900))
