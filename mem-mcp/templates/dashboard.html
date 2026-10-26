@@ -55,6 +55,9 @@
        take the whole estate. */
     #page-memories { max-width: none; padding: .75rem 1rem; }
     #page-diary { max-width: none; padding: .75rem 1rem; }
+    /* The graph is a three-column reading layout like the other two; the
+       1100px page cap starves the canvas and the detail pane alike. */
+    #page-graph { max-width: none; padding: .75rem 1rem; }
 
     /* ── Service sub-tabs ──
        Same show/hide contract as `.page`, for the panels inside the Service
@@ -606,12 +609,14 @@
        so whatever this says is exactly what the user has to pan around in. */
     .graph-sidebar { width: 200px; flex-shrink: 0; border-right: 1px solid var(--border); padding-right: 1rem; }
     .graph-main { flex: 1; display: flex; flex-direction: column; gap: .5rem; min-width: 0; }
-    /* A definite flex basis, not `flex: 1`: in an auto-height column a zero
-       basis resolves against no available space and the pane renders empty
-       (the same trap as the mobile panes below). The [hidden] rule is
+    /* The pane sits on the RIGHT of the canvas (filters left, graph centre,
+       details right). 300px keeps the middle — the canvas — the widest
+       column. A definite flex basis, not `flex: 1`: in an auto-height column
+       a zero basis resolves against no available space and the pane renders
+       empty (the same trap as the mobile panes below). The [hidden] rule is
        explicit because `hidden` on a styled element loses to any display
        declaration otherwise. */
-    .graph-detail-pane { flex: 0 0 auto; width: 340px; align-self: flex-start;
+    .graph-detail-pane { flex: 0 0 auto; width: 300px; align-self: flex-start;
       max-height: 70vh; overflow-y: auto;
       border: 1px solid var(--border); border-radius: 8px; padding: 1rem;
       background: var(--bg, #fff); font-size: .88rem; }
@@ -631,7 +636,8 @@
 
     /* ── Mobile ──────────────────────────────────────────────────────────
        Three page layouts are built as fixed-width columns: memories is
-       180px + 280px + flex, diary flex + 340px + 250px, graph 200px + flex.
+       180px + 280px + flex, diary flex + 340px + 250px, graph
+       200px + flex + 300px.
        None of that fits a phone -- the two diary rails alone are 590px, over
        a small screen before the content column gets a pixel.
 
@@ -969,11 +975,11 @@
         <div style="font-size:.7rem; font-weight:700; text-transform:uppercase; letter-spacing:.5px; color:var(--muted); padding-bottom:.6rem;">Categories</div>
         <div id="graph-categories-sidebar" class="chips-container" style="flex-direction: column;"></div>
       </div>
-      <aside id="graph-detail-pane" class="graph-detail-pane" hidden></aside>
       <div class="graph-main">
         <div id="graph-truncation-note" style="display: none; font-size: .78rem; color: var(--muted); background: var(--bg-subtle, #f8fafc); border: 1px solid var(--border); border-radius: 6px; padding: .5rem .7rem;"></div>
         <div id="graph-container"></div>
       </div>
+      <aside id="graph-detail-pane" class="graph-detail-pane" hidden></aside>
     </div>
   </div>
 </div><!-- /page-graph -->

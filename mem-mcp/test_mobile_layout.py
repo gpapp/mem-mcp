@@ -467,9 +467,10 @@ class LayoutInlineStyleTests(unittest.TestCase):
 class GraphDetailPaneTests(unittest.TestCase):
     """The graph's read-only detail panel for the selected Fact / DiaryEntry.
 
-    - The pane is a flex sibling between the category rail and the canvas, so
-      revealing it narrows the canvas — which is why openInGraph defers its
-      focus until the width-only ResizeObserver refit has landed.
+    - The pane is a flex sibling to the RIGHT of the canvas (filters left,
+      graph centre, details right), so revealing it still narrows the canvas —
+      which is why openInGraph defers its focus until the width-only
+      ResizeObserver refit has landed.
     - A definite flex basis, not `flex: 1`: a zero basis in an auto-height
       column resolves against no available space and the pane renders empty
       (the mobile-pane trap, desktop edition).
@@ -501,14 +502,20 @@ class GraphDetailPaneTests(unittest.TestCase):
                 pass
         return SOURCE[start:min(ends)]
 
-    def test_the_pane_sits_between_the_sidebar_and_the_canvas(self):
-        m = re.search(
-            r'class="graph-sidebar".*?class="graph-detail-pane".*?class="graph-main"',
-            SOURCE, re.S)
-        self.assertIsNotNone(
-            m, "the detail pane is not a flex sibling between the graph "
-               "sidebar and the canvas")
-        self.assertRegex(m.group(0), r'<aside[^>]*\bhidden',
+    def test_the_pane_sits_to_the_right_of_the_canvas(self):
+        # Column order is DOM order in a flex row: filters left, canvas
+        # centre, details right. The `class="..."` strings are HTML-only —
+        # the stylesheet spells these selectors with a leading dot.
+        sidebar = SOURCE.index('class="graph-sidebar"')
+        main = SOURCE.index('class="graph-main"')
+        pane = SOURCE.index('id="graph-detail-pane"')
+        self.assertLess(sidebar, main, "the category rail stays on the left")
+        self.assertLess(main, pane,
+                        "the detail pane sits to the right of the canvas")
+        # `pane` indexes the id attribute, which is already past `<aside ` —
+        # search backwards for the opening tag, not forwards from here.
+        tag = SOURCE.rindex('<aside', 0, pane)
+        self.assertRegex(SOURCE[tag:tag + 120], r'\bhidden',
                          "the pane must ship hidden")
 
     def test_the_pane_has_a_definite_basis_and_scroll_of_its_own(self):
@@ -525,6 +532,15 @@ class GraphDetailPaneTests(unittest.TestCase):
             "display: none", hidden,
             "`hidden` loses to any other display declaration; without the "
             "explicit rule the pane can never be closed")
+
+    def test_the_graph_page_spans_the_full_width(self):
+        # `.page` caps three-column reading layouts at 1100px; the graph tab
+        # holds a 200px rail, the canvas and a 300px pane, so it joins
+        # memories and diary in overriding the cap.
+        self.assertIn(
+            "max-width: none", _decls(self.desktop, "#page-graph"),
+            "#page-graph must override the .page cap the way "
+            "#page-memories/#page-diary do")
 
     def test_a_click_on_a_record_opens_the_panel(self):
         init = self._function("initNetwork")
@@ -575,7 +591,7 @@ class MobileBreakpointTests(unittest.TestCase):
         self.phone = _declarations(self.phone_body)
 
     def test_every_fixed_width_column_collapses(self):
-        # The layouts are 180+280+flex, flex+340+250 and 200+flex. Anything
+        # The layouts are 180+280+flex, flex+340+250 and 200+flex+300. Anything
         # left at its desktop width overflows a 360px viewport -- the diary's
         # two rails are 590px on their own.
         for selector in (
