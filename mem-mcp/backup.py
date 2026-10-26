@@ -33,6 +33,7 @@ it from.
 
 import asyncio
 import gzip
+import hashlib
 import json
 import os
 import re
@@ -213,6 +214,161 @@ def prune_savepoints(keep: int = BACKUP_KEEP) -> list:
         except OSError as exc:
             logger.warning(f"backup: could not prune {entry['id']}: {exc}")
     return removed
+
+
+# ---------------------------------------------------------------------------
+# Change fingerprint — a scheduled run over an unchanged vault is a no-op
+# ---------------------------------------------------------------------------
+# A savepoint costs two Qdrant snapshots plus a full Bolt export, and a vault
+# nobody wrote to overnight produces a byte-identical copy of one that already
+# exists. The fingerprint is a digest over the *content* of the graph and the
+# point counts of both collections -- deliberately not a timestamp: `Fact`
+# carries `updatedAt` but only fact updates write it, and `DiaryEntry` carries
+# no update timestamp at all, so a time-based check would miss every diary edit
+# and every edit of an older fact.
+#
+# Anything that cannot be read makes the fingerprint empty, and an empty
+# fingerprint never matches. "I could not tell whether this changed" has to
+# take the savepoint: skipping on an unknown is how a backup silently stops
+# happening for a week.
+def _digest_line(*parts) -> bytes:
+    """One unambiguous digest line: a NUL separator and a newline terminator.
+
+    Without a separator `("ab", "c")` and `("a", "bc")` hash the same; without
+    the terminator the same pair of rows could be split across two different
+    keys.
+    """
+    return ("\x00".join(str(part) for part in parts) + "\n").encode("utf-8")
+
+
+def fingerprint_matches(previous: dict, current: dict) -> bool:
+    """Whether two fingerprints describe the same vault.
+
+    An empty or missing fingerprint never matches: an unreadable store must
+    not read as "nothing changed".
+    """
+    if not previous or not current:
+        return False
+    return all(previous.get(key) == current.get(key)
+               for key in set(previous) | set(current))
+
+
+def _vault_digest(neo4j_driver) -> dict:
+    """Hash every node and relationship, and count the records by label."""
+    digest = hashlib.sha256()
+    counts = {"nodes": 0, "relationships": 0}
+    labels_seen = {"Fact": 0, "DiaryEntry": 0, "Client": 0, "Context": 0}
+
+    with neo4j_driver.session() as session:
+        offset = 0
+        while True:
+            rows = session.run(
+                """
+                MATCH (n)
+                RETURN elementId(n) AS eid, labels(n) AS labels,
+                       coalesce(n.id, '') AS id,
+                       coalesce(n.name, '') AS name,
+                       coalesce(n.text, n.content, '') AS body
+                ORDER BY eid SKIP $offset LIMIT $limit
+                """,
+                offset=offset, limit=_EXPORT_PAGE,
+            ).data()
+            if not rows:
+                break
+            for row in rows:
+                digest.update(_digest_line(
+                    row["eid"], ",".join(sorted(row["labels"] or [])),
+                    row["id"], row["name"], row["body"],
+                ))
+                counts["nodes"] += 1
+                for label in row["labels"] or []:
+                    if label in labels_seen:
+                        labels_seen[label] += 1
+            offset += len(rows)
+            if len(rows) < _EXPORT_PAGE:
+                break
+
+        # Relationships are a second scan, and they have to be: a reclassify
+        # rewrites scope edges without touching a single node property, so a
+        # digest that ignored them would skip the savepoint that was supposed
+        # to capture the new scope. The digest keys on the endpoints' business
+        # ids rather than their elementIds, so a dump/load that reassigns
+        # elementIds does not change the fingerprint of an unchanged vault.
+        offset = 0
+        while True:
+            rows = session.run(
+                """
+                MATCH (a)-[r]->(b)
+                RETURN coalesce(a.id, '') AS src, type(r) AS rel_type,
+                       coalesce(b.id, '') AS dst
+                ORDER BY elementId(r) SKIP $offset LIMIT $limit
+                """,
+                offset=offset, limit=_EXPORT_PAGE,
+            ).data()
+            if not rows:
+                break
+            for row in rows:
+                digest.update(_digest_line(
+                    row["src"], row["rel_type"], row["dst"],
+                ))
+                counts["relationships"] += 1
+            offset += len(rows)
+            if len(rows) < _EXPORT_PAGE:
+                break
+
+    counts.update(labels_seen)
+    return {"digest": digest.hexdigest(), **counts}
+
+
+async def _collection_point_count(collection: str) -> int | None:
+    """Points in one collection, or ``None`` when the store could not answer."""
+    try:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+            response = await client.get(f"{QDRANT_URL}/collections/{collection}")
+            response.raise_for_status()
+            return int(response.json()["result"]["points_count"] or 0)
+    except Exception as exc:
+        logger.warning(f"backup: could not count {collection} points: {exc}")
+        return None
+
+
+async def vault_fingerprint() -> dict:
+    """Content fingerprint of the live vault, or ``{}`` when unreadable."""
+    from common import get_neo4j
+
+    driver = get_neo4j()
+    if not driver:
+        return {}
+    try:
+        fingerprint = await asyncio.to_thread(_vault_digest, driver)
+    except Exception:
+        logger.warning("backup: could not fingerprint the graph", exc_info=True)
+        return {}
+    for collection in (COLLECTION_NAME, DIARY_COLLECTION):
+        points = await _collection_point_count(collection)
+        if points is None:
+            return {}
+        fingerprint[collection] = points
+    return fingerprint
+
+
+def latest_fingerprint() -> dict:
+    """The fingerprint of the newest *complete* savepoint, or ``{}``.
+
+    Incomplete and failed savepoints are skipped on purpose: their manifest was
+    written before the data was snapshotted, so the fingerprint they carry
+    describes a vault that was never captured. A savepoint taken before this
+    feature existed carries no fingerprint at all, which reads as "unknown" and
+    takes one more savepoint -- that is how the feature starts, not a bug.
+    """
+    for entry in list_savepoints():
+        if entry.get("status") != "complete":
+            continue
+        manifest = _read_manifest(entry["id"])
+        if not manifest:
+            continue
+        return manifest.get("fingerprint") or {}
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -571,14 +727,23 @@ async def _reconcile_after_restore() -> None:
             logger.warning(f"backup: post-restore {name} failed: {exc}")
 
 
-async def run_backup(reason: str = "manual") -> dict:
-    """Create one savepoint. Qdrant first, then Neo4j — see the module docstring."""
+async def run_backup(reason: str = "manual", fingerprint: dict | None = None) -> dict:
+    """Create one savepoint. Qdrant first, then Neo4j — see the module docstring.
+
+    ``fingerprint`` is the vault digest the caller already took, when it had
+    one: the scheduler computes it to decide whether to run at all, and taking
+    it a second time here would both cost another full scan and describe a
+    slightly later moment than the comparison did.
+    """
     from common import get_neo4j, get_qdrant
 
     neo4j_driver = get_neo4j()
     if not neo4j_driver:
         raise RuntimeError("Neo4j is not available")
     await get_qdrant()
+
+    if fingerprint is None:
+        fingerprint = await vault_fingerprint()
 
     entry_id = datetime.now().strftime("%Y%m%d-%H%M%S")
     dest = savepoint_path(entry_id)
@@ -594,6 +759,7 @@ async def run_backup(reason: str = "manual") -> dict:
         "counts": {},
         "collections": [],
         "bytes": 0,
+        "fingerprint": fingerprint,
     }
     manifest_path = os.path.join(dest, MANIFEST_NAME)
 
@@ -701,6 +867,12 @@ async def run_restore(entry_id: str, include_vectors: bool = True) -> dict:
         logger.warning(f"backup: audit.db restore skipped: {_exc}")
 
     await _reconcile_after_restore()
+    # The fingerprint needs no reset here. It lives only in *complete* savepoint
+    # manifests, and each run compares it against the live vault afresh -- so a
+    # restore that lands older data (or a reconcile pass that rewrites scope
+    # links afterwards) simply fails the next comparison and takes a savepoint.
+    # Carrying a "last checked" marker across a restore would be the version
+    # that could go stale, which is why there is no such marker.
     return summary
 
 
@@ -818,7 +990,20 @@ async def scheduled_backup_loop() -> None:
                 )
                 await asyncio.sleep(_RETRY_SECONDS)
                 continue
-            result = await run_backup("scheduled")
+            # Skip the savepoint when nothing has been written since the last
+            # complete one. This is the *scheduled* path only: a manual
+            # `/api/backup/run` is an explicit request and always snapshots.
+            # An unreadable store yields an empty fingerprint, which never
+            # matches, so a failure here means "take the savepoint" rather
+            # than "assume nothing changed".
+            current = await vault_fingerprint()
+            previous = latest_fingerprint()
+            if fingerprint_matches(previous, current):
+                logger.info(
+                    "backup: skipped — no data change since the last savepoint"
+                )
+                continue
+            result = await run_backup("scheduled", fingerprint=current or None)
             logger.warning(f"backup: scheduled savepoint {result['id']} written")
         except asyncio.CancelledError:
             raise

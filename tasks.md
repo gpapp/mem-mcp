@@ -327,3 +327,34 @@ Phase 7 → Phase 8 (continuous) → Phase 9.
 
 Estimated size: large (multi-week). Recommend shipping behind `MEM_SHARING_ENABLED`
 and starting with read-only sharing only, then adding write in a follow-up.
+
+---
+
+# Backup skip when nothing changed — Task (added 2026-10-26)
+
+Don't run a backup if there was no data change since the last backup.
+
+- [x] Detect "no data change since the last savepoint": fingerprint the vault
+      (record counts per store + newest updated_at timestamp in Neo4j, plus
+      Qdrant point counts) before each scheduled run and compare against the
+      fingerprint recorded in the last *complete* savepoint's `manifest.json`.
+- [x] On no change, skip the savepoint (log it at INFO) and keep the existing
+      savepoint as the newest — `prune_savepoints()` retention must not treat
+      the skipped night as missing.
+- [x] `POST /api/backup/run` (manual) ignores the fingerprint — an explicit
+      request always takes a savepoint.
+- [x] A restore or a failed/aborted backup resets the fingerprint (the stored
+      fingerprint must describe the *current* data, not a stale one).
+- [x] Tests: fingerprint stability (two polls, no writes → equal), change
+      detection (a write bumps it), prune interplay, manual run unaffected.
+
+**Implementation note (2026-10-26):** the fingerprint is a sha256 over the
+*content* of every node and relationship (plus both collections' point counts),
+not over timestamps. `Fact.updatedAt` is only written by fact updates and
+`DiaryEntry` carries no update timestamp at all, so a time-based check would
+have missed every diary edit and every edit of an older fact. Edges are hashed
+too, because a reclassify rewrites scope links without touching a node. A
+fingerprint that cannot be read is empty and never matches, so an unreadable
+store takes the savepoint rather than silently skipping it. `run_backup` accepts
+the fingerprint the scheduler already took, so the comparison and the snapshot
+describe the same moment.

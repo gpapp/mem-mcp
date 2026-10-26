@@ -155,5 +155,189 @@ class SnapshotCompressionTests(unittest.TestCase):
         self.assertEqual(_pack(self.payload), _pack(self.payload))
 
 
+# ---------------------------------------------------------------------------
+# Change fingerprint — a scheduled run over an unchanged vault is a no-op
+# ---------------------------------------------------------------------------
+_FINGERPRINT_FUNCTIONS = (
+    "_digest_line", "fingerprint_matches", "_vault_digest", "latest_fingerprint",
+)
+
+
+def _load_fingerprint(namespace_extra=None):
+    """Lift the fingerprint helpers, which need ``hashlib`` and ``_EXPORT_PAGE``."""
+    with open(BACKUP_PY, "r", encoding="utf-8") as handle:
+        source = handle.read()
+    tree = ast.parse(source)
+    found = {node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
+    missing = set(_FINGERPRINT_FUNCTIONS) - found
+    if missing:
+        raise AssertionError(f"backup.py no longer defines {sorted(missing)}")
+    chunks = [
+        ast.get_source_segment(source, node)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name in _FINGERPRINT_FUNCTIONS
+    ]
+    namespace = {"hashlib": __import__("hashlib"), "_EXPORT_PAGE": 500}
+    namespace.update(namespace_extra or {})
+    exec("\n\n".join(chunks), namespace)  # noqa: S102 - our own source
+    return namespace
+
+
+class _FakeResult:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def data(self):
+        return self._rows
+
+
+class _FakeSession:
+    """Only the two query shapes ``_vault_digest`` asks a session for."""
+
+    def __init__(self, nodes, relationships):
+        self._nodes = nodes
+        self._relationships = relationships
+
+    def run(self, query, **kwargs):
+        return _FakeResult(self._nodes if "MATCH (n)" in query else self._relationships)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _FakeDriver:
+    def __init__(self, nodes, relationships):
+        self._nodes = nodes
+        self._relationships = relationships
+
+    def session(self):
+        return _FakeSession(self._nodes, self._relationships)
+
+
+_NODES = [
+    {"eid": "4:1", "labels": ["Fact"], "id": "f1", "name": "A fact", "body": "body text"},
+    {"eid": "4:2", "labels": ["DiaryEntry"], "id": "d1", "name": "A note", "body": "long body"},
+]
+_RELATIONSHIPS = [{"src": "f1", "rel_type": "FOR_CLIENT", "dst": "c1"}]
+
+
+class FingerprintTests(unittest.TestCase):
+    def setUp(self):
+        self.fp = _load_fingerprint()
+
+    def digest(self, nodes=None, relationships=None):
+        return self.fp["_vault_digest"](_FakeDriver(
+            list(_NODES) if nodes is None else nodes,
+            list(_RELATIONSHIPS) if relationships is None else relationships,
+        ))
+
+    def test_two_reads_of_an_unchanged_vault_are_equal(self):
+        first, second = self.digest(), self.digest()
+        self.assertEqual(first, second)
+        self.assertNotEqual(first["digest"], "")
+        self.assertTrue(self.fp["fingerprint_matches"](first, second))
+
+    def test_the_counts_ride_along_for_the_log_and_the_comparison(self):
+        counts = self.digest()
+        self.assertEqual(counts["nodes"], 2)
+        self.assertEqual(counts["relationships"], 1)
+        self.assertEqual(counts["Fact"], 1)
+        self.assertEqual(counts["DiaryEntry"], 1)
+        self.assertEqual(counts["Client"], 0)
+
+    def test_a_body_edit_changes_the_fingerprint(self):
+        edited = [dict(_NODES[0], body="body text, corrected")]
+        self.assertFalse(self.fp["fingerprint_matches"](self.digest(), self.digest(edited)))
+
+    def test_a_same_length_edit_changes_the_fingerprint(self):
+        # Length is not content: fixing a typo keeps the length, so a digest
+        # over counts and sizes alone would call this "no change".
+        edited = [dict(_NODES[0], body="bodx text")]
+        self.assertFalse(self.fp["fingerprint_matches"](self.digest(), self.digest(edited)))
+
+    def test_a_reclassify_that_only_moves_edges_changes_the_fingerprint(self):
+        # The scope classifier rewrites FOR_CLIENT / IN_CONTEXT edges without
+        # touching a single node property. A digest over nodes alone would skip
+        # the savepoint that was supposed to capture the new scope.
+        moved = [{"src": "f1", "rel_type": "RELEVANT_TO", "dst": "c1"}]
+        self.assertFalse(self.fp["fingerprint_matches"](self.digest(), self.digest(relationships=moved)))
+
+    def test_an_unreadable_fingerprint_never_matches(self):
+        real = self.digest()
+        self.assertFalse(self.fp["fingerprint_matches"]({}, {}))
+        self.assertFalse(self.fp["fingerprint_matches"]({}, real))
+        self.assertFalse(self.fp["fingerprint_matches"](real, {}))
+
+    def test_the_digest_line_cannot_be_ambiguous(self):
+        line = self.fp["_digest_line"]
+        self.assertNotEqual(line("ab", "c"), line("a", "bc"))
+        self.assertNotEqual(line("a", "b"), line("a", "b", ""))
+
+    def test_a_failed_savepoint_never_provides_the_baseline(self):
+        # Its manifest was written before the snapshot, so the fingerprint it
+        # carries describes a vault that was never captured.
+        self.fp["list_savepoints"] = lambda: [
+            {"id": "failed", "status": "failed"},
+            {"id": "ok", "status": "complete"},
+        ]
+        self.fp["_read_manifest"] = lambda entry_id: (
+            {"fingerprint": {"digest": "baseline"}} if entry_id == "ok" else
+            {"fingerprint": {"digest": "live-but-never-captured"}}
+        )
+        self.assertEqual(self.fp["latest_fingerprint"](), {"digest": "baseline"})
+
+    def test_a_savepoint_from_before_the_feature_reads_as_unknown(self):
+        self.fp["list_savepoints"] = lambda: [{"id": "old", "status": "complete"}]
+        self.fp["_read_manifest"] = lambda entry_id: {"counts": {"nodes": 1}}
+        self.assertEqual(self.fp["latest_fingerprint"](), {})
+        # ...and unknown therefore takes a savepoint instead of skipping one.
+        self.assertFalse(self.fp["fingerprint_matches"]({}, self.digest()))
+
+
+class ScheduledSkipTests(unittest.TestCase):
+    """The comparison lives in the scheduler, and nowhere else.
+
+    The loop sleeps until the configured hour and is not drivable here, so the
+    call site is pinned as source: the property is *where* the comparison sits,
+    which no helper test can see. The scheduled path compares and skips; the
+    manual path (``start_backup`` -> ``run_backup``) never compares, because an
+    explicit request always takes a savepoint.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        with open(BACKUP_PY, "r", encoding="utf-8") as handle:
+            cls.source = handle.read()
+        tree = ast.parse(cls.source)
+        cls.segments = {
+            node.name: ast.get_source_segment(cls.source, node)
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+
+    def test_the_scheduled_loop_skips_before_taking_a_savepoint(self):
+        loop = self.segments["scheduled_backup_loop"]
+        self.assertTrue("vault_fingerprint()" in loop, loop[:400])
+        self.assertTrue("latest_fingerprint()" in loop, loop[:400])
+        self.assertTrue("fingerprint_matches(" in loop, loop[:400])
+        self.assertTrue("backup: skipped" in loop, loop[:400])
+        self.assertLess(
+            loop.index("fingerprint_matches("),
+            loop.index('run_backup("scheduled"'),
+            msg="the comparison must happen before the savepoint is taken",
+        )
+
+    def test_a_manual_run_never_consults_the_fingerprint(self):
+        for name in ("run_backup", "start_backup"):
+            self.assertFalse(
+                "fingerprint_matches(" in self.segments[name],
+                msg=f"{name} compares fingerprints; only the scheduled loop "
+                    f"may skip — a manual run is an explicit request",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
