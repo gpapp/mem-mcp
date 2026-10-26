@@ -1569,5 +1569,67 @@ class DiaryLinkPickerTests(unittest.TestCase):
                         "the reset does not clear the picked target")
 
 
+class FactDedupMenuTests(unittest.TestCase):
+    """The per-record dedup entry point: the fact menu's own modal.
+
+    The Service tab's workflow is admin-only and category-wide, so a
+    per-record action cannot go through it -- that would put a record's own
+    cleanup behind a gate its owner may not hold. These pin the menu entry,
+    the scan's filter to the source record, and the merge wiring, because
+    each half is one conditional in a template literal and a source-shaped
+    assertion cannot tell a wired handler from a rendered label.
+    """
+
+    def _between(self, start, end):
+        i = SOURCE.index(start)
+        j = SOURCE.index(end, i)
+        return SOURCE[i:j]
+
+    def test_the_menu_offers_deduplicate_and_gates_it_as_a_writer(self):
+        writers = self._between("const _FACT_MENU_WRITERS", "\n")
+        self.assertIn("'_factMenuDedup'", writers,
+                      msg="Deduplicate is not a writer, so a read-only grantee "
+                          "is offered a merge the server refuses")
+        menu = self._between("function _showFactMenu(", "function _factMenuEdit(")
+        self.assertIn("action: '_factMenuDedup'", menu)
+
+    def test_the_menu_handler_opens_the_modal_for_the_selected_fact(self):
+        seg = self._between("function _factMenuDedup()", "async function _factMenuReload(")
+        self.assertIn("_factMenuId", seg)
+        self.assertIn("openFactDedup(_factMenuId)", seg)
+
+    def test_the_scan_keeps_only_clusters_holding_this_record(self):
+        seg = self._between("async function openFactDedup(", "function renderFactDedupClusters(")
+        self.assertIn("threshold=0.75", seg)
+        self.assertIn("max_cluster=4", seg)
+        self.assertIn(".some(m => m.id === id)", seg,
+                      msg="the scan does not filter to the source record, so "
+                          "every cluster in the category is shown")
+        self.assertIn("No duplicates found for this record.", seg)
+        self.assertNotIn("loadMemories", seg,
+                         msg="scanning must not write -- it is a read")
+
+    def test_merging_confirms_posts_and_refreshes_the_list(self):
+        seg = self._between("async function fdMergeCluster(", "// Declared at top of script")
+        self.assertIn("confirm(", seg)
+        self.assertIn("api.post('duplicates/merge'", seg)
+        self.assertIn("closeFactDedup()", seg)
+        self.assertIn("loadMemories()", seg)
+        self.assertIn("!masterId || !duplicateIds.length || !mergedName || !mergedText", seg)
+
+    def test_the_draft_is_generated_from_the_selected_records_only(self):
+        seg = self._between("async function fdGenerateDraft(", "function fdUpdateDraft(")
+        self.assertIn("api.post('duplicates/draft', {factIds})", seg)
+        self.assertIn("factIds.length < 2", seg)
+
+    def test_the_modal_overlays_and_scrolls_without_scrolling_the_page(self):
+        base = _declarations(_base_css())
+        self.assertIn("position: fixed", _decls(base, ".fact-dedup-overlay"))
+        self.assertIn("overflow-y: auto", _decls(base, ".fact-dedup-overlay"),
+                      msg="a tall modal must scroll inside the overlay, not "
+                          "push the three-pane layout past its height cap")
+        self.assertIn("max-width: 860px", _decls(base, ".fact-dedup-box"))
+
+
 if __name__ == "__main__":
     unittest.main()

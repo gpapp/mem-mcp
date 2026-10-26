@@ -83,6 +83,20 @@
     .dedup-record-name { font-weight: 700; font-size: .88rem; margin-bottom: .35rem; }
     .dedup-record-text { font-size: .8rem; line-height: 1.45; color: var(--muted); max-height: 110px; overflow: auto; white-space: pre-wrap; }
     .dedup-record-scope { font-size: .7rem; color: var(--muted); margin-top: .5rem; }
+    /* ---- per-fact dedup modal ------------------------------------------- */
+    /* Same review-first flow as the Service tab's, opened from a fact's own
+       menu. The overlay scrolls, not the page: a tall modal must not make the
+       three-pane layout scroll (the same rule the status strip follows). */
+    .fact-dedup-overlay { position: fixed; inset: 0; z-index: 1200; display: flex;
+                          align-items: flex-start; justify-content: center;
+                          background: rgba(15,23,42,.55); padding: 2rem 1rem;
+                          overflow-y: auto; }
+    .fact-dedup-box { background: var(--surface); border: 1px solid var(--border);
+                      border-radius: var(--radius); width: 100%; max-width: 860px;
+                      padding: 1.1rem 1.2rem; margin: auto 0; }
+    .fact-dedup-head { display: flex; align-items: center; gap: .6rem; margin-bottom: .6rem; }
+    .fact-dedup-sub { color: var(--muted); font-size: .8rem; min-width: 0;
+                      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     /* ---- share modal ---------------------------------------------------- */
     .share-overlay { position: fixed; inset: 0; z-index: 9999; display: flex;
                      align-items: center; justify-content: center;
@@ -670,6 +684,10 @@
       .tabs { padding: .6rem .5rem .2rem; overflow-x: auto; scrollbar-width: none; }
       .tabs::-webkit-scrollbar { display: none; }
       .tab-btn { flex: 0 0 auto; white-space: nowrap; min-height: 40px; }
+      /* The per-fact dedup modal keeps a smaller gutter on a phone. It lives
+         here rather than in its own media block because test_mobile_layout
+         resolves the 900px rules by the FIRST such block in the stylesheet. */
+      .fact-dedup-overlay { padding: 1rem .5rem; }
 
       /* The client filter is a child of the tab bar, after all seven tabs.
          Left as it is on a phone it is the last thing in a horizontal
@@ -3627,7 +3645,7 @@
   // Same rule as _DIARY_MENU_WRITERS: a read-only record offers no action that
   // would 403. Edit, Reclassify scope and Delete write; Show in Graph, Show on
   // Map, Copy MD and Reload are reads and stay.
-  const _FACT_MENU_WRITERS = ['_factMenuEdit', '_factMenuReclassify', '_factMenuDelete'];
+  const _FACT_MENU_WRITERS = ['_factMenuEdit', '_factMenuReclassify', '_factMenuDelete', '_factMenuDedup'];
   function _showFactMenu(anchorEl) {
     if (!selectedFactId) return;
     _factMenuId = selectedFactId;
@@ -3641,6 +3659,7 @@
       { separator: true },
       { icon: '🔄', label: 'Reload',          action: '_factMenuReload' },
       { icon: '🔀', label: 'Reclassify scope', action: '_factMenuReclassify' },
+      { icon: '🧹', label: 'Deduplicate…',    action: '_factMenuDedup' },
       { separator: true },
       { icon: '🗑️', label: 'Delete',          action: '_factMenuDelete', danger: true },
     ].filter(it => !ro || it.separator || _FACT_MENU_WRITERS.indexOf(it.action) === -1));
@@ -3650,6 +3669,7 @@
   function _factMenuMap()        { if (_factMenuId) showOnMap(_factMenuId); }
   function _factMenuCopyMd()     { if (_factMenuId) { const m = memories.find(x=>x.id===_factMenuId); if (m) copyFactMd(m); } }
   function _factMenuDelete()     { if (_factMenuId) deleteMemory(_factMenuId); }
+  function _factMenuDedup()      { if (_factMenuId) openFactDedup(_factMenuId); }
   async function _factMenuReload() {
     if (!_factMenuId) return;
     try {
@@ -5765,6 +5785,198 @@
   }
 
 
+
+  // --- Per-fact deduplication -------------------------------------------
+  //
+  // The Service tab's dedup workflow is admin-only and category-wide. Asked
+  // from a fact's own menu the question is narrower: "is *this* record a
+  // duplicate of something?" So this scans the record's own category with the
+  // service defaults, keeps only the clusters that actually contain the
+  // source record, and renders the same review-first flow in a modal on the
+  // Memories tab. Nothing merges without an explicit click and confirmation,
+  // and the modal is self-contained on purpose -- routing a per-record action
+  // through the admin-only Service tab would have made it unavailable to the
+  // person whose record it is.
+  let factDedupClusters = [];
+  let factDedupSourceId = '';
+
+  function closeFactDedup() {
+    const el = document.getElementById('fact-dedup-overlay');
+    if (el) el.remove();
+    factDedupClusters = [];
+    factDedupSourceId = '';
+  }
+
+  async function openFactDedup(id) {
+    const rec = memories.find(m => m.id === id);
+    if (!rec) { toast('⚠️ Reload the memory before deduplicating it'); return; }
+    factDedupSourceId = id;
+    factDedupClusters = [];
+    let overlay = document.getElementById('fact-dedup-overlay');
+    if (!overlay) {
+      overlay = document.createElement('div');
+      overlay.id = 'fact-dedup-overlay';
+      overlay.className = 'fact-dedup-overlay';
+      // Backdrop click closes; a click inside the box does not bubble to it.
+      overlay.onclick = function (ev) { if (ev.target === overlay) closeFactDedup(); };
+      document.body.appendChild(overlay);
+    }
+    overlay.innerHTML = `<div class="fact-dedup-box">
+      <div class="fact-dedup-head">
+        <strong>🧹 Deduplicate</strong>
+        <span class="fact-dedup-sub">${escHtml(rec.name || 'Untitled')}</span>
+        <button class="btn btn-sm btn-ghost" style="margin-left:auto;" onclick="closeFactDedup()">✕</button>
+      </div>
+      <p class="empty" style="padding:1rem 0;">Scanning for duplicates…</p>
+    </div>`;
+    let clusters = [];
+    try {
+      clusters = await api.get('duplicates?category=' + encodeURIComponent(rec.category || '') +
+                               '&threshold=0.75&max_cluster=4') || [];
+    } catch (e) {
+      overlay.innerHTML = `<div class="fact-dedup-box">
+        <div class="fact-dedup-head">
+          <strong>🧹 Deduplicate</strong>
+          <button class="btn btn-sm btn-ghost" style="margin-left:auto;" onclick="closeFactDedup()">✕</button>
+        </div>
+        <p class="empty" style="padding:1rem 0;">⚠️ Could not scan for duplicates.</p>
+      </div>`;
+      return;
+    }
+    // Closed, or another record's modal opened, while the scan was running.
+    if (factDedupSourceId !== id) return;
+    const mine = (clusters || []).filter(cl => (cl.members || []).some(m => m.id === id));
+    if (!mine.length) {
+      closeFactDedup();
+      toast('🧹 No duplicates found for this record.');
+      return;
+    }
+    factDedupClusters = mine.map(cl => {
+      const members = cl.members || [];
+      return {
+        members,
+        avg_similarity: cl.avg_similarity,
+        selectedIds: members.map(m => m.id),
+        masterId: id,
+        editName: '',
+        editText: '',
+      };
+    });
+    renderFactDedupClusters();
+  }
+
+  function renderFactDedupClusters() {
+    const overlay = document.getElementById('fact-dedup-overlay');
+    if (!overlay) return;
+    const rec = memories.find(m => m.id === factDedupSourceId);
+    const title = escHtml(rec && rec.name ? rec.name : 'Untitled');
+    const clusterHtml = factDedupClusters.map((cluster, index) => {
+      const records = cluster.members.map(m => {
+        const isMaster = cluster.masterId === m.id;
+        const isSelected = cluster.selectedIds.indexOf(m.id) !== -1;
+        return `<div class="dedup-record${isMaster ? ' master' : ''}${isSelected ? '' : ' unselected'}">
+          <input type="checkbox" ${isSelected ? 'checked' : ''}
+                 onchange="fdToggleRecord(${index}, '${m.id}', this.checked)">
+          <input type="radio" name="fd-master-${index}" ${isMaster ? 'checked' : ''}
+                 onchange="fdSetMaster(${index}, '${m.id}')" title="Use as master">
+          <div style="min-width:0;flex:1;">
+            <div class="dedup-record-name">${escHtml(m.name || 'Untitled')}</div>
+            <div class="dedup-record-meta">${isMaster ? 'MASTER' : 'candidate'}${isSelected ? '' : ' · excluded'}${m.clientName ? ' · 🏢 ' + escHtml(m.clientName) : ''}${m.contextName ? ' · 📁 ' + escHtml(m.contextName) : ''}</div>
+          </div>
+        </div>`;
+      }).join('');
+      return `<div class="card dedup-cluster" style="margin-bottom:.75rem;">
+        <div style="display:flex;justify-content:space-between;gap:.6rem;align-items:baseline;">
+          <strong>Related cluster</strong>
+          <span class="dedup-sim">Average similarity: ${Number(cluster.avg_similarity || 0).toFixed(3)}</span>
+        </div>
+        <div class="dedup-records">${records}</div>
+        <div class="dedup-editor">
+          <label class="dedup-label">Merged title</label>
+          <input id="fd-name-${index}" type="text" value="${escHtml(cluster.editName || '')}"
+                 oninput="fdUpdateDraft(${index}, 'editName', this.value)">
+          <label class="dedup-label">Merged content</label>
+          <textarea id="fd-text-${index}" rows="5"
+                    oninput="fdUpdateDraft(${index}, 'editText', this.value)">${escHtml(cluster.editText || '')}</textarea>
+        </div>
+        <div style="display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.6rem;">
+          <button class="btn btn-sm btn-ghost" onclick="fdGenerateDraft(${index})">✨ Generate merge draft</button>
+          <button class="btn btn-sm btn-primary" onclick="fdMergeCluster(${index})">🔀 Merge selected records</button>
+        </div>
+      </div>`;
+    }).join('');
+    overlay.innerHTML = `<div class="fact-dedup-box">
+      <div class="fact-dedup-head">
+        <strong>🧹 Deduplicate</strong>
+        <span class="fact-dedup-sub">${title}</span>
+        <button class="btn btn-sm btn-ghost" style="margin-left:auto;" onclick="closeFactDedup()">✕</button>
+      </div>
+      <p style="color:var(--muted);font-size:.8rem;margin:0 0 .6rem 0;">
+        ${factDedupClusters.length} cluster${factDedupClusters.length === 1 ? '' : 's'} containing this record.
+        Pick one record as master, then generate and review the merged text before merging.
+      </p>
+      ${clusterHtml}
+    </div>`;
+  }
+
+  function fdSetMaster(index, id) {
+    const cluster = factDedupClusters[index];
+    if (!cluster) return;
+    cluster.masterId = id;
+    if (cluster.selectedIds.indexOf(id) === -1) cluster.selectedIds.push(id);
+    renderFactDedupClusters();
+  }
+
+  function fdToggleRecord(index, id, selected) {
+    const cluster = factDedupClusters[index];
+    if (!cluster) return;
+    const ids = new Set(cluster.selectedIds);
+    if (selected) ids.add(id); else ids.delete(id);
+    if (cluster.masterId === id && !selected) {
+      const next = [...ids][0];
+      if (next) cluster.masterId = next;
+    }
+    cluster.selectedIds = [...ids];
+    renderFactDedupClusters();
+  }
+
+  async function fdGenerateDraft(index) {
+    const cluster = factDedupClusters[index];
+    const factIds = cluster ? (cluster.selectedIds || []) : [];
+    if (factIds.length < 2) { toast('⚠️ Select at least two records for the draft'); return; }
+    try {
+      const draft = await api.post('duplicates/draft', {factIds});
+      cluster.editName = draft.mergedName;
+      cluster.editText = draft.mergedText;
+      renderFactDedupClusters();
+      toast('✨ Draft generated from selected records');
+    } catch (e) { toast('⚠️ Could not generate merge draft'); }
+  }
+
+  function fdUpdateDraft(index, field, value) {
+    if (factDedupClusters[index]) factDedupClusters[index][field] = value;
+  }
+
+  async function fdMergeCluster(index) {
+    const cluster = factDedupClusters[index];
+    if (!cluster) return;
+    const ids = cluster.selectedIds || [];
+    const masterId = cluster.masterId || ids[0];
+    const duplicateIds = ids.filter(id => id !== masterId);
+    const mergedName = (cluster.editName || '').trim();
+    const mergedText = (cluster.editText || '').trim();
+    if (!masterId || !duplicateIds.length || !mergedName || !mergedText) {
+      toast('⚠️ Choose a master and provide merged title and content');
+      return;
+    }
+    if (!confirm(`Merge ${duplicateIds.length} record${duplicateIds.length === 1 ? '' : 's'} into “${mergedName}”? This deletes the duplicate records.`)) return;
+    try {
+      await api.post('duplicates/merge', {masterId, duplicateIds, mergedName, mergedText});
+      closeFactDedup();
+      toast('✅ Cluster merged');
+      await loadMemories();
+    } catch (e) { toast('⚠️ Merge failed. No automatic retry was attempted.'); }
+  }
 
   // Declared at top of script to allow loadSessionState initialization
 
