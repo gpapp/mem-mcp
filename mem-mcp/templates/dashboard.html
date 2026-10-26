@@ -4241,6 +4241,15 @@ npm install @modelcontextprotocol/sdk</code></pre>
     setTimeout(() => selectFact(targetId), 100);
   }
 
+  // A vis focus() lands the node at canvas-centre + offset.x, so a negative x
+  // offset shifts it LEFT. The selected item goes on the left quarter of the
+  // canvas, leaving the right side for its connected nodes.
+  function graphLeftFocusOffset() {
+    const el = document.getElementById('graph-container');
+    const w = (el && el.clientWidth) || 0;
+    return { x: -Math.round(w * 0.25), y: 0 };
+  }
+
   async function openInGraph(id) {
     switchTab('graph');
     if (!graphLoaded) await loadGraph();
@@ -4271,7 +4280,7 @@ npm install @modelcontextprotocol/sdk</code></pre>
       toast('⚠️ Not in the current graph — it is outside the selected client / project / categories');
       return;
     }
-    network.focus(id, { scale: 1.5, animation: { duration: 1000, easingFunction: 'easeInOutQuad' } });
+    network.focus(id, { scale: 1.5, offset: graphLeftFocusOffset(), animation: { duration: 1000, easingFunction: 'easeInOutQuad' } });
     network.selectNodes([id]);
   }
 
@@ -6228,7 +6237,7 @@ let contextMenu = null;
 
     if (buildGraphNodes.has(id)) {
       if (network) {
-        network.focus(id, { scale: 1.5, animation: { duration: 1000, easingFunction: 'easeInOutQuad' } });
+        network.focus(id, { scale: 1.5, offset: graphLeftFocusOffset(), animation: { duration: 1000, easingFunction: 'easeInOutQuad' } });
         network.selectNodes([id]);
       }
       toast('Node already on map');
@@ -6287,7 +6296,7 @@ let contextMenu = null;
 
       setTimeout(() => {
         if (network) {
-          network.focus(id, { scale: 1.5, animation: { duration: 1000, easingFunction: 'easeInOutQuad' } });
+          network.focus(id, { scale: 1.5, offset: graphLeftFocusOffset(), animation: { duration: 1000, easingFunction: 'easeInOutQuad' } });
           network.selectNodes([id]);
         }
       }, 300);
@@ -6334,7 +6343,7 @@ let contextMenu = null;
 
       setTimeout(() => {
         if (network) {
-          network.focus(nodeId, { scale: 1.2, animation: { duration: 800, easingFunction: 'easeInOutQuad' } });
+          network.focus(nodeId, { scale: 1.2, offset: graphLeftFocusOffset(), animation: { duration: 800, easingFunction: 'easeInOutQuad' } });
         }
       }, 500);
 
@@ -6371,7 +6380,7 @@ let contextMenu = null;
 
       setTimeout(() => {
         if (network) {
-          network.focus(nodeId, { scale: 1.2, animation: { duration: 800, easingFunction: 'easeInOutQuad' } });
+          network.focus(nodeId, { scale: 1.2, offset: graphLeftFocusOffset(), animation: { duration: 800, easingFunction: 'easeInOutQuad' } });
         }
       }, 300);
 

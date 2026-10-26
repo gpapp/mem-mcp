@@ -913,7 +913,7 @@ def db_get_neighborhood(fact_id: str, depth: int, rel_types: List[str], user_id:
                 owner_of[node_id] = owner
                 if owner != user_id:
                     shared_of[node_id] = owner
-                name = node.get("title") or node.get("content", "")
+                name = node.get("name") or node.get("title") or "Untitled Diary Entry"
                 group = "Diary"
             elif "Client" in labels:
                 node_id, label, name, group = node["id"], "Client", node["name"], "Client"
@@ -2733,7 +2733,7 @@ def db_get_graph(user_id: str, client_id: str = "", context_id: str = "", limit:
                 node_map[d_id] = {
                     "id": d_id,
                     "label": "DiaryEntry",
-                    "name": d_node.get("title") or d_node.get("content", ""),
+                    "name": d_node.get("name") or d_node.get("title") or "Untitled Diary Entry",
                     "group": "Diary"
                 }
             # Seeded empty and filled by the FOR_CLIENT / IN_CONTEXT passes
