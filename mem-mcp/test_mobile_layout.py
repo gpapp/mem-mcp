@@ -248,7 +248,7 @@ class StackedPaneVisibilityTests(unittest.TestCase):
 
 
 class StatusWidgetLayoutTests(unittest.TestCase):
-    """The status widget sits on the bottom edge of the left rail of two pages.
+    """The status widget sits on the bottom edge of the left rail of three pages.
 
     There is no browser here, so what is pinned is the set of ways it can go
     wrong silently: pinned to nothing (a rail that is not a flex column, or a
@@ -261,8 +261,8 @@ class StatusWidgetLayoutTests(unittest.TestCase):
     checked through the same derived rule rather than by listing the widget.
     """
 
-    # The left rail of each page: the categories column and the calendar rail.
-    _RAILS = (".memories-sidebar", ".diary-sidebar")
+    # The left rail of each page: categories, calendar, and graph categories.
+    _RAILS = (".memories-sidebar", ".diary-sidebar", ".graph-sidebar")
     # Markup and stylesheet spell this differently; both are pinned.
     _WIDGET = ".srv-status"
     _WIDGET_CLASS = 'class="srv-status"'
@@ -271,7 +271,7 @@ class StatusWidgetLayoutTests(unittest.TestCase):
         self.base = _declarations(CSS)
         self.tablet = _declarations(_media_block(900))
 
-    def test_the_widget_is_a_child_of_both_left_rails(self):
+    def test_the_widget_is_a_child_of_each_left_rail(self):
         """Not a sibling strip, and not a child of the scroller.
 
         A widget inside the scrolled element scrolls out of sight on a long
@@ -286,10 +286,15 @@ class StatusWidgetLayoutTests(unittest.TestCase):
 
     def _rail_markup(self, rail):
         cls = rail[1:]
+        # The closing tag is bound by the *opening* line's indentation, via a
+        # backreference. A fixed indent cannot work: the graph rail is nested
+        # one level deeper, and the diary rail contains a multi-line child div
+        # whose own `</div>` would otherwise end the capture early.
         m = re.search(
-            r'<div class="%s"[^>]*>(.*?)\n    </div>' % re.escape(cls), SOURCE, re.S
+            r'^( *)<div class="%s"[^>]*>(.*?)\n\1</div>' % re.escape(cls),
+            SOURCE, re.S | re.M,
         )
-        return m.group(1) if m else ""
+        return m.group(2) if m else ""
 
     def test_each_rail_is_a_flex_column_so_the_widget_can_pin(self):
         """Without `display: flex; flex-direction: column` there is no free
@@ -355,6 +360,27 @@ class StatusWidgetLayoutTests(unittest.TestCase):
         for basis in ("flex: 1 1 0;", "flex: 1 1 0%", "flex: 1;"):
             self.assertNotIn(basis, chips,
                              msg="#categories-sidebar is a zero-basis scroller")
+        self.assertIn("min-height: 0", chips)
+
+    def test_the_graph_rail_scrolls_on_its_list_not_itself(self):
+        """The graph rail took the same shape as the memories rail.
+
+        Its chips column is the scroller, on a non-zero basis, and the rail
+        itself is `overflow: hidden` — otherwise the newly pinned widget
+        scrolls away with the chips on a vault with many categories, and on a
+        phone a zero-basis scroller inside the stacked column resolves against
+        nothing at all.
+        """
+        rail = _decls(_declarations(_base_css()), ".graph-sidebar")
+        self.assertNotIn("overflow-y: auto", rail,
+                         msg="the graph rail is the scroller again, so the "
+                             "status widget scrolls away with the chips")
+        chips = _decls(self.base, "#graph-categories-sidebar")
+        self.assertTrue(chips.strip(), msg="#graph-categories-sidebar has no rule at all")
+        self.assertIn("overflow-y: auto", chips)
+        for basis in ("flex: 1 1 0;", "flex: 1 1 0%", "flex: 1;"):
+            self.assertNotIn(basis, chips,
+                             msg="#graph-categories-sidebar is a zero-basis scroller")
         self.assertIn("min-height: 0", chips)
 
     def test_the_category_chips_do_not_stretch_to_fill_the_rail(self):

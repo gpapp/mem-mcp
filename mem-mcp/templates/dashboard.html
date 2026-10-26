@@ -456,10 +456,11 @@
        instead of hugging the left edge of a very wide card. */
     .diary-view-content { }
 
-    /* ── Server status: bottom-left of Memories and Diary ── */
+    /* ── Server status: bottom-left of Memories, Diary and Graph ── */
     /* Pinned to the bottom of the *left* rail of each page -- the Memories
-       categories column and the Diary calendar rail. Both rails are already
-       flex columns with `overflow: hidden`, so a `flex: 0 0 auto` child with
+       categories column, the Diary calendar rail and the Graph categories
+       rail. All three rails are flex columns with `overflow: hidden`, so a
+       `flex: 0 0 auto` child with
        `margin-top: auto` lands on the bottom edge without introducing a
        second scroll region inside a rail that already has one. Sizing the
        widget any other way (a full-width strip under the layout) would push
@@ -607,7 +608,14 @@
        `width: auto` rule a no-op, and the container's `height: 70vh` made
        the mobile height rule a no-op. vis.js sizes its canvas from this box,
        so whatever this says is exactly what the user has to pan around in. */
-    .graph-sidebar { width: 200px; flex-shrink: 0; border-right: 1px solid var(--border); padding-right: 1rem; }
+    /* The rail is a flex column like the memories/diary rails: the chips
+       column is the scroller, so the status strip can pin to the bottom
+       edge without a second scroll region (same shape as the memories
+       rail's #categories-sidebar). */
+    .graph-sidebar { width: 200px; flex-shrink: 0; border-right: 1px solid var(--border); padding-right: 1rem;
+      display: flex; flex-direction: column; overflow: hidden; }
+    #graph-categories-sidebar { flex-direction: column; flex: 0 1 auto;
+      overflow-y: auto; min-height: 0; align-content: flex-start; }
     .graph-main { flex: 1; display: flex; flex-direction: column; gap: .5rem; min-width: 0; }
     /* The pane sits on the RIGHT of the canvas (filters left, graph centre,
        details right). 300px keeps the middle — the canvas — the widest
@@ -973,7 +981,9 @@
     <div class="graph-layout">
       <div class="graph-sidebar">
         <div style="font-size:.7rem; font-weight:700; text-transform:uppercase; letter-spacing:.5px; color:var(--muted); padding-bottom:.6rem;">Categories</div>
-        <div id="graph-categories-sidebar" class="chips-container" style="flex-direction: column;"></div>
+        <div id="graph-categories-sidebar" class="chips-container"></div>
+        <!-- The status strip renders itself from the SSE snapshot (querySelectorAll over .srv-status). -->
+        <div class="srv-status" data-srv></div>
       </div>
       <div class="graph-main">
         <div id="graph-truncation-note" style="display: none; font-size: .78rem; color: var(--muted); background: var(--bg-subtle, #f8fafc); border: 1px solid var(--border); border-radius: 6px; padding: .5rem .7rem;"></div>
@@ -1682,9 +1692,10 @@
 
   function renderServerStatus(snap) {
     serverStatus = snap;
-    // Two widgets, one per page, both filled from the same snapshot. Query by
+    // Three widgets, one per left rail (Memories, Diary, Graph), all filled
+    // from the same snapshot. Query by
     // class rather than by id: a duplicated id would be silently dropped from
-    // the second, and only one of the two pages would ever show a status.
+    // the second, and only some of the rails would ever show a status.
     document.querySelectorAll('.srv-status').forEach(el => { el.innerHTML = statusWidgetHtml(snap); });
     renderModelsPanel(snap);
   }
