@@ -1061,13 +1061,26 @@ def note_job_status(transcription_id: str, user_id: str) -> Optional[dict]:
 
 
 async def _call_live_llm(job: dict, prompt: str, system: str,
-                         num_predict: int) -> str:
+                         num_predict: int, parse=None):
     """One model call whose LLM phase the priority gate can cancel.
 
     The cancellation hook is registered **only around this call** and cleared
     in `finally`. Registering it for the whole job would let audio tear down a
     commit halfway through, which is the one moment the graph and the vector
     store must not be interrupted.
+
+    `parse` is applied to the answer **inside the retry loop**, and that
+    placement is the point. A 2b model can answer with an unusable *non-empty*
+    string -- production got 62 tokens of word salad ("Pro Ad, Access, At S An
+    Ac...") for a JSON rewrite -- and parsing outside the loop turned that into a
+    failure with no second attempt, while an empty answer got one. The retry is
+    worth the same here: different sampling is the only thing that can change a
+    degenerate decode.
+
+    `LiveNoteTooLong` is deliberately **not** retried and is re-raised first: it
+    is a *good* answer that is merely too long, and the caller handles it with
+    the compaction pass. Retrying it would ask the same model to ignore its own
+    instruction and produce the same length again.
     """
     loop_task = asyncio.current_task()
 
@@ -1077,19 +1090,18 @@ async def _call_live_llm(job: dict, prompt: str, system: str,
 
     if not LIVE_GATE.register_llm_cancel(job["userId"], _cancel):
         raise NoteJobDeferred("recording started before the model call")
+    last_error = None
     try:
-        # One retry, and only for the two failures that are the DECODER rather
-        # than the prompt:
+        # One retry, and only for the failures that are the DECODER rather than
+        # the prompt:
         #
         # - Ollama's repetition abort ("token repeat limit reached"), where a
         #   greedy decode of a long Markdown rewrite re-emits the same run until
         #   the guard fires;
-        # - an empty answer. Reported from production as
-        #   `content:"" done_reason:"stop" eval_count:1` after 85 s of prompt
-        #   eval: the model loaded, read the prompt and emitted a single token.
-        #   At temperature 0 that is a fixed point -- the same request produces
-        #   the same nothing -- so the only thing that can help is other
-        #   sampling, which is what the retry set is for.
+        # - an empty answer (`content:"" done_reason:"stop" eval_count:1`): the
+        #   model loaded, read the prompt and emitted a single token. At
+        #   temperature 0 that is a fixed point;
+        # - an answer `parse` rejects (no JSON object, no note text).
         #
         # Anything else (timeout, missing model, HTTP error) propagates on the
         # first attempt, because being asked twice does not improve it.
@@ -1111,22 +1123,38 @@ async def _call_live_llm(job: dict, prompt: str, system: str,
                     f"stronger repeat penalty -- {exc}"
                 )
                 continue
-            if answer and answer.strip():
+            if not answer or not answer.strip():
+                last_error = LiveNoteError("the model returned an empty answer")
+                logger.warning(
+                    f"live notes: {LIVE_MODEL} answered with nothing (attempt "
+                    f"{attempt + 1}, prompt_chars={len(prompt)})"
+                )
+                if attempt:
+                    break
+                continue
+            if parse is None:
                 return answer
-            if attempt:
-                break
-            logger.warning(
-                f"live notes: {LIVE_MODEL} answered with nothing (attempt 1, "
-                f"prompt_chars={len(prompt)}); retrying with temperature "
-                f"{LIVE_SAMPLING_RETRY['temperature']}"
-            )
+            try:
+                return parse(answer)
+            except LiveNoteTooLong:
+                raise
+            except LiveNoteError as exc:
+                last_error = exc
+                if attempt:
+                    break
+                logger.warning(
+                    f"live notes: {LIVE_MODEL} answered but the answer was not "
+                    f"usable ({exc}) on attempt 1; retrying with temperature "
+                    f"{LIVE_SAMPLING_RETRY['temperature']}"
+                )
         raise LiveNoteError(
-            f"{LIVE_MODEL} did not produce a usable answer twice -- either it "
-            "repeated itself until Ollama aborted, or it answered with nothing. "
-            "The note was not changed. Retry the update; the timing lines above "
-            "say whether the model was slow (a prompt rate in the tens of tok/s "
-            "is CPU inference: `docker exec ollama ollama ps` must say 100% GPU) "
-            "or genuinely stuck, and MEM_LIVE_MODEL selects a different model."
+            f"{LIVE_MODEL} did not produce a usable answer twice. The last "
+            f"reason: {last_error or 'no answer'}. The note was not changed. "
+            "Retry the update; the timing lines above say whether the model was "
+            "slow (a prompt rate in the tens of tok/s is CPU inference: "
+            "`docker exec ollama ollama ps` must say 100% GPU) or answering "
+            "rubbish, which is what a model too small for this prompt looks "
+            "like -- MEM_LIVE_MODEL selects a different one."
         )
     finally:
         LIVE_GATE.clear_llm_cancel(job["userId"], _cancel)
@@ -1142,14 +1170,18 @@ async def _compact_note(job: dict, note: dict, allowed_ids) -> dict:
             "the note is over its limit and even its compaction prompt does "
             f"not fit: {budget['reason']}"
         )
-    answer = await _call_live_llm(
+    # Parsed inside the call so an unusable answer is retried with different
+    # sampling. `max_chars` stays at the hard limit: a compaction that comes
+    # back too long is a real answer this pass cannot use, and it is raised
+    # rather than retried into the same length again.
+    return await _call_live_llm(
         job, prompt, COMPACT_SYSTEM_PROMPT, budget["budget"],
-    )
-    return parse_note_json(
-        answer,
-        allowed_ids,
-        existing_ids=note.get("referencedFactIds") or [],
-        max_chars=LIVE_NOTE_MAX_CHARS,
+        parse=lambda text: parse_note_json(
+            text,
+            allowed_ids,
+            existing_ids=note.get("referencedFactIds") or [],
+            max_chars=LIVE_NOTE_MAX_CHARS,
+        ),
     )
 
 
@@ -1273,18 +1305,22 @@ async def _refresh_note(job: dict) -> None:
                 f"{len(window)} segment(s) do not fit the live note window: "
                 f"{budget['reason']}"
             )
-        answer = await _call_live_llm(
-            job, prompt, LIVE_SYSTEM_PROMPT, budget["budget"],
-        )
         allowed_ids = {item["id"] for item in candidates}
         allowed_ids.update(item["id"] for item in referenced)
-        # Parse without the limit first so an over-long answer can be
-        # compacted. Parsing with the limit would raise and throw away the
-        # text the compaction pass is supposed to receive.
-        result = parse_note_json(
-            answer, allowed_ids,
-            existing_ids=[item["id"] for item in referenced],
-            max_chars=max(LIVE_NOTE_MAX_CHARS, len(answer) + 1),
+
+        def parse_answer(text, _allowed=allowed_ids, _refs=referenced):
+            # Parse without the limit first so an over-long answer can be
+            # compacted. Parsing with the limit would raise and throw away the
+            # text the compaction pass is supposed to receive.
+            return parse_note_json(
+                text, _allowed,
+                existing_ids=[item["id"] for item in _refs],
+                max_chars=max(LIVE_NOTE_MAX_CHARS, len(text) + 1),
+            )
+
+        result = await _call_live_llm(
+            job, prompt, LIVE_SYSTEM_PROMPT, budget["budget"],
+            parse=parse_answer,
         )
         if len(result["text"]) > LIVE_NOTE_MAX_CHARS:
             result = await _compact_note(job, result, allowed_ids)

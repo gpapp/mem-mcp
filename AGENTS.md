@@ -2207,12 +2207,28 @@ Three parts, and none of them replaces the others:
   only breaks the tie the loop needs broken. `LIVE_SAMPLING_RETRY` is *stronger
   and narrower* — penalty 1.4 over 64 tokens, temperature 0.35, `top_p: 0.9` —
   because a retry at the same settings is not a retry.
-- **Exactly one retry, and only for these two degenerate outcomes.** `if attempt
+- **Exactly one retry, and only for these degenerate outcomes.** `if attempt
   or not is_repeat_abort(exc): raise` handles the abort, `if attempt: break`
   handles a second empty answer, and everything else (timeout, missing model,
   HTTP error) propagates on the first attempt because being asked twice does not
   improve it. `is_repeat_abort()` lives in `live_notes.py` (stdlib, callable by
   the suite) because the remedy is unique — waiting does nothing.
+- **`parse` runs *inside* the retry loop, and that placement is the fix.** A
+  third degenerate outcome is a **non-empty, unusable** answer: production got 62
+  tokens of word salad — `"Pro Ad / Access / At S An Ac A U Ar Under Of …"` — for
+  a JSON rewrite, `done_reason: "stop"`, `eval_count: 62`. Parsing *after* the
+  call turned that into a dead end while an empty answer got a second attempt,
+  which is the same fault treated two ways. `_call_live_llm(..., parse=…)` now
+  hands the answer to a callable and retries a `LiveNoteError` once.
+  **`LiveNoteTooLong` is re-raised first and never retried**: it is a good answer
+  to a different problem (the caller compacts it), and retrying asks the same
+  model for the same length again. The handler order is load-bearing for exactly
+  the reason the merge-draft `MergeDraftTooLarge` order is.
+  That word-salad answer is also the evidence that `granite3.3:2b` is the wrong
+  model for this one call: it is excellent at extraction from short prompts and
+  loses the thread on a 2.4k-token Markdown rewrite, so `MEM_LIVE_MODEL` (which
+  defaults to `MEM_EXTRACT_MODEL`) is the knob to move — `nemotron-3-nano:4b` is
+  already the judgement model here and is a drop-in.
 
 After the second failure the job raises `LiveNoteError` naming `MEM_LIVE_MODEL`
 and telling the operator to look at the timing lines above: a prompt rate in the
@@ -2223,14 +2239,18 @@ next pause or **Rebuild note**.
 
 `NoteCallRetryTests` **drives** `_call_live_llm` against a scripted
 `get_llm_response` — empty-then-good retries with the retry set, whitespace-only
-counts as empty, one abort retries, and the call **count** is asserted for a
-timeout and a missing model, because "it raised" looks identical whether it was
-retried or not. `RepeatAbortTests` calls the predicate and pins the two sampling
-sets as a pair; `EmptyAnswerTimingTests` in `test_llm_reliability` calls
-`_ollama_timing` with the production numbers, drives the logged ERROR line, and
-asserts a GPU-speed prompt evaluation is **not** blamed on the CPU. Mutations that
-bit: `if True: raise`, `if True: break` on the empty answer, a retry set equal to
-the first, a retry temperature of 0.0, and both directions of the CPU-rate guard.
+counts as empty, one abort retries, **garbage retries and `LiveNoteTooLong` does
+not**, and the call **count** is asserted for a timeout and a missing model,
+because "it raised" looks identical whether it was retried or not. The scripted
+fake raises a named `AssertionError` when its replies are exhausted, so a
+mutation that removes the retry reports "the retry never happened" instead of an
+`IndexError` from the harness. `RepeatAbortTests` calls the predicate and pins the
+two sampling sets as a pair; `EmptyAnswerTimingTests` in `test_llm_reliability`
+calls `_ollama_timing` with the production numbers, drives the logged ERROR line,
+and asserts a GPU-speed prompt evaluation is **not** blamed on the CPU. Mutations
+that bit: `if True: raise`, `if True: break` on the empty answer, a retry set
+equal to the first, a retry temperature of 0.0, `pass` instead of `raise` for
+`LiveNoteTooLong`, and dropping the retry from the parse branch.
 
 
 ### The prompt is four blocks and the output is validated

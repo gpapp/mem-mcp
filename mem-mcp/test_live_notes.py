@@ -1508,6 +1508,12 @@ class NoteCallRetryTests(unittest.TestCase):
         async def fake_llm(prompt, system="", model="", num_predict=0,
                            timeout=0.0, options=None):
             calls.append(dict(options or {}))
+            if not scripted:
+                # A missing retry must read as the property under test, not as
+                # an IndexError from the harness.
+                raise AssertionError(
+                    f"unexpected call {len(calls)}: the scripted replies are used up"
+                )
             value = scripted.pop(0)
             if isinstance(value, BaseException):
                 raise value
@@ -1523,6 +1529,7 @@ class NoteCallRetryTests(unittest.TestCase):
             "LIVE_SAMPLING_RETRY": ln.LIVE_SAMPLING_RETRY,
             "is_repeat_abort": ln.is_repeat_abort,
             "LiveNoteError": ln.LiveNoteError,
+            "LiveNoteTooLong": ln.LiveNoteTooLong,
             "NoteJobDeferred": NoteJobDeferred,
             "get_llm_response": fake_llm,
             "LIVE_GATE": types.SimpleNamespace(
@@ -1537,11 +1544,13 @@ class NoteCallRetryTests(unittest.TestCase):
         exec(compile(module, self.PATH, "exec"), namespace)
         return namespace["_call_live_llm"], calls
 
-    def run_call(self, replies):
+    def run_call(self, replies, parse=None):
         import asyncio
         warnings = []
         call, calls = self._lift(replies, warnings)
-        return asyncio.run(call({"userId": "alice"}, "prompt", "system", 900)), calls, warnings
+        return (asyncio.run(call({"userId": "alice"}, "prompt", "system", 900,
+                                 parse=parse)),
+                calls, warnings)
 
     def test_an_empty_answer_is_retried_with_different_sampling(self):
         answer, calls, _ = self.run_call(["", '{"title":"T","text":"Body"}'])
@@ -1555,6 +1564,86 @@ class NoteCallRetryTests(unittest.TestCase):
     def test_whitespace_only_is_an_empty_answer(self):
         _, calls, _ = self.run_call(["   ", "ok"])
         self.assertEqual(len(calls), 2)
+
+    def test_garbage_is_retried_and_a_too_long_answer_is_not(self):
+        # A non-empty but unusable answer is the same class as an empty one: the
+        # decoder, not the prompt. Production got 62 tokens of word salad where
+        # a JSON note was asked for, and parsing *outside* the retry loop made
+        # that a dead end while an empty answer got a second attempt.
+        def parse(text):
+            if text == "LONG":
+                raise ln.LiveNoteTooLong("too long")
+            if not text.startswith("{"):
+                raise ln.LiveNoteError("the model answer contained no JSON object")
+            return {"text": text}
+
+        import asyncio
+        import test_share_endpoints
+        import ast
+
+        source = test_share_endpoints._read(self.PATH)
+        node = next(n for n in ast.parse(source).body
+                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and n.name == "_call_live_llm")
+        module = ast.Module(body=[node], type_ignores=[])
+        ast.fix_missing_locations(module)
+
+        calls = []
+        scripted = ["Pro Ad Access At S", '{"title":"T","text":"Body"}']
+
+        async def fake_llm(prompt, system="", model="", num_predict=0,
+                           timeout=0.0, options=None):
+            calls.append(dict(options or {}))
+            if not scripted:
+                raise AssertionError(
+                    f"unexpected call {len(calls)}: the scripted replies are used up"
+                )
+            return scripted.pop(0)
+
+        namespace = {
+            "asyncio": asyncio,
+            "LIVE_MODEL": "granite3.3:2b",
+            "LIVE_SAMPLING": ln.LIVE_SAMPLING,
+            "LIVE_SAMPLING_RETRY": ln.LIVE_SAMPLING_RETRY,
+            "is_repeat_abort": ln.is_repeat_abort,
+            "LiveNoteError": ln.LiveNoteError,
+            "LiveNoteTooLong": ln.LiveNoteTooLong,
+            "NoteJobDeferred": type("NoteJobDeferred", (RuntimeError,), {}),
+            "get_llm_response": fake_llm,
+            "LIVE_GATE": types.SimpleNamespace(
+                register_llm_cancel=lambda user, cb: True,
+                clear_llm_cancel=lambda user, cb=None: None,
+            ),
+            "logger": types.SimpleNamespace(
+                warning=lambda *a, **k: None, error=lambda *a, **k: None),
+        }
+        exec(compile(module, self.PATH, "exec"), namespace)
+        call = namespace["_call_live_llm"]
+
+        result = asyncio.run(call({"userId": "alice"}, "p", "s", 900, parse=parse))
+        self.assertEqual(result, {"text": '{"title":"T","text":"Body"}'})
+        self.assertEqual(len(calls), 2,
+                         msg="an unparseable answer must get the retry too")
+        self.assertEqual(calls[1], dict(ln.LIVE_SAMPLING_RETRY))
+
+        # A too-long answer is a GOOD answer to a different problem: the caller
+        # compacts it. Retrying would ask the same model for the same length.
+        calls.clear()
+        scripted[:] = ["LONG", "LONG"]
+        with self.assertRaises(ln.LiveNoteTooLong):
+            asyncio.run(call({"userId": "alice"}, "p", "s", 900, parse=parse))
+        self.assertEqual(len(calls), 1)
+
+    def test_two_unparseable_answers_name_the_model(self):
+        def parse(text):
+            raise ln.LiveNoteError("the model answer contained no JSON object")
+
+        import asyncio
+
+        with self.assertRaises(ln.LiveNoteError) as caught:
+            self.run_call(["garbage", "garbage"], parse=parse)
+        self.assertIn("granite3.3:2b", str(caught.exception))
+        self.assertIn("MEM_LIVE_MODEL", str(caught.exception))
 
     def test_two_empty_answers_fail_with_the_model_and_the_check(self):
         with self.assertRaises(ln.LiveNoteError) as caught:

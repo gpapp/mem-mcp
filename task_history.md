@@ -5,6 +5,45 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# Live notes — the model answered with word salad (2026-10-27)
+
+- **Reported as** `content:"Pro Ad\n Access\n At S An Ac A U Ar Under Of…"` —
+  62 tokens of vocabulary noise for a JSON rewrite, `done_reason:"stop"`,
+  `eval_count:62`. Not an empty answer, so the empty-answer retry from the
+  previous fix did not fire: `parse_note_json` rejected it *after* the call
+  returned, and the job died with `the model answer contained no JSON object`.
+- **The retry now wraps the parse.** `_call_live_llm(..., parse=…)` applies a
+  callable to the answer inside the retry loop and retries a `LiveNoteError`
+  once with `LIVE_SAMPLING_RETRY`. An unusable non-empty answer and an empty one
+  were the same fault treated two ways — one got a second attempt, the other a
+  dead end.
+- **`LiveNoteTooLong` is re-raised before the parse handler and never retried.**
+  It is a good answer that is merely too long, and the caller's compaction pass
+  is what handles it; retrying would ask the same model for the same length
+  again. Handler order is the same trap as `MergeDraftTooLarge`.
+- **Both call sites parse through the call now** — the window rewrite with the
+  permissive `max_chars=max(LIVE_NOTE_MAX_CHARS, len(text) + 1)` so compaction
+  still receives an over-long answer, and the compaction pass with the hard
+  limit.
+- **The word salad is also evidence about the model.** The same run shows prompt
+  evaluation at ~12,500 tok/s with 2448 of 2449 tokens cached, so the GPU is
+  healthy here — this is `granite3.3:2b` losing the thread on a 2.4k-token
+  Markdown rewrite, not a slow host. It is excellent at the short-prompt
+  extraction it is configured for and is the wrong model for this call:
+  `MEM_LIVE_MODEL` (defaulting to `MEM_EXTRACT_MODEL`) is the knob, and
+  `nemotron-3-nano:4b` is already resident as the judgement model.
+- Guards: two new `NoteCallRetryTests` drive garbage-then-good (retried, retry
+  set used) and too-long (one call only), plus two-garbage naming the model and
+  `MEM_LIVE_MODEL`. The scripted fake now raises a named `AssertionError` when
+  its replies run out, so removing the retry reports "the retry never happened"
+  rather than an `IndexError` from the harness.
+- Mutations that bit: `pass` instead of `raise` for `LiveNoteTooLong`, and
+  dropping the retry from the parse branch.
+- **1319 tests OK**; `py_compile`/`diff --check` clean.
+
+---
+
+
 # Live notes — an empty answer at 29 tok/s was CPU inference (2026-10-27)
 
 - **The report was a "Rebuild note" with every model already unloaded**, which
