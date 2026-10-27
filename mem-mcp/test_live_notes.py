@@ -114,6 +114,32 @@ class PromptTests(unittest.TestCase):
         self.assertIn("Real speech", prompt)
         self.assertNotIn("[00:00] Ana:  \n", prompt)
 
+    def test_the_prompt_tells_the_note_to_ignore_off_topic_speech(self):
+        # Reported symptom: the note carried the rambling. The old prompt said
+        # "incorporate every new section", which mandates exactly that -- an
+        # instruction to summarise by topic has to say what to leave out.
+        prompt = ln.LIVE_SYSTEM_PROMPT
+        self.assertIn("meeting's topic", prompt)
+        self.assertIn("small talk", prompt)
+        self.assertIn("Summarise; do not transcribe", prompt)
+        self.assertIn("If a new section adds nothing, return the note unchanged",
+                      prompt)
+
+    def test_the_candidate_list_is_not_a_checklist(self):
+        # Reported symptom: a note linked its whole project scope. The list is
+        # the scope; the prompt has to say that being in it is not evidence.
+        prompt = ln.LIVE_SYSTEM_PROMPT
+        self.assertIn("context, not a checklist", prompt)
+        self.assertIn("not relevant merely because it belongs to the same "
+                      "client or project", prompt)
+        self.assertIn("most sections need no reference at all", prompt)
+
+    def test_the_answer_replaces_the_reference_list(self):
+        # Without this sentence the model cannot know that pruning is allowed,
+        # and the code would be dropping ids it expected to be unioned in.
+        self.assertIn("replaces the current list", ln.LIVE_SYSTEM_PROMPT)
+        self.assertIn("return the ones to keep", ln.BLOCK_REFERENCES)
+
     def test_timestamps_are_minutes_and_seconds(self):
         self.assertEqual(ln.format_timestamp(0), "00:00")
         self.assertEqual(ln.format_timestamp(65), "01:05")
@@ -179,10 +205,38 @@ class ParseNoteTests(unittest.TestCase):
         result = self.parse('{"title":"T","text":"Body","referencedFactIds":["f1","nope"]}')
         self.assertEqual(result["referencedFactIds"], ["f1"])
 
-    def test_existing_references_are_unioned_in_front(self):
-        result = self.parse('{"title":"T","text":"Body","referencedFactIds":["f2","f1"]}',
+    def test_the_answer_replaces_the_reference_list(self):
+        # The old behaviour unioned existing ids in front, so a note that once
+        # cited its whole project scope could never shed a link: the list only
+        # ever grew. The model is told the field replaces the list, and the
+        # facts it cites today are in the prompt, so dropping one is a choice
+        # it made rather than an oversight.
+        result = self.parse('{"title":"T","text":"Body","referencedFactIds":["f2"]}',
                             existing=["f1", "old"])
-        self.assertEqual(result["referencedFactIds"], ["f1", "f2"])
+        self.assertEqual(result["referencedFactIds"], ["f2"])
+
+    def test_an_empty_list_clears_the_references(self):
+        result = self.parse('{"title":"T","text":"Body","referencedFactIds":[]}',
+                            existing=["f1", "f2"])
+        self.assertEqual(result["referencedFactIds"], [])
+
+    def test_an_answer_without_the_key_keeps_the_existing_references(self):
+        # "If a new section adds nothing, return the note unchanged" -- an
+        # unchanged answer must not silently unlink everything.
+        result = self.parse('{"title":"T","text":"Body"}', existing=["f1"])
+        self.assertEqual(result["referencedFactIds"], ["f1"])
+
+    def test_the_reference_count_is_capped(self):
+        allowed = {f"f{i}" for i in range(20)}
+        result = ln.parse_note_json(
+            '{"title":"T","text":"Body","referencedFactIds":[%s]}'
+            % ",".join('"f%d"' % i for i in range(20)),
+            allowed, (), max_chars=1000,
+        )
+        self.assertEqual(len(result["referencedFactIds"]),
+                         ln.LIVE_REFERENCE_LIMIT,
+                         msg="the candidate list is the client scope; a note "
+                             "citing all of it describes the project, not the meeting")
 
     def test_missing_title_defaults(self):
         self.assertEqual(self.parse('{"text":"Body"}')["title"], "Live notes")

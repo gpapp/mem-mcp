@@ -43,6 +43,11 @@ LIVE_CONTEXT_TOKENS = int(os.getenv("MEM_LIVE_CONTEXT_TOKENS") or 16332)
 LIVE_MIN_NUM_PREDICT = int(os.getenv("MEM_LIVE_MIN_NUM_PREDICT") or 1500)
 LIVE_NOTE_MAX_CHARS = int(os.getenv("MEM_LIVE_NOTE_MAX_CHARS") or 12000)
 LIVE_WINDOW = int(os.getenv("MEM_LIVE_WINDOW") or 6000)
+# Backstop on `referencedFactIds`, not a target. A note that cites more than a
+# dozen records is describing the project rather than this meeting, which is the
+# shape this cap exists to stop: the candidate list is the whole client scope, so
+# "link everything it matches" is the failure mode of an unfocused note.
+LIVE_REFERENCE_LIMIT = int(os.getenv("MEM_LIVE_REFERENCE_LIMIT") or 12)
 
 # Measured against the merge draft: the char/token ratio drifts downwards as a
 # prompt grows (3.21 at 6.7k chars, 3.31 at 43.5k), so the guard rounds down.
@@ -55,13 +60,26 @@ NOTE_TITLE_MAX_CHARS = 200
 LIVE_SYSTEM_PROMPT = (
     "You maintain a live note from a meeting transcript. You are given the "
     "note as it stands, only the transcript sections that have not been added "
-    "to it yet, the titles of facts the note already references, and the "
-    "titles of facts you may reference. Rewrite the note so it incorporates "
-    "every new section. Preserve existing detail and Markdown structure; merge "
-    "repetition rather than appending a second copy. Never invent names, "
-    "decisions, numbers or facts. Reference a fact only by the exact id shown "
-    "in the candidate list. If a new section adds nothing, return the note "
-    "unchanged. Answer with JSON only, with the keys title, text and "
+    "to it yet, the facts the note references today, and the facts you may "
+    "reference. Rewrite the note so it reflects the substance of the new "
+    "sections.\n\n"
+    "The note is about the meeting's topic -- the client and project named in "
+    "the header. Keep what belongs to that topic: decisions, requirements, "
+    "names, roles, owners, numbers, dates, risks and open questions. Leave out "
+    "what does not: small talk, side conversations, unrelated work, and speech "
+    "that adds nothing to the note. Summarise; do not transcribe. Never invent "
+    "names, decisions, numbers or facts.\n\n"
+    "Preserve existing detail and Markdown structure; merge repetition rather "
+    "than appending a second copy. If a new section adds nothing, return the "
+    "note unchanged.\n\n"
+    "Reference a fact only when the note's own content discusses or depends on "
+    "that fact. The candidate list is context, not a checklist: most sections "
+    "need no reference at all, and a fact is not relevant merely because it "
+    "belongs to the same client or project. `referencedFactIds` must be the "
+    "complete list of facts the note references after this update -- it "
+    "replaces the current list, so keep the ones that still apply and drop the "
+    "ones that no longer do. Reference a fact only by the exact id shown in "
+    "the candidate list. Answer with JSON only, with the keys title, text and "
     "referencedFactIds."
 )
 
@@ -69,7 +87,7 @@ LIVE_SYSTEM_PROMPT = (
 # trusting prose. They are also the only labels the model is given.
 BLOCK_NOTE = "EXISTING NOTE"
 BLOCK_TRANSCRIPT = "NEW TRANSCRIPT SECTIONS"
-BLOCK_REFERENCES = "FACTS THIS NOTE ALREADY REFERENCES"
+BLOCK_REFERENCES = "FACTS THIS NOTE REFERENCES TODAY (return the ones to keep)"
 BLOCK_CANDIDATES = "FACTS YOU MAY REFERENCE"
 
 
@@ -281,8 +299,20 @@ def parse_note_json(raw, allowed_ids, existing_ids=(), max_chars=None) -> dict:
 
     Unknown ids are dropped rather than treated as an error: the model naming a
     fact outside the client-scoped candidate list is a reason not to link it,
-    not a reason to discard an otherwise good note. Existing references are
-    unioned in front of the new ones, so an id the model forgot stays linked.
+    not a reason to discard an otherwise good note.
+
+    **`referencedFactIds` replaces the note's references; it is not unioned into
+    them.** The union was here so an id the model forgot stayed linked, and it
+    turned every early over-link permanent: the list could only grow, so a note
+    that started by citing its whole project scope could never be corrected. The
+    model is told the list replaces the current one, and the facts it references
+    today are in the prompt (and in `allowed_ids`) so keeping one costs it
+    nothing. An answer that omits the key altogether keeps what is there —
+    "unchanged" is a legitimate answer for a section that adds nothing.
+
+    `LIVE_REFERENCE_LIMIT` is a backstop on count, not a target: the candidate
+    list is the entire client scope, so a note citing more than a dozen records
+    is describing the project rather than this meeting.
 
     An over-long note raises `LiveNoteTooLong` instead of being sliced. A note
     cut at a fixed character count ends mid-sentence and reads as complete,
@@ -313,9 +343,15 @@ def parse_note_json(raw, allowed_ids, existing_ids=(), max_chars=None) -> dict:
         raw_refs = [raw_refs]
     if not isinstance(raw_refs, (list, tuple)):
         raw_refs = []
+    # Absent and empty are different answers: absent means "leave the list
+    # alone", empty means "this note references nothing".
+    if "referencedFactIds" not in data:
+        raw_refs = existing
 
     ordered = []
-    for cid in list(existing) + list(raw_refs):
+    for cid in raw_refs:
+        if len(ordered) >= LIVE_REFERENCE_LIMIT:
+            break
         cid = str(cid or "").strip()
         if cid and cid in allowed and cid not in ordered:
             ordered.append(cid)

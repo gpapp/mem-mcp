@@ -5,6 +5,41 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# Live notes — the note kept the rambling and linked the whole project (2026-10-27)
+
+- **Two complaints, and the first was self-inflicted by the prompt.** *"The notes
+  should ignore non-relevant ramblings, the note should be about the topic"* —
+  the system prompt said **"incorporate every new section"**, which is an
+  instruction to keep the rambling. It now states the topic (the client and
+  project in the header), what belongs to it, what does not (small talk, side
+  conversations, unrelated work), and `Summarise; do not transcribe`.
+- **"Only the note-relevant links should be created"** had a code cause as well
+  as a prose one. `parse_note_json` **unioned** `referencedFactIds` into the
+  note's existing references, so the list could only grow: one early over-link
+  was permanent, and the model had no visible way to prune. The answer now
+  **replaces** the list, the prompt says so, and `BLOCK_REFERENCES` reads "FACTS
+  THIS NOTE REFERENCES TODAY (return the ones to keep)".
+- **Absent is not empty.** An answer that omits the key keeps the existing
+  references (the prompt's "return the note unchanged" case must not unlink
+  everything); an explicit `[]` clears them. Both are pinned.
+- **The candidate list was the whole client scope and read as a checklist.** The
+  prompt now says it is *context, not a checklist*, that most sections need no
+  reference at all, and that a fact is not relevant merely because it shares the
+  client or project.
+- **`MEM_LIVE_REFERENCE_LIMIT` (default 12) is a backstop, not a target** — a
+  note citing more than a dozen records is describing the project. Wired in
+  `.env.example` and compose; `MEM_LIVE_FACT_LIMIT` (100) still bounds the
+  candidate titles, ranked before the cap, and lowering it is the next lever.
+- Guards: three `PromptTests` pinning the sentences, and `ParseNoteTests`
+  covering replace / omit / empty / cap. Three mutations bit — restoring the
+  union (three failures), dropping the cap, and softening "not a checklist".
+- **1303 tests OK**; `py_compile`/`diff --check` clean. The template was not
+  touched, so no `node --check`.
+
+---
+
+
+
 # Live notes — the pause answered its own summarise with 409 (2026-10-27)
 
 - **Reported as two 409s**, `/summarize` and `/reprocess`, from clicks in the

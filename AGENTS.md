@@ -623,7 +623,7 @@ which cannot be imported here, and holds two guards worth knowing about:
 - Query rewrite cache: `MEM_QUERY_CACHE_TTL` (default 900s) and `MEM_QUERY_CACHE_MAX` (default 256 entries); either `0` disables the cache — see "Query Rewrite Cache"
 - Embedding retries: `MEM_EMBED_RETRIES` (default 2) and `MEM_EMBED_RETRY_BACKOFF` (default 1.5, in seconds), `MEM_EMBED_MAX_CHARS` (default 8000) — see "Embedding Reliability"
 - Server status widget: `MEM_STATUS_POLL_SECONDS` (default 10) and `MEM_STATUS_HTTP_TIMEOUT` (default 8) — see "Server Status Widget"
-- Live notes: `MEM_ASR_WS_URL`, `MEM_LIVE_MODEL` (defaults to `MEM_EXTRACT_MODEL`), `MEM_LIVE_FACT_LIMIT` (100), `MEM_LIVE_CONTEXT_TOKENS` (must track `OLLAMA_CONTEXT_LENGTH`), `MEM_LIVE_MIN_NUM_PREDICT` (1500, a refusal floor), `MEM_LIVE_NOTE_MAX_CHARS` (12000), `MEM_LIVE_WINDOW` (6000), `MEM_LIVE_TAIL_SILENCE_MS` (480, the pause tail — see "A pause ends the stream") and `MEM_LIVE_UNLOAD_ON_RECORD` — see "Live Notes"
+- Live notes: `MEM_ASR_WS_URL`, `MEM_LIVE_MODEL` (defaults to `MEM_EXTRACT_MODEL`), `MEM_LIVE_FACT_LIMIT` (100), `MEM_LIVE_REFERENCE_LIMIT` (12, the backstop on a note's links — see "The note is about the topic"), `MEM_LIVE_CONTEXT_TOKENS` (must track `OLLAMA_CONTEXT_LENGTH`), `MEM_LIVE_MIN_NUM_PREDICT` (1500, a refusal floor), `MEM_LIVE_NOTE_MAX_CHARS` (12000), `MEM_LIVE_WINDOW` (6000), `MEM_LIVE_TAIL_SILENCE_MS` (480, the pause tail — see "A pause ends the stream") and `MEM_LIVE_UNLOAD_ON_RECORD` — see "Live Notes"
 - User vault resolved from a session cookie, `Authorization: Basic`, an access key, or proxy headers — see Authentication
 - Sessions and access keys: `MEM_SESSION_DIR` (must be the bind mount, or a container rebuild logs everyone out) and `MEM_SESSION_SECURE` (adds `Secure` to the session cookie; only enable when the app is reached over HTTPS, since the process cannot detect the proxy's scheme and a `Secure` cookie on a plain-HTTP visit is silently dropped). `MEM_SESSION_SECRET` is no longer used to sign anything.
 - Admin surface: `MEM_ADMIN_USER` names the one account that may reach the **Service** tab
@@ -2120,10 +2120,54 @@ detail and discarded (the `_service_unavailable` rule, one status code over).
 `LiveGateRaceTests` covers the message, the `_conflict` call sites, and the four
 client properties above; each was mutation-checked by reverting it.
 
+### The note is about the topic, and a reference is not a mention
+
+Two complaints, one prompt. *"The notes should ignore non-relevant ramblings,
+the note should be about the topic"* and *"Only the note-relevant links should be
+created, not links to the entire project scope."*
+
+The focus half was self-inflicted: the prompt said **"incorporate every new
+section"**, which is an instruction to keep the rambling. It now says what a note
+is for — the meeting's topic, i.e. the client and project in the header — what
+belongs to it (decisions, requirements, names, roles, owners, numbers, dates,
+risks, open questions) and what does not (small talk, side conversations,
+unrelated work, speech that adds nothing), and `Summarise; do not transcribe`.
+"Return the note unchanged" when a section adds nothing stays, and is what makes
+the silence legitimate rather than a model that gave up.
+
+The link half had two causes, and the code one mattered as much as the prose:
+
+- **`referencedFactIds` was unioned into the note's existing references.** That
+  made every early over-link permanent: the list could only grow, so a note that
+  once cited its project scope could never be corrected, and the union was
+  invisible in the prompt — the model had no way to prune. It **replaces** the
+  list now, the prompt says so ("keep the ones that still apply and drop the ones
+  that no longer do"), `BLOCK_REFERENCES` reads *"FACTS THIS NOTE REFERENCES
+  TODAY (return the ones to keep)"*, and an answer that **omits** the key keeps
+  what is there — "unchanged" is a legitimate answer and must not unlink
+  everything. An explicit `[]` clears it.
+- **The candidate list is the whole client scope**, and a small model reads a
+  list in front of it as a checklist. The prompt now says the list is *context,
+  not a checklist*: refer to a fact only when the note's own content discusses or
+  depends on it, "most sections need no reference at all", and a fact is "not
+  relevant merely because it belongs to the same client or project".
+
+`MEM_LIVE_REFERENCE_LIMIT` (default 12) is the **backstop, not a target**: more
+than a dozen citations is a note describing the project rather than the meeting.
+`MEM_LIVE_FACT_LIMIT` (100) still bounds how many candidate titles are offered,
+and the ranking by overlap with the current window happens *before* that cap — so
+lowering it is the knob to reach for if the model still over-links.
+
+`PromptTests` pins the sentences (a prompt is text; nothing else notices when one
+changes) and `ParseNoteTests` pins replace-vs-omit-vs-empty and the cap. Three
+mutations bit: restoring the union fails three tests, dropping the cap fails the
+count test, and softening "not a checklist" fails the prompt test.
+
 A note job is per-user serialised with its own `asyncio.Lock`, **not**
 `claim_maintenance`. Maintenance locks the vault for a reclassify or restore;
 holding one for the length of a meeting would block both and has nothing to do
 with the microphone.
+
 
 ### The prompt is four blocks and the output is validated
 
