@@ -3281,9 +3281,20 @@ async def api_test_asr_token(request: Request):
 # Audio is forwarded before anything is written. Transcript messages go to the
 # browser first and are queued for a single writer task, so the receive loop
 # never waits on Neo4j; a slow write can delay a segment, never the microphone.
+#
+# A pause ends the upstream stream on purpose rather than closing it. asr-mcp
+# endpoints on 320 ms of silence AUDIO and holds the resulting turn for a second
+# before decoding, so a client that just stops sending loses the last utterance
+# to the close -- see `pause_flush_frames()` in live_notes.py for the frame
+# sequence and why its order cannot be reversed.
 # ---------------------------------------------------------------------------
 
-_LIVE_PAUSE_HANGOVER_SECONDS = 0.8
+# How long a pause waits for the last utterance to come back before it stops
+# waiting and reports. asr-mcp's own clients allow 30s; this is the same idea
+# with a little less patience, because a pause is something a person is watching.
+# Hitting it is a degraded pause, not a lost recording: the segments already
+# written stay written.
+_LIVE_TAIL_DRAIN_SECONDS = 20
 
 # How long a recording may run before the absence of any microphone audio is
 # worth a WARNING. The browser side has the same check for the user's benefit;
@@ -3473,6 +3484,11 @@ async def live_stream(websocket: WebSocket, transcription_id: str):
     upstream = None
     asr_task = None
     asr_quiet = None
+    # Set by the reader when asr-mcp's `stats` frame arrives (or when the stream
+    # ends), so a pause can wait for the last utterance instead of guessing at a
+    # delay. Replaced on every connection: a stale event would make the next
+    # pause return before its own tail had been transcribed.
+    asr_drained = {"event": asyncio.Event()}
     audio_task = None
     stopping = False
     # Counted so a recorder that is open but silent can say so. A browser whose
@@ -3510,7 +3526,7 @@ async def live_stream(websocket: WebSocket, transcription_id: str):
             finally:
                 queue.task_done()
 
-    async def asr_reader(connection, offset: float, quiet: dict):
+    async def asr_reader(connection, offset: float, quiet: dict, drained):
         try:
             async for raw in connection:
                 if isinstance(raw, bytes):
@@ -3526,6 +3542,13 @@ async def live_stream(websocket: WebSocket, transcription_id: str):
                 except (ValueError, TypeError):
                     continue
                 if not isinstance(payload, dict):
+                    continue
+                if payload.get("type") == "stats":
+                    # asr-mcp sends `stats` only after its decode queue has
+                    # drained, so receiving it is proof that every transcript
+                    # this stream produced has already been forwarded -- the
+                    # one end-of-stream ack the protocol has.
+                    drained.set()
                     continue
                 item = asr_segment(payload, offset)
                 if item:
@@ -3550,6 +3573,10 @@ async def live_stream(websocket: WebSocket, transcription_id: str):
                     })
                 except Exception:
                     pass
+        finally:
+            # A stream that ends without `stats` must still release a waiting
+            # pause; otherwise the alternative is the full timeout below.
+            drained.set()
 
     async def open_upstream():
         state = await asyncio.to_thread(
@@ -3570,14 +3597,47 @@ async def live_stream(websocket: WebSocket, transcription_id: str):
         connection = upstream
         reader = asr_task
         quiet = asr_quiet
+        drained = asr_drained["event"]
         upstream = None
         asr_task = None
         asr_quiet = None
-        if wait_tail:
-            # asr-mcp's detector has a 320 ms hangover and a 200 ms post-roll.
-            # Closing immediately after the last block would cut the final
-            # clause out of the transcript.
-            await asyncio.sleep(_LIVE_PAUSE_HANGOVER_SECONDS)
+        flushed = False
+        if wait_tail and connection is not None:
+            # The last utterance is still open in asr-mcp's detector when the
+            # microphone stops. Its turns end on 320 ms of sub-threshold AUDIO,
+            # never on a wall clock, so merely stopping the audio strands the
+            # tail until disconnect -- and the transcripts that flush produces
+            # are then written to a socket this side has already closed, which
+            # is a pause that loses the end of a sentence.
+            #
+            # So the tail is sent as real frames: silence closes the detector's
+            # turn, and the end-of-stream frame then releases it without waiting
+            # out the coalescer's one-second merge window. The order matters --
+            # asr-mcp skips its own detector flush once it has seen an explicit
+            # one, so flushing first would discard the open utterance instead.
+            try:
+                for frame in mem.pause_flush_frames():
+                    await connection.send(frame)
+                flushed = True
+            except Exception as exc:  # noqa: BLE001 - close anyway
+                mem.logger.warning(
+                    f"live notes: could not flush the tail of "
+                    f"{transcription_id}: {type(exc).__name__}: {exc}"
+                )
+        if flushed:
+            # Deliberately no close yet: the flush exists to read the answer.
+            # asr-mcp decodes its queue and then sends `stats` on this socket,
+            # and closing first would throw those frames away -- the exact
+            # failure this replaced.
+            try:
+                await asyncio.wait_for(
+                    drained.wait(), timeout=_LIVE_TAIL_DRAIN_SECONDS
+                )
+            except asyncio.TimeoutError:
+                mem.logger.warning(
+                    f"live notes: the tail of {transcription_id} did not arrive "
+                    f"within {_LIVE_TAIL_DRAIN_SECONDS}s -- pausing anyway"
+                )
         if quiet is not None:
             quiet["value"] = True
         if connection is not None:
@@ -3602,7 +3662,10 @@ async def live_stream(websocket: WebSocket, transcription_id: str):
         writer_task = asyncio.create_task(writer_loop())
         upstream, offset = await open_upstream()
         asr_quiet = {"value": False}
-        asr_task = asyncio.create_task(asr_reader(upstream, offset, asr_quiet))
+        asr_drained["event"] = asyncio.Event()
+        asr_task = asyncio.create_task(
+            asr_reader(upstream, offset, asr_quiet, asr_drained["event"])
+        )
         audio_task = asyncio.create_task(audio_watchdog())
 
         while True:
@@ -3636,8 +3699,10 @@ async def live_stream(websocket: WebSocket, transcription_id: str):
                     await websocket.send_json({"type": "paused"})
                     continue
                 await close_upstream(wait_tail=True)
-                # Every segment the tail produced has been written before the
-                # UI is told it may summarise.
+                # close_upstream returns only after asr-mcp's `stats` ack (or the
+                # drain timeout), and every tail segment it produced was queued
+                # on the way past. So this join is what lets the UI summarise
+                # with the end of the sentence already stored.
                 await queue.join()
                 await asyncio.to_thread(
                     mem.db_update_transcription, transcription_id, user_id,
@@ -3665,8 +3730,9 @@ async def live_stream(websocket: WebSocket, transcription_id: str):
                 mem.LIVE_GATE.begin_recording(user_id)
                 upstream, offset = await open_upstream()
                 asr_quiet = {"value": False}
+                asr_drained["event"] = asyncio.Event()
                 asr_task = asyncio.create_task(
-                    asr_reader(upstream, offset, asr_quiet)
+                    asr_reader(upstream, offset, asr_quiet, asr_drained["event"])
                 )
                 await asyncio.to_thread(
                     mem.db_update_transcription, transcription_id, user_id,

@@ -535,10 +535,11 @@
        instead of hugging the left edge of a very wide card. */
     .diary-view-content { }
 
-    /* ── Server status: bottom-left of Memories, Diary and Graph ── */
+    /* ── Server status: bottom-left of Memories, Diary, Graph and Live ── */
     /* Pinned to the bottom of the *left* rail of each page -- the Memories
-       categories column, the Diary calendar rail and the Graph categories
-       rail. All three rails are flex columns with `overflow: hidden`, so a
+       categories column, the Diary calendar rail, the Graph categories
+       rail and the Live sessions rail. All four rails are flex columns with
+       `overflow: hidden`, so a
        `flex: 0 0 auto` child with
        `margin-top: auto` lands on the bottom edge without introducing a
        second scroll region inside a rail that already has one. Sizing the
@@ -1073,6 +1074,9 @@
       <div id="live-session-list" class="live-session-scroll">
         <div class="empty">Loading…</div>
       </div>
+      <!-- Same widget as the other three rails: filled from the SSE snapshot,
+           so recording never depends on a poll of its own. -->
+      <div class="srv-status" data-srv></div>
     </aside>
 
     <section class="live-main">
@@ -2174,7 +2178,7 @@
 
   function renderServerStatus(snap) {
     serverStatus = snap;
-    // Three widgets, one per left rail (Memories, Diary, Graph), all filled
+    // One widget per left rail (Memories, Diary, Graph, Live), all filled
     // from the same snapshot. Query by
     // class rather than by id: a duplicated id would be silently dropped from
     // the second, and only some of the rails would ever show a status.

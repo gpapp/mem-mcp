@@ -623,6 +623,7 @@ which cannot be imported here, and holds two guards worth knowing about:
 - Query rewrite cache: `MEM_QUERY_CACHE_TTL` (default 900s) and `MEM_QUERY_CACHE_MAX` (default 256 entries); either `0` disables the cache — see "Query Rewrite Cache"
 - Embedding retries: `MEM_EMBED_RETRIES` (default 2) and `MEM_EMBED_RETRY_BACKOFF` (default 1.5, in seconds), `MEM_EMBED_MAX_CHARS` (default 8000) — see "Embedding Reliability"
 - Server status widget: `MEM_STATUS_POLL_SECONDS` (default 10) and `MEM_STATUS_HTTP_TIMEOUT` (default 8) — see "Server Status Widget"
+- Live notes: `MEM_ASR_WS_URL`, `MEM_LIVE_MODEL` (defaults to `MEM_EXTRACT_MODEL`), `MEM_LIVE_FACT_LIMIT` (100), `MEM_LIVE_CONTEXT_TOKENS` (must track `OLLAMA_CONTEXT_LENGTH`), `MEM_LIVE_MIN_NUM_PREDICT` (1500, a refusal floor), `MEM_LIVE_NOTE_MAX_CHARS` (12000), `MEM_LIVE_WINDOW` (6000), `MEM_LIVE_TAIL_SILENCE_MS` (480, the pause tail — see "A pause ends the stream") and `MEM_LIVE_UNLOAD_ON_RECORD` — see "Live Notes"
 - User vault resolved from a session cookie, `Authorization: Basic`, an access key, or proxy headers — see Authentication
 - Sessions and access keys: `MEM_SESSION_DIR` (must be the bind mount, or a container rebuild logs everyone out) and `MEM_SESSION_SECURE` (adds `Secure` to the session cookie; only enable when the app is reached over HTTPS, since the process cannot detect the proxy's scheme and a `Secure` cookie on a plain-HTTP visit is silently dropped). `MEM_SESSION_SECRET` is no longer used to sign anything.
 - Admin surface: `MEM_ADMIN_USER` names the one account that may reach the **Service** tab
@@ -1128,7 +1129,7 @@ Tests live in `mem-mcp/test_llm_reliability.py`, using the same `ast.get_source_
 
 ## Server Status Widget
 
-A status strip pinned to the bottom of the left rail of the **Memories** and **Diary** tabs, and a full model panel on the admin-only **Service** tab, both fed by one snapshot pushed over SSE from one poller. It answers the question the "must say `100% GPU`" rule in Critical Config keeps needing answered, and it puts an unload button where the model it evicts is named.
+A status strip pinned to the bottom of the left rail of the **Memories**, **Diary**, **Graph** and **Live notes** tabs, and a full model panel on the admin-only **Service** tab, both fed by one snapshot pushed over SSE from one poller. It answers the question the "must say `100% GPU`" rule in Critical Config keeps needing answered, and it puts an unload button where the model it evicts is named.
 
 - **One poller for the process, not one per browser tab.** `status_monitor.broadcast_loop(mem.fetch_ollama_status, mem.STATUS_POLL_SECONDS)` is started in the `server.py` lifespan and cancelled with the other tasks. `GET /api/status/stream` subscribes; `GET /api/status` returns the stored snapshot (and probes once on the cold path). N tabs must not mean N polls of a GPU that is already contended.
 - **The change fingerprint excludes the wall clock, and that is the whole design.** `status_monitor.signature()` covers `ok`, `version`, `error`, `warnings`, `maintenance` and the per-model state — and deliberately *not* `checked` or `expiresAt`, both listed in `VOLATILE_SNAPSHOT_KEYS`. Fingerprint the snapshot wholesale and every poll looks like a change, so the widget is rewritten six times a minute to say nothing; fingerprint too narrowly and a model that loaded never appears. The keep-alive countdown is therefore a **client-side timer over an absolute timestamp** (`fmtEta` + `updateEtas`), not part of the pushed state. Do not move a timestamp into the signature.
@@ -1138,7 +1139,9 @@ A status strip pinned to the bottom of the left rail of the **Memories** and **D
 - **Unloading is `keep_alive: 0` and nothing else.** There is no DELETE in Ollama's API. A model that is not resident answers 200 and does nothing, so `api_unload_model` **validates the name against the live snapshot first** and 400s with the real names — otherwise a typo is an operation that reports success and changes nothing. It then re-probes and broadcasts rather than patching the snapshot locally: what actually left VRAM is Ollama's answer, not our assumption about it.
 - **`publish()` answers whether it changed, not what the snapshot is.** `_status_snapshot` in `gui.py` therefore calls it and *then* reads `last_snapshot()` back; assigning the return value hands the caller a `True`, which surfaces two lines later as an `AttributeError` in a different endpoint. `StatusEndpointTests` runs it, because the line reads correctly on its own.
 - **Subscriber queues are bounded to one and evict the oldest.** A widget one tick stale is much cheaper than a poller wedged on a browser that stopped reading. The SSE generator also sends a `ping` every 15s, because an idle stream is the normal case and a proxy in front of the app closes it without one. The browser keeps a 30s `GET /api/status` poll running *only* while `readyState !== OPEN`, so a proxy that keeps dropping the stream cannot leave a frozen widget that still looks live.
-- **The widget is pinned inside the rail, not below the layout.** Both rails are flex columns with `overflow: hidden` and the widget is `flex: 0 0 auto; margin-top: auto`. A strip *under* `.memories-layout` pushes the page past `height: calc(100vh - 140px)` and makes a three-pane reading screen scroll — which is the one thing that layout avoids. `.memories-sidebar` consequently became `overflow: hidden` and its scroller moved to `#categories-sidebar` (with `flex: 1 1 auto`, not a zero basis — same trap as the mobile panes, in miniature). `StatusWidgetLayoutTests` pins the placement, the rail structure and the absence of a sibling strip.
+- **The widget is pinned inside the rail, not below the layout.** Each rail is a flex column with `overflow: hidden` and the widget is `flex: 0 0 auto; margin-top: auto`. A strip *under* `.memories-layout` pushes the page past `height: calc(100vh - 140px)` and makes a three-pane reading screen scroll — which is the one thing that layout avoids. `.memories-sidebar` consequently became `overflow: hidden` and its scroller moved to `#categories-sidebar` (with `flex: 1 1 auto`, not a zero basis — same trap as the mobile panes, in miniature). `StatusWidgetLayoutTests` pins the placement, the rail structure and the absence of a sibling strip.
+- **There are four copies, and no JS knows the count.** Every copy is an empty `<div class="srv-status" data-srv></div>`; `renderServerStatus` fills them with `document.querySelectorAll('.srv-status')` and `updateEtas` does the same for `.srv-eta[data-eta]`, so adding the Live notes rail was one line of markup and no code. **Query by class, never by id** — a duplicated id would be silently dropped from the second element and only some rails would ever show a status. `data-srv` is not read by anything and never was.
+- **The Live rail is an `<aside>`, which the layout test could not see.** `_rail_markup()` matched `<div class="…">` only, so adding `.live-sidebar` to `_RAILS` while it still did would have reported "not found in the template" for a widget that was present. It is now `<(div|aside) …>` closed by a matching backreference, and `_RAILS` names four rails. The "no sibling strip" test covers `.live-layout` too. Re-injecting the old markup fails the widget assertion with the rail named, and the Live rail's existing `display: flex; flex-direction: column; overflow: hidden` already satisfies the rail rules — so the strip needed no new CSS at all.
 
 ## Gotchas
 
@@ -2033,6 +2036,57 @@ Two habits keep it fixed, and neither is optional:
   microphone and the socket, and that a stuck context refuses before the socket
   opens. Both were mutation-checked by swapping the two calls back.
 
+### A pause ends the stream; it does not hang up on it
+
+Pausing used to send the last audio block, sleep 0.8 s, and close the upstream
+socket — and the user reported exactly what that does: *"It seems like the voice
+is cut off at pause."* Two independent mechanisms in asr-mcp make a bare close
+lose the tail, and both are invisible from our side:
+
+- **A turn ends on audio, never on a clock.** `TurnDetector` closes an utterance
+  after 10 consecutive 32 ms frames below the end threshold — **320 ms of
+  sub-threshold audio** — so a client that simply stops sending leaves the
+  utterance open until `detector.flush()` runs at disconnect. There is no
+  wall-clock end-of-turn.
+- **The flushed transcripts then go nowhere.** asr-mcp *does* flush and decode
+  that tail on disconnect, but `websockets` discards data frames after a local
+  close, so the transcripts were written to a socket nobody was reading. asr-mcp
+  swallows its own send failure, so nothing was logged at either end.
+
+`pause_flush_frames()` in `live_notes.py` builds the only robust sequence, and
+**the order is load-bearing**:
+
+1. `MEM_LIVE_TAIL_SILENCE_MS` (default **480**) of real digital silence as legacy
+   mic frames, which closes the detector's turn by hangover. Under 320 ms the
+   turn is still open and the next step discards it.
+2. The 24-byte `MSG_FLUSH` control frame (`b"LVT1"` + version 1 + type 2 + 20
+   zero bytes), which breaks asr-mcp's receive loop and releases the coalescer's
+   held turn **immediately** — its merge window is a wall-clock second, so
+   waiting it out would make every pause feel stuck.
+3. Read until `{"type": "stats"}`, **then** close.
+
+**Flushing first is wrong, not merely different.** `MSG_FLUSH` sets
+`remote_flushed = True`, which makes asr-mcp skip `detector.flush()` — an
+explicit flush is meant for a client that already endpointed its own turns, so
+sending it while the detector still holds an utterance throws that utterance
+away. Silence-then-flush is the sequence asr-mcp's own clients use
+(`static/live.js`, `asr-client/live_client.py`).
+
+`stats` is the **only** end-of-stream ack the protocol has: it is sent after
+`queue.join()`, i.e. after every queued turn has been decoded. So the proxy's
+`asr_reader` takes a `drained` event, `close_upstream(wait_tail=True)` awaits it
+for `_LIVE_TAIL_DRAIN_SECONDS` (20; asr-mcp's own clients allow 30) **before**
+closing, and the reader sets it in a `finally` as well as on `stats` — otherwise
+a stream that ended without an ack would hold every pause for the full timeout.
+The event is re-created per connection: a reused one would let the next pause
+return before its own tail had been transcribed.
+
+`PauseTailTests` calls the builder (frame count, order, 24-byte shape, channel 0,
+all-zero PCM, the 320 ms…2 s silence window, `silence_ms=0`) and reads the one
+call site for the order the behavioural test cannot see: flush frames → await
+the ack → close. Both halves were mutation-checked (closing first, and deleting
+`drained.set()` from the `stats` branch alone).
+
 A note job is per-user serialised with its own `asyncio.Lock`, **not**
 `claim_maintenance`. Maintenance locks the vault for a reclassify or restore;
 holding one for the length of a meeting would block both and has nothing to do
@@ -2150,10 +2204,11 @@ Two consequences worth keeping:
 
 ### Files and tests
 
-- `live_notes.py` is **stdlib-only** (`json`, `math`, `os`, `re`, `threading`,
-  `urllib.parse`) so every prompt, budget, validation, windowing, origin and
-  gate decision is called by `test_live_notes.py` on a machine with no DB
-  drivers. Do not import `common`, a logger or a database client into it.
+- `live_notes.py` is **stdlib-only** (`json`, `math`, `os`, `re`, `struct`,
+  `threading`, `urllib.parse`) so every prompt, budget, validation, windowing,
+  origin, pause-tail and gate decision is called by `test_live_notes.py` on a
+  machine with no DB drivers. Do not import `common`, a logger or a database
+  client into it.
 - `live_manager.py` owns transcription/segment CRUD, consumption markers, note
   links, candidates and the job runner.
 - `gui.py` owns the WebSocket proxy, worklet route and REST surface.
@@ -2166,6 +2221,12 @@ Two consequences worth keeping:
   in the source — two `await`s swapped look equally correct — and the failure it
   prevents produces no exception to assert on. It skips when `node` is absent,
   like the render tests that own the harness.
+- `test_live_notes.PauseTailTests` is split the same way, and for the same
+  reason: the frame builder is **called** (order, 24-byte shape, channel 0,
+  all-zero PCM, the 320 ms…2 s window, `silence_ms=0`), while the ordering that
+  matters lives at one call site and is read from it — flush frames, then await
+  the ack, then close. A behavioural test of the builder cannot see a swapped
+  pair of `await`s in `close_upstream`, and that swap is the whole bug.
 - Run `python3 -m unittest ... test_live_notes.py` with the rest of the suites.
   The template script must pass the extraction + `node --check` harness after
   any edit; `py_compile` cannot see a JS syntax error.

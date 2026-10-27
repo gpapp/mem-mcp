@@ -29,6 +29,7 @@ import json
 import math
 import os
 import re
+import struct
 import threading
 from urllib.parse import urlsplit, urlunsplit
 
@@ -552,6 +553,67 @@ def asr_languages_url(ws_url: str) -> str:
         path = path.rsplit("/", 1)[0]
     path = path.rstrip("/") + "/languages"
     return urlunsplit((scheme, parts.netloc, path, "", ""))
+
+
+# --- the pause tail -------------------------------------------------------
+# asr-mcp ends a turn after 320 ms of *sub-threshold audio*, and then holds the
+# closed turn for a further second looking for something to merge it with. A
+# client that simply stops sending therefore strands the last utterance: the
+# detector's open turn is only flushed at disconnect, and the transcripts that
+# flush produces are sent to a socket the client has already closed. That is
+# why a pause sends real silence first, and only then the end-of-stream frame.
+LIVE_TAIL_SILENCE_MS = int(os.getenv("MEM_LIVE_TAIL_SILENCE_MS") or 480)
+
+# 1024 samples at 16 kHz is the block the browser's worklet posts, so the tail
+# is shaped like the audio it follows rather than like a different client.
+LIVE_AUDIO_BLOCK_SAMPLES = 1024
+LIVE_ASR_SAMPLE_RATE = 16000
+
+# The legacy frame header every audio packet carries: channel (0 = mic), then
+# a sequence number. Raw int16 LE PCM follows it.
+LIVE_AUDIO_HEADER = struct.Struct("<II")
+
+# One turn frame declaring MSG_FLUSH and carrying no audio, laid out as asr-mcp's
+# TURN_HEADER = struct.Struct("<4sBBHQII"): magic, version, msg_type, channel,
+# start_sample, n_samples, sequence. Spelled out here rather than imported
+# because asr-mcp is another process on the end of a socket, not a dependency.
+LIVE_FLUSH_FRAME = struct.pack("<4sBBHQII", b"LVT1", 1, 2, 0, 0, 0, 0)
+
+
+def pause_flush_frames(silence_ms=None, sequence=0, sample_rate=None):
+    """The frames that get the last utterance out of asr-mcp before a pause.
+
+    Both halves are needed, and the order is the whole point. The silence
+    closes the turn the detector still has open -- it needs ten 32 ms frames
+    below the end threshold, so half a second is used rather than the exact
+    320 ms, because the detector realigns frames from wherever the last one
+    ended. Only once that turn is closed and held in the coalescer does the
+    flush frame end the stream: asr-mcp *skips its own detector flush* when it
+    sees an explicit one, so flushing first throws the open utterance away
+    instead of saving it.
+
+    A burst is enough even though the coalescer waits a second before releasing
+    a held turn, because that wait is wall-clock and the flush frame releases
+    the turn immediately. That is also why trailing bytes on their own do not
+    work: the client would have to keep the socket open for real time, and it
+    has no way to know when the wait is over.
+
+    Returns the frames in wire order, the end-of-stream frame last. Empty
+    silence returns just the flush, which still drains what the coalescer holds.
+    """
+    rate = int(sample_rate or LIVE_ASR_SAMPLE_RATE)
+    ms = LIVE_TAIL_SILENCE_MS if silence_ms is None else int(silence_ms)
+    total = max(0, int(round(rate * ms / 1000.0)))
+    frames = []
+    sent = 0
+    seq = int(sequence)
+    while sent < total:
+        take = min(LIVE_AUDIO_BLOCK_SAMPLES, total - sent)
+        frames.append(LIVE_AUDIO_HEADER.pack(0, seq & 0xFFFFFFFF) + b"\x00" * (take * 2))
+        seq += 1
+        sent += take
+    frames.append(LIVE_FLUSH_FRAME)
+    return frames
 
 
 class LivePriorityGate:

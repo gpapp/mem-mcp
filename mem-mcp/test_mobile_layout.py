@@ -248,7 +248,7 @@ class StackedPaneVisibilityTests(unittest.TestCase):
 
 
 class StatusWidgetLayoutTests(unittest.TestCase):
-    """The status widget sits on the bottom edge of the left rail of three pages.
+    """The status widget sits on the bottom edge of the left rail of four pages.
 
     There is no browser here, so what is pinned is the set of ways it can go
     wrong silently: pinned to nothing (a rail that is not a flex column, or a
@@ -261,8 +261,13 @@ class StatusWidgetLayoutTests(unittest.TestCase):
     checked through the same derived rule rather than by listing the widget.
     """
 
-    # The left rail of each page: categories, calendar, and graph categories.
-    _RAILS = (".memories-sidebar", ".diary-sidebar", ".graph-sidebar")
+    # The left rail of each page: categories, calendar, graph categories and
+    # the live session list. The live rail is an <aside>, so the markup capture
+    # below matches either tag -- an assumption of <div> silently returned "" and
+    # would have reported a present widget as missing.
+    _RAILS = (
+        ".memories-sidebar", ".diary-sidebar", ".graph-sidebar", ".live-sidebar",
+    )
     # Markup and stylesheet spell this differently; both are pinned.
     _WIDGET = ".srv-status"
     _WIDGET_CLASS = 'class="srv-status"'
@@ -286,15 +291,19 @@ class StatusWidgetLayoutTests(unittest.TestCase):
 
     def _rail_markup(self, rail):
         cls = rail[1:]
-        # The closing tag is bound by the *opening* line's indentation, via a
-        # backreference. A fixed indent cannot work: the graph rail is nested
-        # one level deeper, and the diary rail contains a multi-line child div
-        # whose own `</div>` would otherwise end the capture early.
+        # The closing tag is bound by the *opening* line's indentation and its
+        # tag name, via backreferences. A fixed indent cannot work: the graph
+        # rail is nested one level deeper, and the diary rail contains a
+        # multi-line child div whose own `</div>` would otherwise end the
+        # capture early. The tag name is matched rather than assumed because the
+        # live rail is an <aside>: `<div class="live-sidebar">` never matches,
+        # and an empty capture reads as "the widget is missing" on a template
+        # that has it.
         m = re.search(
-            r'^( *)<div class="%s"[^>]*>(.*?)\n\1</div>' % re.escape(cls),
+            r'^( *)<(div|aside) class="%s"[^>]*>(.*?)\n\1</\2>' % re.escape(cls),
             SOURCE, re.S | re.M,
         )
-        return m.group(2) if m else ""
+        return m.group(3) if m else ""
 
     def test_each_rail_is_a_flex_column_so_the_widget_can_pin(self):
         """Without `display: flex; flex-direction: column` there is no free
@@ -318,12 +327,16 @@ class StatusWidgetLayoutTests(unittest.TestCase):
         self.assertIn("margin-top: auto", decls,
                       msg="without this the widget is not on the bottom edge")
 
-    def test_no_strip_is_added_below_either_layout(self):
+    def test_no_strip_is_added_below_any_layout(self):
         """`calc(100vh - 140px)` leaves no room for a footer under the panes."""
-        for layout in (".memories-layout", ".diary-layout"):
+        for layout in (".memories-layout", ".diary-layout", ".live-layout"):
             with self.subTest(layout=layout):
+                # Bound to the opening line's own indent, so each layout's own
+                # closing tag ends the capture rather than whichever `</div>`
+                # happens to come first.
                 m = re.search(
-                    r'<div class="%s">(.*?)\n  </div>' % re.escape(layout[1:]), SOURCE, re.S
+                    r'^( *)<div class="%s">(.*?)\n\1</div>' % re.escape(layout[1:]),
+                    SOURCE, re.S | re.M,
                 )
                 self.assertTrue(m, msg=f"{layout} markup not found")
                 after = SOURCE.split(m.group(0), 1)[1]

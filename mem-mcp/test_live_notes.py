@@ -1163,5 +1163,89 @@ class LiveCaptureAudioOrderTests(unittest.TestCase):
                              "symptom this check exists to prevent")
 
 
+class PauseTailTests(unittest.TestCase):
+    """A pause must end the stream, not merely hang up on it.
+
+    asr-mcp ends a turn on 320 ms of sub-threshold *audio* and then holds the
+    closed turn for a wall-clock second before decoding. A client that stops
+    sending therefore loses the last utterance twice over: the detector's open
+    turn is only flushed at disconnect, and whatever that flush produces is
+    written to a socket the client has already closed. Both halves are pinned
+    here -- the frames by calling the builder, the order by reading the one
+    call site, because a swapped pair of awaits is invisible in a diff.
+    """
+
+    _route_source = AsrProxyTests._route_source
+
+    def test_the_tail_is_silence_then_the_end_of_stream_frame(self):
+        frames = ln.pause_flush_frames()
+        self.assertGreater(len(frames), 1,
+                           msg="the flush frame alone drops the open utterance: "
+                               "asr-mcp skips its own detector flush once it sees one")
+        self.assertEqual(frames[-1], ln.LIVE_FLUSH_FRAME,
+                         msg="the end-of-stream frame must come last, after the "
+                             "silence that closes the turn")
+
+    def test_the_end_of_stream_frame_is_the_shape_asr_mcp_parses(self):
+        import struct
+        magic, version, msg_type, channel, start, samples, sequence = struct.unpack(
+            "<4sBBHQII", ln.LIVE_FLUSH_FRAME
+        )
+        self.assertEqual(magic, b"LVT1")
+        self.assertEqual(version, 1)
+        self.assertEqual(msg_type, 2, msg="2 is MSG_FLUSH; 1 would be an empty turn")
+        self.assertEqual((channel, start, samples, sequence), (0, 0, 0, 0))
+        self.assertEqual(len(ln.LIVE_FLUSH_FRAME), 24)
+
+    def test_the_silence_is_longer_than_the_hangover_and_short_enough_to_wait_for(self):
+        frames = ln.pause_flush_frames()[:-1]
+        samples = sum(len(frame) - 8 for frame in frames) // 2
+        ms = samples * 1000.0 / ln.LIVE_ASR_SAMPLE_RATE
+        self.assertGreaterEqual(ms, 320,
+                                msg="the detector needs 10 frames of 32 ms below "
+                                    "the end threshold before it closes a turn")
+        self.assertLess(ms, 2000,
+                        msg="a pause must not feel like a stall")
+
+    def test_the_silence_frames_are_legacy_mic_frames_of_zeros(self):
+        import struct
+        for index, frame in enumerate(ln.pause_flush_frames()[:-1]):
+            with self.subTest(frame=index):
+                channel, _sequence = struct.unpack("<II", frame[:8])
+                self.assertEqual(channel, 0, msg="channel 0 is the microphone; any "
+                                                 "other channel is discarded by asr-mcp")
+                self.assertFalse(any(frame[8:]),
+                                 msg="the tail has to be silence, not noise")
+                self.assertEqual((len(frame) - 8) % 2, 0)
+
+    def test_no_silence_still_releases_what_the_coalescer_holds(self):
+        self.assertEqual(ln.pause_flush_frames(silence_ms=0), [ln.LIVE_FLUSH_FRAME])
+
+    def test_the_proxy_sends_the_tail_before_it_closes(self):
+        route = self._route_source()
+        flush = route.index("for frame in mem.pause_flush_frames():")
+        close = route.index("await connection.close()")
+        self.assertLess(flush, close,
+                        msg="closing first is the bug: asr-mcp's flushed transcripts "
+                            "are then written to a socket nobody is reading")
+        drain = route.index("drained.wait()")
+        self.assertLess(flush, drain)
+        self.assertLess(drain, close,
+                        msg="the ack has to be awaited before the local close, or "
+                            "the frames that carry the tail are thrown away")
+
+    def test_the_reader_marks_the_drain_on_the_stats_ack(self):
+        route = self._route_source()
+        stats = route.index('payload.get("type") == "stats"')
+        self.assertIn("drained.set()", route[stats:stats + 400].split("continue", 1)[0],
+                      msg="`stats` is the only end-of-stream ack asr-mcp sends, so "
+                          "that branch is where the pause stops waiting")
+        self.assertIn("asr_reader(upstream, offset, asr_quiet, asr_drained", route,
+                      msg="the reader and the closer must share one event")
+        self.assertIn('asr_drained["event"] = asyncio.Event()', route,
+                      msg="a reused event would let the next pause return before "
+                          "its own tail had been transcribed")
+
+
 if __name__ == "__main__":
     unittest.main()

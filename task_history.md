@@ -5,6 +5,51 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# Live notes — a pause hung up on the last utterance, and the widget reached the Live rail (2026-10-27)
+
+- **The report was "it seems like the voice is cut off at pause", and the pause
+  path was closing the socket instead of ending the stream.** Two mechanisms in
+  asr-mcp conspired, and neither is visible from our side: `TurnDetector` ends a
+  turn on **320 ms of sub-threshold audio**, never on a wall clock, so stopping
+  the microphone leaves the last utterance open until disconnect; and the flush
+  that disconnect triggers produces transcripts that are then written to a
+  socket `websockets` has already closed — asr-mcp swallows its own send
+  failure, so both ends were silent about it.
+- **The fix is silence, then an explicit flush, then wait for `stats`, then
+  close.** `pause_flush_frames()` in `live_notes.py` builds 480 ms
+  (`MEM_LIVE_TAIL_SILENCE_MS`) of digital silence as legacy mic frames followed
+  by the 24-byte `MSG_FLUSH` control frame. The order is load-bearing: the
+  silence is what closes the detector's turn, and `MSG_FLUSH` makes asr-mcp
+  **skip its own `detector.flush()`** — so flushing first discards the utterance
+  instead of saving it. `stats` is the only end-of-stream ack the protocol has
+  (sent after `queue.join()`), so the proxy now awaits it via a `drained` event
+  before closing, and `asr_reader` sets that event in a `finally` as well as on
+  `stats` — otherwise a stream that ended without one would hold every pause for
+  the full `_LIVE_TAIL_DRAIN_SECONDS` (20 s) timeout.
+- **The event is re-created per connection.** A reused `asyncio.Event` is
+  already set from the previous stream, so the next pause would return before
+  its own tail had been transcribed — a cut-off that looks exactly like the one
+  being fixed.
+- **`PauseTailTests` (7) splits where the property lives**: the builder is
+  *called* (frame order, 24-byte shape, channel 0, all-zero PCM, the
+  320 ms…2 s silence window, `silence_ms=0`), and the ordering is read from the
+  single call site because a swapped pair of `await`s is invisible in a diff.
+  Both halves were mutation-checked — closing before the flush, and deleting
+  `drained.set()` from the `stats` branch alone — and both bit.
+- **The status widget is now on the Live notes rail too.** It is one markup
+  line: `renderServerStatus` has always used `querySelectorAll('.srv-status')`,
+  so a fourth copy needed no JS. The layout test could not have seen it —
+  `_rail_markup()` matched `<div class="…">` only and the Live rail is an
+  `<aside>` — so the regex is now `<(div|aside) …>` closed by a backreference,
+  `_RAILS` names four rails, and the "no sibling strip" test covers
+  `.live-layout` as well. The Live rail already had
+  `display:flex; flex-direction:column; overflow:hidden`, so no CSS changed.
+  Mutation-checked by removing the widget line: the failure names
+  `.live-sidebar` rather than reporting the rail missing.
+
+1289 tests OK, `node --check` clean on the extracted dashboard script,
+`py_compile` clean, `git diff --check` clean.
+
 # Live notes — the microphone produced no audio at all (2026-10-27)
 
 - **The report was "recording starts but no transcription is happening", and the
