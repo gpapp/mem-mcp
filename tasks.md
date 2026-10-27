@@ -21,38 +21,6 @@ commit. Audio forwarding never waits on processing.
 
 ---
 
-## L5. WebSocket proxy to asr-mcp
-
-- [ ] Add `WS /api/live/stream/{transcriptionId}` in `gui.py`.
-- [ ] Authenticate from `websocket.scope["session"]`; `auth_guard` does not cover
-      WebSocket scope. Verify ownership before connecting upstream.
-- [ ] Enforce `Origin` against `BASE_URL`; close with `4403` on mismatch.
-- [ ] Resolve the caller's ASR token from `sessions.get_asr_token`; close with
-      `4409` and an actionable `{"type":"error"}` message if unset.
-- [ ] Connect to `MEM_ASR_WS_URL` with `X-API-Key` and `?language=`, passing the
-      legacy 8-byte PCM frames through unchanged.
-- [ ] Forward every ASR JSON message to the browser **before** persisting; use a
-      dedicated writer task and an `asyncio.Queue` so the receive loop never
-      awaits Neo4j.
-- [ ] Assign `seq` from the stored maximum and add the connection time offset to
-      `start`/`end`.
-- [ ] Pause protocol: close upstream, persist tail/`stats`, drain the queue, send
-      `{"type":"paused"}`. Resume opens a new upstream connection at
-      `offset = max(endSec)`.
-- [ ] Call `begin_recording` before the upstream connect and `end_recording` on
-      pause/stop/error.
-- [ ] With `MEM_LIVE_UNLOAD_ON_RECORD=1`, unload the live model after recording
-      starts; never before the socket is accepted.
-- [ ] Map failures to close codes `4401`, `4403`, `4409`, `4502`, `1008` and log
-      the reason.
-
-**Acceptance:** tokenless and cross-user connects are refused before any upstream
-connection. A fake ASR server receives audio, returns `transcript`/`stats`, and
-the proxy persists ordered segments with correct offsets. A recording opened
-while a fake LLM job is running cancels that job before commit.
-
----
-
 ## L6. Browser capture client and worklet
 
 - [ ] Vendor `live-worklet.js` unchanged from

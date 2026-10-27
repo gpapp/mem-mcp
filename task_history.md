@@ -5,6 +5,58 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+---
+
+# Live notes — ASR WebSocket proxy (2026-10-27)
+
+Shipped in `5e36c71` on `feature/live-notes`.
+
+- **L5 — the proxy.** `WS /api/live/stream/{transcriptionId}` in `gui.py` accepts
+  the browser socket, resolves the user from `websocket.scope["session"]`
+  (`auth_guard` does not run for a WebSocket scope), checks `Origin` through
+  `live_notes.origin_allowed` with `BASE_URL` and the request origin as
+  fallbacks, verifies ownership, reads the caller's token from
+  `sessions.get_asr_token`, and only then calls `LIVE_GATE.begin_recording`.
+  Every refusal accepts first, sends an actionable `{"type":"error"}` and closes
+  with `4401` / `1008` / `4403` / `4409` / `4502`; refusing before `accept()`
+  collapses all of them into an opaque 403.
+
+- **Nothing is opened for a failed check.** The tests pin the order in the route
+  source: ownership, token and `begin_recording` all precede `_ws_connect`.
+  The upstream URL gets `X-API-Key` (never the browser) and `?language=` merged
+  into an existing query. The websockets client is imported with
+  `additional_headers` for 14+ and `extra_headers` for older versions.
+
+- **Audio first, storage second.** `asr_reader` forwards each ASR message to the
+  browser *before* parsing it, then `live_notes.asr_segment` maps a non-empty
+  `transcript` to `{text, speaker, startSec, endSec}` with the connection offset
+  added, and a single writer task drains an `asyncio.Queue`. `seq` is assigned
+  from the stored maximum by `db_append_segment`, so a reconnect needs no client
+  state. The tests pin the forward-before-queue order and the offset maths.
+
+- **Pause/resume.** Pause waits the ASR detector's 0.8 s hangover before closing
+  upstream, drains the reader (which lets a flushed tail and `stats` through),
+  waits `queue.join()`, sets status `paused`, and only then sends
+  `{"type":"paused"}`. Resume opens a new upstream connection at
+  `offset = max(endSec)`, because asr-mcp timestamps restart at zero per
+  connection. A close we initiated suppresses the "service disconnected" error
+  via a per-connection quiet flag; an unexpected drop still reports it.
+
+- **Priority.** `LIVE_GATE` is one process-wide gate in `live_manager.py`.
+  `begin_recording` runs before the upstream connect and `end_recording` is in
+  the `finally` block, so a browser crash cannot leave the vault permanently
+  "recording". When `MEM_LIVE_UNLOAD_ON_RECORD` is on, a background task evicts
+  the live model after the socket is accepted; it never delays the microphone,
+  and it only calls `unload_ollama_model` when the snapshot says the model is
+  actually resident.
+
+The lesson to carry: a pause is not a disconnect. Closing the upstream must
+first let the detector's hangover and post-roll finish, and the reader must be
+allowed to drain its final messages before it is cancelled — otherwise the last
+sentence of every section is silently missing from a recording that otherwise
+looks complete.
+
+---
 # Live notes — transcription storage and note links (2026-10-27)
 
 Shipped in `8d43536` on `feature/live-notes`.
