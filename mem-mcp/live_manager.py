@@ -1123,10 +1123,10 @@ async def _call_live_llm(job: dict, prompt: str, system: str,
         raise LiveNoteError(
             f"{LIVE_MODEL} did not produce a usable answer twice -- either it "
             "repeated itself until Ollama aborted, or it answered with nothing. "
-            "The note was not changed. Retry the update; if it keeps happening "
-            "the model is probably struggling for memory next to the "
-            "transcriber -- check `docker exec ollama ollama ps`, or use a "
-            "smaller or larger MEM_LIVE_MODEL."
+            "The note was not changed. Retry the update; the timing lines above "
+            "say whether the model was slow (a prompt rate in the tens of tok/s "
+            "is CPU inference: `docker exec ollama ollama ps` must say 100% GPU) "
+            "or genuinely stuck, and MEM_LIVE_MODEL selects a different model."
         )
     finally:
         LIVE_GATE.clear_llm_cancel(job["userId"], _cancel)

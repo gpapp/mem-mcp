@@ -2187,6 +2187,16 @@ emitted a single token. At temperature 0 that is a fixed point — the identical
 request produces the identical nothing — so patience is not the remedy and only
 different sampling is.
 
+**Those numbers are the diagnosis, and "memory pressure" was the wrong reading.**
+The report came from a **Rebuild note with every model unloaded**, so nothing was
+competing for the card: 2449 tokens in 85 s is ~29 tok/s, which is **CPU
+inference**, the documented consequence of a deploy that dropped
+`docker-compose.gpu.yml`. `_ollama_timing()` now renders Ollama's own nanosecond
+fields into the empty-answer ERROR line — `prompt=2449 tok in 85.1s (29 tok/s),
+answer=1 tok, load=2.7s, done_reason=stop` — and appends the GPU check only when
+the rate is under 100 tok/s, because a *fast* empty answer is a different fault
+and must not send every operator to the overlay.
+
 Three parts, and none of them replaces the others:
 
 - **`get_llm_response` takes an `options` dict** merged over the default
@@ -2205,9 +2215,9 @@ Three parts, and none of them replaces the others:
   the suite) because the remedy is unique — waiting does nothing.
 
 After the second failure the job raises `LiveNoteError` naming `MEM_LIVE_MODEL`
-and telling the operator to run `docker exec ollama ollama ps`: 2449 prompt tokens
-in 85 s is ~29 tok/s, which is a card shared with the transcriber rather than a
-prompt problem, and "Ollama returned HTTP 500" tells the reader none of that.
+and telling the operator to look at the timing lines above: a prompt rate in the
+tens of tok/s is CPU inference (`docker exec ollama ollama ps` must say
+`100% GPU`), and "Ollama returned HTTP 500" tells the reader none of that.
 Nothing is consumed on a failed window, so the segments are still there for the
 next pause or **Rebuild note**.
 
@@ -2216,10 +2226,11 @@ next pause or **Rebuild note**.
 counts as empty, one abort retries, and the call **count** is asserted for a
 timeout and a missing model, because "it raised" looks identical whether it was
 retried or not. `RepeatAbortTests` calls the predicate and pins the two sampling
-sets as a pair; `test_llm_reliability` drives the `options` merge through the
-recording fake client. Mutations that bit: `if True: raise`,
-`if True: break` on the empty answer, a retry set equal to the first, and a retry
-temperature of 0.0.
+sets as a pair; `EmptyAnswerTimingTests` in `test_llm_reliability` calls
+`_ollama_timing` with the production numbers, drives the logged ERROR line, and
+asserts a GPU-speed prompt evaluation is **not** blamed on the CPU. Mutations that
+bit: `if True: raise`, `if True: break` on the empty answer, a retry set equal to
+the first, a retry temperature of 0.0, and both directions of the CPU-rate guard.
 
 
 ### The prompt is four blocks and the output is validated

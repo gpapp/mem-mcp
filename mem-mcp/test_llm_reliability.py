@@ -23,6 +23,7 @@ the shipping code, not a copy of it.
 
 import ast
 import asyncio
+import json
 import os
 import re
 import unittest
@@ -31,7 +32,7 @@ COMMON_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "common.py"
 GUI_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui.py")
 
 _FUNCTION = "get_llm_response"
-_HELPERS = ("_llm_excerpt",)
+_HELPERS = ("_llm_excerpt", "_ollama_timing")
 _ASSIGNMENTS = ("LLM_TIMEOUT", "LLM_CONNECT_TIMEOUT", "SEARCH_LLM_TIMEOUT", "LLM_LOG_CHARS")
 
 
@@ -168,6 +169,7 @@ def _load(recorder, responder, **overrides):
         "httpx": FakeHttpx,
         "logger": FakeLogger(recorder),
         "asyncio": asyncio,
+        "json": json,
         "time": _time,
         "LLM_QUERY_MODEL": "qwen3.5:0.8b",
         "OLLAMA_URL": "http://ollama:11434",
@@ -553,6 +555,59 @@ class ContentLoggingTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # gui.py: a 503 must say why
 # ---------------------------------------------------------------------------
+class EmptyAnswerTimingTests(unittest.TestCase):
+    """An empty answer must say *why*, and the cause is in Ollama's own body.
+
+    Production: `content:""`, `done_reason:"stop"`, `eval_count:1`, and
+    `prompt_eval_duration` 85 s over 2449 tokens — with every other model
+    unloaded. ~29 tok/s is CPU inference, so the old wording ("check docker logs
+    ollama for memory pressure") sent the reader to the wrong fault entirely.
+    """
+
+    # The numbers from the report, in Ollama's nanosecond fields.
+    SLOW = {"prompt_eval_count": 2449, "prompt_eval_duration": 85_123_989_000,
+            "eval_count": 1, "eval_duration": 1_000,
+            "load_duration": 2_738_199_161, "done_reason": "stop"}
+
+    def test_the_helper_summarises_the_numbers_and_flags_cpu_speed(self):
+        ns = _load(Recorder(), _ok("x"))
+        summary = ns["_ollama_timing"](json.dumps(self.SLOW))
+        self.assertIn("prompt=2449 tok in 85.1s", summary)
+        self.assertIn("29 tok/s", summary,
+                      msg="a rate in the tens of tok/s is the diagnosis")
+        self.assertIn("100% GPU", summary,
+                      msg="the check is `ollama ps`, not the model's memory")
+        self.assertIn("answer=1 tok", summary)
+        self.assertIn("done_reason=stop", summary)
+        self.assertIn("load=2.7s", summary)
+
+    def test_a_gpu_speed_prompt_evaluation_is_not_blamed_on_the_cpu(self):
+        fast = dict(self.SLOW, prompt_eval_duration=500_000_000)  # 2449 tok in 0.5s
+        summary = _load(Recorder(), _ok("x"))["_ollama_timing"](json.dumps(fast))
+        self.assertIn("4898 tok/s", summary)
+        self.assertNotIn("100% GPU", summary,
+                         msg="a fast empty answer is a different fault; do not "
+                             "send every operator to the GPU overlay")
+
+    def test_an_unreadable_body_says_nothing_rather_than_raising(self):
+        timing = _load(Recorder(), _ok("x"))["_ollama_timing"]
+        for body in ("not json", "", "[]", "null"):
+            with self.subTest(body=body):
+                self.assertEqual(timing(body), "")
+
+    def test_the_logged_error_carries_the_timing(self):
+        rec = Recorder()
+        ns = _load(rec, lambda url, body, n: FakeResponse(200, {
+            "message": {"content": ""}, **self.SLOW,
+        }))
+        self.assertEqual(asyncio.run(ns[_FUNCTION]("a prompt")), "")
+        logged = "\n".join(rec.errors)
+        self.assertIn("LLM returned no content", logged)
+        self.assertIn("85.1s", logged,
+                      msg="the elapsed prompt evaluation is the whole diagnosis")
+        self.assertIn("100% GPU", logged)
+
+
 class ServiceUnavailableLoggingTests(unittest.TestCase):
     """Every 503 in gui.py is produced by this helper.
 

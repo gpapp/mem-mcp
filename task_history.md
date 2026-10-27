@@ -5,6 +5,37 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# Live notes — an empty answer at 29 tok/s was CPU inference (2026-10-27)
+
+- **The report was a "Rebuild note" with every model already unloaded**, which
+  retires the contention theory the previous message carried: nothing was
+  competing for the card, so `2449 tokens in 85 s` (~29 tok/s) is **CPU
+  inference** — the documented consequence of a deploy that dropped
+  `docker-compose.gpu.yml`. The load was fast (2.7 s) and the answer was one
+  token, so the model was resident; it was just being evaluated on the processor.
+- **`_ollama_timing()` in `common.py` turns Ollama's nanosecond fields into one
+  readable clause** on the empty-answer ERROR line:
+  `prompt=2449 tok in 85.1s (29 tok/s), answer=1 tok, load=2.7s,
+  done_reason=stop`. It appends the GPU check **only under 100 tok/s**, because a
+  *fast* empty answer is a different fault and must not send every operator
+  hunting the overlay. Unparseable bodies return `""` rather than raising.
+- **The old wording was actively wrong**: *"check `docker logs ollama` for memory
+  pressure"* names a cause this deployment did not have. The log now states the
+  measurement and the one check that distinguishes the faults.
+- **`_call_live_llm`'s failure message was wrong in the same way** — it claimed
+  the model was "struggling for memory next to the transcriber". It now points at
+  the timing lines and at `docker exec ollama ollama ps` saying `100% GPU`, with
+  `MEM_LIVE_MODEL` as the lever.
+- `EmptyAnswerTimingTests` (4) calls the helper with the production numbers,
+  pins `answer=1 tok` / `done_reason=stop` / `load=2.7s`, drives the logged ERROR
+  line end to end, and asserts a 4898 tok/s prompt is **not** blamed on the CPU.
+  Both directions of the rate guard were mutation-checked, as were the
+  empty-answer retry's `if True: break` and a retry set equal to the first.
+- **1317 tests OK**; `py_compile`/`diff --check` clean.
+
+---
+
+
 # Live notes — the model answered with nothing after 85 s (2026-10-27)
 
 - **Reported as an empty 200**: `content:""`, `done_reason:"stop"`,

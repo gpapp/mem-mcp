@@ -821,6 +821,60 @@ def _llm_excerpt(text: str, limit: int = 0) -> str:
                   .replace("\t", "\\t"))
 
 
+def _ollama_timing(body) -> str:
+    """Summarise an /api/chat body's timings in the units a human reads.
+
+    Ollama answers 200 with `content:""` when the model emits a stop token as its
+    first token, and the numbers in that body are the whole diagnosis. Production
+    reported exactly that after **85 s** of prompt evaluation over 2449 tokens
+    (~29 tok/s) with every other model unloaded -- a prompt rate in the tens of
+    tokens per second means CPU inference, which is the opposite of "the model
+    ran out of memory next to the transcriber" and sends the reader to the wrong
+    place. Without this the log line said only "the model answered with nothing".
+    """
+    try:
+        data = json.loads(body)
+    except (ValueError, TypeError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+
+    def _seconds(key):
+        try:
+            return float(data.get(key) or 0) / 1e9
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _count(key):
+        try:
+            return int(data.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    prompt_tokens = _count("prompt_eval_count")
+    prompt_seconds = _seconds("prompt_eval_duration")
+    parts = []
+    if prompt_tokens and prompt_seconds > 0:
+        rate = prompt_tokens / prompt_seconds
+        parts.append(
+            f"prompt={prompt_tokens} tok in {prompt_seconds:.1f}s ({rate:.0f} tok/s)"
+        )
+        if rate < 100:
+            parts.append(
+                "CPU-speed prompt evaluation -- `docker exec ollama ollama ps` "
+                "must say 100% GPU, and a bare `docker compose up -d ollama` "
+                "drops the GPU overlay"
+            )
+    parts.append(f"answer={_count('eval_count')} tok")
+    load_seconds = _seconds("load_duration")
+    if load_seconds:
+        parts.append(f"load={load_seconds:.1f}s")
+    reason = data.get("done_reason")
+    if reason:
+        parts.append(f"done_reason={reason}")
+    return ", ".join(parts)
+
+
 async def get_llm_response(prompt: str, system: str = "", model: str = "",
                            num_predict: int = 0, timeout: float = 0.0,
                            options: Optional[dict] = None) -> str:
@@ -929,16 +983,19 @@ async def get_llm_response(prompt: str, system: str = "", model: str = "",
     content = _re.sub(r"<think>.*?</think>", "", content, flags=_re.DOTALL).strip()
     if not content:
         # Logged hard, but still returned as "". A model that loaded and produced
-        # nothing is the signature of a host with no memory for it, and it used
-        # to be completely invisible -- the caller fell back to the raw query or
-        # to no keywords and the vault just quietly got worse. Callers have
-        # deliberate fallbacks for an empty answer; breaking those would turn a
-        # degraded search into a failed request.
+        # nothing used to be completely invisible -- the caller fell back to the
+        # raw query or to no keywords and the vault just quietly got worse.
+        # Callers have deliberate fallbacks for an empty answer; breaking those
+        # would turn a degraded search into a failed request. The timings are
+        # what makes this diagnosable: an immediate stop token and a CPU-rate
+        # prompt evaluation are different faults.
+        timing = _ollama_timing(resp.text)
         logger.error(
             f"LLM returned no content: model={resolved_model}, "
             f"prompt_chars={len(prompt)}, response_chars={len(resp.text)}, "
-            f"elapsed_s={time.monotonic() - started:.1f}. The model answered with "
-            f"nothing -- check `docker logs ollama` for memory pressure."
+            f"elapsed_s={time.monotonic() - started:.1f}"
+            + (f", {timing}" if timing else "")
+            + ". The model answered with nothing."
         )
     logger.warning(
         f"Ollama result: chat model={resolved_model} content_chars={len(content)} "
