@@ -7,7 +7,7 @@ recorded in `AGENTS.md` (Task Tracking).
 
 # Live notes — Setup ASR-token card (2026-10-27)
 
-Shipped in `76fd0f6` on `feature/live-notes`.
+Shipped in `ef7d90a` on `feature/live-notes`.
 
 - **L9 — the key is write-only.** Setup now carries **🎙️ Live transcription
   key**: a password input, Save, Test saved key and Clear, with the stored
