@@ -5,6 +5,40 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# The note described the garble instead of the meeting (2026-10-27)
+
+- **Reported as** a produced note whose own numbers appeared three times and
+  which closed on *"Dan Pyre is identified as suspectable, indicating potential
+  issues with the process"*, with the instruction to tell the model it works from
+  a transcription and is **allowed** to assume phonetically similar content.
+- **Two gaps, not one.** "Leave out small talk" was already there and does not
+  reach either: the note restated facts *within* the topic, and it turned speech
+  the model could not parse into an apparent conclusion rather than dropping it.
+- `LIVE_SYSTEM_PROMPT` (`live_notes.py`) gained two paragraphs. The first makes
+  relevance per-sentence — every sentence must carry something a reader would act
+  on, a sentence that only restates another is deleted, hedged commentary about
+  speech that was not understood is forbidden. The second states that the input
+  is **machine speech recognition** and grants the licence explicitly: a garbled
+  phrase may be read as the thing it sounds like, preferring a spelling already
+  present in the header or the candidate list over a homophone, and a mangled
+  number or acronym may be reconstructed from sounds and context.
+- **The licence is bounded in the same paragraph** ("correcting a misheard word
+  is not inventing a fact", and an unresolvable passage is left out). The
+  pre-existing "never invent names, decisions, numbers or facts" would otherwise
+  contradict the permission, and an unbounded version is simply a licence to
+  invent — which is worse than the garble, because the garble is visibly wrong
+  and an invented name is not.
+- `PromptTests` pins the four sentences that carry it (`machine speech
+  recognition`, `mishears words`, `sounds like`, `not inventing a fact`,
+  `leave it out`) and the per-sentence rules. Both mutations were re-injected and
+  bit: softening "sounds like" to "literally", and dropping the
+  "hedged commentary" clause.
+- 1335 tests OK; `py_compile` and `git diff --check` clean. Prompt text only —
+  no schema, no route, no template.
+
+---
+
+
 # Ollama lost the Vulkan device and its CPU fallback dumped core (2026-10-27)
 
 - **Reported as** `ggml_vulkan: device lost on Vulkan0` during a `/api/chat`

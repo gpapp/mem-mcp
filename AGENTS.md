@@ -2165,6 +2165,27 @@ changes) and `ParseNoteTests` pins replace-vs-omit-vs-empty and the cap. Three
 mutations bit: restoring the union fails three tests, dropping the cap fails the
 count test, and softening "not a checklist" fails the prompt test.
 
+**Relevance at the topic is not relevance at the sentence, and the input is
+speech recognition.** A note came back with its own numbers stated three times
+and closing on *"Dan Pyre is identified as suspectable, indicating potential
+issues with the process"* — a misheard name and a nonsense word presented as a
+finding. Two instructions were missing, and neither is a duplicate of "leave out
+small talk":
+
+- Every sentence must carry something a reader would act on (a decision,
+  requirement, number, date, owner, risk or open question), a sentence that only
+  restates another is deleted, and hedged commentary about speech the model could
+  not follow is forbidden. That last one is what turned an unintelligible phrase
+  into an apparent conclusion.
+- The model is told the text is **machine speech recognition**: no reliable
+  punctuation, repetitions, and misheard proper nouns, numbers and abbreviations.
+  It is explicitly **allowed** to read a garbled phrase as the thing it sounds
+  like — preferring a spelling that appears in the header or the candidate list
+  over a homophone — and the permission is bounded in the same paragraph
+  ("correcting a misheard word is not inventing a fact", and an unresolvable
+  passage is left out). A licence without that bound is a licence to invent, and
+  the pre-existing "never invent" sentence would then contradict it.
+
 A note job is per-user serialised with its own `asyncio.Lock`, **not**
 `claim_maintenance`. Maintenance locks the vault for a reclassify or restore;
 holding one for the length of a meeting would block both and has nothing to do

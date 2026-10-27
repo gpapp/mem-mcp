@@ -140,6 +140,32 @@ class PromptTests(unittest.TestCase):
         self.assertIn("replaces the current list", ln.LIVE_SYSTEM_PROMPT)
         self.assertIn("return the ones to keep", ln.BLOCK_REFERENCES)
 
+    def test_the_model_is_told_the_input_is_a_transcript(self):
+        # Reported symptom: a note carried "Dan Pyre is identified as
+        # suspectable" -- a misheard name and a nonsense word presented as
+        # findings. The model was never told the text is speech recognition, so
+        # it had no licence to read through a homophone and no instruction to
+        # drop what it could not resolve.
+        prompt = ln.LIVE_SYSTEM_PROMPT
+        self.assertIn("machine speech recognition", prompt)
+        self.assertIn("mishears words", prompt)
+        self.assertIn("sounds like", prompt,
+                      msg="the licence to normalise is the point; without it the "
+                          "model either keeps the garble or invents a meaning")
+        self.assertIn("not inventing a fact", prompt,
+                      msg="the permission has to be bounded, or it licenses "
+                          "invention instead of correction")
+        self.assertIn("leave it out", prompt)
+
+    def test_every_sentence_must_carry_something(self):
+        # The same note restated its own numbers three times and closed with a
+        # hedged guess. Relevance at sentence granularity is a separate
+        # instruction from relevance at topic granularity.
+        prompt = ln.LIVE_SYSTEM_PROMPT
+        self.assertIn("must carry something a reader would act on", prompt)
+        self.assertIn("only restates another", prompt)
+        self.assertIn("hedged commentary", prompt)
+
     def test_timestamps_are_minutes_and_seconds(self):
         self.assertEqual(ln.format_timestamp(0), "00:00")
         self.assertEqual(ln.format_timestamp(65), "01:05")
