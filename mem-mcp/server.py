@@ -18,7 +18,7 @@ import memory as mem
 import status_monitor
 
 from mcp_tools import mcp
-from gui import web_app, McpAuthGuard
+from gui import web_app, McpAuthGuard, assert_middleware_order
 from fastapi.middleware.cors import CORSMiddleware
 import sessions as vault_sessions
 import audit
@@ -68,6 +68,12 @@ web_app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# The stack is complete only now, so this is the first point where the order can
+# be checked. A process that serves 500s on every request because the session
+# middleware ended up inside the gates is much worse than one that refuses to
+# start and says so — see gui.assert_middleware_order.
+assert_middleware_order(web_app)
 
 # The MCP CORS above (`mcp_cors`) keeps its wildcard, and that is not an
 # oversight: it is handed to mcp.http_app() and therefore sits *inside*

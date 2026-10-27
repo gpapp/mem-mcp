@@ -255,6 +255,10 @@ already-stripped path alone, and both `auth_guard` and `log_gui_requests` use it
 the fix — which is what made a WebSocket handshake look like an ordinary GET.
 `ApiAuthTests.test_the_gate_still_runs_behind_a_base_url_path_prefix` drives the
 guard with `root_path="/mem-mcp"` on `_Request` and fails on the old expression.
+Fixing it is also what **exposed** the session-middleware ordering defect (see
+Sessions & Access Keys): the gate had never run far enough to read
+`request.session`. Expect that shape whenever a guard like this is repaired —
+the code behind it has not been exercised in production either.
 
 **`_user` must not parse headers.** It ended with `mem.extract_user_from_headers(...)`,
 which made `_require_user` in every handler a "did somebody hand us a username"
@@ -321,6 +325,25 @@ not a style choice.** `/api/events` and `/api/status/stream` are SSE; a
 Wrapping `send` is what lets a `Set-Cookie` be appended to the response start
 message without touching the body. It reads and writes `scope["headers"]`
 directly, which is also what keeps the starlette import out of the file.
+
+**It is registered *after* the two `@web_app.middleware("http")` gates, and that
+ordering is the whole reason `request.session` works.** `add_middleware()`
+inserts at position 0, so the middleware registered **last** is the **outermost**
+one — registration order is the reverse of execution order. `VaultSessionMiddleware`
+sat near the top of `gui.py` for a long time, which put it *inside* `auth_guard`,
+and `auth_guard` calls `_check_session_auth` on every `/gui` and `/api` request:
+it read `request.session` before anything had put `"session"` in the scope and
+raised `AssertionError: SessionMiddleware must be installed` — a 500 on every
+request. **Nothing noticed for the whole life of the bug, because the same gate's
+path test was also broken** (`_request_path`, see Authentication): both prefix
+tests were false, so the gate never reached that line. Fixing the path exposed
+the ordering on the next deploy, which is what a second defect hiding behind the
+first looks like — one layer up from the usual case. The registration now sits
+immediately below `log_gui_requests`, `assert_middleware_order(web_app)` runs in
+`server.py` once the stack is complete (so a reorder refuses to start instead of
+serving 500s), and `test_auth_guard.MiddlewareOrderTests` pins the source order
+with the guard itself driven against both lists in `MiddlewareOrderGuardTests`.
+The final order is `CORS -> session -> log_gui_requests -> auth_guard -> routes`.
 
 - **Sessions are server-side; the cookie is only an opaque id.** That is what
   makes login survive a container rebuild — but only because `MEM_SESSION_DIR`

@@ -1751,3 +1751,114 @@ class CorsAndDocsTests(unittest.TestCase):
                 self.assertIsInstance(
                     kwargs[name], ast.Constant, msg=f"{name} must be a literal")
                 self.assertIsNone(kwargs[name].value, msg=f"{name} must be None")
+
+
+# ---------------------------------------------------------------------------
+# middleware order — the session must wrap the gates
+# ---------------------------------------------------------------------------
+
+class MiddlewareOrderTests(unittest.TestCase):
+    """`VaultSessionMiddleware` must be registered AFTER the two http gates.
+
+    Starlette's `add_middleware()` inserts at position 0, so registration order
+    is the reverse of execution order and the LAST registration is the OUTERMOST
+    middleware. Registered above `auth_guard`, the session middleware runs
+    *inside* it — `auth_guard` then calls `request.session` with nothing in
+    `scope["session"]` and every `/gui` and `/api` request raises
+
+        AssertionError: SessionMiddleware must be installed ...
+
+    This shipped and was invisible for as long as `auth_guard`'s path test never
+    matched (`_request_path`), because the broken gate never reached that line.
+    The guard below is on the *source order*, which is the only place the
+    property exists: the two functions are identical once FastAPI has built the
+    stack, and the app 500s either way.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.source = _read("gui.py")
+        cls.tree = ast.parse(cls.source)
+
+    def _session_registration_line(self):
+        for node in ast.walk(self.tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not (isinstance(func, ast.Attribute) and func.attr == "add_middleware"):
+                continue
+            if not node.args:
+                continue
+            target = node.args[0]
+            if isinstance(target, ast.Name) and target.id == "VaultSessionMiddleware":
+                return node.lineno
+        self.fail("gui.py registers no VaultSessionMiddleware")
+
+    def _gate_lines(self):
+        found = {}
+        for node in self.tree.body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for decorator in node.decorator_list:
+                if (isinstance(decorator, ast.Call)
+                        and isinstance(decorator.func, ast.Attribute)
+                        and decorator.func.attr == "middleware"):
+                    found[node.name] = node.lineno
+        return found
+
+    def test_the_session_middleware_is_registered_after_every_http_gate(self):
+        gates = self._gate_lines()
+        self.assertEqual(sorted(gates), ["auth_guard", "log_gui_requests"],
+                         msg="the http gates this test knows about have changed")
+        session_line = self._session_registration_line()
+        for name, line in gates.items():
+            self.assertGreater(
+                session_line, line,
+                msg=(f"VaultSessionMiddleware is registered above {name} "
+                     f"(line {line}), so it runs inside the gate and "
+                     f"request.session raises on every request"))
+
+
+class MiddlewareOrderGuardTests(unittest.TestCase):
+    """`assert_middleware_order` must refuse the old order and accept the new one.
+
+    Lifted and *called*, because the function's whole value is which list it
+    decides is wrong — and a source assertion would be satisfied by a check that
+    compares the wrong indices, which is exactly the bug it exists to catch.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.session_cls = type("VaultSessionMiddleware", (), {})
+        cls.gate_cls = type("BaseHTTPMiddleware", (), {})
+        cls.cors_cls = type("CORSMiddleware", (), {})
+        namespace = {
+            "VaultSessionMiddleware": cls.session_cls,
+            "BaseHTTPMiddleware": cls.gate_cls,
+        }
+        # `staticmethod`, or the lifted function binds as a method and every
+        # call gains an unexpected `self`.
+        cls.check = staticmethod(_lift("gui.py", "assert_middleware_order", namespace))
+
+    def _app(self, *classes):
+        return types.SimpleNamespace(
+            user_middleware=[types.SimpleNamespace(cls=cls) for cls in classes])
+
+    def test_the_shipped_order_is_accepted(self):
+        # Outermost first, as Starlette builds it: CORS is added last in
+        # server.py, the session next, then the gates.
+        self.check(self._app(self.cors_cls, self.session_cls,
+                             self.gate_cls, self.gate_cls))
+
+    def test_a_session_middleware_inside_the_gates_is_refused(self):
+        app = self._app(self.cors_cls, self.gate_cls, self.gate_cls,
+                        self.session_cls)
+        with self.assertRaises(RuntimeError) as raised:
+            self.check(app)
+        self.assertIn("request.session", str(raised.exception))
+
+    def test_an_app_with_no_gates_is_left_alone(self):
+        self.check(self._app(self.session_cls))
+
+    def test_an_app_without_a_session_middleware_is_left_alone(self):
+        self.check(self._app(self.gate_cls))

@@ -42,6 +42,7 @@ from migrate_client_context import (
 )
 from fastapi import Request, HTTPException, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response, JSONResponse, HTMLResponse, RedirectResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 from memory import SESSION_MAX_AGE # Import from memory.py
 import sessions as vault_sessions
@@ -99,8 +100,15 @@ web_app = FastAPI(
 # Persistent sessions, not cookie sessions. See sessions.py for why, and for the
 # one thing that changed as a result: `request.session["pass"]` no longer exists
 # and cannot be written, so the Setup page shows a PSK instead of the password.
-web_app.add_middleware(VaultSessionMiddleware, max_age=SESSION_MAX_AGE,
-                       cookie_name=vault_sessions.SESSION_COOKIE)
+#
+# It is registered further down, immediately below `log_gui_requests`, and that
+# placement is load-bearing rather than stylistic: `add_middleware()` inserts at
+# position 0, so the middleware registered LAST is the OUTERMOST one, and a
+# session middleware registered here runs *inside* both @web_app.middleware("http")
+# gates below. `auth_guard` then reads `request.session` before anything has set
+# `scope["session"]`, and every /gui and /api request dies with
+# `AssertionError: SessionMiddleware must be installed`. `assert_middleware_order`
+# at the bottom of that section turns the same mistake into a refusal to start.
 
 HTPASSWD_PATH = os.getenv("HTPASSWD_PATH", os.path.join(os.path.dirname(__file__), "htpasswd"))
 
@@ -414,6 +422,42 @@ def _request_path(request) -> str:
     return path
 
 
+def assert_middleware_order(app) -> None:
+    """Refuse to serve unless the session middleware wraps the two gates.
+
+    `add_middleware()` inserts at position 0, so the middleware registered LAST
+    is the OUTERMOST one and registration order is the reverse of execution
+    order. `VaultSessionMiddleware` sat above these gates for a long time, which
+    put it *inside* them: `auth_guard` called `request.session` before anything
+    had put `"session"` in the scope, and every `/gui` and `/api` request raised
+
+        AssertionError: SessionMiddleware must be installed to access request.session
+
+    Nothing caught it, because the same gate's path test was also broken at the
+    time (`_request_path` above) and it never reached that line — one defect was
+    hiding the other. Fixing the path exposed this one on the next deploy.
+
+    Raising at import is deliberate: a process that 500s every request looks
+    like a dozen unrelated bugs, while one that refuses to start names the two
+    lines that are in the wrong order.
+    """
+    entries = list(getattr(app, "user_middleware", None) or [])
+    classes = [getattr(entry, "cls", None) for entry in entries]
+    if VaultSessionMiddleware not in classes:
+        return
+    session_at = classes.index(VaultSessionMiddleware)
+    gates = [i for i, cls in enumerate(classes)
+             if isinstance(cls, type) and issubclass(cls, BaseHTTPMiddleware)]
+    if not gates or session_at < min(gates):
+        return
+    raise RuntimeError(
+        "middleware order: VaultSessionMiddleware is registered before the "
+        '@web_app.middleware("http") gates, so it runs inside them and '
+        "request.session raises on every request. Register the session "
+        "middleware after the gates (gui.py, below log_gui_requests)."
+    )
+
+
 # Auth guard middleware - protect /gui routes
 @web_app.middleware("http")
 async def auth_guard(request: Request, call_next):
@@ -452,6 +496,17 @@ async def log_gui_requests(request: Request, call_next):
     if path not in ["/", "/api/ping", "/favicon.ico"]:
         print(f"[GUI] {request.method} {path}")
     return await call_next(request)
+
+# Registered here, below both gates, so that it WRAPS them. `add_middleware()`
+# inserts at position 0 — the last registration is the outermost middleware — so
+# this one statement is what decides whether `request.session` exists by the time
+# `auth_guard` reads it. `assert_middleware_order()` enforces it at boot, and
+# `test_auth_guard.MiddlewareOrderTests` pins the source order, because the
+# failure mode is a 500 on every request with nothing else in the log to say why.
+# server.py then adds CORS after importing this module, making the final order
+# CORS -> session -> log_gui_requests -> auth_guard -> routes.
+web_app.add_middleware(VaultSessionMiddleware, max_age=SESSION_MAX_AGE,
+                       cookie_name=vault_sessions.SESSION_COOKIE)
 
 # Allow both /path and /path/ for all routes
 from fastapi.routing import APIRoute

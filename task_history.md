@@ -5,6 +5,42 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# Live notes — the session middleware was inside the gate it had to wrap (2026-10-27)
+
+- **The deploy after the path fix answered every request with a 500:**
+  `AssertionError: SessionMiddleware must be installed to access request.session`
+  out of `auth_guard`. Not a new bug — `web_app.add_middleware` inserts at
+  position 0, so the middleware registered **last** is the outermost one, and
+  `VaultSessionMiddleware` was registered *above* the two
+  `@web_app.middleware("http")` gates. It therefore ran inside them, and the gate
+  read `request.session` before anything had set `scope["session"]`.
+- **Two defects, one hiding the other.** The ordering had been wrong for as long
+  as the middleware existed, but the same gate's `startswith("/gui")` /
+  `startswith("/api")` tests were false in the documented deployment
+  (`root_path`), so it never ran far enough to read the session. Repairing the
+  path is precisely what armed the second one. The general lesson is recorded in
+  `AGENTS.md`: when a guard that has never actually fired is repaired, the code
+  behind it has never been exercised either.
+- **The registration moved below `log_gui_requests`**, so the stack is
+  `CORS -> session -> log_gui_requests -> auth_guard -> routes`, and
+  `assert_middleware_order(web_app)` now runs in `server.py` after the CORS
+  middleware is added — a reorder refuses to start instead of serving a 500 per
+  request. **That check belongs in `server.py` and not in `gui.py`:** only after
+  `server.py` has added its middleware is the stack complete, and a check placed
+  beside the registration would not see a gate registered further down the file.
+- **Guards:** `test_auth_guard.MiddlewareOrderTests` asserts the session
+  registration line is below both gate decorators (a source-order property, since
+  the functions are indistinguishable once FastAPI has built the stack), and
+  `MiddlewareOrderGuardTests` **calls** `assert_middleware_order` with the good
+  order, the bad order (accepts CORS outside, refuses the session inside), no
+  gates, and no session middleware. Both were re-injected: restoring the old
+  registration fails the first, inverting the index comparison in the guard fails
+  the second.
+- Full suite: **1277 tests**, all passing. `py_compile` clean on `gui.py`,
+  `server.py`, `test_auth_guard.py`.
+
+---
+
 # Live notes — recording start, the proxy Upgrade, and a cheap ASR-key probe (2026-10-27)
 
 - **"Starting the recording failed" was nginx, not the app.** The handshake
