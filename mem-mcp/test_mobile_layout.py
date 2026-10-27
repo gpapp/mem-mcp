@@ -1150,6 +1150,59 @@ class DiaryFillsThePageTests(unittest.TestCase):
 
 
 
+class LiveNotesLayoutTests(unittest.TestCase):
+    """The Live notes tab is the fourth full-bleed reading screen.
+
+    It repeats every trap the other three have already paid for: a page cap
+    that starves the panes, a 100vh budget that must match the chrome, a
+    zero-basis pane that collapses when stacked, and an inline display on a
+    layout container that outranks the media query.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.base = _declarations(_base_css())
+        cls.mobile = _declarations(_media_block(900))
+
+    def test_the_live_page_is_not_capped(self):
+        merged = _decls(self.base, "#page-live")
+        self.assertTrue("max-width: none" in merged,
+                        f"#page-live still inherits the 1100px page cap; got: {merged.strip()!r}")
+        self.assertTrue("margin: 0 auto" not in merged,
+                        f"#page-live re-centres itself; got: {merged.strip()!r}")
+
+    def test_the_live_pane_budget_matches_the_other_reading_screens(self):
+        def budget(selector):
+            merged = _decls(self.base, selector)
+            found = re.search(r"height:\s*calc\(100vh\s*-\s*(\d+)px\)", merged)
+            self.assertIsNotNone(found, f"{selector} has no 100vh budget: {merged!r}")
+            return int(found.group(1))
+        self.assertEqual(budget(".live-layout"), budget(".memories-layout"),
+                         "live notes sits under the same chrome as memories, so a "
+                         "different subtracted constant leaves a dead band")
+
+    def test_the_live_layout_has_no_inline_display(self):
+        self.assertNotIn('<div class="live-layout" style=', SOURCE,
+                         "an inline display on .live-layout outranks the mobile block")
+        self.assertNotIn('<div id="live-pane-transcription" class="live-panel active" style=',
+                         SOURCE)
+
+    def test_the_live_columns_stack_and_release_their_zero_bases(self):
+        self.assertIn("flex-direction: column", _decls(self.mobile, ".live-layout"))
+        self.assertIn("width: auto", _decls(self.mobile, ".live-sidebar"))
+        for selector in (".live-workspace", ".live-panel", ".live-panel-scroll"):
+            self.assertIn("flex: 0 0 auto", _decls(self.mobile, selector),
+                          f"{selector} keeps its zero flex basis when stacked")
+        self.assertIn("overflow-y: visible", _decls(self.mobile, ".live-panel-scroll"))
+
+    def test_the_live_tab_and_state_are_wired(self):
+        self.assertIn('data-tab="live"', SOURCE)
+        self.assertIn('id="page-live"', SOURCE)
+        self.assertIn("activeLiveTranscriptionId: activeLiveTranscriptionId", SOURCE)
+        self.assertIn("liveTab: liveTab", SOURCE)
+        self.assertIn("if (LIVE_TABS.indexOf(state.liveTab) !== -1)", SOURCE)
+
+
 class GraphHeightIsDefiniteTests(unittest.TestCase):
     """The graph container's height must not be derived from its content.
 

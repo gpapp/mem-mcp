@@ -59,6 +59,71 @@
        1100px page cap starves the canvas and the detail pane alike. */
     #page-graph { max-width: none; padding: .75rem 1rem; }
 
+    /* ── Live notes ──
+       The same full-bleed, fixed-height reading screen as Memories and Diary:
+       a session rail that scrolls on its own and a main column that owns the
+       toolbar and the two panes. The page cap would starve the note pane for
+       the same reason it starves the diary. */
+    #page-live { max-width: none; padding: .75rem 1rem; }
+    .live-layout { display: flex; gap: 1rem; height: calc(100vh - 140px); min-height: 500px; }
+    .live-sidebar { width: 250px; flex-shrink: 0; background: var(--surface);
+                    border: 1px solid var(--border); border-radius: var(--radius);
+                    display: flex; flex-direction: column; overflow: hidden; }
+    .live-sidebar-head { padding: .6rem; border-bottom: 1px solid var(--border); }
+    .live-session-scroll { flex: 1; overflow-y: auto; padding: .5rem; }
+    .live-session { padding: .55rem .6rem; border-radius: 6px; cursor: pointer;
+                    font-size: .86rem; border: 1px solid transparent; }
+    .live-session:hover { background: var(--primary-light); }
+    .live-session.active { border-color: var(--primary); background: var(--primary-light); }
+    .live-session-title { font-weight: 600; white-space: nowrap; overflow: hidden;
+                          text-overflow: ellipsis; }
+    .live-session-meta { font-size: .72rem; color: var(--muted); margin-top: .2rem; }
+    .live-main { flex: 1; min-width: 0; display: flex; flex-direction: column;
+                 gap: .6rem; min-height: 0; }
+    .live-workspace { display: none; flex: 1; min-height: 0;
+                      flex-direction: column; gap: .6rem; }
+    .live-workspace.active { display: flex; }
+    .live-toolbar { display: flex; gap: .5rem; flex-wrap: wrap; align-items: center;
+                    background: var(--surface); border: 1px solid var(--border);
+                    border-radius: var(--radius); padding: .6rem .75rem; }
+    .live-toolbar input, .live-toolbar select { min-width: 130px; }
+    .live-toolbar .live-name { flex: 1 1 220px; }
+    .live-controls { display: flex; gap: .4rem; flex-wrap: wrap; }
+    .live-state { font-size: .8rem; color: var(--muted); flex-basis: 100%; }
+    .live-token-missing { display: none; background: var(--primary-light);
+                          border: 1px solid var(--primary); border-radius: var(--radius);
+                          padding: .8rem 1rem; font-size: .88rem; }
+    .live-token-missing.show { display: block; }
+    .live-panel { display: none; flex: 1; min-height: 0; flex-direction: column;
+                  background: var(--surface); border: 1px solid var(--border);
+                  border-radius: var(--radius); overflow: hidden; }
+    .live-panel.active { display: flex; }
+    .live-panel-head { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap;
+                       padding: .55rem .75rem; border-bottom: 1px solid var(--border); }
+    .live-panel-head h3 { margin: 0; font-size: .95rem; }
+    .live-panel-scroll { flex: 1; overflow-y: auto; padding: .75rem; min-height: 0; }
+    .live-segment { display: flex; gap: .65rem; padding: .5rem 0;
+                    border-bottom: 1px solid var(--border); }
+    .live-segment-time { flex: 0 0 48px; font-size: .75rem; color: var(--muted);
+                         font-variant-numeric: tabular-nums; }
+    .live-segment-body { flex: 1; min-width: 0; }
+    .live-segment-speaker { font-size: .75rem; font-weight: 600; color: var(--primary); }
+    .live-segment-text { white-space: pre-wrap; overflow-wrap: anywhere; font-size: .9rem; }
+    .live-segment-actions { flex: 0 0 auto; display: flex; gap: .25rem; }
+    .live-segment-actions button { padding: .1rem .35rem; font-size: .75rem; }
+    .live-segment textarea { width: 100%; min-height: 70px; }
+    .live-note-body { font-size: .92rem; }
+    .live-ref-list { display: flex; flex-wrap: wrap; gap: .35rem; margin-top: .75rem; }
+    .live-ref-badge { background: var(--primary-light); border: 1px solid var(--primary);
+                      border-radius: 999px; padding: .15rem .6rem; font-size: .78rem;
+                      cursor: pointer; }
+    .live-job-banner { display: none; padding: .45rem .65rem; border-radius: 6px;
+                       font-size: .82rem; margin-bottom: .6rem; }
+    .live-job-banner.show { display: block; }
+    .live-job-banner.warn { background: var(--primary-light); color: var(--text); }
+    .live-job-banner.error { background: #fee; color: var(--danger); }
+    .live-note-empty { color: var(--muted); font-size: .9rem; }
+
     /* ── Service sub-tabs ──
        Same show/hide contract as `.page`, for the panels inside the Service
        tab. That is what lets switchServiceTab() reuse switchTab()'s
@@ -768,6 +833,22 @@
       .diary-list-col { order: 2; }
       .diary-main { order: 3; }
 
+      /* Live notes stacks rail -> toolbar/panes. Both halves of the
+         zero-basis fix are needed, exactly as for the other panes:
+         `overflow-y: visible` restores the intrinsic height and
+         `flex: 0 0 auto` stops the basis from resolving against nothing. */
+      #page-live { padding: .5rem; }
+      .live-layout { flex-direction: column; height: auto; min-height: 0; gap: .5rem; }
+      .live-sidebar { width: auto; max-height: 32vh; }
+      .live-session-scroll { flex: 0 1 auto; }
+      .live-main { min-height: auto; }
+      .live-workspace { flex: 0 0 auto; min-height: auto; }
+      .live-panel { flex: 0 0 auto; min-height: auto; }
+      .live-panel-scroll { flex: 0 0 auto; overflow-y: visible; min-height: auto; }
+      .live-toolbar .live-name { flex-basis: 100%; }
+      .live-controls { width: 100%; }
+      .live-controls .btn { flex: 1 1 auto; min-height: 40px; }
+
       /* Chip rows run sideways rather than stacking into a tall rail. */
       .chips-container { flex-direction: row !important; flex-wrap: nowrap; overflow-x: auto; }
 
@@ -828,6 +909,7 @@
 <div class="tabs">
   <button class="tab-btn active" data-tab="memories" onclick="switchTab('memories')">📝 Memories</button>
   <button class="tab-btn" data-tab="diary" onclick="switchTab('diary')">📖 Diary</button>
+  <button class="tab-btn" data-tab="live" onclick="switchTab('live')">🎙️ Live notes</button>
   <button class="tab-btn" data-tab="graph" onclick="switchTab('graph')">🕸️ Graph</button>
   <button class="tab-btn" data-tab="clients" onclick="switchTab('clients')">🏢 Clients</button>
   <button class="tab-btn" data-tab="setup" onclick="switchTab('setup')">🔌 Setup</button>
@@ -980,6 +1062,95 @@
 </div>
 
 
+
+<!-- ═══ LIVE NOTES PAGE ═══ -->
+<div id="page-live" class="page">
+  <div class="live-layout">
+    <aside class="live-sidebar">
+      <div class="live-sidebar-head">
+        <button id="live-new-btn" class="btn btn-primary btn-sm" onclick="createLiveTranscription()">＋ New recording</button>
+      </div>
+      <div id="live-session-list" class="live-session-scroll">
+        <div class="empty">Loading…</div>
+      </div>
+    </aside>
+
+    <section class="live-main">
+      <div id="live-empty" class="empty">
+        No transcription selected. Create one to start recording.
+      </div>
+
+      <div id="live-workspace" class="live-workspace">
+        <div id="live-token-missing" class="live-token-missing">
+          <strong>🎙️ A transcription key is needed first.</strong>
+          Recording streams through your own asr-mcp server, which requires its API key.
+          <ol style="margin:.5rem 0 .6rem 1.2rem; padding:0;">
+            <li>Open <strong>Setup → Live transcription key</strong>.</li>
+            <li>Paste the API key your asr-mcp server accepts and press <strong>Save key</strong>.</li>
+            <li>Come back here — Start becomes available once a key is saved.</li>
+          </ol>
+          <button class="btn btn-sm" onclick="switchTab('setup')">Open Setup</button>
+        </div>
+
+        <div class="live-toolbar">
+          <input id="live-name" class="live-name" type="text" placeholder="Recording name"
+                 onchange="renameLiveTranscription()">
+          <select id="live-client" onchange="updateLiveScope()" title="Client"></select>
+          <select id="live-context" onchange="updateLiveScope()" title="Project"></select>
+          <select id="live-language" onchange="updateLiveLanguage()" title="Language">
+            <option value="auto">Auto language</option>
+            <option value="en">English</option>
+            <option value="de">German</option>
+            <option value="fr">French</option>
+            <option value="es">Spanish</option>
+            <option value="it">Italian</option>
+          </select>
+          <div class="live-controls">
+            <button id="live-start-btn" class="btn btn-primary btn-sm" onclick="startLiveRecording()">● Start</button>
+            <button id="live-pause-btn" class="btn btn-sm" onclick="pauseLiveRecording()" disabled>⏸ Pause &amp; summarise</button>
+            <button id="live-resume-btn" class="btn btn-sm" onclick="resumeLiveRecording()" disabled>▶ Resume</button>
+            <button id="live-stop-btn" class="btn btn-sm" onclick="stopLiveRecording()" disabled>■ Stop</button>
+            <button id="live-delete-btn" class="btn btn-sm" onclick="deleteLiveTranscription()">🗑 Delete</button>
+          </div>
+          <div id="live-state" class="live-state">Not recording.</div>
+        </div>
+
+        <div class="mode-toggle" style="margin:0;">
+          <button id="live-tab-transcription" class="active" onclick="switchLiveTab('transcription')">Transcription</button>
+          <button id="live-tab-notes" onclick="switchLiveTab('notes')">Notes</button>
+        </div>
+
+        <div id="live-pane-transcription" class="live-panel active">
+          <div class="live-panel-head">
+            <h3>Transcript</h3>
+            <span id="live-segment-count" style="font-size:.8rem;color:var(--muted);"></span>
+          </div>
+          <div id="live-segments" class="live-panel-scroll">
+            <div class="empty">No segments yet. Start recording to capture speech.</div>
+          </div>
+        </div>
+
+        <div id="live-pane-notes" class="live-panel">
+          <div class="live-panel-head">
+            <h3>Running note</h3>
+            <span id="live-note-title" style="font-size:.82rem;color:var(--muted);"></span>
+            <button id="live-open-note-btn" class="btn btn-sm" onclick="openLiveNoteInMemories()" disabled>Open note</button>
+            <button id="live-update-btn" class="btn btn-sm" onclick="summarizeLive()">Update now</button>
+            <button id="live-rebuild-btn" class="btn btn-sm" onclick="rebuildLiveNote()">↻ Rebuild note</button>
+            <span id="live-note-saved" style="font-size:.78rem;color:var(--muted);"></span>
+          </div>
+          <div class="live-panel-scroll">
+            <div id="live-job-banner" class="live-job-banner"></div>
+            <div id="live-note-body" class="live-note-body markdown-body">
+              <div class="live-note-empty">Nothing summarised yet. Pause the recording, or press <strong>Update now</strong>.</div>
+            </div>
+            <div id="live-references" class="live-ref-list"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+</div><!-- /page-live -->
 
 <!-- ═══ GRAPH PAGE ═══ -->
 <div id="page-graph" class="page">
@@ -1389,6 +1560,7 @@
     get:    (url, params) => fetch(apiUrl(url, params)).then(r => r.ok ? r.json() : apiFail(r)),
     post:   (url, body) => fetch(`${apiBase}/${url}`, {method:'POST',  headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}).then(r => r.ok ? r.json() : apiFail(r)),
     put:    (url, body) => fetch(`${apiBase}/${url}`, {method:'PUT',   headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}).then(r => r.ok ? r.json() : apiFail(r)),
+    patch:  (url, body) => fetch(`${apiBase}/${url}`, {method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}).then(r => r.ok ? r.json() : apiFail(r)),
     delete: (url, body) => fetch(`${apiBase}/${url}`, {method:'DELETE', headers:{'Content-Type':'application/json'}, body: body ? JSON.stringify(body) : undefined}).then(r => r.ok ? r.json() : apiFail(r)),
   };
 
@@ -1470,6 +1642,24 @@
   // to the repair panel, not to Users.
   const SERVICE_TABS = ['users', 'models', 'data'];
   let serviceTab = 'users';
+  // Live notes. `liveTab` and the selected transcription are persisted with
+  // the rest of the view state for the same reason as serviceTab: a reload
+  // should land back on the pane the user was reading, not reset to the rail.
+  const LIVE_TABS = ['transcription', 'notes'];
+  let liveTab = 'transcription';
+  let activeLiveTranscriptionId = null;
+  let liveSessions = [];
+  let liveDetail = null;
+  let liveJob = null;
+  let liveLoaded = false;
+  let liveLoadInFlight = null;
+  let liveLoadedTranscriptionId = null;
+  let livePollTimer = null;
+  let livePollToken = 0;
+  let liveRecording = false;
+  let livePaused = false;
+  let liveEditingSegmentId = null;
+  let liveOffset = 0;
   let selectedFactId = null;
   let network = null;
   let graphResizeObserver = null;
@@ -1510,6 +1700,8 @@
         selectedDiaryDate: selectedDiaryDate,
         selectedMonth: selectedMonth,
         activeDiaryId: activeDiaryId,
+        activeLiveTranscriptionId: activeLiveTranscriptionId,
+        liveTab: liveTab,
         isBuildMode: isBuildMode,
         buildGraphNodes: Array.from(buildGraphNodes)
       };
@@ -1546,6 +1738,8 @@
         if (state.selectedDiaryDate !== undefined) selectedDiaryDate = state.selectedDiaryDate;
         if (state.selectedMonth !== undefined) selectedMonth = state.selectedMonth;
         if (state.activeDiaryId !== undefined) activeDiaryId = state.activeDiaryId;
+        if (state.activeLiveTranscriptionId !== undefined) activeLiveTranscriptionId = state.activeLiveTranscriptionId;
+        if (LIVE_TABS.indexOf(state.liveTab) !== -1) liveTab = state.liveTab;
 
         if (state.isBuildMode !== undefined) isBuildMode = state.isBuildMode;
         if (state.buildGraphNodes !== undefined) buildGraphNodes = new Set(state.buildGraphNodes);
@@ -2164,6 +2358,10 @@
     if (tab === 'diary' && !diaryEntries.length) loadDiary();
     if (tab === 'graph' && !graphLoaded) loadGraph();
     if (tab === 'clients') loadClients();
+    if (tab === 'live') {
+      switchLiveTab(liveTab, {silent: true});
+      loadLive({force: true});
+    }
     if (tab === 'setup') {
       loadPSKs();
       loadAsrToken();
@@ -2917,6 +3115,614 @@
   // A job that is already running when the page opens is adopted, so its
   // result is still picked up, but an idle vault makes no requests.
   // ---------------------------------------------------------------------
+  // ── Live notes tab ─────────────────────────────────────────────────────
+  //
+  // The browser holds only the session cookie; the ASR token lives in
+  // sessions.db and is replayed by the WebSocket proxy. Start is disabled
+  // until Setup reports a saved key, and the empty state says where to add it.
+  //
+  // Polling is deliberately not a heartbeat: /status is requested once after
+  // a job is started and then only while its status is non-terminal, so an
+  // idle tab makes no requests.
+
+  const LIVE_JOB_ACTIVE = ['queued', 'running', 'starting'];
+
+  function fmtClock(sec) {
+    const total = Math.max(0, Math.floor(Number(sec) || 0));
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = total % 60;
+    const mm = String(m).padStart(2, '0');
+    const ss = String(s).padStart(2, '0');
+    return h ? h + ':' + mm + ':' + ss : mm + ':' + ss;
+  }
+
+  function liveStatusLabel(record) {
+    const status = (record && record.status) || 'idle';
+    if (status === 'recording') return 'Recording';
+    if (status === 'paused') return 'Paused';
+    if (status === 'processing') return 'Updating note';
+    if (status === 'deferred') return 'Update deferred';
+    if (status === 'error') return 'Last update failed';
+    return 'Idle';
+  }
+
+  async function loadLive(opts) {
+    const force = !!(opts && opts.force);
+    if (liveLoadInFlight) return liveLoadInFlight;
+    if (liveLoaded && !force && liveSessions.length) {
+      renderLive();
+      return;
+    }
+    liveLoadInFlight = (async () => {
+      try {
+        const data = await api.get('live/transcriptions');
+        liveSessions = data.transcriptions || [];
+        liveLoaded = true;
+        renderLiveSessions();
+        const known = liveSessions.some(t => t.id === activeLiveTranscriptionId);
+        if (!known) activeLiveTranscriptionId = liveSessions.length ? liveSessions[0].id : null;
+        if (activeLiveTranscriptionId) {
+          await openLiveTranscription(activeLiveTranscriptionId, {force: force, silent: true});
+        } else {
+          liveDetail = null;
+          renderLiveWorkspace();
+        }
+      } catch (e) {
+        const el = document.getElementById('live-session-list');
+        if (el) el.innerHTML = '<div class="empty">⚠️ Could not load transcriptions' +
+          (e && e.status ? ' (' + e.status + ')' : '') + '</div>';
+      } finally {
+        liveLoadInFlight = null;
+      }
+    })();
+    return liveLoadInFlight;
+  }
+
+  function renderLive() {
+    renderLiveSessions();
+    renderLiveWorkspace();
+  }
+
+  function renderLiveSessions() {
+    const el = document.getElementById('live-session-list');
+    if (!el) return;
+    if (!liveSessions.length) {
+      el.innerHTML = '<div class="empty">No recordings yet.<br>Press <strong>＋ New recording</strong>.</div>';
+      return;
+    }
+    el.innerHTML = liveSessions.map(t => {
+      const active = t.id === activeLiveTranscriptionId;
+      const scope = [t.clientName, t.contextName].filter(Boolean).join(' / ');
+      const meta = [liveStatusLabel(t), (t.segmentCount || 0) + ' segments', scope]
+        .filter(Boolean).join(' · ');
+      return '<div class="live-session' + (active ? ' active' : '') + '"' +
+        ' onclick="openLiveTranscription(\'' + escHtml(t.id) + '\')">' +
+        '<div class="live-session-title">' + escHtml(t.name || 'Untitled recording') + '</div>' +
+        '<div class="live-session-meta">' + escHtml(meta) + '</div></div>';
+    }).join('');
+  }
+
+  async function openLiveTranscription(id, opts) {
+    opts = opts || {};
+    if (liveRecording && id !== activeLiveTranscriptionId) {
+      toast('⚠️ Stop or pause the current recording before switching');
+      return;
+    }
+    if (!opts.force && id === activeLiveTranscriptionId && liveDetail &&
+        liveDetail.transcription && liveDetail.transcription.id === id) {
+      renderLive();
+      return;
+    }
+    try {
+      const detail = await api.get('live/transcriptions/' + encodeURIComponent(id));
+      activeLiveTranscriptionId = id;
+      liveDetail = detail;
+      liveJob = detail.job || null;
+      liveLoadedTranscriptionId = id;
+      liveEditingSegmentId = null;
+      liveOffset = (detail.segments || []).reduce((m, s) => Math.max(m, Number(s.endSec) || 0), 0);
+      if (!liveRecording) {
+        livePaused = detail.transcription && detail.transcription.status === 'paused';
+      }
+      renderLive();
+      scheduleLivePoll();
+    } catch (e) {
+      toastApiError(e, 'Could not open that transcription');
+    }
+  }
+
+  function renderLiveWorkspace() {
+    const empty = document.getElementById('live-empty');
+    const workspace = document.getElementById('live-workspace');
+    if (!empty || !workspace) return;
+    const has = !!(liveDetail && liveDetail.transcription);
+    empty.style.display = has ? 'none' : 'block';
+    workspace.classList.toggle('active', has);
+    if (!has) return;
+
+    const t = liveDetail.transcription;
+    const name = document.getElementById('live-name');
+    if (name && document.activeElement !== name) name.value = t.name || '';
+    renderLiveSelects(t);
+    renderLiveSegments();
+    renderLiveNote();
+    renderLiveControls(t);
+  }
+
+  function renderLiveSelects(t) {
+    const clientSel = document.getElementById('live-client');
+    const contextSel = document.getElementById('live-context');
+    if (!clientSel || !contextSel) return;
+    const clients = clientListCache || [];
+    const currentClient = t.clientId || '';
+    clientSel.innerHTML = '<option value="">No client</option>' + clients.map(c =>
+      '<option value="' + escHtml(c.id) + '">' + escHtml(c.name) + '</option>').join('');
+    clientSel.value = currentClient;
+    const client = clients.find(c => c.id === currentClient);
+    const contexts = (client && client.contexts) || [];
+    contextSel.innerHTML = '<option value="">No project</option>' + contexts.map(c =>
+      '<option value="' + escHtml(c.id) + '">' + escHtml(c.name) + '</option>').join('');
+    contextSel.value = t.contextId || '';
+    const locked = liveRecording;
+    clientSel.disabled = locked;
+    contextSel.disabled = locked;
+    if (clientSel) clientSel.disabled = locked || !clients.length;
+    if (contextSel) contextSel.disabled = locked || !contexts.length;
+    const lang = document.getElementById('live-language');
+    if (lang) { lang.value = t.language || 'auto'; lang.disabled = locked; }
+  }
+
+  function renderLiveControls(t) {
+    const start = document.getElementById('live-start-btn');
+    const pause = document.getElementById('live-pause-btn');
+    const resume = document.getElementById('live-resume-btn');
+    const stop = document.getElementById('live-stop-btn');
+    const del = document.getElementById('live-delete-btn');
+    const update = document.getElementById('live-update-btn');
+    const rebuild = document.getElementById('live-rebuild-btn');
+    const token = document.getElementById('live-token-missing');
+    const state = document.getElementById('live-state');
+    if (token) token.classList.toggle('show', !asrTokenSet);
+    if (start) start.disabled = !asrTokenSet || liveRecording;
+    if (pause) pause.disabled = !liveRecording || livePaused;
+    if (resume) resume.disabled = !liveRecording || !livePaused;
+    if (stop) stop.disabled = !liveRecording;
+    if (del) del.disabled = liveRecording;
+    if (update) update.disabled = liveRecording && !livePaused;
+    if (rebuild) rebuild.disabled = liveRecording;
+    if (state) {
+      if (liveRecording && livePaused) state.textContent = 'Paused — the current section is being summarised.';
+      else if (liveRecording) state.textContent = 'Recording — audio is being transcribed.';
+      else state.textContent = liveStatusLabel(t) + (t.segmentCount ? ' · ' + t.segmentCount + ' segments' : '');
+    }
+  }
+
+  function renderLiveSegments() {
+    const el = document.getElementById('live-segments');
+    const count = document.getElementById('live-segment-count');
+    if (!el) return;
+    const segments = (liveDetail && liveDetail.segments) || [];
+    if (count) count.textContent = segments.length ? segments.length + ' segment' + (segments.length === 1 ? '' : 's') : '';
+    if (!segments.length) {
+      el.innerHTML = '<div class="empty">No segments yet. Start recording to capture speech.</div>';
+      return;
+    }
+    el.innerHTML = segments.map(s => {
+      const editing = s.id === liveEditingSegmentId;
+      const speaker = s.speaker ? '<div class="live-segment-speaker">' + escHtml(s.speaker) + '</div>' : '';
+      const body = editing
+        ? '<textarea id="live-seg-edit-' + escHtml(s.id) + '">' + escHtml(s.text || '') + '</textarea>' +
+          '<div style="margin-top:.35rem;display:flex;gap:.35rem;">' +
+          '<button class="btn btn-sm btn-primary" onclick="saveLiveSegment(\'' + escHtml(s.id) + '\')">Save</button>' +
+          '<button class="btn btn-sm" onclick="cancelLiveSegmentEdit()">Cancel</button></div>'
+        : '<div class="live-segment-text">' + escHtml(s.text || '') + '</div>';
+      const actions = editing || String(s.id).indexOf('live-tmp-') === 0 ? '' :
+        '<div class="live-segment-actions">' +
+        '<button class="btn" title="Edit segment" onclick="editLiveSegment(\'' + escHtml(s.id) + '\')">✏️</button>' +
+        '<button class="btn" title="Delete segment" onclick="deleteLiveSegment(\'' + escHtml(s.id) + '\')">🗑</button></div>';
+      return '<div class="live-segment">' +
+        '<div class="live-segment-time">' + fmtClock(s.startSec) + '</div>' +
+        '<div class="live-segment-body">' + speaker + body + '</div>' + actions + '</div>';
+    }).join('');
+  }
+
+  function openLiveNoteInMemories() {
+    const note = liveDetail && liveDetail.note;
+    if (note) showFactInMemories(note.id);
+  }
+
+  function renderLiveNote() {
+    const body = document.getElementById('live-note-body');
+    const refs = document.getElementById('live-references');
+    const saved = document.getElementById('live-note-saved');
+    const title = document.getElementById('live-note-title');
+    const open = document.getElementById('live-open-note-btn');
+    if (!body) return;
+    const note = liveDetail && liveDetail.note;
+    if (title) title.textContent = note && note.name ? note.name : '';
+    if (open) open.disabled = !note;
+    if (!note) {
+      body.innerHTML = '<div class="live-note-empty">Nothing summarised yet. Pause the recording, or press <strong>Update now</strong>.</div>';
+      if (refs) refs.innerHTML = '';
+      if (saved) saved.textContent = '';
+    } else {
+      body.innerHTML = marked.parse(note.text || '');
+      const list = note.references || [];
+      if (refs) {
+        refs.innerHTML = list.map(r =>
+          '<span class="live-ref-badge" onclick="showFactInMemories(\'' + escHtml(r.id) + '\')" ' +
+          'title="Open this fact">🔗 ' + escHtml(r.name || r.id) + '</span>').join('');
+      }
+      if (saved) saved.textContent = list.length ? list.length + ' referenced fact' + (list.length === 1 ? '' : 's') : 'Saved';
+    }
+    renderLiveJob();
+  }
+
+  function renderLiveJob() {
+    const el = document.getElementById('live-job-banner');
+    if (!el) return;
+    const job = liveJob;
+    el.className = 'live-job-banner';
+    if (!job || !job.status || job.status === 'idle' || job.status === 'done') {
+      el.textContent = '';
+      return;
+    }
+    el.classList.add('show');
+    if (job.status === 'error') {
+      el.classList.add('error');
+      el.textContent = '⚠️ Note update failed: ' + (job.error || 'unknown error') +
+        '. The transcript is intact — try Update now again.';
+      return;
+    }
+    el.classList.add('warn');
+    if (job.status === 'deferred') {
+      el.textContent = '⏸ Update paused — recording resumed before it could save. ' +
+        'The transcript is safe; pause again to summarise it.';
+      return;
+    }
+    el.textContent = '⏳ Updating the note' +
+      (job.consumedSegments ? ' (' + job.consumedSegments + ' segments so far)' : '') + '…';
+  }
+
+  function stopLivePoll() {
+    if (livePollTimer) { clearTimeout(livePollTimer); livePollTimer = null; }
+    livePollToken++;
+  }
+
+  function liveJobActive(job) {
+    return !!(job && LIVE_JOB_ACTIVE.indexOf(job.status) !== -1);
+  }
+
+  function scheduleLivePoll() {
+    if (!liveJobActive(liveJob) || !activeLiveTranscriptionId) {
+      stopLivePoll();
+      return;
+    }
+    if (livePollTimer) return;
+    const token = ++livePollToken;
+    livePollTimer = setTimeout(async () => {
+      livePollTimer = null;
+      if (token !== livePollToken || !activeLiveTranscriptionId) return;
+      const id = activeLiveTranscriptionId;
+      try {
+        const data = await api.get('live/transcriptions/' + encodeURIComponent(id) + '/status');
+        if (token !== livePollToken || id !== activeLiveTranscriptionId) return;
+        liveJob = data.job || liveJob;
+        if (liveDetail && data.transcription) liveDetail.transcription = data.transcription;
+        renderLiveControls(liveDetail && liveDetail.transcription);
+        renderLiveJob();
+        if (liveJobActive(liveJob)) {
+          scheduleLivePoll();
+        } else {
+          stopLivePoll();
+          await openLiveTranscription(id, {force: true, silent: true});
+        }
+      } catch (e) {
+        stopLivePoll();
+      }
+    }, 1500);
+  }
+
+  async function createLiveTranscription() {
+    const suggested = 'Live notes — ' + new Date().toLocaleString();
+    const name = prompt('Name this recording', suggested);
+    if (name === null) return;
+    const body = { name: name.trim() || suggested, language: 'auto' };
+    // A specific client filter is a useful default; 'all'/'active' are not ids.
+    if (clientFilter && clientFilter !== 'all' && clientFilter !== 'active') body.clientId = clientFilter;
+    if (contextFilter) body.contextId = contextFilter;
+    try {
+      const data = await api.post('live/transcriptions', body);
+      const t = data.transcription;
+      liveLoaded = false;
+      await loadLive({force: true});
+      await openLiveTranscription(t.id, {force: true});
+      toast('🎙️ Recording created');
+    } catch (e) {
+      toastApiError(e, 'Could not create a recording');
+    }
+  }
+
+  async function renameLiveTranscription() {
+    const input = document.getElementById('live-name');
+    if (!input || !liveDetail || !liveDetail.transcription) return;
+    const name = input.value.trim();
+    if (!name || name === liveDetail.transcription.name) return;
+    try {
+      const detail = await api.patch('live/transcriptions/' + encodeURIComponent(liveDetail.transcription.id), {name: name});
+      liveDetail = detail;
+      liveSessions = liveSessions.map(t => t.id === detail.transcription.id ? detail.transcription : t);
+      renderLiveSessions();
+    } catch (e) {
+      toastApiError(e, 'Could not rename the recording');
+      renderLiveWorkspace();
+    }
+  }
+
+  async function updateLiveScope() {
+    if (!liveDetail || !liveDetail.transcription) return;
+    const clientId = document.getElementById('live-client').value || null;
+    const contextId = document.getElementById('live-context').value || null;
+    try {
+      const detail = await api.patch('live/transcriptions/' + encodeURIComponent(liveDetail.transcription.id), {
+        clientId: clientId, contextId: clientId ? contextId : null,
+      });
+      liveDetail = detail;
+      liveJob = detail.job || liveJob;
+      liveSessions = liveSessions.map(t => t.id === detail.transcription.id ? detail.transcription : t);
+      renderLive();
+      toast('Scope updated');
+    } catch (e) {
+      toastApiError(e, 'Could not update the client or project');
+      renderLiveWorkspace();
+    }
+  }
+
+  async function updateLiveLanguage() {
+    if (!liveDetail || !liveDetail.transcription) return;
+    const lang = document.getElementById('live-language').value || 'auto';
+    try {
+      const detail = await api.patch('live/transcriptions/' + encodeURIComponent(liveDetail.transcription.id), {language: lang});
+      liveDetail = detail;
+      toast('Language set to ' + lang);
+    } catch (e) {
+      toastApiError(e, 'Could not update the language');
+      renderLiveWorkspace();
+    }
+  }
+
+  function editLiveSegment(id) {
+    liveEditingSegmentId = id;
+    renderLiveSegments();
+  }
+
+  function cancelLiveSegmentEdit() {
+    liveEditingSegmentId = null;
+    renderLiveSegments();
+  }
+
+  async function saveLiveSegment(id) {
+    const el = document.getElementById('live-seg-edit-' + id);
+    if (!el || !liveDetail) return;
+    try {
+      const data = await api.patch(
+        'live/transcriptions/' + encodeURIComponent(liveDetail.transcription.id) +
+        '/segments/' + encodeURIComponent(id), {text: el.value});
+      const idx = (liveDetail.segments || []).findIndex(s => s.id === id);
+      if (idx !== -1) liveDetail.segments[idx] = data.segment;
+      liveEditingSegmentId = null;
+      renderLiveSegments();
+      toast('Segment updated');
+    } catch (e) {
+      toastApiError(e, 'Could not update the segment');
+    }
+  }
+
+  async function deleteLiveSegment(id) {
+    if (!liveDetail) return;
+    if (!confirm('Delete this transcript segment? If it has already been summarised, the note keeps its text snapshot.')) return;
+    try {
+      await api.delete('live/transcriptions/' + encodeURIComponent(liveDetail.transcription.id) +
+        '/segments/' + encodeURIComponent(id));
+      liveDetail.segments = (liveDetail.segments || []).filter(s => s.id !== id);
+      renderLiveSegments();
+      toast('Segment deleted');
+    } catch (e) {
+      toastApiError(e, 'Could not delete the segment');
+    }
+  }
+
+  async function summarizeLive() {
+    if (!liveDetail || !liveDetail.transcription) return;
+    if (liveRecording && !livePaused) {
+      toast('⚠️ Pause the recording first — audio has priority');
+      return;
+    }
+    const id = liveDetail.transcription.id;
+    try {
+      const data = await api.post('live/transcriptions/' + encodeURIComponent(id) + '/summarize', {});
+      liveJob = data.job || liveJob;
+      renderLiveJob();
+      renderLiveControls(liveDetail.transcription);
+      scheduleLivePoll();
+    } catch (e) {
+      toastApiError(e, 'Could not summarise the transcript');
+    }
+  }
+
+  async function rebuildLiveNote() {
+    if (!liveDetail || !liveDetail.transcription) return;
+    if (liveRecording) { toast('⚠️ Stop the recording before rebuilding the note'); return; }
+    if (!confirm('Rebuild the note from the whole transcript? This replaces the current note text and loses any manual edits.')) return;
+    const id = liveDetail.transcription.id;
+    try {
+      const data = await api.post('live/transcriptions/' + encodeURIComponent(id) + '/reprocess', {mode: 'all'});
+      liveJob = data.job || liveJob;
+      liveTab = 'notes';
+      renderLive();
+      renderLiveJob();
+      scheduleLivePoll();
+    } catch (e) {
+      toastApiError(e, 'Could not rebuild the note');
+    }
+  }
+
+  async function startLiveRecording() {
+    if (!liveDetail || !liveDetail.transcription) return;
+    if (liveRecording) return;
+    if (!asrTokenSet) {
+      await loadAsrToken({force: true});
+      if (!asrTokenSet) {
+        toast('⚠️ Save your asr-mcp key in Setup first');
+        return;
+      }
+    }
+    stopLivePoll();
+    liveRecording = true;
+    livePaused = false;
+    renderLiveControls(liveDetail.transcription);
+    const id = liveDetail.transcription.id;
+    const handlers = {
+      open: () => { liveRecording = true; renderLiveControls(liveDetail.transcription); },
+      message: (payload) => {
+        if (!payload || typeof payload !== 'object') return;
+        if (payload.type === 'transcript') {
+          const start = Number(payload.start || 0) + liveOffset;
+          const end = Number(payload.end != null ? payload.end : start) + liveOffset;
+          liveDetail.segments = liveDetail.segments || [];
+          liveDetail.segments.push({
+            id: 'live-tmp-' + (liveDetail.segments.length + 1),
+            text: String(payload.text || ''),
+            speaker: String(payload.speaker || ''),
+            startSec: start, endSec: Math.max(start, end),
+            temp: true,
+          });
+          liveOffset = Math.max(liveOffset, end);
+          renderLiveSegments();
+        } else if (payload.type === 'paused') {
+          livePaused = true;
+          renderLiveControls(liveDetail.transcription);
+          summarizeLive();
+        } else if (payload.type === 'resumed') {
+          livePaused = false;
+          renderLiveControls(liveDetail.transcription);
+        } else if (payload.type === 'error') {
+          toast('⚠️ ' + (payload.message || 'The transcription service reported an error'));
+        }
+      },
+      pausing: () => {
+        const state = document.getElementById('live-state');
+        if (state) state.textContent = 'Finishing the current segment…';
+      },
+      resuming: () => {
+        const state = document.getElementById('live-state');
+        if (state) state.textContent = 'Reconnecting the microphone…';
+      },
+      stopped: () => { onLiveCaptureStopped(id); },
+      closed: (info) => {
+        if (info && info.code === 4409) asrTokenSet = false;
+        if (info && info.reason && info.code && info.code !== 1000 && info.code !== 1001 && info.code !== 1005) {
+          toast('⚠️ ' + info.reason);
+        }
+        onLiveCaptureStopped(id);
+      },
+      error: (err) => {
+        toast('⚠️ ' + (err && err.message ? err.message : 'Live transcription failed'));
+        onLiveCaptureStopped(id);
+      },
+    };
+    try {
+      await LiveCapture.start(id, handlers);
+    } catch (e) {
+      liveRecording = false;
+      livePaused = false;
+      renderLiveControls(liveDetail.transcription);
+    }
+  }
+
+  async function onLiveCaptureStopped(id) {
+    const wasRecording = liveRecording;
+    liveRecording = false;
+    livePaused = false;
+    renderLiveControls(liveDetail && liveDetail.transcription);
+    if (!wasRecording) return;
+    // The server drains its segment writer on pause/stop; give it a beat
+    // before reading so the final clause is not missing from the transcript.
+    setTimeout(async () => {
+      if (activeLiveTranscriptionId !== id) return;
+      await openLiveTranscription(id, {force: true, silent: true});
+      await loadLive({force: true});
+    }, 1800);
+  }
+
+  async function pauseLiveRecording() {
+    if (!liveRecording) { await summarizeLive(); return; }
+    if (livePaused) { await summarizeLive(); return; }
+    livePaused = true;
+    renderLiveControls(liveDetail && liveDetail.transcription);
+    const state = document.getElementById('live-state');
+    if (state) state.textContent = 'Finishing the current segment…';
+    if (!LiveCapture.pause()) {
+      livePaused = false;
+      await summarizeLive();
+    }
+  }
+
+  function resumeLiveRecording() {
+    if (!liveRecording) return;
+    if (LiveCapture.resume()) {
+      livePaused = false;
+      renderLiveControls(liveDetail && liveDetail.transcription);
+    }
+  }
+
+  async function stopLiveRecording() {
+    if (!liveRecording) return;
+    const state = document.getElementById('live-state');
+    if (state) state.textContent = 'Saving the final segments…';
+    // LiveCapture.stop() emits `stopped` synchronously after teardown, and
+    // onLiveCaptureStopped refreshes the transcript after the server has had
+    // time to drain its writer. Clearing the flags here would enable Start
+    // while the server socket is still open, which it refuses with 4502.
+    await LiveCapture.stop();
+  }
+
+  async function deleteLiveTranscription() {
+    if (!liveDetail || !liveDetail.transcription) return;
+    if (liveRecording) { toast('⚠️ Stop the recording before deleting it'); return; }
+    const t = liveDetail.transcription;
+    if (!confirm('Delete “' + (t.name || 'this recording') + '” and its running note? The transcript segments are removed and this cannot be undone.')) return;
+    try {
+      await api.delete('live/transcriptions/' + encodeURIComponent(t.id) + '?delete_note=1');
+      activeLiveTranscriptionId = null;
+      liveDetail = null;
+      liveJob = null;
+      liveLoaded = false;
+      liveSessions = liveSessions.filter(x => x.id !== t.id);
+      renderLive();
+      await loadLive({force: true});
+      toast('Recording deleted');
+    } catch (e) {
+      toastApiError(e, 'Could not delete the recording');
+    }
+  }
+
+  function switchLiveTab(tab, opts) {
+    if (LIVE_TABS.indexOf(tab) === -1) {
+      console.warn('Unknown live sub-tab "' + tab + '"; falling back to transcription');
+      tab = 'transcription';
+    }
+    liveTab = tab;
+    document.querySelectorAll('.live-panel').forEach(p => p.classList.remove('active'));
+    const panel = document.getElementById('live-pane-' + tab);
+    if (panel) panel.classList.add('active');
+    document.querySelectorAll('.mode-toggle button[id^="live-tab-"]').forEach(b => b.classList.remove('active'));
+    const btn = document.getElementById('live-tab-' + tab);
+    if (btn) btn.classList.add('active');
+    if (!(opts && opts.silent)) saveSessionState();
+  }
+
   // Live transcription key (Setup page)
   //
   // The plaintext is write-only: GET returns {set, hint} and the input is
@@ -2924,6 +3730,9 @@
   // the key against asr-mcp before storing it, so "saved" means "accepted".
   let asrTokenLoaded = false;
   let asrTokenInFlight = null;
+  // Read by the Live notes tab: Start must be disabled before a key exists,
+  // and the Setup card is the only place it can be added.
+  let asrTokenSet = false;
 
   async function fetchAsrToken() {
     try {
@@ -2952,6 +3761,7 @@
     const clear = document.getElementById('asr-token-clear');
     const input = document.getElementById('asr-token-input');
     const set = !!data.set;
+    asrTokenSet = set;
     if (state) {
       state.textContent = set
         ? 'A key is saved (' + (data.hint || 'hidden') + '…). Recording can start.'
@@ -2962,6 +3772,9 @@
     if (test) test.disabled = !set;
     if (clear) clear.disabled = !set;
     if (input) input.placeholder = set ? 'Replace the saved key…' : 'asr-mcp API key';
+    // The Live tab may already be rendered behind this save (Setup and Live
+    // are different pages, but the flag is global), and Start is gated on it.
+    if (liveDetail && liveDetail.transcription) renderLiveControls(liveDetail.transcription);
   }
 
   async function saveAsrToken() {
