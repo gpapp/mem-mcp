@@ -1361,19 +1361,22 @@
       <div id="asr-token-state" style="font-size:.9rem; color:var(--muted); margin-bottom:.75rem;">
         Loading…
       </div>
-      <div id="asr-token-form">
+      <!-- A real <form>, not a div: a password field outside one is a Chrome
+           console warning and a password manager that offers to save the key. The
+           submit handler is the Save button, so Enter in the field works too. -->
+      <form id="asr-token-form" onsubmit="saveAsrToken(); return false;">
         <div style="display:flex; gap:.5rem; flex-wrap:wrap; align-items:center;">
           <input id="asr-token-input" type="password" autocomplete="new-password"
                  placeholder="asr-mcp API key" style="flex:1; min-width:200px;">
-          <button id="asr-token-save" class="btn btn-primary btn-sm" onclick="saveAsrToken()">Save key</button>
-          <button id="asr-token-test" class="btn btn-sm" onclick="testAsrToken()">Test saved key</button>
-          <button id="asr-token-clear" class="btn btn-sm" onclick="clearAsrToken()">Clear</button>
+          <button id="asr-token-save" type="submit" class="btn btn-primary btn-sm">Save key</button>
+          <button id="asr-token-test" type="button" class="btn btn-sm" onclick="testAsrToken()">Test saved key</button>
+          <button id="asr-token-clear" type="button" class="btn btn-sm" onclick="clearAsrToken()">Clear</button>
         </div>
         <p style="font-size:0.8rem; color:var(--muted); margin:.5rem 0 0;">
           “Test saved key” opens a short throwaway connection, so it can tell a rejected key
           from an unreachable server. Recording stays disabled until a key is saved and accepted.
         </p>
-      </div>
+      </form>
       <div id="asr-token-hint" style="display:none; margin-top:1rem; padding:.75rem 1rem;
            border:1px solid var(--border); border-radius:8px; font-size:.85rem; color:var(--muted);">
         Open <strong>Setup → Live transcription key</strong> and save your asr-mcp API key

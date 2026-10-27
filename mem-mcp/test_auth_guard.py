@@ -834,6 +834,37 @@ class SetupPageAuthGuidanceTests(unittest.TestCase):
         self.assertLess(create, run,
                         msg="the key must be created before the command that needs it")
 
+    def test_the_asr_key_field_is_inside_a_real_form(self):
+        # Chrome prints "Password field is not contained in a form" for a
+        # type="password" input outside one, and a password manager that cannot
+        # find the form offers to save the asr-mcp key under this site instead.
+        # The field is a secret, so the wrapping is functional, not decoration.
+        # The marker is the opening tag, so a regression to a <div> fails as a
+        # missing marker rather than passing on a field that is merely close to
+        # a form.
+        block = self._between('<form id="asr-token-form"', 'id="asr-token-hint"')
+        self.assertIn("</form>", block)
+        self.assertIn('id="asr-token-input"', block)
+        # Enter in the field must reach the same handler as the button, or the
+        # form swallows the keystroke and nothing happens.
+        self.assertIn("onsubmit=\"saveAsrToken(); return false;\"", block)
+
+    def test_only_the_save_button_submits_the_asr_key_form(self):
+        # Every <button> inside a form defaults to type="submit". Test and Clear
+        # are not saves, and without an explicit type the submit handler runs
+        # saveAsrToken() first -- so Clear would toast "Paste an asr-mcp API key
+        # first" before it cleared anything.
+        block = self._between('<form id="asr-token-form"', 'id="asr-token-hint"')
+        self.assertIn('<button id="asr-token-save" type="submit"', block)
+        for button in ("asr-token-test", "asr-token-clear"):
+            with self.subTest(button=button):
+                start = block.find(f'<button id="{button}"')
+                self.assertTrue(start > 0, msg=f"{button} is missing from the card")
+                tag = block[start:block.index(">", start)]
+                self.assertIn('type="button"', tag,
+                              msg=f"{button} would submit the form and run "
+                                  f"saveAsrToken() on the way")
+
 
 def _function_source(relative_path, name):
     """The source of one top-level Python function, by name."""

@@ -2151,6 +2151,18 @@ asr-mcp before storing it, so "saved" means accepted. The Setup card explains
 that recording is disabled until a key exists, and the Live tab repeats it with
 a numbered path to Setup. The browser never holds the key.
 
+**The key field is a `type="password"` input, so it must live inside a real
+`<form>`.** It was in a `<div>`, which Chrome reports as *"Password field is not
+contained in a form"* on every Setup visit and which leaves a password manager
+free to offer to save the asr-mcp key under this site. The form's `onsubmit`
+calls `saveAsrToken()` and returns false, so Enter in the field saves too, and
+**only the Save button is `type="submit"`** — a `<button>` inside a form submits
+by default, so "Test saved key" and "Clear" carry an explicit `type="button"` or
+they would run `saveAsrToken()` on the way (Clear toasted "Paste an asr-mcp API
+key first" before clearing anything). Both halves are pinned by
+`SetupPageAuthGuidanceTests` in `test_auth_guard.py`, and each was
+mutation-checked by reverting it.
+
 `MEM_ASR_WS_URL` defaults to
 `ws://host.docker.internal:8087/api/asr/ws/stream`; the container needs the
 `host.docker.internal:host-gateway` extra host, and asr-mcp must be reachable on

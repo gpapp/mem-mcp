@@ -5,6 +5,37 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# Live notes — the ASR key field was not in a form (2026-10-27)
+
+- **Reported as a console line**: `[DOM] Password field is not contained in a
+  form … <input id="asr-token-input" type="password">`. The Setup card's field
+  sat in a `<div id="asr-token-form">` — the id said form and the element was
+  not one — so Chrome warned on every visit and a password manager could offer
+  to save the asr-mcp key against this site instead of leaving it alone.
+- **It is now a real `<form>`** whose `onsubmit` is `saveAsrToken(); return
+  false;`. The wrapping is functional in both directions: the warning goes away,
+  and Enter in the field now saves, which it previously did nothing at all.
+- **The trap in the fix is `<button>` defaulting to `type="submit"`.** Save
+  became `type="submit"` and lost its `onclick` (an `onclick` plus the form
+  handler would save twice), while Test and Clear needed an explicit
+  `type="button"` — without it, Clear submits first, so `saveAsrToken()` runs
+  against an empty field and toasts "Paste an asr-mcp API key first" before
+  anything is cleared.
+- **No JS changed.** `renderAsrToken` only touches the state line, hint, the two
+  buttons' `disabled` and the input placeholder; nothing read
+  `#asr-token-form` as an element, so the tag change was safe.
+- Guards: `SetupPageAuthGuidanceTests.test_the_asr_key_field_is_inside_a_real_form`
+  (the marker is the opening `<form …>` tag, so a regression to a `<div>` fails
+  as a missing marker) and `test_only_the_save_button_submits_the_asr_key_form`.
+  Both mutation-checked (form→div fails both; dropping `type="button"` from
+  Clear fails the second with the button named), then restored.
+- **1291 tests OK**, `node --check` clean on the extracted dashboard script,
+  `py_compile`/`diff --check` clean.
+
+---
+
+
+
 # Live notes — a pause hung up on the last utterance, and the widget reached the Live rail (2026-10-27)
 
 - **The report was "it seems like the voice is cut off at pause", and the pause
