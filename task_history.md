@@ -5,6 +5,37 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# Live notes — documentation, verification and epic close (2026-10-27)
+
+Shipped in `40c2330` on `feature/live-notes`.
+
+- **L11 — the invariants are written down where the next edit will read them.**
+  `AGENTS.md` now has a **Live Notes** section covering the Neo4j-only transcript
+  and Qdrant note split, the one-way `REFERENCES` edge (and why `db_link_facts`
+  is wrong for it), the priority gate's pause/resume generation semantics, the
+  four-block prompt, candidate scoping and ranking-before-cap, the output budget
+  and compaction, the in-memory job registry, the write-only per-user ASR token,
+  the proxy close codes, deployment (`extra_hosts`, `MEM_ASR_WS_URL`) and the
+  stdlib-only rule for `live_notes.py`. `test_live_notes.py` is in the documented
+  regression command.
+- **Two final guards were added.** The pause branch now has a test that the gate
+  is released **before** the `paused` acknowledgement (the browser starts the
+  job from that message), and the resume branch a test that `begin_recording`
+  precedes `open_upstream`. These are the two halves of the bug that made every
+  pause-triggered summarise answer 409.
+- **Two races were closed.** Changing a transcription's client/project while a
+  note job is running now answers 409, because the job is choosing candidates
+  from the old scope. Deleting a transcription is refused for the same interval.
+  The UI disables those controls while a job is active, rather than offering an
+  action the server refuses.
+- **Verification.** Full suite: **1257 tests**, all passing, including
+  `test_live_notes.py` (88), `test_mobile_layout.py` (95), `test_sessions.py`
+  and `test_env_wiring.py`. `py_compile` clean on every touched Python module;
+  `node --check` clean on the extracted dashboard script; `git diff --check`
+  clean with `cr-at-eol`.
+- `plans/live-notes.md` is marked shipped and `tasks.md` is empty again — the
+  epic's completion lives here, not as a list of ticked boxes.
+
 # Live notes — Live notes tab and mobile layout (2026-10-27)
 
 Shipped in `fca4fbf` on `feature/live-notes`.
