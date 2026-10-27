@@ -5,6 +5,41 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# Live notes — the panel polled a job the event bus never carried (2026-10-27)
+
+- **Reported as** a question, not a bug: *"why use status queries, when all other
+  calls use SSE?"* The honest answer was that `/api/events` was populated only by
+  `gui.py` route handlers, so a note job — which runs in `live_manager` below the
+  HTTP layer — published nothing at all. Three consequences, one of them a real
+  defect: the panel had to poll `GET /status` every 1.5 s, `settleLiveGate` polled
+  it every 700 ms, and **a committed note was invisible to Memories and Diary**,
+  because no `memory_changed` event was ever emitted for it.
+- **Shipped**: `live_manager._announce()` publishes a `live_note_job` snapshot
+  from `_set_job` and from `start_note_job` before its task starts (fire-and-forget,
+  and a no-op without a running loop so the sync `_set_job` stays callable);
+  `_commit_note_window` publishes `memory_changed` after the write and after the
+  consumption markers; `gui._announce_gate_release()` publishes
+  `live_gate_released` after each of the three `LIVE_GATE.end_recording` calls.
+  The dashboard subscribes to both in `initSSE`, `scheduleLivePoll` returns early
+  while `sseOpen()` (re-armed by `onerror`, disarmed by `onopen`), and
+  `settleLiveGate` waits on `waitForLiveGate()` — a resolver list the gate event
+  wakes — before falling back to `/status`.
+- **What a future reader would otherwise rediscover**: `renderLiveControls(null)`
+  throws (`null.segmentCount`) because it labels the state from the record. An SSE
+  event can arrive before a transcription is open, so both handlers guard the
+  render. The node harness surfaced that as a thrown `null.segmentCount`; in the
+  browser the listener's `try/catch` would have swallowed it.
+- **Guards**: `test_live_notes.LiveJobEventTests` (6 — `_announce` **called**
+  against a recording bus, plus the two call-site orderings and the
+  release-per-exit count) and `LivePanelPushTests` (5 — listener registration,
+  the `sseOpen()` guard, and two handlers driven through the fake DOM: a gate
+  event clears the flag *and* wakes a waiter, another recording's event is
+  ignored). Mutations bit: deleting `_announce(job)` from `_set_job`, and deleting
+  the `sseOpen()` block.
+- **Verified**: 1330 tests OK (was 1319), `node --check` on the dashboard script,
+  `py_compile` on `live_manager.py`/`gui.py`/`test_live_notes.py`, `diff --check`
+  clean.
+
 # Live notes — the model answered with word salad (2026-10-27)
 
 - **Reported as** `content:"Pro Ad\n Access\n At S An Ac A U Ar Under Of…"` —

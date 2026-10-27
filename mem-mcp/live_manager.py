@@ -32,7 +32,9 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from common import LIVE_MODEL, get_llm_response, get_neo4j, logger
+from common import (
+    LIVE_MODEL, get_llm_response, get_neo4j, logger, publish_db_event,
+)
 from client_manager import _resolve_client_by_id, _resolve_context_by_id
 from live_notes import (
     COMPACT_SYSTEM_PROMPT,
@@ -884,6 +886,31 @@ def _job_public(job: dict) -> dict:
     }
 
 
+async def _publish_job_event(user_id: str, payload: dict) -> None:
+    """Put one job snapshot on the event bus, never at the job's expense."""
+    try:
+        await publish_db_event(user_id, "live_note_job", payload)
+    except Exception as exc:  # noqa: BLE001 -- a bus failure is not a job failure
+        logger.warning("live notes: could not announce a job event: %s", exc)
+
+
+def _announce(job: dict) -> None:
+    """Tell open tabs that this job changed state.
+
+    Fire and forget, deliberately: `publish_db_event` awaits a put per
+    subscriber, and a browser that has stopped reading must not hold the
+    coroutine that owns the note commit. Without this the only way to see a
+    job finish was the 1.5 s status poll the dashboard used to run, which is
+    why a note written here was invisible to every other tab.
+    """
+    payload = _job_public(job)
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:  # no loop: a sync caller or a unit test
+        return
+    loop.create_task(_publish_job_event(job.get("userId") or "", payload))
+
+
 def _prune_jobs() -> None:
     """Keep terminal jobs bounded; a long-lived vault has one per pause."""
     with _JOB_LOCK:
@@ -923,6 +950,9 @@ def _set_job(job: dict, status: str = None, phase: str = None,
         job["updatedAt"] = _now()
         if status in _TERMINAL_JOB_STATUSES:
             job["finishedAt"] = _now()
+    # Outside the lock: the payload is a snapshot, and the lock is held by
+    # callers that may be mid-commit.
+    _announce(job)
 
 
 def _safe_transcription_status(transcription_id: str, user_id: str,
@@ -1032,6 +1062,9 @@ def start_note_job(transcription_id: str, user_id: str,
     _prune_jobs()
     with _JOB_LOCK:
         _NOTE_JOBS[transcription_id] = job
+    # Announced before the task starts so a tab that opened between the POST
+    # and the first `_set_job` still learns the job exists.
+    _announce(job)
     job["task"] = asyncio.create_task(_run_note_job(job))
     return _job_public(job)
 
@@ -1217,6 +1250,7 @@ async def _commit_note_window(job: dict, note: dict, note_id,
     }
 
     writable_id = note_id
+    created = False
     if writable_id:
         ok = await db_update_memory(
             writable_id, note["title"], note["text"], None, user_id,
@@ -1236,6 +1270,7 @@ async def _commit_note_window(job: dict, note: dict, note_id,
             client_id=transcription.get("clientId"),
             context_id=transcription.get("contextId"),
         )
+        created = True
     db_set_note_transcription(writable_id, transcription_id, user_id)
     db_set_note_references(
         writable_id, note.get("referencedFactIds") or [], user_id,
@@ -1243,6 +1278,18 @@ async def _commit_note_window(job: dict, note: dict, note_id,
     marked = db_mark_segments_consumed(
         transcription_id, segment_ids, writable_id, user_id,
     )
+    # The note is an ordinary fact, and every other write of one is announced
+    # so an open Memories or Diary tab can refetch it. This commit happens in a
+    # background job rather than in a GUI handler, so nothing else would.
+    try:
+        await publish_db_event(user_id, "memory_changed", {
+            "action": "add" if created else "update",
+            "id": writable_id,
+            "source": "live_notes",
+        })
+    except Exception as exc:  # noqa: BLE001 -- the note is already written
+        logger.warning("live notes: could not announce note %s: %s",
+                       writable_id, exc)
     return {"noteId": writable_id, "marked": int(marked or 0)}
 
 

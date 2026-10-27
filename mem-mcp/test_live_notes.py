@@ -1682,5 +1682,239 @@ class NoteCallRetryTests(unittest.TestCase):
                 self.assertEqual(len(calls), expected_calls)
 
 
+class LiveJobEventTests(unittest.TestCase):
+    """A note job ran below the HTTP layer, so it published nothing at all.
+
+    Every other write in the app announces itself from its route handler
+    (`publish_db_event` lives only in `gui.py`), which is why the Live panel had
+    to poll `/status` every 1.5 s and why a note written by a background job was
+    invisible to Memories and Diary. These pin the push: a job announces each
+    state change, and the commit announces the fact like any other write.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import ast
+        from pathlib import Path
+        cls.source = Path(__file__).with_name("live_manager.py").read_text()
+        cls.tree = ast.parse(cls.source)
+        cls.gui = Path(__file__).with_name("gui.py").read_text()
+
+    def _segment(self, name):
+        import ast
+        for node in ast.walk(self.tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+                return ast.get_source_segment(self.source, node) or ""
+        self.fail(f"{name} not found")
+
+    def _announcer(self):
+        """`_publish_job_event` and `_announce`, exec'd against a recording bus."""
+        import ast
+        import asyncio
+        import types
+
+        published = []
+
+        async def publish_db_event(user_id, event_type, payload=None):
+            published.append((user_id, event_type, payload))
+
+        namespace = {
+            "asyncio": asyncio,
+            "logger": types.SimpleNamespace(
+                warning=lambda *a, **k: None, info=lambda *a, **k: None,
+                error=lambda *a, **k: None),
+            "publish_db_event": publish_db_event,
+        }
+        for name in ("_job_public", "_publish_job_event", "_announce"):
+            node = next(n for n in self.tree.body
+                        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                        and n.name == name)
+            exec(compile(ast.get_source_segment(self.source, node), "live_manager.py", "exec"),
+                 namespace)
+        return namespace, published
+
+    def test_announcing_a_job_publishes_the_whole_snapshot(self):
+        # Called, not read: the payload is what the browser renders, and a
+        # source assertion cannot see whether it carries a status.
+        import asyncio
+        namespace, published = self._announcer()
+
+        async def run():
+            namespace["_announce"]({
+                "transcriptionId": "t1", "userId": "alice",
+                "status": "running", "phase": "summarising",
+                "mode": "unconsumed", "consumedSegments": 3,
+            })
+            await asyncio.sleep(0)  # let the fire-and-forget task run
+
+        asyncio.run(run())
+        self.assertEqual(len(published), 1)
+        user_id, event_type, payload = published[0]
+        self.assertEqual(user_id, "alice")
+        self.assertEqual(event_type, "live_note_job")
+        self.assertEqual(payload["transcriptionId"], "t1")
+        self.assertEqual(payload["status"], "running")
+        self.assertEqual(payload["consumedSegments"], 3)
+
+    def test_announcing_without_a_running_loop_is_not_an_error(self):
+        # `_set_job` is sync and is called from tools and tests as well as from
+        # the job task; scheduling a task there would raise.
+        namespace, published = self._announcer()
+        namespace["_announce"]({"transcriptionId": "t1", "userId": "alice"})
+        self.assertEqual(published, [])
+
+    def test_every_state_change_announces(self):
+        body = self._segment("_set_job")
+        self.assertIn("_announce(job)", body,
+                      msg="a status change nobody hears about leaves the panel "
+                          "on the poll it exists to replace")
+
+    def test_the_job_is_announced_before_its_task_starts(self):
+        body = self._segment("start_note_job")
+        self.assertLess(body.index("_announce(job)"),
+                        body.index("create_task(_run_note_job"),
+                        msg="a tab that opened between the POST and the first "
+                            "state change would never learn the job exists")
+
+    def test_the_commit_announces_the_note_like_any_other_write(self):
+        # The one gap the poll was papering over: the note is an ordinary fact,
+        # but it is written by a job rather than by a handler, so nothing told
+        # Memories or Diary about it.
+        body = self._segment("_commit_note_window")
+        self.assertIn('"memory_changed"', body)
+        self.assertIn('"source": "live_notes"', body)
+        self.assertLess(body.index("db_mark_segments_consumed"),
+                        body.index('"memory_changed"'),
+                        msg="announcing before the write would tell open tabs to "
+                            "refetch a note that is not there yet")
+        self.assertIn('"add" if created else "update"', body)
+
+    def test_the_gate_release_is_announced_at_every_exit(self):
+        releases = self.gui.count("mem.LIVE_GATE.end_recording(user_id)")
+        announced = self.gui.count(
+            "_announce_gate_release(user_id, transcription_id)")
+        self.assertGreaterEqual(releases, 3)
+        self.assertEqual(
+            announced, releases,
+            msg="every path that opens the audio gate must say so, or the "
+                "buttons wait for a poll that no longer runs")
+
+
+class LivePanelPushTests(unittest.TestCase):
+    """The Live panel reads the push, and polls only when the stream is down.
+
+    `/api/events` is the app's write bus and the dashboard already subscribes to
+    it. The Live panel was the one place that polled a *running job*, which is
+    also why a note commit was invisible to every other tab.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import re
+        import shutil
+        from pathlib import Path
+        cls.node = shutil.which("node")
+        cls.source = Path(__file__).with_name("templates").joinpath(
+            "dashboard.html").read_text()
+        cls.blocks = re.findall(r"<script[^>]*>(.*?)</script>", cls.source, re.S)
+
+    def _body(self, name):
+        """The JS function's source, by brace matching (the template is not Python)."""
+        marker = f"function {name}("
+        start = self.source.find(marker)
+        self.assertTrue(start > 0, msg=f"{name} is not defined in dashboard.html")
+        index = self.source.index("{", start)
+        begin, depth = index, 0
+        while index < len(self.source):
+            if self.source[index] == "{":
+                depth += 1
+            elif self.source[index] == "}":
+                depth -= 1
+                if depth == 0:
+                    return self.source[start:index + 1]
+            index += 1
+        self.fail(f"unbalanced braces in {name}")
+
+    def _run(self, cases):
+        import json
+        import os
+        import re
+        import subprocess
+        import tempfile
+        import test_share_endpoints
+        payload = "".join(
+            f"  try {{ out[{name!r}] = ({expr}); }} "
+            f"catch (e) {{ out[{name!r}] = 'THREW: ' + e.message; }}\n"
+            for name, expr in cases
+        )
+        harness = test_share_endpoints._NODE_HARNESS.replace(
+            "__APP_JS__", "\n".join(self.blocks[2:])
+        ).replace("__CASES__", payload)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "live-push.js")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(harness)
+            proc = subprocess.run([self.node, path], capture_output=True,
+                                  text=True, timeout=120)
+        if proc.returncode != 0:
+            self.fail("the dashboard script did not load under the fake DOM: "
+                      + proc.stderr.strip()[:400])
+        return json.loads(proc.stdout)
+
+    def test_the_panel_subscribes_to_both_live_events(self):
+        body = self._body("initSSE")
+        self.assertIn("'live_note_job'", body,
+                      msg="without it a job that finished is only visible to a "
+                          "poll that no longer runs")
+        self.assertIn("'live_gate_released'", body)
+
+    def test_the_poll_is_a_fallback_and_asks_the_stream_first(self):
+        body = self._body("scheduleLivePoll")
+        self.assertIn("sseOpen()", body,
+                      msg="a poll running while the push is alive is the request "
+                          "loop this change exists to remove")
+        self.assertLess(body.index("sseOpen()"), body.index("setTimeout("),
+                        msg="the stream check must be before the timer is armed")
+
+    def test_the_gate_wait_is_settled_by_the_push(self):
+        body = self._body("settleLiveGate")
+        self.assertLess(body.index("waitForLiveGate("),
+                        body.index("data.recording === false"),
+                        msg="the poll is the fallback; the push settles it")
+
+    def test_a_gate_event_clears_the_flag_and_wakes_the_waiters(self):
+        expr = ("(async () => {\n"
+                "  liveGatePending = true;\n"
+                "  liveDetail = null;\n"
+                "  activeLiveTranscriptionId = 't1';\n"
+                "  const waiting = waitForLiveGate(5000);\n"
+                "  onLiveGateReleased({ transcriptionId: 't1' });\n"
+                "  const woken = await waiting;\n"
+                "  return { pending: liveGatePending, woken: woken };\n"
+                "})()")
+        result = self._run([("released", expr)])["released"]
+        self.assertNotIsInstance(result, str, msg=result)
+        self.assertFalse(result["pending"],
+                         msg="the push must clear the flag the poll used to clear")
+        self.assertTrue(result["woken"],
+                         msg="a click queued behind the gate waits on the waiter "
+                             "list; not waking it holds the toolbar for 1.5 s and "
+                             "then starts a poll that has nothing to ask")
+
+    def test_an_event_for_another_transcription_is_ignored(self):
+        expr = ("(async () => {\n"
+                "  activeLiveTranscriptionId = 't1';\n"
+                "  liveJob = { transcriptionId: 't1', status: 'running' };\n"
+                "  liveDetail = null;\n"
+                "  liveGatePending = true;\n"
+                "  onLiveGateReleased({ transcriptionId: 'other' });\n"
+                "  return { pending: liveGatePending };\n"
+                "})()")
+        result = self._run([("ignored", expr)])["ignored"]
+        self.assertNotIsInstance(result, str, msg=result)
+        self.assertTrue(result["pending"],
+                        msg="one recording's gate says nothing about another's")
+
+
 if __name__ == "__main__":
     unittest.main()

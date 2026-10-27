@@ -1663,6 +1663,9 @@
   let liveLoadedTranscriptionId = null;
   let livePollTimer = null;
   let livePollToken = 0;
+  // The `/api/events` stream, kept so `scheduleLivePoll` can tell whether the
+  // push path is alive. Polling is the fallback, never the first choice.
+  let sseSource = null;
   let liveRecording = false;
   let livePaused = false;
   // True while the SERVER still holds the audio gate: from the moment a pause
@@ -1672,6 +1675,9 @@
   // closes the stream on purpose and then waits for asr-mcp to finish the last
   // sentence, so the gate outlives the click that appears to have paused it.
   let liveGatePending = false;
+  // Resolvers waiting for `live_gate_released`. A push wakes them; the timeout
+  // in waitForLiveGate is what keeps a dropped stream from wedging the panel.
+  let liveGateWaiters = [];
   let liveEditingSegmentId = null;
   let liveOffset = 0;
   let selectedFactId = null;
@@ -2261,7 +2267,24 @@
 
   function initSSE() {
     console.log("[SSE] Initializing real-time event listener...");
-    const eventSource = new EventSource(`${apiBase}/events`);
+    // Kept in a module-level binding so the Live panel can tell whether the
+    // event bus is answering, and only fall back to polling when it is not.
+    const eventSource = sseSource = new EventSource(`${apiBase}/events`);
+
+    // A note job runs below the HTTP layer, so it published nothing and the
+    // Live panel had to poll `/status` every 1.5 s to see it finish. It now
+    // announces each state change; the poll is the fallback for a dead stream.
+    eventSource.addEventListener('live_note_job', (e) => {
+      try { onLiveJobEvent(JSON.parse(e.data)); }
+      catch (err) { console.warn('[SSE] bad live_note_job payload', err); }
+    });
+
+    // The audio gate is a property of an open socket, not a row, so this is
+    // the only push that can say the summarise buttons may work again.
+    eventSource.addEventListener('live_gate_released', (e) => {
+      try { onLiveGateReleased(JSON.parse(e.data)); }
+      catch (err) { console.warn('[SSE] bad live_gate_released payload', err); }
+    });
 
     eventSource.addEventListener('memory_changed', async (e) => {
       const data = JSON.parse(e.data);
@@ -2381,6 +2404,15 @@
 
     eventSource.onerror = (err) => {
       console.warn("[SSE] Connection lost. EventSource will automatically reconnect.");
+      // The push path is what drives a running note job now, so a stream that
+      // dropped must hand the panel back to the poll -- otherwise the job's
+      // terminal event never arrives and the toolbar sits disabled forever.
+      // `readyState` is CONNECTING here, so `sseOpen()` is false and the timer
+      // arms; `onopen` below disarms it again.
+      if (liveJobActive(liveJob)) scheduleLivePoll();
+    };
+    eventSource.onopen = () => {
+      if (liveJobActive(liveJob)) scheduleLivePoll();
     };
 
     eventSource.addEventListener('reclassify_done', async (e) => {
@@ -3453,8 +3485,53 @@
     return !!(job && LIVE_JOB_ACTIVE.indexOf(job.status) !== -1);
   }
 
+  function sseOpen() {
+    return !!(sseSource && sseSource.readyState === 1);
+  }
+
+  // One push says more than the poll ever did: the whole job snapshot, the
+  // moment it changes. `liveJobActive` is hoisted, so this is safe to call
+  // from a listener registered before the definition below.
+  function onLiveJobEvent(data) {
+    if (!data || !data.transcriptionId) return;
+    if (data.transcriptionId !== activeLiveTranscriptionId) return;
+    liveJob = data;
+    renderLiveJob();
+    // Guarded: an event can arrive before a transcription is open in the pane,
+    // and `renderLiveControls(null)` reads the record to label the state.
+    if (liveDetail && liveDetail.transcription) renderLiveControls(liveDetail.transcription);
+    if (liveJobActive(liveJob)) {
+      // Nothing to fetch while it runs; keep the fallback armed only if the
+      // stream is down, so a dropped SSE cannot freeze the panel.
+      scheduleLivePoll();
+      return;
+    }
+    stopLivePoll();
+    // Terminal: the transcription row and the segment list changed too, and
+    // one detail read is cheaper than pushing every segment.
+    openLiveTranscription(data.transcriptionId, {force: true, silent: true});
+  }
+
+  function onLiveGateReleased(data) {
+    const id = data && data.transcriptionId;
+    if (id && activeLiveTranscriptionId && id !== activeLiveTranscriptionId) return;
+    liveGatePending = false;
+    // Wake anybody awaiting the release before re-rendering, so a click that
+    // was queued behind the gate does not also trip the poll fallback.
+    const waiters = liveGateWaiters;
+    liveGateWaiters = [];
+    waiters.forEach(resolve => { try { resolve(true); } catch (e) {} });
+    if (liveDetail && liveDetail.transcription) renderLiveControls(liveDetail.transcription);
+  }
+
   function scheduleLivePoll() {
     if (!liveJobActive(liveJob) || !activeLiveTranscriptionId) {
+      stopLivePoll();
+      return;
+    }
+    // The event bus is the transport; this timer only exists for a proxy that
+    // keeps dropping `/api/events`, the same rule the status widget follows.
+    if (sseOpen()) {
       stopLivePoll();
       return;
     }
@@ -3602,7 +3679,12 @@
   // or three. Asking it is the only honest answer to "may I summarise yet" --
   // the local flags are a guess, and acting on the guess is what made a pause
   // answer 409 on its own summarise.
+  //
+  // A push settles it: `live_gate_released` arrives the moment the gate opens.
+  // The poll below is the fallback for a dropped stream, and it is the only
+  // reason `/status` is still read from the client at all.
   async function settleLiveGate(id, attempts) {
+    if (await waitForLiveGate(1500)) return true;
     const tries = attempts || 12;
     for (let i = 0; i < tries; i++) {
       try {
@@ -3615,6 +3697,20 @@
       await new Promise(resolve => setTimeout(resolve, 700));
     }
     return false;
+  }
+
+  function waitForLiveGate(timeoutMs) {
+    return new Promise(resolve => {
+      const timer = setTimeout(() => {
+        liveGateWaiters = liveGateWaiters.filter(fn => fn !== done);
+        resolve(false);
+      }, timeoutMs);
+      const done = (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      };
+      liveGateWaiters.push(done);
+    });
   }
 
   function awaitLiveGate(id) {

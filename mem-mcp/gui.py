@@ -3345,6 +3345,21 @@ async def _ws_fail(websocket: WebSocket, code: int, message: str) -> None:
         pass
 
 
+async def _announce_gate_release(user_id: str, transcription_id: str) -> None:
+    """Tell open tabs the audio gate is open, so the buttons stop waiting.
+
+    The gate is per (user, socket), not a row, so nothing else publishes it.
+    Without this the browser could only discover the release by polling
+    `/status` for `recording === false`, which is the one place in the app
+    that polled a running job.
+    """
+    try:
+        await mem.publish_db_event(user_id, "live_gate_released",
+                                   {"transcriptionId": transcription_id})
+    except Exception as exc:  # noqa: BLE001 -- an announcement cannot fail a socket
+        mem.logger.warning(f"live notes: could not announce the gate release: {exc}")
+
+
 async def _unload_live_model() -> None:
     """Best-effort eviction of the note model when recording starts."""
     if not mem.LIVE_UNLOAD_ON_RECORD:
@@ -3693,6 +3708,7 @@ async def live_stream(websocket: WebSocket, transcription_id: str):
             if kind == "pause":
                 if upstream is None:
                     mem.LIVE_GATE.end_recording(user_id)
+                    await _announce_gate_release(user_id, transcription_id)
                     await websocket.send_json({"type": "paused"})
                     continue
                 await close_upstream(wait_tail=True)
@@ -3710,6 +3726,7 @@ async def live_stream(websocket: WebSocket, transcription_id: str):
                 # would make every pause-triggered job answer 409 while the
                 # microphone still looks closed.
                 mem.LIVE_GATE.end_recording(user_id)
+                await _announce_gate_release(user_id, transcription_id)
                 state = await asyncio.to_thread(
                     mem.db_transcription_state, transcription_id, user_id
                 )
@@ -3782,6 +3799,7 @@ async def live_stream(websocket: WebSocket, transcription_id: str):
         except Exception:
             pass
         mem.LIVE_GATE.end_recording(user_id)
+        await _announce_gate_release(user_id, transcription_id)
         mem.logger.info(
             f"live notes: recording stopped user={user_id} "
             f"transcription={transcription_id} audioBlocks={audio_blocks['value']}"

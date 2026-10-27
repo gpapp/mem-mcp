@@ -2253,6 +2253,55 @@ equal to the first, a retry temperature of 0.0, `pass` instead of `raise` for
 `LiveNoteTooLong`, and dropping the retry from the parse branch.
 
 
+### The panel is pushed to; the poll is a fallback
+
+The Live panel was the one place in the app that polled a *running job* — a
+`GET /status` every 1.5 s until it finished. The reason was structural, not a
+preference: **`publish_db_event` was only ever called from `gui.py` route
+handlers**, so a note job, which runs in `live_manager` below the HTTP layer,
+published nothing. Nothing was listening on the bus for it, and a note the job
+committed was invisible to Memories and Diary as well — the panel looked right
+only because it refetched when the poll went quiet.
+
+Three publishes fixed it, and each is at the layer that knows the fact:
+
+- **`live_note_job`** from `_announce()`, called at the end of `_set_job` and
+  once in `start_note_job` before the task starts. It carries `_job_public()`, so
+  the browser gets the same snapshot the endpoint returns.
+  `_announce` is fire-and-forget on purpose: `publish_db_event` awaits a put per
+  subscriber, and a browser that stopped reading must not hold the coroutine
+  that owns the commit. It returns silently when there is no running loop, which
+  is what keeps `_set_job` callable from tools and tests.
+- **`memory_changed`** from `_commit_note_window`, after the write and after the
+  consumption markers, with `action: add|update` decided by whether the note was
+  created. This is the piece that was actually missing: a note is an ordinary
+  fact, and every other fact write announces itself.
+- **`live_gate_released`** from `_announce_gate_release()` in `gui.py`, after
+  every `LIVE_GATE.end_recording`. The gate is a property of an open socket, not
+  a row, so nothing else could publish it — and without it the only way to learn
+  the release was the 700 ms `settleLiveGate` poll.
+
+Client side: `initSSE` registers both listeners; `scheduleLivePoll` returns
+early when `sseOpen()` — a live stream means no timer at all — and the
+`onerror` handler re-arms it, because a dropped stream would otherwise leave the
+toolbar disabled for a job whose terminal event never arrives. `onopen` disarms
+it again. `settleLiveGate` awaits `waitForLiveGate(1500)` (a resolver list the
+gate event wakes) and only then falls back to polling `/status`, which is the
+one thing that still has to exist for a proxy that keeps dropping the stream.
+
+`onLiveJobEvent` and `onLiveGateReleased` guard their `renderLiveControls` call
+on an open transcription: an event can arrive before a pane is showing one, and
+`renderLiveControls(null)` reads the record to label the state. The node harness
+caught that as a thrown `null.segmentCount`, which is exactly the class of defect
+it exists for.
+
+`LiveJobEventTests` **calls** `_announce` against a recording bus (payload
+fields, `user_id`, event name) and pins the two call sites a behavioural test
+cannot see; `LivePanelPushTests` drives the handlers through the fake DOM — a
+gate event must clear `liveGatePending` *and* wake a waiter, and another
+recording's event must be ignored. Both mutations bit: removing `_announce` from
+`_set_job`, and removing the `sseOpen()` guard.
+
 ### The prompt is four blocks and the output is validated
 
 `build_live_prompt` emits exactly: the existing note (title + markdown), the
