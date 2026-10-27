@@ -102,6 +102,20 @@ CREATE TABLE IF NOT EXISTS psks (
 CREATE INDEX IF NOT EXISTS psks_user_id_index ON psks (user_id);
 CREATE INDEX IF NOT EXISTS sessions_expires_index ON sessions (expires_at);
 
+-- The ASR access token each user's Live notes proxy presents to asr-mcp.
+--
+-- This is the one credential this app stores in a form it can replay rather
+-- than a hash: mem-mcp opens the upstream WebSocket on the user's behalf, and
+-- asr-mcp expects the token itself. The database lives on the session bind
+-- mount, so it survives a rebuild; no API returns the value, only `set` and a
+-- last-four hint. A token is per user, because an asr-mcp key is what scopes
+-- the audio and the transcript to that person.
+CREATE TABLE IF NOT EXISTS asr_tokens (
+    user_id    TEXT PRIMARY KEY,
+    token      TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
+
 -- Which external identity may open which vault. `user_id` is the same plain
 -- username string every other store in this app uses — there is no user table —
 -- so signing in with Google is the act of pointing a subject at a name.
@@ -712,6 +726,94 @@ def transfer_psks(old_user: str, new_user: str) -> int:
         return cursor.rowcount
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# ASR access tokens (Live notes)
+# ---------------------------------------------------------------------------
+
+MAX_ASR_TOKEN_CHARS = 512
+
+
+def set_asr_token(user_id: str, token: str, now=None) -> dict:
+    """Store the asr-mcp token this user's Live notes proxy will present.
+
+    The value is kept in plaintext because the proxy has to replay it; hashing
+    it would make the outbound handshake impossible. It is scoped to one user
+    and the only thing returned here is a hint, so a response body cannot be
+    read back as the credential. An empty token is refused rather than stored:
+    "set" and "cleared" must not be the same state with different audit rows.
+    """
+    user_id = (user_id or "").strip()
+    if not user_id:
+        raise ValueError("An ASR token needs a user")
+    value = (token or "").strip()
+    if not value:
+        raise ValueError("An ASR token cannot be empty")
+    if len(value) > MAX_ASR_TOKEN_CHARS:
+        raise ValueError(f"An ASR token cannot exceed {MAX_ASR_TOKEN_CHARS} characters")
+    moment = _now(now)
+    init_db()
+    conn = _connect()
+    try:
+        conn.execute(
+            "INSERT INTO asr_tokens (user_id, token, updated_at) VALUES (?, ?, ?)"
+            " ON CONFLICT(user_id) DO UPDATE SET token = excluded.token,"
+            " updated_at = excluded.updated_at",
+            (user_id, value, moment),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return {"set": True, "hint": value[-4:], "updated_at": moment}
+
+
+def get_asr_token(user_id: str) -> str | None:
+    """The stored token, for the proxy only.
+
+    Never render this. The HTTP surface uses `asr_token_hint`; this function
+    exists because the WebSocket bridge has to put the value in an `X-API-Key`
+    header, and that is the only caller it is meant for.
+    """
+    user_id = (user_id or "").strip()
+    if not user_id:
+        return None
+    init_db()
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT token FROM asr_tokens WHERE user_id = ?", (user_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    return row["token"] if row else None
+
+
+def clear_asr_token(user_id: str) -> bool:
+    """Forget a user's token. False when there was nothing stored.
+
+    False is not an error: the endpoint answers the same way for "cleared" and
+    "was already clear", so a repeated click does not look like a failure.
+    """
+    user_id = (user_id or "").strip()
+    if not user_id:
+        return False
+    init_db()
+    conn = _connect()
+    try:
+        cursor = conn.execute("DELETE FROM asr_tokens WHERE user_id = ?", (user_id,))
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        conn.close()
+
+
+def asr_token_hint(user_id: str) -> str | None:
+    """The last four characters, or None. Never enough to authenticate."""
+    token = get_asr_token(user_id)
+    if not token:
+        return None
+    return token[-4:]
 
 
 # ---------------------------------------------------------------------------

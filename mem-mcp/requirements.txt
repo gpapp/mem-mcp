@@ -7,6 +7,9 @@ neo4j
 ollama
 httpx
 uvicorn
+# Live notes: the browser WebSocket server (uvicorn is not uvicorn[standard])
+# and the outbound client to asr-mcp.
+websockets
 markdown2
 openai
 itsdangerous

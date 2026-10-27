@@ -474,6 +474,77 @@ class PskTests(StoreCase):
                 sessions.create_psk("alice", expires_in_days=days)
 
 
+class AsrTokenTests(StoreCase):
+    """The per-user asr-mcp token the Live notes proxy replays.
+
+    This credential is stored in plaintext on purpose — the proxy has to put it
+    in an `X-API-Key` header — so the properties worth pinning are that it never
+    comes back out of `set_asr_token`, that a hint cannot authenticate, and that
+    one user's token is invisible to another.
+    """
+
+    def test_the_token_round_trips_for_the_proxy(self):
+        sessions.set_asr_token("alice", "asr-secret-1234")
+        self.assertEqual(sessions.get_asr_token("alice"), "asr-secret-1234")
+
+    def test_set_returns_a_hint_and_never_the_value(self):
+        result = sessions.set_asr_token("alice", "asr-secret-1234")
+        self.assertEqual(result["hint"], "1234")
+        self.assertNotIn("token", result)
+        self.assertNotIn("asr-secret", repr(result))
+        self.assertEqual(sessions.asr_token_hint("alice"), "1234")
+
+    def test_the_hint_is_too_short_to_be_a_second_credential(self):
+        sessions.set_asr_token("alice", "asr-secret-1234")
+        hint = sessions.asr_token_hint("alice")
+        self.assertEqual(len(hint), 4)
+        self.assertIsNone(sessions.resolve_psk(hint),
+                          "The hint must not be accepted as an access key")
+        self.assertNotEqual(sessions.get_asr_token("alice"), hint)
+
+    def test_a_token_is_scoped_to_its_user(self):
+        sessions.set_asr_token("alice", "alice-token")
+        sessions.set_asr_token("bob", "bob-token")
+        self.assertEqual(sessions.get_asr_token("alice"), "alice-token")
+        self.assertEqual(sessions.get_asr_token("bob"), "bob-token")
+        self.assertIsNone(sessions.get_asr_token("carol"))
+        self.assertTrue(sessions.clear_asr_token("alice"))
+        self.assertIsNone(sessions.get_asr_token("alice"))
+        self.assertEqual(sessions.get_asr_token("bob"), "bob-token",
+                         "Clearing one user's token must not touch another's")
+
+    def test_an_empty_or_missing_token_is_refused_not_stored(self):
+        for value in ("", "   ", None):
+            with self.subTest(value=repr(value)):
+                with self.assertRaises(ValueError):
+                    sessions.set_asr_token("alice", value)
+        self.assertIsNone(sessions.get_asr_token("alice"))
+        with self.assertRaises(ValueError):
+            sessions.set_asr_token("", "asr-token")
+
+    def test_an_over_long_token_is_refused_rather_than_truncated(self):
+        with self.assertRaises(ValueError):
+            sessions.set_asr_token("alice", "x" * (sessions.MAX_ASR_TOKEN_CHARS + 1))
+
+    def test_clearing_twice_reports_no_row_but_is_not_an_error(self):
+        sessions.set_asr_token("alice", "asr-token")
+        self.assertTrue(sessions.clear_asr_token("alice"))
+        self.assertFalse(sessions.clear_asr_token("alice"))
+        self.assertFalse(sessions.clear_asr_token("nobody"))
+
+    def test_the_token_survives_a_fresh_process(self):
+        """The row lives under MEM_SESSION_DIR, which is the bind mount.
+
+        `_initialised_path` is the only in-process cache, so dropping it is what
+        a rebuilt container looks like to this module: a new interpreter runs
+        init_db and reads the same file.
+        """
+        sessions.set_asr_token("alice", "asr-token-persisted")
+        sessions._initialised_path = None
+        self.addCleanup(setattr, sessions, "_initialised_path", None)
+        self.assertEqual(sessions.get_asr_token("alice"), "asr-token-persisted")
+
+
 class PskOwnershipTests(StoreCase):
     """One user's key must never be visible to, or revocable by, another."""
 
