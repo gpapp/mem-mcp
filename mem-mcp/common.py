@@ -233,6 +233,16 @@ SCOPE_MODEL = os.getenv("MEM_SCOPE_MODEL") or LLM_QUERY_MODEL
 # scopeCheckedSig and never revisited, so it is permanent, not a retry.
 # Defaults to LLM_QUERY_MODEL, so an operator who sets nothing changes nothing.
 EXTRACT_MODEL = os.getenv("MEM_EXTRACT_MODEL") or LLM_QUERY_MODEL
+# Live notes use the extraction role for summarising a transcript into a note:
+# it is a rewrite over supplied text, not a judgement between candidates, and
+# the extraction model is the one measured fastest on that shape of work.
+# A separate knob so an operator can pin a different model without moving the
+# extractors, but it defaults to the extraction role rather than the query one.
+LIVE_MODEL = os.getenv("MEM_LIVE_MODEL") or EXTRACT_MODEL
+# The 4 GB card is shared with asr-mcp. Evicting the live model when recording
+# starts is what keeps the transcriber resident; the cost is a cold load at the
+# next pause. Set to 0 when the host has enough VRAM for both.
+LIVE_UNLOAD_ON_RECORD = os.getenv("MEM_LIVE_UNLOAD_ON_RECORD", "1") == "1"
 # Set MEM_SCOPE_BACKFILL=0 to skip the LLM scope backfill pass at startup.
 SCOPE_BACKFILL_ENABLED = os.getenv("MEM_SCOPE_BACKFILL", "1") == "1"
 SCOPE_BACKFILL_CONCURRENCY = int(os.getenv("MEM_SCOPE_CONCURRENCY", "3"))
@@ -259,6 +269,12 @@ SEARCH_LLM_TIMEOUT = float(os.getenv("MEM_SEARCH_LLM_TIMEOUT", "45.0"))
 # worth knowing if the vault holds anything you would not want at rest there.
 LLM_LOG_CHARS = max(0, int(os.getenv("MEM_LLM_LOG_CHARS", "1000")))
 BASE_URL       = os.getenv("BASE_URL",            "").rstrip("/")
+# asr-mcp runs on its own compose network and publishes 8087 on the host, so
+# `host.docker.internal` is the path between the containers (see the
+# `extra_hosts` entry in docker-compose.yml). The public nginx route is a
+# fallback for a deployment that has not added it.
+ASR_WS_URL     = (os.getenv("MEM_ASR_WS_URL")
+                  or "ws://host.docker.internal:8087/api/asr/ws/stream")
 
 COLLECTION_NAME  = "ea_memories"
 DIARY_COLLECTION = "ea_diary"

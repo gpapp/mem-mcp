@@ -8,6 +8,7 @@ from common.py, fact_manager.py, diary_manager.py, and client_manager.py.
 from common import (
     QDRANT_URL, NEO4J_URL, NEO4J_USER, NEO4J_PASS, OLLAMA_URL, EMBED_MODEL,
     LLM_QUERY_MODEL, EXTRACT_MODEL, SCOPE_MODEL, MERGE_MODEL,
+    LIVE_MODEL, LIVE_UNLOAD_ON_RECORD, ASR_WS_URL,
     HTTP_TIMEOUT, BASE_URL, COLLECTION_NAME, DIARY_COLLECTION,
     SESSION_SECRET, SESSION_MAX_AGE, db_subscribers,
     publish_db_event, get_qdrant, get_neo4j, wait_for_service, ensure_ollama_models,
@@ -50,7 +51,7 @@ from client_manager import (
 )
 
 from live_manager import (
-    NOTE_CATEGORY, TRANSCRIPTION_STATUSES,
+    NOTE_CATEGORY, TRANSCRIPTION_STATUSES, LIVE_GATE,
     db_create_transcription, db_list_transcriptions, db_get_transcription,
     db_update_transcription, db_set_transcription_scope,
     db_delete_transcription,
@@ -60,3 +61,7 @@ from live_manager import (
     db_get_note_references, db_set_note_references,
     db_note_fact_candidates, release_note_segments,
 )
+
+# The WebSocket origin check is a pure helper; keeping it in `live_notes.py`
+# means the rule can be tested without a running server.
+from live_notes import origin_allowed as live_notes_origin_allowed

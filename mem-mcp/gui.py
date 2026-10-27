@@ -38,7 +38,7 @@ from migrate_client_context import (
     start_reclassify_scope, get_reclassify_status,
     reclassify_single_fact, reclassify_single_diary,
 )
-from fastapi import Request, HTTPException, FastAPI
+from fastapi import Request, HTTPException, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response, JSONResponse, HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 from memory import SESSION_MAX_AGE # Import from memory.py
@@ -63,8 +63,25 @@ import audit
 import sharing
 from matching_utils import (MergeDraftTooLarge, execute_merge,
                              format_people_merge_text, merge_draft_output_budget)
+from live_notes import asr_segment
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from sse_starlette.sse import EventSourceResponse
+
+# The outbound half of the Live notes proxy. uvicorn serves the browser socket
+# without this package, but the server-side connection to asr-mcp needs a
+# client. The two imports cover websockets 14+ (`additional_headers`) and the
+# older asyncio client (`extra_headers`); the app refuses recording with a
+# clear message rather than failing at import when neither is available.
+try:  # pragma: no cover - version selection is environment-dependent
+    from websockets.asyncio.client import connect as _ws_connect
+    _WS_HEADER_KWARG = "additional_headers"
+except Exception:  # noqa: BLE001
+    try:
+        from websockets import connect as _ws_connect
+        _WS_HEADER_KWARG = "extra_headers"
+    except Exception:  # noqa: BLE001
+        _ws_connect = None
+        _WS_HEADER_KWARG = "additional_headers"
 web_app = FastAPI(
     title="Memory Vault GUI",
     # FastAPI registers /docs, /redoc and /openapi.json inside __init__, i.e.
@@ -2642,6 +2659,399 @@ async def share_landing(request: Request, token: str):
     html = _render("share", BASE_URL=mem.BASE_URL or "/",
                    SIGNED_IN=signed_in, ACCEPT_URL=accept_url)
     return HTMLResponse(content=html)
+
+
+# ---------------------------------------------------------------------------
+# Live notes — WebSocket proxy to asr-mcp
+#
+# The browser never holds the ASR credential. It opens this socket with its
+# session cookie, this process resolves the caller's own token from
+# `sessions.db`, and the upstream connection carries it in `X-API-Key`.
+#
+# `auth_guard` is an HTTP middleware and does not run for a websocket scope, so
+# this route authenticates itself. The order is deliberate: identity, origin,
+# ownership, token, and only then `begin_recording`. Nothing upstream is opened
+# for a request that has failed any of those checks.
+#
+# Audio is forwarded before anything is written. Transcript messages go to the
+# browser first and are queued for a single writer task, so the receive loop
+# never waits on Neo4j; a slow write can delay a segment, never the microphone.
+# ---------------------------------------------------------------------------
+
+_LIVE_PAUSE_HANGOVER_SECONDS = 0.8
+
+
+def _websocket_user(websocket: WebSocket) -> Optional[str]:
+    session = websocket.scope.get("session")
+    if session is None:
+        return None
+    try:
+        user = (session.get("user") or "").strip()
+    except Exception:
+        return None
+    return user or None
+
+
+def _websocket_request_origin(websocket: WebSocket) -> str:
+    """The origin this request was addressed to, for the no-BASE_URL case."""
+    scheme = "https" if websocket.scope.get("scheme") in ("wss", "https") else "http"
+    host = websocket.headers.get("host") or ""
+    return f"{scheme}://{host}" if host else ""
+
+
+def _asr_url_with_language(base_url: str, language: str) -> str:
+    parts = urllib.parse.urlsplit(base_url)
+    query = [(k, v) for k, v in urllib.parse.parse_qsl(parts.query)
+             if k != "language"]
+    query.append(("language", (language or "auto").strip() or "auto"))
+    return urllib.parse.urlunsplit((
+        parts.scheme, parts.netloc, parts.path,
+        urllib.parse.urlencode(query), parts.fragment,
+    ))
+
+
+async def _ws_fail(websocket: WebSocket, code: int, message: str) -> None:
+    """Send an actionable reason, then close with the given code.
+
+    The socket has already been accepted so the browser can read the message;
+    refusing before `accept()` collapses every cause into an opaque 403 and
+    leaves the user with nothing to act on.
+    """
+    try:
+        await websocket.send_json({"type": "error", "code": code, "message": message})
+    except Exception:
+        pass
+    try:
+        await websocket.close(code=code)
+    except Exception:
+        pass
+
+
+async def _unload_live_model() -> None:
+    """Best-effort eviction of the note model when recording starts."""
+    if not mem.LIVE_UNLOAD_ON_RECORD:
+        return
+    try:
+        snapshot = await mem.fetch_ollama_status()
+        names = [m.get("name") for m in (snapshot.get("models") or [])
+                 if m.get("resident") and m.get("name")]
+        wanted = mem.LIVE_MODEL
+        base = wanted.split(":", 1)[0]
+        matches = [name for name in names
+                   if name == wanted or name == f"{wanted}:latest"
+                   or name.split(":", 1)[0] == base]
+        if not matches:
+            mem.logger.info(
+                f"live notes: {wanted} is not resident; nothing to unload"
+            )
+            return
+        await mem.unload_ollama_model(wanted)
+        mem.logger.info(f"live notes: unloaded {wanted} for recording")
+    except Exception as exc:  # noqa: BLE001 - never delay the microphone
+        mem.logger.warning(f"live notes: could not unload {mem.LIVE_MODEL}: {exc}")
+
+
+@web_app.websocket("/api/live/stream/{transcription_id}")
+async def live_stream(websocket: WebSocket, transcription_id: str):
+    """Bridge browser audio to asr-mcp and persist final segments.
+
+    Protocol to the browser: raw PCM frames (the legacy asr-mcp 8-byte header
+    plus int16 LE mono 16 kHz) for audio, and JSON control messages
+    ``{"type":"pause"|"resume"|"stop"}``. The server forwards every ASR JSON
+    message unchanged, then adds ``{"type":"paused"}`` when the queue is
+    drained and the upstream has flushed its tail.
+    """
+    await websocket.accept()
+
+    user_id = _websocket_user(websocket)
+    if not user_id:
+        await _ws_fail(websocket, 4401,
+                       "Not signed in. Reload the dashboard and sign in again.")
+        return
+
+    origin = websocket.headers.get("origin")
+    if not mem.live_notes_origin_allowed(
+            origin, mem.BASE_URL, _websocket_request_origin(websocket)):
+        await _ws_fail(
+            websocket, 1008,
+            "This page is not allowed to open the transcription socket. "
+            "Check BASE_URL matches the address you use to open the dashboard.",
+        )
+        return
+
+    record = await asyncio.to_thread(
+        mem.db_get_transcription, transcription_id, user_id
+    )
+    if not record:
+        await _ws_fail(
+            websocket, 4403,
+            "That transcription does not exist, or it belongs to another account.",
+        )
+        return
+
+    token = await asyncio.to_thread(vault_sessions.get_asr_token, user_id)
+    if not token:
+        await _ws_fail(
+            websocket, 4409,
+            "No ASR access token is set. Open Setup → Live notes and paste the "
+            "token your asr-mcp server accepts, then try again.",
+        )
+        return
+
+    if _ws_connect is None:
+        await _ws_fail(
+            websocket, 4502,
+            "The server is missing the websockets dependency. Rebuild the "
+            "mem-mcp container from requirements.txt.",
+        )
+        return
+
+    if mem.LIVE_GATE.is_recording(user_id):
+        await _ws_fail(
+            websocket, 4502,
+            "A transcription is already recording for this account. Stop it "
+            "before starting another.",
+        )
+        return
+
+    generation = mem.LIVE_GATE.begin_recording(user_id)
+    mem.logger.info(
+        f"live notes: recording started user={user_id} "
+        f"transcription={transcription_id} generation={generation}"
+    )
+    # Recording has priority over processing, so the model is evicted as soon
+    # as the socket is open. The task is not awaited: a microphone must not
+    # wait for an HTTP round trip to Ollama.
+    asyncio.create_task(_unload_live_model())
+
+    await asyncio.to_thread(
+        mem.db_update_transcription, transcription_id, user_id,
+        None, None, "recording",
+    )
+
+    queue: asyncio.Queue = asyncio.Queue()
+    writer_task = None
+    upstream = None
+    asr_task = None
+    asr_quiet = None
+    stopping = False
+
+    async def writer_loop():
+        while True:
+            item = await queue.get()
+            try:
+                await asyncio.to_thread(
+                    mem.db_append_segment,
+                    transcription_id, user_id, item["text"],
+                    item.get("speaker") or "", item["startSec"], item["endSec"],
+                )
+            except Exception as exc:  # noqa: BLE001 - keep the socket alive
+                mem.logger.error(
+                    f"live notes: could not store segment for "
+                    f"{transcription_id}: {exc}"
+                )
+            finally:
+                queue.task_done()
+
+    async def asr_reader(connection, offset: float, quiet: dict):
+        try:
+            async for raw in connection:
+                if isinstance(raw, bytes):
+                    # ASR speaks JSON to us; binary is unexpected but harmless
+                    # to pass through for a client that understands it.
+                    await websocket.send_bytes(raw)
+                    continue
+                # Forward first: the user watching the transcript must not wait
+                # for a Neo4j write. Persisting is the queue's job.
+                await websocket.send_text(raw)
+                try:
+                    payload = json.loads(raw)
+                except (ValueError, TypeError):
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                item = asr_segment(payload, offset)
+                if item:
+                    queue.put_nowait(item)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a dropped ASR link is reported
+            # A close we initiated is not a fault: pausing and stopping both
+            # close the upstream on purpose, and reporting that as "service
+            # disconnected" would put an error on a perfectly normal pause.
+            if quiet.get("value"):
+                return
+            mem.logger.warning(
+                f"live notes: ASR stream ended for {transcription_id}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            if not stopping:
+                try:
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": "The transcription service disconnected.",
+                    })
+                except Exception:
+                    pass
+
+    async def open_upstream():
+        state = await asyncio.to_thread(
+            mem.db_transcription_state, transcription_id, user_id
+        )
+        offset = float((state or {}).get("maxEndSec") or 0.0)
+        url = _asr_url_with_language(mem.ASR_WS_URL, record.get("language"))
+        connection = await asyncio.wait_for(
+            _ws_connect(
+                url, **{_WS_HEADER_KWARG: {"X-API-Key": token}},
+            ),
+            timeout=15,
+        )
+        return connection, offset
+
+    async def close_upstream(wait_tail: bool = True):
+        nonlocal upstream, asr_task, asr_quiet
+        connection = upstream
+        reader = asr_task
+        quiet = asr_quiet
+        upstream = None
+        asr_task = None
+        asr_quiet = None
+        if wait_tail:
+            # asr-mcp's detector has a 320 ms hangover and a 200 ms post-roll.
+            # Closing immediately after the last block would cut the final
+            # clause out of the transcript.
+            await asyncio.sleep(_LIVE_PAUSE_HANGOVER_SECONDS)
+        if quiet is not None:
+            quiet["value"] = True
+        if connection is not None:
+            try:
+                await connection.close()
+            except Exception:
+                pass
+        if reader is not None:
+            try:
+                # The server sends its flushed tail and `stats` as part of the
+                # close handshake, so the reader gets a bounded chance to drain
+                # before it is cancelled.
+                await asyncio.wait_for(reader, timeout=6)
+            except Exception:
+                reader.cancel()
+                try:
+                    await reader
+                except Exception:
+                    pass
+
+    try:
+        writer_task = asyncio.create_task(writer_loop())
+        upstream, offset = await open_upstream()
+        asr_quiet = {"value": False}
+        asr_task = asyncio.create_task(asr_reader(upstream, offset, asr_quiet))
+
+        while True:
+            message = await websocket.receive()
+            if message.get("type") == "websocket.disconnect":
+                break
+            if message.get("bytes") is not None:
+                if upstream is not None:
+                    try:
+                        await upstream.send(message["bytes"])
+                    except Exception as exc:  # noqa: BLE001
+                        mem.logger.warning(
+                            f"live notes: audio forward failed for "
+                            f"{transcription_id}: {type(exc).__name__}: {exc}"
+                        )
+                continue
+            text = message.get("text")
+            if not text:
+                continue
+            try:
+                command = json.loads(text)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(command, dict):
+                continue
+            kind = command.get("type")
+            if kind == "pause":
+                if upstream is None:
+                    await websocket.send_json({"type": "paused"})
+                    continue
+                await close_upstream(wait_tail=True)
+                # Every segment the tail produced has been written before the
+                # UI is told it may summarise.
+                await queue.join()
+                await asyncio.to_thread(
+                    mem.db_update_transcription, transcription_id, user_id,
+                    None, None, "paused",
+                )
+                state = await asyncio.to_thread(
+                    mem.db_transcription_state, transcription_id, user_id
+                )
+                await websocket.send_json({
+                    "type": "paused",
+                    "segmentCount": (state or {}).get("segmentCount", 0),
+                    "unconsumedCount": (state or {}).get("unconsumedCount", 0),
+                })
+            elif kind == "resume":
+                if upstream is not None:
+                    continue
+                upstream, offset = await open_upstream()
+                asr_quiet = {"value": False}
+                asr_task = asyncio.create_task(
+                    asr_reader(upstream, offset, asr_quiet)
+                )
+                await asyncio.to_thread(
+                    mem.db_update_transcription, transcription_id, user_id,
+                    None, None, "recording",
+                )
+                await websocket.send_json({"type": "resumed"})
+            elif kind == "stop":
+                break
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:  # noqa: BLE001 - report, then clean up
+        mem.logger.error(
+            f"live notes: stream failed for {transcription_id}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        try:
+            await websocket.send_json({
+                "type": "error",
+                "message": f"Transcription stopped: {exc}",
+            })
+        except Exception:
+            pass
+    finally:
+        stopping = True
+        try:
+            await close_upstream(wait_tail=False)
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(queue.join(), timeout=5)
+        except Exception:
+            pass
+        if writer_task is not None:
+            writer_task.cancel()
+            try:
+                await writer_task
+            except Exception:
+                pass
+        try:
+            await asyncio.to_thread(
+                mem.db_update_transcription, transcription_id, user_id,
+                None, None, "paused",
+            )
+        except Exception:
+            pass
+        mem.LIVE_GATE.end_recording(user_id)
+        mem.logger.info(
+            f"live notes: recording stopped user={user_id} "
+            f"transcription={transcription_id}"
+        )
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
 @web_app.get("/api/events")

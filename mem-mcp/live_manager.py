@@ -32,9 +32,14 @@ from typing import Optional
 
 from common import get_neo4j, logger
 from client_manager import _resolve_client_by_id, _resolve_context_by_id
-from live_notes import LIVE_FACT_LIMIT
+from live_notes import LIVE_FACT_LIMIT, LivePriorityGate
 
 NOTE_CATEGORY = "Notes"
+
+# One gate for the process: the WS route begins recording on it and the job
+# layer registers its LLM-phase cancel hook on it. A per-request instance would
+# let a second tab record while a job from the first was still committing.
+LIVE_GATE = LivePriorityGate()
 
 TRANSCRIPTION_STATUSES = (
     "idle", "recording", "paused", "processing", "deferred", "error",

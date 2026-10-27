@@ -494,6 +494,103 @@ class SegmentStorageTests(unittest.TestCase):
         self.assertFalse(any("DETACH DELETE" in query for query in driver.queries))
 
 
+class AsrProxyTests(unittest.TestCase):
+    """The parts of the proxy that can be exercised without a socket."""
+
+    def _route_source(self):
+        import os
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui.py")
+        with open(path, "r", encoding="utf-8") as handle:
+            source = handle.read()
+        start = source.index('@web_app.websocket("/api/live/stream')
+        end = source.index('@web_app.get("/api/events")', start)
+        return source[start:end]
+
+    def test_url_helper_replaces_language_and_keeps_other_parameters(self):
+        import ast
+        import os
+        import urllib.parse
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui.py")
+        with open(path, "r", encoding="utf-8") as handle:
+            source = handle.read()
+        tree = ast.parse(source)
+        node = next(n for n in tree.body
+                    if isinstance(n, ast.FunctionDef)
+                    and n.name == "_asr_url_with_language")
+        module = ast.Module(body=[node], type_ignores=[])
+        ast.fix_missing_locations(module)
+        namespace = {"__builtins__": __builtins__, "urllib": urllib}
+        exec(compile(module, path, "exec"), namespace)
+        build = namespace["_asr_url_with_language"]
+        self.assertEqual(
+            build("ws://asr:8080/api/asr/ws/stream?foo=1&language=de", "auto"),
+            "ws://asr:8080/api/asr/ws/stream?foo=1&language=auto",
+        )
+        self.assertEqual(
+            build("wss://asr/api/asr/ws/stream", "hu"),
+            "wss://asr/api/asr/ws/stream?language=hu",
+        )
+
+    def test_identity_and_ownership_come_before_the_upstream_connection(self):
+        route = self._route_source()
+        token = route.index("get_asr_token")
+        owner = route.index("db_get_transcription")
+        begin = route.index("begin_recording")
+        connect = route.index("_ws_connect(")
+        self.assertLess(owner, begin)
+        self.assertLess(token, begin)
+        self.assertLess(begin, connect)
+        self.assertIn("X-API-Key", route)
+
+    def test_transcript_is_forwarded_before_it_is_queued_for_writing(self):
+        route = self._route_source()
+        forwarded = route.index("await websocket.send_text(raw)")
+        queued = route.index("queue.put_nowait")
+        self.assertLess(forwarded, queued)
+        self.assertIn("asyncio.to_thread(\n                    mem.db_append_segment", route)
+
+    def test_the_gate_is_released_on_every_exit_path(self):
+        route = self._route_source()
+        self.assertGreaterEqual(route.count("end_recording"), 1)
+        self.assertIn("finally:", route)
+        self.assertIn("LIVE_GATE.end_recording(user_id)", route)
+
+
+class AsrSegmentTests(unittest.TestCase):
+    def test_a_transcript_becomes_a_segment_with_the_connection_offset(self):
+        item = ln.asr_segment({
+            "type": "transcript", "speaker": "Speaker 1", "text": " Next point. ",
+            "start": 1.5, "end": 4.0,
+        }, offset=90.0)
+        self.assertEqual(item, {
+            "text": "Next point.", "speaker": "Speaker 1",
+            "startSec": 91.5, "endSec": 94.0,
+        })
+
+    def test_duration_is_the_end_fallback(self):
+        item = ln.asr_segment({
+            "type": "transcript", "text": "Hello", "start": 2.0, "duration": 3.5,
+        })
+        self.assertEqual((item["startSec"], item["endSec"]), (2.0, 5.5))
+
+    def test_non_transcript_and_blank_messages_are_not_stored(self):
+        self.assertIsNone(ln.asr_segment({"type": "stats"}))
+        self.assertIsNone(ln.asr_segment({"type": "transcript", "text": "  "}))
+        self.assertIsNone(ln.asr_segment(None))
+
+    def test_unparseable_timings_are_refused_rather_than_raising(self):
+        item = ln.asr_segment({
+            "type": "transcript", "text": "Still useful", "start": "nope",
+        })
+        self.assertIsNone(item)
+
+    def test_an_inverted_end_is_clamped_to_start(self):
+        item = ln.asr_segment({
+            "type": "transcript", "text": "Boundary", "start": 10.0, "end": 9.0,
+        })
+        self.assertEqual((item["startSec"], item["endSec"]), (10.0, 10.0))
+
+
 class NoteStorageTests(unittest.TestCase):
     def test_deleting_a_note_releases_its_segments_and_clears_the_link(self):
         driver = _FakeDriver(lambda query, params: _FakeResult(single={"released": 3}))

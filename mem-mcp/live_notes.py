@@ -419,6 +419,41 @@ def offset_segments(segments, offset):
     return [with_time_offset(segment, offset) for segment in (segments or [])]
 
 
+def asr_segment(payload, offset=0.0):
+    """Map one asr-mcp message to the segment this app stores.
+
+    Returns ``None`` for anything that is not a non-empty ``transcript``.
+    asr-mcp timestamps restart at zero on every connection, so the caller adds
+    the stored maximum end offset; a segment written on a resumed socket
+    without it would appear at the beginning of the recording and the next
+    pause would summarise the transcript out of order.
+
+    ``end`` is preferred, with ``start + duration`` as the fallback. An
+    inverted or missing pair is clamped to ``start`` rather than raising,
+    because a malformed timing field must not drop the words.
+    """
+    if not isinstance(payload, dict) or payload.get("type") != "transcript":
+        return None
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        return None
+    try:
+        start_raw = float(payload.get("start") or 0.0)
+        end_raw = payload.get("end")
+        if end_raw is None:
+            end_raw = start_raw + float(payload.get("duration") or 0.0)
+        start = max(0.0, start_raw + float(offset or 0.0))
+        end = max(start, float(end_raw) + float(offset or 0.0))
+    except (TypeError, ValueError):
+        return None
+    return {
+        "text": text,
+        "speaker": str(payload.get("speaker") or ""),
+        "startSec": start,
+        "endSec": end,
+    }
+
+
 def _origin_of(url) -> str:
     """scheme://host[:port] for an absolute URL, else ''."""
     value = str(url or "").strip()
