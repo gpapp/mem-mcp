@@ -3010,11 +3010,11 @@ async def api_summarize_live_transcription(request: Request,
         # and are small; the LLM work is what the task exists to move off this
         # request.
         job = mem.start_note_job(transcription_id, user_id, "unconsumed")
-    except mem.RecordingActiveError:
-        raise HTTPException(
-            status_code=409,
-            detail="A recording is open. Pause it before summarising.",
-        )
+    except mem.RecordingActiveError as exc:
+        # Through _conflict rather than a bare HTTPException: the reason is
+        # data-dependent ("still finishing the tail" vs "the microphone is
+        # open"), and the access log records only the status.
+        raise _conflict(exc)
     except mem.LiveNoteTooLong as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except ValueError as exc:
@@ -3040,11 +3040,8 @@ async def api_reprocess_live_transcription(request: Request,
         )
     try:
         job = mem.start_note_job(transcription_id, user_id, mode)
-    except mem.RecordingActiveError:
-        raise HTTPException(
-            status_code=409,
-            detail="A recording is open. Pause it before rebuilding the note.",
-        )
+    except mem.RecordingActiveError as exc:
+        raise _conflict(exc)
     except mem.LiveNoteTooLong as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except ValueError as exc:

@@ -2087,6 +2087,39 @@ call site for the order the behavioural test cannot see: flush frames → await
 the ack → close. Both halves were mutation-checked (closing first, and deleting
 `drained.set()` from the `stats` branch alone).
 
+### The gate closes on audio, so the buttons must ask rather than assume
+
+That pause sequence has a consequence the UI had to learn: **the server keeps the
+audio gate closed for seconds after the browser thinks it is paused.** The pause
+acks only once the tail is stored, and the stop path runs its `finally` behind a
+5 s `queue.join()`, so `LIVE_GATE.is_recording()` is still true while the pane
+already says "Paused" — and both note routes answer `409` for that whole window.
+Reported as a pair of 409s on `/summarize` and `/reprocess` from clicks in it.
+
+The browser's `liveRecording` / `livePaused` are a guess made a second early;
+`liveGatePending` is the server's answer, and only the server can give it:
+
+- it is set when a pause is requested and when a stop arrives, and cleared by
+  the `paused` ack (sent after `end_recording`) or by `settleLiveGate()`, which
+  polls `GET /api/live/transcriptions/{id}/status` for `recording === false`;
+- `renderLiveControls` disables Update / Rebuild / Delete on it and the state
+  line says "Finishing the last seconds…", so the click that produced the 409 is
+  not offered in the first place;
+- a 409 that still arrives is **a wait, not an error**: `summarizeLive` and
+  `rebuildLiveNote` set the flag, await the gate and ask the user to press again.
+  The race is transient and self-clearing, which is what separates it from the
+  failures a toast is for.
+
+**The 409 text had to change too.** `assert_idle` said "Pause the microphone
+before updating notes", which is what a user who just paused has already done —
+a refusal that accuses the reader of the thing they did sends them hunting a bug
+that is not there. It now allows for the finishing tail and names the remedy
+("give it a moment and try again"), and both routes raise it through
+`_conflict(exc)` so the reason reaches the log rather than being formatted into a
+detail and discarded (the `_service_unavailable` rule, one status code over).
+`LiveGateRaceTests` covers the message, the `_conflict` call sites, and the four
+client properties above; each was mutation-checked by reverting it.
+
 A note job is per-user serialised with its own `asyncio.Lock`, **not**
 `claim_maintenance`. Maintenance locks the vault for a reclassify or restore;
 holding one for the length of a meeting would block both and has nothing to do

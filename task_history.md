@@ -5,7 +5,43 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
-# Live notes — the ASR key field was not in a form (2026-10-27)
+# Live notes — the pause answered its own summarise with 409 (2026-10-27)
+
+- **Reported as two 409s**, `/summarize` and `/reprocess`, from clicks in the
+  Live pane. `RecordingActiveError` is the only 409 those routes can raise, so
+  the server still considered the microphone open at a moment the pane said
+  "Paused".
+- **That window is by design and the UI was guessing.** A pause acks only after
+  asr-mcp finishes the last sentence (the tail drain, up to 20 s), and the stop
+  path's `finally` sits behind a 5 s `queue.join()`, so the gate outlives the
+  browser's own flags. `pauseLiveRecording` set `livePaused = true`
+  optimistically, which re-enabled "Update now" during the drain — a click that
+  could only ever 409.
+- **Fix: a third flag, `liveGatePending`, set when the pause or stop is asked
+  for and cleared by the server.** The `paused` ack clears it (the server calls
+  `end_recording` before sending it) and `settleLiveGate()` polls `GET
+  /api/live/transcriptions/{id}/status` for `recording === false` after a stop.
+  Update / Rebuild / Delete are disabled while it is set and the state line says
+  "Finishing the last seconds…".
+- **A 409 that still slips through is a wait, not a failure.** Both actions set
+  the flag, await the gate and ask for a second press. Reporting a transient,
+  self-clearing refusal as an error is a message the user cannot act on.
+- **`assert_idle`'s message was wrong in the same direction.** It said "Pause the
+  microphone before updating notes" to a user who had just paused. It now allows
+  for the tail ("its last seconds are still being transcribed… try again"), and
+  both routes raise it through `_conflict` so the reason is logged — a bare
+  `HTTPException(409)` formats the reason into a response body and drops it.
+- Guards: `LiveGateRaceTests` (6) — the message, `_conflict` at both call sites,
+  the pending flag set/cleared around the pause ack, the disabled actions, and
+  that the gate is read from `/status` rather than assumed. Three mutations bit
+  (dropping `liveGatePending` from the update disable; reverting a route to a
+  bare 409; restoring the old message), then were restored.
+- **1297 tests OK**; `node --check` clean on the extracted dashboard script,
+  `py_compile`/`diff --check` clean.
+
+---
+
+
 
 - **Reported as a console line**: `[DOM] Password field is not contained in a
   form … <input id="asr-token-input" type="password">`. The Setup card's field

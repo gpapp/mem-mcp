@@ -676,8 +676,9 @@ class LivePriorityGate:
     def assert_idle(self, user_id) -> None:
         if self.is_recording(user_id):
             raise RecordingActiveError(
-                "Recording is in progress. Pause the microphone before updating "
-                "notes; audio always takes priority over processing."
+                "Audio has priority: a recording is open, or its last seconds "
+                "are still being transcribed. If you have already paused, give "
+                "it a moment and try again."
             )
 
     def register_llm_cancel(self, user_id, callback) -> bool:

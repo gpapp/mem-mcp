@@ -7,6 +7,7 @@ contains, which ids survive validation, and whether the generation counter
 actually preempts a job are all invisible in the shape of the code.
 """
 
+import types
 import unittest
 
 import live_notes as ln
@@ -1245,6 +1246,118 @@ class PauseTailTests(unittest.TestCase):
         self.assertIn('asr_drained["event"] = asyncio.Event()', route,
                       msg="a reused event would let the next pause return before "
                           "its own tail had been transcribed")
+
+
+class LiveGateRaceTests(unittest.TestCase):
+    """The gate the server holds outlives the browser's own pause/stop.
+
+    Reported as a pair of 409s from the Live pane. The pause now ends the stream
+    properly, which means the server keeps the audio gate closed while asr-mcp
+    finishes the last sentence -- seconds after the browser has already decided
+    it is paused. The client was acting on its own optimistic flag, so the
+    buttons were enabled throughout that window and every click in it answered
+    409.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import test_share_endpoints
+        import test_auth_guard
+        cls._share = test_share_endpoints
+        cls._js = staticmethod(test_auth_guard._js_function_source)
+        cls.dashboard = test_share_endpoints._read("mem-mcp/templates/dashboard.html")
+
+    def _between(self, start, end):
+        i = self.dashboard.find(start)
+        self.assertTrue(i >= 0, msg=f"missing marker: {start!r}")
+        j = self.dashboard.find(end, i)
+        self.assertTrue(j > i, msg=f"missing {end!r} after {start!r}")
+        return self.dashboard[i:j]
+
+    # -- the server half ---------------------------------------------------
+
+    def test_the_gate_says_the_pause_may_still_be_finishing(self):
+        # The old message said "pause the microphone", which is exactly what a
+        # user who just paused has already done. A 409 that accuses the reader
+        # of the thing they did sends them looking for a bug that is not there.
+        gate = ln.LivePriorityGate()
+        gate.begin_recording("alice")
+        with self.assertRaises(ln.RecordingActiveError) as caught:
+            gate.assert_idle("alice")
+        message = str(caught.exception).lower()
+        self.assertIn("still being transcribed", message,
+                      msg="the reason must allow for a pause that has not finished")
+        self.assertIn("try again", message,
+                      msg="a transient refusal must name the remedy")
+
+    def test_both_note_routes_log_their_409_through_conflict(self):
+        # A bare HTTPException(status_code=409, ...) is formatted into the
+        # response and then discarded: the access log records the status and
+        # nothing records which of the two conditions produced it.
+        namespace = {
+            "web_app": types.SimpleNamespace(
+                post=lambda *a, **k: (lambda fn: fn)),
+            "_conflict": lambda exc: exc,
+            "mem": types.SimpleNamespace(RecordingActiveError=ln.RecordingActiveError),
+            "HTTPException": type("HTTPException", (Exception,), {}),
+            "JSONResponse": type("JSONResponse", (), {}),
+        }
+        gui_functions({"api_summarize_live_transcription",
+                       "api_reprocess_live_transcription"}, namespace)
+        for name in ("api_summarize_live_transcription",
+                     "api_reprocess_live_transcription"):
+            with self.subTest(route=name):
+                source = self._share._read("mem-mcp/gui.py")
+                tree = __import__("ast").parse(source)
+                node = [n for n in tree.body
+                        if isinstance(n, (__import__("ast").FunctionDef,
+                                          __import__("ast").AsyncFunctionDef))
+                        and n.name == name][0]
+                body = __import__("ast").get_source_segment(source, node)
+                self.assertIn("raise _conflict(exc)", body)
+                self.assertNotIn("status_code=409", body,
+                                 msg="the conflict must go through _conflict so it "
+                                     "is logged")
+
+    # -- the client half ---------------------------------------------------
+
+    def test_a_pause_marks_the_gate_pending_until_the_server_answers(self):
+        body = self._js("templates/dashboard.html", "pauseLiveRecording")
+        self.assertIn("liveGatePending = true", body,
+                      msg="the click that pauses must also disable the actions")
+        ack = self._between("else if (payload.type === 'paused') {",
+                            "else if (payload.type === 'resumed') {")
+        self.assertIn("liveGatePending = false", ack,
+                      msg="the pause ack is the only proof the gate is free")
+
+    def test_the_write_actions_are_disabled_while_the_gate_is_held(self):
+        body = self._js("templates/dashboard.html", "renderLiveControls")
+        for line in ('if (update) update.disabled', 'if (rebuild) rebuild.disabled'):
+            with self.subTest(control=line):
+                start = body.index(line)
+                self.assertIn("liveGatePending", body[start:body.index(";", start)],
+                              msg=f"{line} ignores the pending gate")
+        self.assertIn("Finishing the last seconds", body,
+                      msg="the state line must say why the buttons are dead")
+
+    def test_both_note_actions_wait_instead_of_reporting_the_race(self):
+        for name in ("summarizeLive", "rebuildLiveNote"):
+            with self.subTest(action=name):
+                body = self._js("templates/dashboard.html", name)
+                self.assertIn("liveGatePending", body,
+                              msg="the optimistic guard is what produced the 409")
+                self.assertIn("awaitLiveGate", body,
+                              msg="a 409 here is a wait, not a failure the user "
+                                  "can act on")
+                self.assertIn("status === 409", body)
+
+    def test_the_gate_is_read_from_the_server_not_assumed(self):
+        body = self._js("templates/dashboard.html", "settleLiveGate")
+        self.assertIn("data.recording === false", body,
+                      msg="only the server knows when its writer and ASR tail are done")
+        stopped = self._js("templates/dashboard.html", "onLiveCaptureStopped")
+        self.assertIn("liveGatePending = true", stopped)
+        self.assertIn("awaitLiveGate(id)", stopped)
 
 
 if __name__ == "__main__":

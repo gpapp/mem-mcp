@@ -1665,6 +1665,13 @@
   let livePollToken = 0;
   let liveRecording = false;
   let livePaused = false;
+  // True while the SERVER still holds the audio gate: from the moment a pause
+  // or stop is asked for until it answers that nothing is being transcribed.
+  // The local liveRecording/livePaused flags are a guess made a second early,
+  // and acting on the guess is what made "Update now" answer 409 -- the pause
+  // closes the stream on purpose and then waits for asr-mcp to finish the last
+  // sentence, so the gate outlives the click that appears to have paused it.
+  let liveGatePending = false;
   let liveEditingSegmentId = null;
   let liveOffset = 0;
   let selectedFactId = null;
@@ -3336,11 +3343,15 @@
     if (resume) resume.disabled = !liveRecording || !livePaused;
     if (stop) stop.disabled = !liveRecording;
     const busy = liveJobActive(liveJob);
-    if (del) del.disabled = liveRecording || busy;
-    if (update) update.disabled = busy || (liveRecording && !livePaused);
-    if (rebuild) rebuild.disabled = liveRecording || busy;
+    // `liveGatePending` is the gate the server still holds, which outlives the
+    // browser's own pause/stop. Without it the buttons are enabled during the
+    // tail drain and every click there is a 409.
+    if (del) del.disabled = liveRecording || busy || liveGatePending;
+    if (update) update.disabled = busy || liveGatePending || (liveRecording && !livePaused);
+    if (rebuild) rebuild.disabled = liveRecording || busy || liveGatePending;
     if (state) {
-      if (liveRecording && livePaused) state.textContent = 'Paused — the current section is being summarised.';
+      if (liveGatePending) state.textContent = 'Finishing the last seconds…';
+      else if (liveRecording && livePaused) state.textContent = 'Paused — the current section is being summarised.';
       else if (liveRecording) state.textContent = 'Recording — audio is being transcribed.';
       else state.textContent = liveStatusLabel(t) + (t.segmentCount ? ' · ' + t.segmentCount + ' segments' : '');
     }
@@ -3586,8 +3597,41 @@
     }
   }
 
+  // The server keeps the audio gate closed until its segment writer and the ASR
+  // tail are finished, which outlives the browser's own stop/pause by a second
+  // or three. Asking it is the only honest answer to "may I summarise yet" --
+  // the local flags are a guess, and acting on the guess is what made a pause
+  // answer 409 on its own summarise.
+  async function settleLiveGate(id, attempts) {
+    const tries = attempts || 12;
+    for (let i = 0; i < tries; i++) {
+      try {
+        const data = await api.get('live/transcriptions/' + encodeURIComponent(id) + '/status');
+        if (data && data.recording === false) return true;
+      } catch (e) {
+        // A failed probe is not a reason to stay disabled for ever; the next
+        // attempt is 700ms away.
+      }
+      await new Promise(resolve => setTimeout(resolve, 700));
+    }
+    return false;
+  }
+
+  function awaitLiveGate(id) {
+    if (!liveGatePending) return Promise.resolve(true);
+    return settleLiveGate(id).then(free => {
+      liveGatePending = false;
+      renderLiveControls(liveDetail && liveDetail.transcription);
+      return free;
+    });
+  }
+
   async function summarizeLive() {
     if (!liveDetail || !liveDetail.transcription) return;
+    if (liveGatePending) {
+      toast('⏳ Still finishing the last seconds — try again in a moment');
+      return;
+    }
     if (liveRecording && !livePaused) {
       toast('⚠️ Pause the recording first — audio has priority');
       return;
@@ -3600,6 +3644,15 @@
       renderLiveControls(liveDetail.transcription);
       scheduleLivePoll();
     } catch (e) {
+      if (e && e.status === 409) {
+        // The race the disabled buttons exist to avoid, so the answer is to
+        // wait for the gate rather than to report a failure the user cannot act on.
+        liveGatePending = true;
+        renderLiveControls(liveDetail.transcription);
+        await awaitLiveGate(id);
+        toast('⏳ Audio had priority — press Update now again');
+        return;
+      }
       toastApiError(e, 'Could not summarise the transcript');
     }
   }
@@ -3607,6 +3660,10 @@
   async function rebuildLiveNote() {
     if (!liveDetail || !liveDetail.transcription) return;
     if (liveRecording) { toast('⚠️ Stop the recording before rebuilding the note'); return; }
+    if (liveGatePending) {
+      toast('⏳ Still finishing the last seconds — try again in a moment');
+      return;
+    }
     if (!confirm('Rebuild the note from the whole transcript? This replaces the current note text and loses any manual edits.')) return;
     const id = liveDetail.transcription.id;
     try {
@@ -3617,6 +3674,13 @@
       renderLiveJob();
       scheduleLivePoll();
     } catch (e) {
+      if (e && e.status === 409) {
+        liveGatePending = true;
+        renderLiveControls(liveDetail.transcription);
+        await awaitLiveGate(id);
+        toast('⏳ Audio had priority — press Rebuild note again');
+        return;
+      }
       toastApiError(e, 'Could not rebuild the note');
     }
   }
@@ -3654,6 +3718,9 @@
           liveOffset = Math.max(liveOffset, end);
           renderLiveSegments();
         } else if (payload.type === 'paused') {
+          // The server released the gate before it sent this, so this is the
+          // authoritative "summarising is allowed now".
+          liveGatePending = false;
           livePaused = true;
           renderLiveControls(liveDetail.transcription);
           summarizeLive();
@@ -3704,14 +3771,22 @@
     const wasRecording = liveRecording;
     liveRecording = false;
     livePaused = false;
+    // The socket is gone but the server is still draining its writer and the
+    // ASR tail, so the gate is not free yet. Ask it instead of assuming.
+    if (wasRecording) liveGatePending = true;
     renderLiveControls(liveDetail && liveDetail.transcription);
     if (!wasRecording) return;
     // The server drains its segment writer on pause/stop; give it a beat
     // before reading so the final clause is not missing from the transcript.
     setTimeout(async () => {
-      if (activeLiveTranscriptionId !== id) return;
+      if (activeLiveTranscriptionId !== id) {
+        liveGatePending = false;
+        renderLiveControls(liveDetail && liveDetail.transcription);
+        return;
+      }
       await openLiveTranscription(id, {force: true, silent: true});
       await loadLive({force: true});
+      await awaitLiveGate(id);
     }, 1800);
   }
 
@@ -3719,11 +3794,13 @@
     if (!liveRecording) { await summarizeLive(); return; }
     if (livePaused) { await summarizeLive(); return; }
     livePaused = true;
+    liveGatePending = true;
     renderLiveControls(liveDetail && liveDetail.transcription);
     const state = document.getElementById('live-state');
     if (state) state.textContent = 'Finishing the current segment…';
     if (!LiveCapture.pause()) {
       livePaused = false;
+      liveGatePending = false;
       await summarizeLive();
     }
   }
