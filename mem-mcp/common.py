@@ -822,7 +822,8 @@ def _llm_excerpt(text: str, limit: int = 0) -> str:
 
 
 async def get_llm_response(prompt: str, system: str = "", model: str = "",
-                           num_predict: int = 0, timeout: float = 0.0) -> str:
+                           num_predict: int = 0, timeout: float = 0.0,
+                           options: Optional[dict] = None) -> str:
     """Call Ollama /api/chat and return the assistant's text response.
 
     Uses LLM_QUERY_MODEL (default: qwen3.5:0.8b) unless overridden by `model`.
@@ -844,15 +845,20 @@ async def get_llm_response(prompt: str, system: str = "", model: str = "",
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
-    options: dict = {"temperature": 0.0}
+    body_options: dict = {"temperature": 0.0}
+    if options:
+        # Caller-supplied keys win, including temperature: a caller that names a
+        # sampling setting has a reason to, and silently keeping 0.0 would make
+        # the retry below a retry of the same greedy decode.
+        body_options.update({k: v for k, v in options.items() if v is not None})
     if num_predict > 0:
-        options["num_predict"] = num_predict
+        body_options["num_predict"] = num_predict
     request_body = {
         "model": resolved_model,
         "messages": messages,
         "stream": False,
         "think": False,
-        "options": options,
+        "options": body_options,
     }
     budget = timeout or LLM_TIMEOUT
     url = f"{OLLAMA_URL}/api/chat"

@@ -1414,5 +1414,64 @@ class LiveGateRaceTests(unittest.TestCase):
         self.assertIn("awaitLiveGate(id)", stopped)
 
 
+class RepeatAbortTests(unittest.TestCase):
+    """Ollama aborts a prediction that repeats itself; retry with other sampling.
+
+    Reported as `ERROR live notes: note job failed ... Ollama returned HTTP 500
+    for model 'granite3.3:2b': {"error":"prediction aborted, token repeat limit
+    reached"}`. The prompt was fine and the model answered -- it just looped
+    until Ollama's own guard stopped it, which is what greedy decoding of a long
+    Markdown rewrite does to a 2b model.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import test_share_endpoints
+        cls.source = test_share_endpoints._read("mem-mcp/live_manager.py")
+
+    def test_the_predicate_matches_the_abort_and_nothing_else(self):
+        abort = ('Ollama returned HTTP 500 for model \'granite3.3:2b\': '
+                 '{"error":"prediction aborted, token repeat limit reached"}')
+        self.assertTrue(ln.is_repeat_abort(abort))
+        # The predicate drives a retry, so a false positive costs a second call
+        # on a failure that cannot improve -- a timeout, a missing model, a 404.
+        for other in ("LLM call timed out after 300.0s",
+                      "model 'nope' is not installed",
+                      "Ollama returned HTTP 404"):
+            with self.subTest(case=other):
+                self.assertFalse(ln.is_repeat_abort(other))
+        self.assertFalse(ln.is_repeat_abort(None))
+
+    def test_the_first_attempt_stays_deterministic_and_the_retry_does_not(self):
+        self.assertEqual(ln.LIVE_SAMPLING["temperature"], 0.0,
+                         msg="the normal path must stay reproducible")
+        self.assertGreater(ln.LIVE_SAMPLING["repeat_penalty"], 1.0,
+                           msg="without a penalty a loop just re-runs")
+        self.assertGreater(ln.LIVE_SAMPLING_RETRY["repeat_penalty"],
+                           ln.LIVE_SAMPLING["repeat_penalty"])
+        self.assertLess(ln.LIVE_SAMPLING_RETRY["repeat_last_n"],
+                        ln.LIVE_SAMPLING["repeat_last_n"],
+                        msg="the retry must act on the run that is looping")
+        self.assertGreater(ln.LIVE_SAMPLING_RETRY["temperature"], 0.0,
+                           msg="a retry at temperature 0 is the same decode")
+
+    def test_the_note_call_passes_them_and_retries_only_the_abort(self):
+        start = self.source.index("async def _call_live_llm")
+        body = self.source[start:self.source.index("async def _compact_note")]
+        self.assertIn("options=sampling", body,
+                      msg="the sampling sets are useless unless they are sent")
+        self.assertIn("for attempt, sampling in enumerate((LIVE_SAMPLING, "
+                      "LIVE_SAMPLING_RETRY))", body)
+        # Exactly one retry, and only when the abort is the repetition one:
+        # `attempt or not is_repeat_abort(exc)` is the whole policy.
+        self.assertIn("if attempt or not is_repeat_abort(exc):", body)
+        self.assertIn("raise", body.split("if attempt or not is_repeat_abort(exc):")[1][:80])
+        self.assertEqual(body.count("get_llm_response("), 1,
+                         msg="the call must happen once, inside the loop")
+        # The second failure must name the remedy rather than the raw 500.
+        self.assertIn("MEM_LIVE_NOTE_MAX_CHARS", body)
+        self.assertIn("MEM_LIVE_MODEL", body)
+
+
 if __name__ == "__main__":
     unittest.main()

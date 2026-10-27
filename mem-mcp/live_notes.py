@@ -103,6 +103,44 @@ class RecordingActiveError(RuntimeError):
     """An operation that must not run while the microphone is open."""
 
 
+# Sampling for the note rewrite.
+#
+# `temperature: 0.0` is what every other call in the app uses, and for a task
+# that returns JSON out of a short prompt it is right. Rewriting a long Markdown
+# note is a different shape: greedy decoding there re-emits a bullet or a
+# heading until Ollama's own guard aborts the prediction outright --
+# `{"error":"prediction aborted, token repeat limit reached"}`, HTTP 500, which
+# is not a transient failure and does not improve on retry with the same
+# settings. The penalty is what breaks the tie at temperature 0, so the first
+# attempt stays deterministic and only the retry re-rolls.
+LIVE_SAMPLING = {
+    "temperature": 0.0,
+    "repeat_penalty": 1.15,
+    "repeat_last_n": 256,
+}
+
+# The retry: a stronger penalty over a shorter window (so it acts on the run
+# that is actually looping), and a little temperature so a different token wins
+# the tie. Same prompt, different decode -- the only thing that can help when
+# the abort is the decoder and not the input.
+LIVE_SAMPLING_RETRY = {
+    "temperature": 0.35,
+    "repeat_penalty": 1.4,
+    "repeat_last_n": 64,
+    "top_p": 0.9,
+}
+
+
+def is_repeat_abort(message) -> bool:
+    """True when Ollama aborted a prediction for repeating itself.
+
+    Worth its own predicate because the remedy is different from every other
+    LLM failure here: the prompt is fine and the model responded, so waiting or
+    raising a timeout does nothing. Only different sampling has a chance.
+    """
+    return "token repeat limit" in str(message or "").lower()
+
+
 def format_timestamp(seconds) -> str:
     """mm:ss, or h:mm:ss past an hour. Stable width keeps prompts readable."""
     try:

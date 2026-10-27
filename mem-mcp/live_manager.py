@@ -38,6 +38,8 @@ from live_notes import (
     COMPACT_SYSTEM_PROMPT,
     LIVE_FACT_LIMIT,
     LIVE_NOTE_MAX_CHARS,
+    LIVE_SAMPLING,
+    LIVE_SAMPLING_RETRY,
     LIVE_SYSTEM_PROMPT,
     LiveNoteError,
     LiveNoteTooLong,
@@ -45,6 +47,7 @@ from live_notes import (
     RecordingActiveError,
     build_compaction_prompt,
     build_live_prompt,
+    is_repeat_abort,
     live_output_budget,
     parse_note_json,
     rank_fact_candidates,
@@ -1075,15 +1078,38 @@ async def _call_live_llm(job: dict, prompt: str, system: str,
     if not LIVE_GATE.register_llm_cancel(job["userId"], _cancel):
         raise NoteJobDeferred("recording started before the model call")
     try:
-        answer = await get_llm_response(
-            prompt,
-            system=system,
-            model=LIVE_MODEL,
-            num_predict=max(1, int(num_predict)),
+        # One retry, and only for Ollama's repetition abort. That failure is the
+        # decoder, not the prompt: a note rewrite at temperature 0 can emit the
+        # same token run until Ollama gives up, and the answer is different
+        # sampling rather than another wait. Anything else propagates on the
+        # first attempt -- a timeout or a missing model does not improve because
+        # it was asked twice.
+        for attempt, sampling in enumerate((LIVE_SAMPLING, LIVE_SAMPLING_RETRY)):
+            try:
+                answer = await get_llm_response(
+                    prompt,
+                    system=system,
+                    model=LIVE_MODEL,
+                    num_predict=max(1, int(num_predict)),
+                    options=sampling,
+                )
+                return answer or ""
+            except RuntimeError as exc:
+                if attempt or not is_repeat_abort(exc):
+                    raise
+                logger.warning(
+                    f"live notes: {LIVE_MODEL} repeated itself and Ollama "
+                    f"aborted the note answer (attempt 1); retrying with a "
+                    f"stronger repeat penalty -- {exc}"
+                )
+        raise LiveNoteError(
+            f"{LIVE_MODEL} repeated itself until Ollama aborted the answer, "
+            "twice. The note was not changed. Retry the update; if it keeps "
+            "happening the note is too long for this model -- lower "
+            "MEM_LIVE_NOTE_MAX_CHARS or use a larger MEM_LIVE_MODEL."
         )
     finally:
         LIVE_GATE.clear_llm_cancel(job["userId"], _cancel)
-    return answer or ""
 
 
 async def _compact_note(job: dict, note: dict, allowed_ids) -> dict:

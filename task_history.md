@@ -5,6 +5,45 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# Live notes — the model looped until Ollama aborted the note (2026-10-27)
+
+- **Reported as an error, not a symptom**:
+  `{"error":"prediction aborted, token repeat limit reached"}`, HTTP 500, then
+  `live notes: note job failed ... Ollama returned HTTP 500`. That is Ollama's
+  own guard stopping a degenerate prediction, and the app's default sampling
+  invites it: every chat call here passes `temperature: 0.0`, which is right for
+  short JSON answers and wrong for the one call that rewrites a long Markdown
+  document — greedy decoding re-emits a heading or a bullet until the guard fires.
+- **`get_llm_response` gained an `options` dict** merged over the default
+  `{"temperature": 0.0}`, caller keys winning *including* temperature. Without
+  that override a retry would be the same decode under a different label. Every
+  existing caller is unchanged.
+- **`LIVE_SAMPLING`** sends `repeat_penalty: 1.15` / `repeat_last_n: 256` and
+  keeps temperature at 0, so the normal path stays reproducible.
+  **`LIVE_SAMPLING_RETRY`** is stronger and narrower (penalty 1.4 over 64 tokens,
+  temperature 0.35, `top_p: 0.9`): a retry at the same settings is not a retry.
+- **Exactly one retry, and only for this abort** — `if attempt or not
+  is_repeat_abort(exc): raise` is the whole policy, because a timeout or a
+  missing model cannot improve by being asked twice. `is_repeat_abort()` is in
+  `live_notes.py` (stdlib) so the suite calls it: the remedy is unique, since
+  waiting does nothing and only different sampling has a chance.
+- **A second abort raises `LiveNoteError` naming `MEM_LIVE_NOTE_MAX_CHARS` and
+  `MEM_LIVE_MODEL`** instead of surfacing the raw 500, and nothing is consumed on
+  a failed window — the segments are still there for the next pause or **Rebuild
+  note**.
+- Guards: `RepeatAbortTests` (the predicate against the real string plus three
+  that must not match; the two sampling sets as a pair; the call site's
+  one-call-in-a-loop shape) and two `test_llm_reliability.HappyPathTests` driving
+  the `options` merge through the recording fake client. Mutations that bit:
+  `if True: raise`, and a retry temperature of 0.0.
+- **1308 tests OK**; `py_compile`/`diff --check` clean.
+
+---
+
+
+
+---
+
 # Live notes — the note kept the rambling and linked the whole project (2026-10-27)
 
 - **Two complaints, and the first was self-inflicted by the prompt.** *"The notes

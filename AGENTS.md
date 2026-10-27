@@ -1120,6 +1120,7 @@ A reclassify returned `503 Service Unavailable` and was read as "out of memory l
 - **The read budget is its own knob, and it is not 60s.** `LLM_TIMEOUT` (`MEM_LLM_TIMEOUT`, default **300**) for background passes; `SEARCH_LLM_TIMEOUT` (`MEM_SEARCH_LLM_TIMEOUT`, default 45) for the search-query rewrite, which sits between the user and their results and must not inherit the background budget; a per-call `timeout=` argument for anything else. The measured reason: a 4420-char prompt took **46s** on `qwen3.5:2b` on the production host. A 60s cap is not a safety margin on a machine doing CPU inference, it is a coin flip.
 - **Connect stays short and independent.** `LLM_CONNECT_TIMEOUT` (10s) so a genuinely dead Ollama fails fast instead of burning the full read budget first. It is a separate argument to `httpx.Timeout`, not the same value.
 - **A chat timeout used to write nothing at all.** The request line was logged at WARNING *before* the call and the response line only *after* it returned, with no `except` in between — so a timeout was indistinguishable from a request that never happened, which is why this took a log dive to explain. Every failure mode now logs at ERROR with the model, the prompt size, the elapsed time and the knob to turn, and raises `RuntimeError` naming the remedy. Nothing upstream caught `httpx.ReadTimeout`, so the type change is safe.
+- **A call may pass its own sampling, and the live-note rewrite has to.** `get_llm_response(..., options={...})` merges over the default `{"temperature": 0.0}`, with the caller's keys winning — including temperature, or a retry would be the same greedy decode again. Greedy is right for short JSON answers and wrong for the one call that rewrites a long Markdown document, where `granite3.3:2b` looped until Ollama aborted with `{"error":"prediction aborted, token repeat limit reached"}` (HTTP 500, which reads like a service failure and is not). See Live Notes → "A rewrite that repeats itself is a decoder failure".
 - **An empty answer is logged, not raised.** A model that loads and then produces nothing is the memory-pressure shape the user suspected — and it used to return `""` in total silence while callers fell back to the raw query or to no keywords, so the vault quietly got worse. Raising here would break those deliberate fallbacks and turn a degraded search into a failed request, so the fix is the ERROR line, not an exception. Keep it that way: *log* the empty answer, never throw on it.
 - **The log carries the content, not just the size.** `prompt_chars=3572` tells you a call was big; it does not tell you what the model was shown or what it said, so a mis-scoped or hallucinating verdict could not be checked without reproducing the call. `_llm_excerpt()` adds `system=`, `prompt=` and `content=` (and the raw `body=`) capped at `LLM_LOG_CHARS` (`MEM_LLM_LOG_CHARS`, default 1000), with `…+N more chars` so the total is still known. It **escapes newlines, tabs and backslashes** — prompts are multi-line by nature, and a raw newline in a `RotatingFileHandler` record makes one event span several lines, at which point `grep` reports a fragment as if it were the whole message. `MEM_LLM_LOG_CHARS=0` restores sizes-only, and that is a privacy switch, not an "unlimited" one: this writes entry and meeting text into the log file. The 1K cap is per field, not per line, so a 40k-char entry cannot put 40k chars on a reclassify line.
 - **A 503 must say why.** All 44 `except RuntimeError` handlers in `gui.py` route through `_service_unavailable(e)`, which logs the reason before building the response. The detail used to be formatted into an `HTTPException` and discarded: the access log recorded the status and nothing recorded the cause. "Another maintenance operation is running" and "Ollama timed out" are completely different problems, and the most informative message in the codebase was the one that never got logged. Do not reintroduce a bare `raise HTTPException(status_code=503, detail=str(e))` — `ServiceUnavailableLoggingTests` checks for it.
@@ -2167,6 +2168,45 @@ A note job is per-user serialised with its own `asyncio.Lock`, **not**
 `claim_maintenance`. Maintenance locks the vault for a reclassify or restore;
 holding one for the length of a meeting would block both and has nothing to do
 with the microphone.
+
+### A rewrite that repeats itself is a decoder failure, not a prompt failure
+
+`granite3.3:2b` answered a note update with `{"error":"prediction aborted, token
+repeat limit reached"}` — HTTP 500, and the job died with it: *"Ollama returned
+HTTP 500 ..."* in the log and no note at all. That message is Ollama's own guard
+stopping a prediction that degenerated into the same token run, and the app's
+default sampling is what invites it. **Every chat call here passes
+`temperature: 0.0`**, which is right for the short JSON answers the classifier and
+the extractors want, and wrong for the one call that rewrites a long Markdown
+document: greedy decoding re-emits a heading or a bullet until the guard fires.
+
+Three parts, and none of them replaces the others:
+
+- **`get_llm_response` takes an `options` dict** merged over the default
+  `{"temperature": 0.0}`, caller keys winning — including temperature, or a retry
+  would be the same decode again. Every other caller is unchanged.
+- **`LIVE_SAMPLING` sends `repeat_penalty: 1.15` / `repeat_last_n: 256`** with
+  temperature left at 0, so the normal path stays reproducible and the penalty
+  only breaks the tie the loop needs broken. `LIVE_SAMPLING_RETRY` is *stronger
+  and narrower* — penalty 1.4 over 64 tokens, temperature 0.35, `top_p: 0.9` —
+  because a retry at the same settings is not a retry.
+- **Exactly one retry, and only for this abort.** `if attempt or not
+  is_repeat_abort(exc): raise` is the whole policy: a timeout, a missing model or
+  a 404 cannot improve by being asked twice, so those propagate on the first
+  attempt. `is_repeat_abort()` lives in `live_notes.py` (stdlib, callable by the
+  suite) because the remedy is unique — waiting does nothing, only different
+  sampling has a chance.
+
+After the second abort the job raises `LiveNoteError` naming
+`MEM_LIVE_NOTE_MAX_CHARS` and `MEM_LIVE_MODEL`, because "Ollama returned HTTP
+500" tells the reader nothing they can act on. Nothing is consumed on a failed
+window, so the segments are still there for the next pause or **Rebuild note**.
+
+`RepeatAbortTests` calls the predicate (the real abort string and three that must
+not match), pins the two sampling sets as a pair (deterministic first, different
+second) and reads the call site for the one-call-in-a-loop shape;
+`test_llm_reliability` drives the `options` merge through the recording fake
+client. Both mutations bit — `if True: raise`, and a retry temperature of 0.0.
 
 
 ### The prompt is four blocks and the output is validated

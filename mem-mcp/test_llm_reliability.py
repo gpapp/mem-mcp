@@ -395,6 +395,26 @@ class HappyPathTests(unittest.TestCase):
         _, body = self.rec.posts[0]
         self.assertEqual(body["options"]["num_predict"], 80)
 
+    def test_sampling_options_reach_the_request_and_win_over_the_default(self):
+        """The live-note rewrite needs repeat_penalty; greedy decoding of a long
+        Markdown note is where Ollama aborts with "token repeat limit reached".
+        A caller that names a setting has to get it, temperature included --
+        silently keeping 0.0 would make a retry the same decode again.
+        """
+        ns = _load(self.rec, _ok("x"))
+        asyncio.run(ns[_FUNCTION](
+            "p", options={"temperature": 0.35, "repeat_penalty": 1.4}))
+        _, body = self.rec.posts[0]
+        self.assertEqual(body["options"]["temperature"], 0.35)
+        self.assertEqual(body["options"]["repeat_penalty"], 1.4)
+
+    def test_no_options_leaves_the_default_sampling_alone(self):
+        ns = _load(self.rec, _ok("x"))
+        asyncio.run(ns[_FUNCTION]("p"))
+        _, body = self.rec.posts[0]
+        self.assertEqual(body["options"], {"temperature": 0.0})
+        self.assertNotIn("repeat_penalty", body["options"])
+
     def test_the_request_line_reports_the_budget(self):
         """So a log reader can tell a 300s wait from a 45s one."""
         ns = _load(self.rec, _ok("x"))
