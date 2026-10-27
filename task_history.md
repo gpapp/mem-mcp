@@ -5,6 +5,32 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# Ollama lost the Vulkan device and its CPU fallback dumped core (2026-10-27)
+
+- **Reported as** `ggml_vulkan: device lost on Vulkan0` during a `/api/chat`
+  that ran **1m55s** over ~2422 tokens (the note rewrite), followed by
+  `GGML_ASSERT(batch.slot_batched || batch.size() == 0) failed` on the CPU
+  runner and `llama-server terminated … core dumped` — so the 500 was a dead
+  runner, and every later call failed with it.
+- **Cause**: VRAM over-commitment on a 4 GB card shared with ASR. Ollama's
+  defaults are `OLLAMA_MAX_LOADED_MODELS = 3 × GPU count` and
+  `OLLAMA_NUM_PARALLEL = auto`, so granite (2.34 GB) + nemotron (2.63 GB) + the
+  embedder could be resident at once against a 16332-token context. Not an app
+  bug, and not fixable in the app — a lost device is the driver's answer.
+- **Shipped**: `docker-compose.yml` pins `OLLAMA_MAX_LOADED_MODELS=2` and
+  `OLLAMA_NUM_PARALLEL=1` with the incident in the comment;
+  `common._ollama_failure_hint()` maps the device-lost/terminated body to
+  "restart ollama, then `docker ps`/`ollama ps` and the two knobs", appended to
+  the `HTTP 5xx` `RuntimeError`. `test_llm_reliability.OllamaFailureHintTests`
+  (3) pins the hint and, just as importantly, that an ordinary error gets none.
+- **What a future reader would otherwise rediscover**: the note rewrite is the
+  single largest prompt in the app, so it is the request that finds an
+  over-committed card first; a `500` here is not a prompt problem, and no retry
+  policy helps because the runner process is gone. `_ollama_timing` exists for
+  the same class of "the number is the diagnosis".
+- **Verified**: 1333 tests OK, `py_compile` clean on `common.py`, `diff --check`
+  clean.
+
 # Live notes — the panel polled a job the event bus never carried (2026-10-27)
 
 - **Reported as** a question, not a bug: *"why use status queries, when all other

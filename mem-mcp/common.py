@@ -875,6 +875,30 @@ def _ollama_timing(body) -> str:
     return ", ".join(parts)
 
 
+def _ollama_failure_hint(body) -> str:
+    """A remedy for an Ollama error, when the body names a known one.
+
+    A GPU that is over-committed does not fail politely. Production lost the
+    Vulkan device mid-decode (`ggml_vulkan: device lost on Vulkan0`), Ollama fell
+    back to its CPU runner, that runner hit a llama.cpp assertion and the process
+    dumped core -- so the 500 that reached us was really "the card ran out", and
+    the retry that follows fails too because the runner is gone. The body carries
+    the words; only this function knows what they mean.
+    """
+    text = str(body or "").lower()
+    if not text:
+        return ""
+    if "device lost" in text or "devicelost" in text or "llama-server terminated" in text:
+        return (
+            "Ollama lost the GPU and its runner died with it, so every call "
+            "fails until it respawns: `docker compose restart ollama`. Then "
+            "check `docker exec ollama ollama ps` -- the card is 4 GB shared "
+            "with ASR, and OLLAMA_MAX_LOADED_MODELS (2) / OLLAMA_NUM_PARALLEL (1) "
+            "in docker-compose.yml are what keep it from over-committing"
+        )
+    return ""
+
+
 async def get_llm_response(prompt: str, system: str = "", model: str = "",
                            num_predict: int = 0, timeout: float = 0.0,
                            options: Optional[dict] = None) -> str:
@@ -963,9 +987,10 @@ async def get_llm_response(prompt: str, system: str = "", model: str = "",
             f"LLM request failed: status={resp.status_code}, model={resolved_model}, "
             f"url={url}, response={detail[:500]}"
         )
+        hint = _ollama_failure_hint(detail)
         raise RuntimeError(
             f"Ollama returned HTTP {resp.status_code} for model {resolved_model!r}: "
-            f"{detail[:500]}"
+            f"{detail[:500]}" + (f". {hint}" if hint else "")
         )
     try:
         content = resp.json()["message"]["content"]

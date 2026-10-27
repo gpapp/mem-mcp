@@ -32,7 +32,7 @@ COMMON_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "common.py"
 GUI_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui.py")
 
 _FUNCTION = "get_llm_response"
-_HELPERS = ("_llm_excerpt", "_ollama_timing")
+_HELPERS = ("_llm_excerpt", "_ollama_timing", "_ollama_failure_hint")
 _ASSIGNMENTS = ("LLM_TIMEOUT", "LLM_CONNECT_TIMEOUT", "SEARCH_LLM_TIMEOUT", "LLM_LOG_CHARS")
 
 
@@ -758,6 +758,44 @@ class ConflictLoggingTests(unittest.TestCase):
         segment = html[start:end]
         self.assertIn("e.detail", segment, "the server's detail is never read")
         self.assertIn("fallback", segment, "there is no message for a detail-less failure")
+
+
+class OllamaFailureHintTests(unittest.TestCase):
+    """A dead GPU must be named as one, not reported as "HTTP 500".
+
+    Production: `ggml_vulkan: device lost on Vulkan0`, then Ollama's CPU fallback
+    aborted on a llama.cpp assertion and dumped core. The 500 that reached the app
+    was really "the card ran out of room", and the runner is gone, so the next
+    call fails too — no retry helps and only a restart does.
+    """
+
+    DEVICE_LOST = ('{"error":"llama-server terminated: signal: aborted (core '
+                   'dumped); ggml_vulkan: device lost on Vulkan0"}')
+
+    def _hint(self, body):
+        ns = _load(Recorder(), _ok("x"))
+        return ns["_ollama_failure_hint"](body)
+
+    def test_a_lost_device_names_the_restart_and_the_knobs(self):
+        hint = self._hint(self.DEVICE_LOST)
+        self.assertIn("restart ollama", hint)
+        self.assertIn("OLLAMA_MAX_LOADED_MODELS", hint,
+                      msg="the knob that keeps the card from over-committing is "
+                          "the only durable fix")
+        self.assertIn("4 GB", hint,
+                      msg="the card size is the reason the knobs exist")
+
+    def test_a_terminated_runner_alone_is_enough(self):
+        # The abort line arrives without the Vulkan line when the CPU runner is
+        # the one that died.
+        self.assertTrue(self._hint("llama-server terminated: signal: aborted"))
+
+    def test_an_ordinary_error_gets_no_hint(self):
+        # A 404 for a missing model has its own remedy and must not be sent to
+        # the GPU section.
+        for body in ('{"error":"model \\"nope\\" not found"}', "", "read timeout"):
+            with self.subTest(body=body):
+                self.assertEqual(self._hint(body), "")
 
 
 if __name__ == "__main__":
