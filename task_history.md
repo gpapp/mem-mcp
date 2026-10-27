@@ -5,6 +5,20 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# Live notes — Setup ASR-token card (2026-10-27)
+
+Shipped in `76fd0f6` on `feature/live-notes`.
+
+- **L9 — the key is write-only.** Setup now carries **🎙️ Live transcription
+  key**: a password input, Save, Test saved key and Clear, with the stored
+  `hint` shown and the input deliberately never populated from the server. Save
+  validates against asr-mcp first (`PUT /api/settings/asr-token` probes before
+  storing), so "saved" means accepted rather than merely written. The card says
+  the key is the user's own asr-mcp API key, stored per account, and that
+  recording is unavailable without one; a banner under the form repeats the
+  consequence while the key is unset. No new inline `display`/`width` that the
+  mobile block has to override.
+
 # Live notes — capture client, note jobs and REST surface (2026-10-27)
 
 Shipped in `c053471` on `feature/live-notes`.

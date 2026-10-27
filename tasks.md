@@ -21,20 +21,6 @@ commit. Audio forwarding never waits on processing.
 
 ---
 
-## L9. Setup ASR-token card
-
-- [ ] Add a **Live notes — ASR access token** card to the Setup page.
-- [ ] Password input, Save, Test, Clear; show the stored hint, never the token.
-- [ ] Explain that the token is the user's own asr-mcp API key and that recording
-      is unavailable without it.
-- [ ] Reuse the existing toast/error handling; no new inline styles on elements
-      that mobile CSS must override.
-
-**Acceptance:** saving, testing and clearing work from the page; the token field
-is never populated from the server; `node --check` passes.
-
----
-
 ## L10. Live notes tab and mobile layout
 
 - [ ] Add the top-level **🎙️ Live notes** tab (`data-tab="live"`, `#page-live`).

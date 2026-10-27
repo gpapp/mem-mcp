@@ -1175,6 +1175,38 @@
       </div>
     </div>
 
+    <div style="margin-top: 2.5rem; padding-top: 1.5rem; border-top: 1px solid var(--border);">
+      <h3 style="margin-top:0;">🎙️ Live transcription key</h3>
+      <p style="font-size: 0.9rem; color: var(--muted); margin-bottom: 1rem;">
+        Live notes record through your own <strong>asr-mcp</strong> server. Paste the API key
+        that server accepts — it is sent as an <code>X-API-Key</code> header on the
+        transcription connection and is <strong>never shown again</strong> after you save it.
+        It is stored per account, so a different login needs its own key.
+      </p>
+      <div id="asr-token-state" style="font-size:.9rem; color:var(--muted); margin-bottom:.75rem;">
+        Loading…
+      </div>
+      <div id="asr-token-form">
+        <div style="display:flex; gap:.5rem; flex-wrap:wrap; align-items:center;">
+          <input id="asr-token-input" type="password" autocomplete="new-password"
+                 placeholder="asr-mcp API key" style="flex:1; min-width:200px;">
+          <button id="asr-token-save" class="btn btn-primary btn-sm" onclick="saveAsrToken()">Save key</button>
+          <button id="asr-token-test" class="btn btn-sm" onclick="testAsrToken()">Test saved key</button>
+          <button id="asr-token-clear" class="btn btn-sm" onclick="clearAsrToken()">Clear</button>
+        </div>
+        <p style="font-size:0.8rem; color:var(--muted); margin:.5rem 0 0;">
+          “Test saved key” opens a short throwaway connection, so it can tell a rejected key
+          from an unreachable server. Recording stays disabled until a key is saved and accepted.
+        </p>
+      </div>
+      <div id="asr-token-hint" style="display:none; margin-top:1rem; padding:.75rem 1rem;
+           border:1px solid var(--border); border-radius:8px; font-size:.85rem; color:var(--muted);">
+        Open <strong>Setup → Live transcription key</strong> and save your asr-mcp API key
+        first. The <strong>Live notes</strong> tab explains where to find it if you have not
+        configured that server yet.
+      </div>
+    </div>
+
   </div>
 </div>
 {% if IS_ADMIN %}
@@ -1749,6 +1781,7 @@
     loadSharedWithMe();
     if (document.getElementById('page-service')) loadSavepoints();  // admin only; deduped against switchTab('service')
     loadPSKs();  // same deal as loadSavepoints
+    loadAsrToken();
     initSSE();
     initStatusStream();
     switchTab(activeTab);
@@ -2133,6 +2166,7 @@
     if (tab === 'clients') loadClients();
     if (tab === 'setup') {
       loadPSKs();
+      loadAsrToken();
     }
     // Through switchServiceTab, not straight to loadServiceData: the panel
     // classes have to be applied on entry, or a remembered sub-tab shows the
@@ -2883,6 +2917,104 @@
   // A job that is already running when the page opens is adopted, so its
   // result is still picked up, but an idle vault makes no requests.
   // ---------------------------------------------------------------------
+  // Live transcription key (Setup page)
+  //
+  // The plaintext is write-only: GET returns {set, hint} and the input is
+  // deliberately never populated from the server. The Save button validates
+  // the key against asr-mcp before storing it, so "saved" means "accepted".
+  let asrTokenLoaded = false;
+  let asrTokenInFlight = null;
+
+  async function fetchAsrToken() {
+    try {
+      const data = await api.get('settings/asr-token');
+      asrTokenLoaded = true;
+      renderAsrToken(data || {});
+    } catch (e) {
+      asrTokenLoaded = false;
+      const el = document.getElementById('asr-token-state');
+      if (el) el.textContent = 'Could not load the saved key' + (e && e.status ? ' (' + e.status + ')' : '') + '.';
+    }
+  }
+
+  function loadAsrToken(opts) {
+    const force = !!(opts && opts.force);
+    if (asrTokenInFlight) return asrTokenInFlight;
+    if (asrTokenLoaded && !force) return Promise.resolve();
+    asrTokenInFlight = fetchAsrToken().finally(() => { asrTokenInFlight = null; });
+    return asrTokenInFlight;
+  }
+
+  function renderAsrToken(data) {
+    const state = document.getElementById('asr-token-state');
+    const hint = document.getElementById('asr-token-hint');
+    const test = document.getElementById('asr-token-test');
+    const clear = document.getElementById('asr-token-clear');
+    const input = document.getElementById('asr-token-input');
+    const set = !!data.set;
+    if (state) {
+      state.textContent = set
+        ? 'A key is saved (' + (data.hint || 'hidden') + '…). Recording can start.'
+        : 'No key saved. Recording is disabled until you add one.';
+      state.style.color = set ? 'var(--success)' : 'var(--danger)';
+    }
+    if (hint) hint.style.display = set ? 'none' : 'block';
+    if (test) test.disabled = !set;
+    if (clear) clear.disabled = !set;
+    if (input) input.placeholder = set ? 'Replace the saved key…' : 'asr-mcp API key';
+  }
+
+  async function saveAsrToken() {
+    const input = document.getElementById('asr-token-input');
+    const btn = document.getElementById('asr-token-save');
+    const token = input ? input.value.trim() : '';
+    if (!token) { toast('⚠️ Paste an asr-mcp API key first'); return; }
+    try {
+      if (btn) btn.disabled = true;
+      const data = await api.put('settings/asr-token', { token: token });
+      if (input) input.value = '';
+      renderAsrToken(data || {});
+      toast('✅ Key saved — live transcription is ready');
+    } catch (e) {
+      if (e && e.status === 400) {
+        toastApiError(e, 'asr-mcp rejected that key');
+      } else if (e && e.status === 503) {
+        toastApiError(e, 'Could not reach asr-mcp to check the key');
+      } else {
+        toastApiError(e, 'Could not save the key');
+      }
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  async function testAsrToken() {
+    const btn = document.getElementById('asr-token-test');
+    try {
+      if (btn) btn.disabled = true;
+      const data = await api.post('settings/asr-token/test', {});
+      const status = data && data.status;
+      if (status === 'accepted') toast('✅ asr-mcp accepted the saved key');
+      else if (status === 'rejected') toast('❌ asr-mcp rejected the saved key — save a new one');
+      else toast('⚠️ Could not reach asr-mcp — check MEM_ASR_WS_URL and that it is running');
+    } catch (e) {
+      toastApiError(e, 'Could not test the saved key');
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  async function clearAsrToken() {
+    if (!confirm('Clear the saved asr-mcp key? Recording will be disabled until you save another.')) return;
+    try {
+      await api.delete('settings/asr-token');
+      renderAsrToken({ set: false });
+      toast('Key cleared');
+    } catch (e) {
+      toastApiError(e, 'Could not clear the key');
+    }
+  }
+
   // Access keys (Setup page)
   //
   // Loaded the same way as savepoints: once per visit, deduped, forced on
