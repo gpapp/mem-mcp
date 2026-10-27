@@ -28,7 +28,7 @@ Shipped in `40c2330` on `feature/live-notes`.
   from the old scope. Deleting a transcription is refused for the same interval.
   The UI disables those controls while a job is active, rather than offering an
   action the server refuses.
-- **Verification.** Full suite: **1257 tests**, all passing, including
+- **Verification.** Full suite: **1259 tests**, all passing, including
   `test_live_notes.py` (88), `test_mobile_layout.py` (95), `test_sessions.py`
   and `test_env_wiring.py`. `py_compile` clean on every touched Python module;
   `node --check` clean on the extracted dashboard script; `git diff --check`
