@@ -33,7 +33,6 @@ it from.
 
 import asyncio
 import gzip
-import hashlib
 import json
 import os
 import re
@@ -221,26 +220,16 @@ def prune_savepoints(keep: int = BACKUP_KEEP) -> list:
 # ---------------------------------------------------------------------------
 # A savepoint costs two Qdrant snapshots plus a full Bolt export, and a vault
 # nobody wrote to overnight produces a byte-identical copy of one that already
-# exists. The fingerprint is a digest over the *content* of the graph and the
-# point counts of both collections -- deliberately not a timestamp: `Fact`
-# carries `updatedAt` but only fact updates write it, and `DiaryEntry` carries
-# no update timestamp at all, so a time-based check would miss every diary edit
-# and every edit of an older fact.
+# exists. The fingerprint is the newest `updatedAt` per label plus that label's
+# count, and the relationship total. Every write path stamps `updatedAt` on
+# *both* ends of a link it creates or removes, so a reclassify that rewrites
+# nothing but scope edges is still visible, and a delete is visible because the
+# count moved — which is why no property content is hashed here.
 #
 # Anything that cannot be read makes the fingerprint empty, and an empty
 # fingerprint never matches. "I could not tell whether this changed" has to
 # take the savepoint: skipping on an unknown is how a backup silently stops
 # happening for a week.
-def _digest_line(*parts) -> bytes:
-    """One unambiguous digest line: a NUL separator and a newline terminator.
-
-    Without a separator `("ab", "c")` and `("a", "bc")` hash the same; without
-    the terminator the same pair of rows could be split across two different
-    keys.
-    """
-    return ("\x00".join(str(part) for part in parts) + "\n").encode("utf-8")
-
-
 def fingerprint_matches(previous: dict, current: dict) -> bool:
     """Whether two fingerprints describe the same vault.
 
@@ -253,71 +242,36 @@ def fingerprint_matches(previous: dict, current: dict) -> bool:
                for key in set(previous) | set(current))
 
 
-def _vault_digest(neo4j_driver) -> dict:
-    """Hash every node and relationship, and count the records by label."""
-    digest = hashlib.sha256()
-    counts = {"nodes": 0, "relationships": 0}
-    labels_seen = {"Fact": 0, "DiaryEntry": 0, "Client": 0, "Context": 0}
+def _vault_stamp(neo4j_driver) -> dict:
+    """The newest ``updatedAt`` and the record count per label, plus edges.
 
+    The relationship total is read separately on purpose: a link between two
+    records that were already stamped is still a change to the vault, and it is
+    the one a node-only fingerprint would miss.
+    """
+    stamp: dict = {}
     with neo4j_driver.session() as session:
-        offset = 0
-        while True:
-            rows = session.run(
-                """
-                MATCH (n)
-                RETURN elementId(n) AS eid, labels(n) AS labels,
-                       coalesce(n.id, '') AS id,
-                       coalesce(n.name, '') AS name,
-                       coalesce(n.text, n.content, '') AS body
-                ORDER BY eid SKIP $offset LIMIT $limit
-                """,
-                offset=offset, limit=_EXPORT_PAGE,
-            ).data()
-            if not rows:
-                break
-            for row in rows:
-                digest.update(_digest_line(
-                    row["eid"], ",".join(sorted(row["labels"] or [])),
-                    row["id"], row["name"], row["body"],
-                ))
-                counts["nodes"] += 1
-                for label in row["labels"] or []:
-                    if label in labels_seen:
-                        labels_seen[label] += 1
-            offset += len(rows)
-            if len(rows) < _EXPORT_PAGE:
-                break
+        rows = session.run(
+            """
+            MATCH (n)
+            RETURN labels(n) AS labels, count(*) AS nodes,
+                   toString(max(n.updatedAt)) AS newest
+            """
+        ).data()
+        for row in rows:
+            key = ",".join(sorted(row["labels"] or [])) or "(none)"
+            entry = stamp.setdefault(key, {"count": 0, "updatedAt": ""})
+            entry["count"] += int(row["nodes"] or 0)
+            newest = row["newest"] or ""
+            if newest > entry["updatedAt"]:
+                entry["updatedAt"] = newest
 
-        # Relationships are a second scan, and they have to be: a reclassify
-        # rewrites scope edges without touching a single node property, so a
-        # digest that ignored them would skip the savepoint that was supposed
-        # to capture the new scope. The digest keys on the endpoints' business
-        # ids rather than their elementIds, so a dump/load that reassigns
-        # elementIds does not change the fingerprint of an unchanged vault.
-        offset = 0
-        while True:
-            rows = session.run(
-                """
-                MATCH (a)-[r]->(b)
-                RETURN coalesce(a.id, '') AS src, type(r) AS rel_type,
-                       coalesce(b.id, '') AS dst
-                ORDER BY elementId(r) SKIP $offset LIMIT $limit
-                """,
-                offset=offset, limit=_EXPORT_PAGE,
-            ).data()
-            if not rows:
-                break
-            for row in rows:
-                digest.update(_digest_line(
-                    row["src"], row["rel_type"], row["dst"],
-                ))
-                counts["relationships"] += 1
-            offset += len(rows)
-            if len(rows) < _EXPORT_PAGE:
-                break
-
-    counts.update(labels_seen)
-    return {"digest": digest.hexdigest(), **counts}
+        edges = session.run(
+            "MATCH ()-[r]->() RETURN count(r) AS relationships"
+        ).data()
+        total = int(edges[0]["relationships"] or 0) if edges else 0
+        stamp["relationships"] = {"count": total}
+    return stamp
 
 
 async def _collection_point_count(collection: str) -> int | None:
@@ -333,14 +287,14 @@ async def _collection_point_count(collection: str) -> int | None:
 
 
 async def vault_fingerprint() -> dict:
-    """Content fingerprint of the live vault, or ``{}`` when unreadable."""
+    """Change fingerprint of the live vault, or ``{}`` when unreadable."""
     from common import get_neo4j
 
     driver = get_neo4j()
     if not driver:
         return {}
     try:
-        fingerprint = await asyncio.to_thread(_vault_digest, driver)
+        fingerprint = await asyncio.to_thread(_vault_stamp, driver)
     except Exception:
         logger.warning("backup: could not fingerprint the graph", exc_info=True)
         return {}
@@ -348,7 +302,7 @@ async def vault_fingerprint() -> dict:
         points = await _collection_point_count(collection)
         if points is None:
             return {}
-        fingerprint[collection] = points
+        fingerprint[collection] = {"points": points}
     return fingerprint
 
 
@@ -730,10 +684,10 @@ async def _reconcile_after_restore() -> None:
 async def run_backup(reason: str = "manual", fingerprint: dict | None = None) -> dict:
     """Create one savepoint. Qdrant first, then Neo4j — see the module docstring.
 
-    ``fingerprint`` is the vault digest the caller already took, when it had
+    ``fingerprint`` is the vault stamp the caller already took, when it had
     one: the scheduler computes it to decide whether to run at all, and taking
-    it a second time here would both cost another full scan and describe a
-    slightly later moment than the comparison did.
+    it a second time here would cost another read and describe a slightly later
+    moment than the comparison did.
     """
     from common import get_neo4j, get_qdrant
 

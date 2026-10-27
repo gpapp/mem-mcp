@@ -389,6 +389,7 @@ async def _auto_link_people(entry_id: str, content: str, user_id: str,
                 MATCH (d:DiaryEntry {id: $did, userId: $userId})-[r:MENTIONS]->(f:Fact)
                 WHERE coalesce(r.source, 'manual') = 'auto'
                   AND NOT f.id IN $personIds
+                SET d.updatedAt = datetime(), f.updatedAt = datetime()
                 DELETE r
                 """,
                 did=entry_id, userId=user_id, personIds=person_ids,
@@ -401,6 +402,7 @@ async def _auto_link_people(entry_id: str, content: str, user_id: str,
                         WHERE NOT (d)-[:MENTIONS]->(f)
                         MERGE (d)-[r:MENTIONS]->(f)
                         SET r.source = 'auto'
+                        SET d.updatedAt = datetime(), f.updatedAt = datetime()
                         RETURN count(f) AS n
                         """,
                         did=entry_id, userId=user_id, fid=person["id"],
@@ -419,6 +421,7 @@ async def _auto_link_people(entry_id: str, content: str, user_id: str,
                     WHERE NOT (d)-[:MENTIONS]->(f)
                     MERGE (d)-[r:MENTIONS]->(f)
                     SET r.source = 'manual'
+                    SET d.updatedAt = datetime(), f.updatedAt = datetime()
                     RETURN count(f) AS n
                     """,
                     did=entry_id, userId=user_id, fid=fid
@@ -464,6 +467,7 @@ async def sync_diary_mentions(entry_id: str, user_id: str,
                 """
                 MATCH (d:DiaryEntry {id: $id, userId: $userId})-[r:MENTIONS]->(f:Fact)
                 WHERE NOT f.id IN $factIds
+                SET d.updatedAt = datetime(), f.updatedAt = datetime()
                 DELETE r
                 """,
                 id=entry_id, userId=user_id, factIds=linked_facts,
@@ -474,13 +478,20 @@ async def sync_diary_mentions(entry_id: str, user_id: str,
                 MATCH (f:Fact) WHERE f.id IN $factIds
                 MERGE (d)-[r:MENTIONS]->(f)
                 SET r.source = 'manual'
+                SET d.updatedAt = datetime(), f.updatedAt = datetime()
                 """,
                 id=entry_id, userId=user_id, factIds=linked_facts,
             )
         else:
             # An explicit empty list clears them.
             s.run(
-                "MATCH (d:DiaryEntry {id: $id, userId: $userId})-[r:MENTIONS]->() DELETE r",
+                """
+                MATCH (d:DiaryEntry {id: $id, userId: $userId})
+                SET d.updatedAt = datetime()
+                WITH d
+                MATCH (d)-[r:MENTIONS]->()
+                DELETE r
+                """,
                 id=entry_id, userId=user_id,
             )
 
@@ -529,7 +540,7 @@ async def db_save_diary(content: str, user_id: str, timestamp: str, name: str, m
     # before the Neo4j MERGE below, so a failed embed leaves no entry behind.
     await _upsert_diary_points(qdrant, doc_id, content, payload, prefix=name)
 
-    neo4j_props = "d.date = $date, d.timestamp = $timestamp, d.content = $content, d.name = $name"
+    neo4j_props = "d.date = $date, d.timestamp = $timestamp, d.content = $content, d.name = $name, d.updatedAt = datetime()"
     if keywords:
         neo4j_props += ", d.keywords = $keywords"
     if metadata:
@@ -968,7 +979,7 @@ async def db_update_diary(entry_id: str, user_id: str, content: Optional[str] = 
         await _upsert_diary_points(qdrant, entry_id, new_content, payload,
                                    prefix=new_name, replace=True)
 
-        neo4j_props = "d.content = $content, d.name = $name, d.timestamp = $ts, d.date = $date"
+        neo4j_props = "d.content = $content, d.name = $name, d.timestamp = $ts, d.date = $date, d.updatedAt = datetime()"
         params = dict(id=entry_id, userId=user_id, content=new_content, name=new_name, ts=new_ts, date=entry_date)
         if keywords:
             neo4j_props += ", d.keywords = $keywords"
@@ -1058,7 +1069,8 @@ async def db_update_diary_metadata(entry_id: str, user_id: str,
         existing = json.loads(raw_meta) if isinstance(raw_meta, str) else (raw_meta or {})
         merged = {**existing, **metadata} if merge else dict(metadata)
         s.run(
-            "MATCH (d:DiaryEntry {id: $id, userId: $userId}) SET d.metadata = $metadata",
+            "MATCH (d:DiaryEntry {id: $id, userId: $userId}) "
+            "SET d.metadata = $metadata, d.updatedAt = datetime()",
             id=entry_id, userId=user_id, metadata=json.dumps(merged),
         )
 
@@ -1095,7 +1107,7 @@ async def db_link_diary_mention(entry_id: str, fact_id: str, user_id: str):
             MATCH (d:DiaryEntry {id: $entryId, userId: $userId})
             MATCH (f:Fact {id: $factId, userId: $userId})
             MERGE (d)-[r:MENTIONS]->(f)
-            SET r.source = 'manual'
+            SET r.source = 'manual', d.updatedAt = datetime(), f.updatedAt = datetime()
             """,
             entryId=entry_id, factId=fact_id, userId=user_id
         )
@@ -1111,6 +1123,7 @@ async def db_unlink_diary_mention(entry_id: str, fact_id: str, user_id: str):
         s.run(
             """
             MATCH (d:DiaryEntry {id: $entryId, userId: $userId})-[r:MENTIONS]->(f:Fact {id: $factId, userId: $userId})
+            SET d.updatedAt = datetime(), f.updatedAt = datetime()
             DELETE r
             """,
             entryId=entry_id, factId=fact_id, userId=user_id
@@ -1134,6 +1147,7 @@ async def db_add_diary_relevant(entry_id: str, client_id: str, user_id: str):
             MATCH (c {id: $clientId, userId: $userId})
             WHERE c:Client OR c:Context
             MERGE (d)-[:RELEVANT_TO]->(c)
+            SET d.updatedAt = datetime(), c.updatedAt = datetime()
             """,
             entryId=entry_id, clientId=client_id, userId=user_id
         )
@@ -1150,6 +1164,7 @@ async def db_remove_diary_relevant(entry_id: str, client_id: str, user_id: str):
             """
             MATCH (d:DiaryEntry {id: $entryId, userId: $userId})-[r:RELEVANT_TO]->(c {id: $clientId, userId: $userId})
             WHERE c:Client OR c:Context
+            SET d.updatedAt = datetime(), c.updatedAt = datetime()
             DELETE r
             """,
             entryId=entry_id, clientId=client_id, userId=user_id

@@ -256,7 +256,7 @@ async def db_add_memory(text: str, category: str, user_id: str, metadata: Option
             MERGE (u:User {id: $userId})
             MERGE (c:Category {name: $category})
             CREATE (f:Fact {id: $id, text: $text, name: $name, category: $category,
-                            timestamp: datetime(), userId: $userId})
+                            timestamp: datetime(), updatedAt: datetime(), userId: $userId})
             SET f += $metadata
             CREATE (u)-[:KNOWS]->(f)
             CREATE (f)-[:IN_CATEGORY]->(c)
@@ -481,6 +481,7 @@ async def db_add_fact_relevant(fact_id: str, client_id: str, user_id: str):
             MATCH (c {id: $clientId, userId: $userId})
             WHERE c:Client OR c:Context
             MERGE (f)-[:RELEVANT_TO]->(c)
+            SET f.updatedAt = datetime(), c.updatedAt = datetime()
             """,
             factId=fact_id, clientId=client_id, userId=user_id,
         )
@@ -499,6 +500,7 @@ async def db_remove_fact_relevant(fact_id: str, client_id: str, user_id: str):
             """
             MATCH (f:Fact {id: $factId, userId: $userId})-[r:RELEVANT_TO]->(c {id: $clientId, userId: $userId})
             WHERE c:Client OR c:Context
+            SET f.updatedAt = datetime(), c.updatedAt = datetime()
             DELETE r
             """,
             factId=fact_id, clientId=client_id, userId=user_id,
@@ -546,6 +548,7 @@ async def db_link_facts(source_id: str, target_id: str, rel_type: str, metadata:
                 MATCH (b:Fact {{id: $tid, userId: $userId}})
                 MERGE (a)-[r:{rel_type}]->(b)
                 SET r += $metadata
+                SET a.updatedAt = datetime(), b.updatedAt = datetime()
                 """,
                 sid=source_id, tid=target_id, userId=user_id, metadata=metadata
             )
@@ -555,6 +558,7 @@ async def db_link_facts(source_id: str, target_id: str, rel_type: str, metadata:
                 MATCH (b:Fact {{id: $tid, userId: $userId}})
                 MERGE (b)-[r:{rel_type}]->(a)
                 SET r += $metadata
+                SET a.updatedAt = datetime(), b.updatedAt = datetime()
                 """,
                 sid=source_id, tid=target_id, userId=user_id, metadata=metadata
             )
@@ -569,6 +573,7 @@ async def db_link_facts(source_id: str, target_id: str, rel_type: str, metadata:
                 MATCH (d:DiaryEntry {id: $sid, userId: $userId})
                 MATCH (f:Fact {id: $tid, userId: $userId})
                 MERGE (d)-[:MENTIONS]->(f)
+                SET d.updatedAt = datetime(), f.updatedAt = datetime()
                 """,
                 sid=source_id, tid=target_id, userId=user_id
             )
@@ -581,6 +586,7 @@ async def db_link_facts(source_id: str, target_id: str, rel_type: str, metadata:
                 MATCH (f:Fact {id: $sid, userId: $userId})
                 MATCH (d:DiaryEntry {id: $tid, userId: $userId})
                 MERGE (d)-[:MENTIONS]->(f)
+                SET d.updatedAt = datetime(), f.updatedAt = datetime()
                 """,
                 sid=source_id, tid=target_id, userId=user_id
             )
@@ -597,6 +603,7 @@ async def db_link_facts(source_id: str, target_id: str, rel_type: str, metadata:
                     MATCH (b:DiaryEntry {id: $tid, userId: $userId})
                     MERGE (a)-[r:RELATED_TO]->(b)
                     SET r += $metadata
+                    SET a.updatedAt = datetime(), b.updatedAt = datetime()
                     """,
                     sid=sid, tid=tid, userId=user_id, metadata=metadata
                 )
@@ -644,6 +651,7 @@ async def db_unlink_facts(source_id: str, target_id: str, rel_type: str, user_id
                     MATCH (a:Fact {{id: $sid, userId: $userId}})
                     MATCH (b:Fact {{id: $tid, userId: $userId}})
                     OPTIONAL MATCH (a)-[r:{rel_type}]->(b)
+                    SET a.updatedAt = datetime(), b.updatedAt = datetime()
                     DELETE r
                     """,
                     sid=source_id, tid=target_id, userId=user_id
@@ -653,6 +661,7 @@ async def db_unlink_facts(source_id: str, target_id: str, rel_type: str, user_id
                     MATCH (a:Fact {{id: $sid, userId: $userId}})
                     MATCH (b:Fact {{id: $tid, userId: $userId}})
                     OPTIONAL MATCH (b)-[r:{rel_type}]->(a)
+                    SET a.updatedAt = datetime(), b.updatedAt = datetime()
                     DELETE r
                     """,
                     sid=source_id, tid=target_id, userId=user_id
@@ -663,6 +672,7 @@ async def db_unlink_facts(source_id: str, target_id: str, rel_type: str, user_id
                     MATCH (a:Fact {id: $sid, userId: $userId})
                     MATCH (b:Fact {id: $tid, userId: $userId})
                     OPTIONAL MATCH (a)-[r]-(b)
+                    SET a.updatedAt = datetime(), b.updatedAt = datetime()
                     DELETE r
                     """,
                     sid=source_id, tid=target_id, userId=user_id
@@ -676,6 +686,7 @@ async def db_unlink_facts(source_id: str, target_id: str, rel_type: str, user_id
             s.run(
                 """
                 MATCH (d:DiaryEntry {id: $sid, userId: $userId})-[r:MENTIONS]->(f:Fact {id: $tid, userId: $userId})
+                SET d.updatedAt = datetime(), f.updatedAt = datetime()
                 DELETE r
                 """,
                 sid=source_id, tid=target_id, userId=user_id
@@ -686,6 +697,7 @@ async def db_unlink_facts(source_id: str, target_id: str, rel_type: str, user_id
             s.run(
                 """
                 MATCH (d:DiaryEntry {id: $tid, userId: $userId})-[r:MENTIONS]->(f:Fact {id: $sid, userId: $userId})
+                SET d.updatedAt = datetime(), f.updatedAt = datetime()
                 DELETE r
                 """,
                 sid=source_id, tid=target_id, userId=user_id
@@ -698,6 +710,7 @@ async def db_unlink_facts(source_id: str, target_id: str, rel_type: str, user_id
                 s.run(
                     """
                     MATCH (a:DiaryEntry {id: $sid, userId: $userId})-[r:RELATED_TO]->(b:DiaryEntry {id: $tid, userId: $userId})
+                    SET a.updatedAt = datetime(), b.updatedAt = datetime()
                     DELETE r
                     """,
                     sid=sid, tid=tid, userId=user_id

@@ -90,7 +90,8 @@ async def db_create_client(name: str, user_id: str) -> str:
             """
             MERGE (u:User {id: $userId})
             MERGE (c:Client {name: $name, userId: $userId})
-            SET c.id = $clientId, c.active = true, c.createdAt = coalesce(c.createdAt, datetime())
+            SET c.id = $clientId, c.active = true, c.createdAt = coalesce(c.createdAt, datetime()),
+                c.updatedAt = datetime()
             MERGE (u)-[:OWNS_CLIENT]->(c)
             """,
             userId=user_id, name=name.strip(), clientId=client_id
@@ -112,7 +113,8 @@ async def db_create_context(name: str, client_id: str, user_id: str) -> str:
             MERGE (u:User {id: $userId})
             MERGE (c:Client {id: $clientId, userId: $userId})
             MERGE (ctx:Context {name: $name, userId: $userId, clientId: $clientId})
-            SET ctx.id = $contextId, ctx.active = true, ctx.createdAt = coalesce(ctx.createdAt, datetime())
+            SET ctx.id = $contextId, ctx.active = true, ctx.createdAt = coalesce(ctx.createdAt, datetime()),
+                ctx.updatedAt = datetime()
             MERGE (u)-[:OWNS_CONTEXT]->(ctx)
             MERGE (c)-[:HAS_CONTEXT]->(ctx)
             """,
@@ -414,7 +416,7 @@ async def db_set_client_active(client_id: str, active: bool, user_id: str) -> bo
         result = s.run(
             """
             MATCH (c:Client {id: $clientId, userId: $userId})
-            SET c.active = $active, c.statusPinned = true
+            SET c.active = $active, c.statusPinned = true, c.updatedAt = datetime()
             RETURN count(c) AS n
             """,
             clientId=client_id, userId=user_id, active=bool(active)
@@ -439,7 +441,7 @@ async def db_set_client_cross(client_id: str, cross: bool, user_id: str) -> bool
         result = s.run(
             """
             MATCH (c:Client {id: $clientId, userId: $userId})
-            SET c.crossClient = $cross
+            SET c.crossClient = $cross, c.updatedAt = datetime()
             RETURN count(c) AS n
             """,
             clientId=client_id, userId=user_id, cross=bool(cross)
@@ -472,7 +474,7 @@ async def db_rename_client(client_id: str, name: str, user_id: str) -> bool:
         rec = s.run(
             """
             MATCH (c:Client {id: $clientId, userId: $userId})
-            SET c.name = $name
+            SET c.name = $name, c.updatedAt = datetime()
             RETURN count(c) AS n
             """,
             clientId=client_id, userId=user_id, name=name
@@ -512,7 +514,7 @@ async def db_rename_context(context_id: str, name: str, user_id: str) -> bool:
         rec = s.run(
             """
             MATCH (ctx:Context {id: $contextId, userId: $userId})
-            SET ctx.name = $name
+            SET ctx.name = $name, ctx.updatedAt = datetime()
             RETURN count(ctx) AS n
             """,
             contextId=context_id, userId=user_id, name=name
@@ -546,7 +548,7 @@ def _stamp_manual_scope(node_id: str, label: str, user_id: str) -> None:
         with neo4j_driver.session() as s:
             s.run(
                 f"MATCH (n:{label} {{id: $id, userId: $userId}}) "
-                "SET n.scopeCheckedSig = $sig, n.scopeManual = true",
+                "SET n.scopeCheckedSig = $sig, n.scopeManual = true, n.updatedAt = datetime()",
                 id=node_id, userId=user_id, sig=sig,
             )
     except Exception as exc:
@@ -603,11 +605,13 @@ async def db_set_fact_scope(fact_id: str, client_id: Optional[str], context_id: 
         if not found or found["n"] == 0:
             return None
         s.run(
-            "MATCH (f:Fact {id: $factId, userId: $userId})-[r:FOR_CLIENT]->(:Client) DELETE r",
+            "MATCH (f:Fact {id: $factId, userId: $userId}) SET f.updatedAt = datetime() "
+            "WITH f MATCH (f)-[r:FOR_CLIENT]->(:Client) DELETE r",
             factId=fact_id, userId=user_id
         )
         s.run(
-            "MATCH (f:Fact {id: $factId, userId: $userId})-[r:IN_CONTEXT]->(:Context) DELETE r",
+            "MATCH (f:Fact {id: $factId, userId: $userId}) SET f.updatedAt = datetime() "
+            "WITH f MATCH (f)-[r:IN_CONTEXT]->(:Context) DELETE r",
             factId=fact_id, userId=user_id
         )
     if client:
@@ -1195,7 +1199,8 @@ async def link_fact_to_client(fact_id: str, client_id: str, user_id: str):
             WITH c
             MATCH (f:Fact {id: $factId, userId: $userId})
             MERGE (f)-[:FOR_CLIENT]->(c)
-            SET c.lastMentioned = datetime(), c.active = CASE WHEN coalesce(c.statusPinned, false) THEN c.active ELSE true END
+            SET c.lastMentioned = datetime(), c.active = CASE WHEN coalesce(c.statusPinned, false) THEN c.active ELSE true END,
+                f.updatedAt = datetime(), c.updatedAt = datetime()
             """,
             clientId=client_id, userId=user_id, factId=fact_id
         )
@@ -1213,7 +1218,8 @@ async def link_fact_to_context(fact_id: str, context_id: str, user_id: str):
             WITH ctx
             MATCH (f:Fact {id: $factId, userId: $userId})
             MERGE (f)-[:IN_CONTEXT]->(ctx)
-            SET ctx.lastMentioned = datetime(), ctx.active = CASE WHEN coalesce(ctx.statusPinned, false) THEN ctx.active ELSE true END
+            SET ctx.lastMentioned = datetime(), ctx.active = CASE WHEN coalesce(ctx.statusPinned, false) THEN ctx.active ELSE true END,
+                f.updatedAt = datetime(), ctx.updatedAt = datetime()
             """,
             contextId=context_id, userId=user_id, factId=fact_id
         )
@@ -1268,11 +1274,13 @@ async def db_set_diary_scope(entry_id: str, client_id: Optional[str], context_id
         if not found or found["n"] == 0:
             return None
         s.run(
-            "MATCH (d:DiaryEntry {id: $entryId, userId: $userId})-[r:FOR_CLIENT]->(:Client) DELETE r",
+            "MATCH (d:DiaryEntry {id: $entryId, userId: $userId}) SET d.updatedAt = datetime() "
+            "WITH d MATCH (d)-[r:FOR_CLIENT]->(:Client) DELETE r",
             entryId=entry_id, userId=user_id
         )
         s.run(
-            "MATCH (d:DiaryEntry {id: $entryId, userId: $userId})-[r:IN_CONTEXT]->(:Context) DELETE r",
+            "MATCH (d:DiaryEntry {id: $entryId, userId: $userId}) SET d.updatedAt = datetime() "
+            "WITH d MATCH (d)-[r:IN_CONTEXT]->(:Context) DELETE r",
             entryId=entry_id, userId=user_id
         )
     if client:
@@ -1322,7 +1330,8 @@ async def link_diary_to_client(entry_id: str, client_id: str, user_id: str):
             WITH c
             MATCH (d:DiaryEntry {id: $entryId, userId: $userId})
             MERGE (d)-[:FOR_CLIENT]->(c)
-            SET c.lastMentioned = datetime(), c.active = CASE WHEN coalesce(c.statusPinned, false) THEN c.active ELSE true END
+            SET c.lastMentioned = datetime(), c.active = CASE WHEN coalesce(c.statusPinned, false) THEN c.active ELSE true END,
+                d.updatedAt = datetime(), c.updatedAt = datetime()
             """,
             clientId=client_id, userId=user_id, entryId=entry_id
         )
@@ -1340,7 +1349,8 @@ async def link_diary_to_context(entry_id: str, context_id: str, user_id: str):
             WITH ctx
             MATCH (d:DiaryEntry {id: $entryId, userId: $userId})
             MERGE (d)-[:IN_CONTEXT]->(ctx)
-            SET ctx.lastMentioned = datetime(), ctx.active = CASE WHEN coalesce(ctx.statusPinned, false) THEN ctx.active ELSE true END
+            SET ctx.lastMentioned = datetime(), ctx.active = CASE WHEN coalesce(ctx.statusPinned, false) THEN ctx.active ELSE true END,
+                d.updatedAt = datetime(), ctx.updatedAt = datetime()
             """,
             contextId=context_id, userId=user_id, entryId=entry_id
         )

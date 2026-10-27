@@ -409,6 +409,7 @@ def _link_diary_relevant_to(diary_id: str, client_ids: list, user_id: str, neo4j
                 MATCH (n:{label} {{id: $nid, userId: $userId}})
                 MATCH (c:Client {{id: $clientId, userId: $userId}})
                 MERGE (n)-[:RELEVANT_TO]->(c)
+                SET n.updatedAt = datetime(), c.updatedAt = datetime()
                 """,
                 nid=diary_id, userId=user_id, clientId=cid
             )
@@ -1291,6 +1292,7 @@ def clear_scope_links_batch(node_ids: list, user_id: str, neo4j_driver) -> int:
             OPTIONAL MATCH (n)-[r:FOR_CLIENT|IN_CONTEXT]->()
             FOREACH (ignored IN CASE WHEN r IS NULL THEN [] ELSE [r] END | DELETE ignored)
             REMOVE n.scopeCheckedSig
+            SET n.updatedAt = datetime()
             RETURN count(DISTINCT n) AS cleared
             """,
             ids=ids, userId=user_id,
