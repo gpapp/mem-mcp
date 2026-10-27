@@ -21,6 +21,32 @@ def seg(start, text, speaker="Ana", end=None):
     }
 
 
+def gui_functions(names, namespace):
+    """Exec selected top-level functions out of gui.py into `namespace`.
+
+    gui.py cannot be imported here (no fastapi, no database drivers), so the
+    shipping functions are lifted with `ast` and **called**. A source assertion
+    would not be able to tell a probe that checks the cheap endpoint from one
+    that opens a socket, and that difference is the whole property below.
+    """
+    import ast
+    import os
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui.py")
+    with open(path, "r", encoding="utf-8") as handle:
+        source = handle.read()
+    tree = ast.parse(source)
+    wanted = [n for n in tree.body
+              if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+              and n.name in names]
+    missing = set(names) - {n.name for n in wanted}
+    if missing:
+        raise AssertionError(f"gui.py has no top-level {sorted(missing)}")
+    module = ast.Module(body=wanted, type_ignores=[])
+    ast.fix_missing_locations(module)
+    exec(compile(module, path, "exec"), namespace)
+    return namespace
+
+
 class PromptTests(unittest.TestCase):
     def setUp(self):
         self.segments = [seg(0, "We should migrate the PPC reports first."),
@@ -580,6 +606,197 @@ class AsrProxyTests(unittest.TestCase):
         self.assertLess(branch.index("LIVE_GATE.begin_recording(user_id)"),
                         branch.index("open_upstream("),
                         "resume must preempt a queued note job before audio flows")
+
+
+    def test_a_plain_http_handshake_is_answered_with_the_reason(self):
+        """A dropped Upgrade must not be reported as a bad access key.
+
+        A WebSocketRoute cannot match an http scope, so before this route existed
+        the handshake fell through to the catch-all MCP mount and was refused
+        with a 401 naming an access key. The realistic cause is a proxy that
+        stripped `Upgrade`/`Connection`, so the answer names the directive and
+        the status is the one that means "use the upgrade protocol".
+        """
+        import asyncio
+        import types
+
+        class JSON:
+            def __init__(self, content, status_code=200, headers=None):
+                self.content = content
+                self.status_code = status_code
+                self.headers = headers or {}
+
+        messages = []
+        namespace = {
+            "JSONResponse": JSON,
+            "Request": object,      # only ever an annotation
+            "mem": types.SimpleNamespace(
+                logger=types.SimpleNamespace(warning=messages.append)),
+            "web_app": types.SimpleNamespace(
+                get=lambda *args, **kwargs: (lambda fn: fn)),
+        }
+        gui_functions({"live_stream_needs_upgrade"}, namespace)
+        response = asyncio.run(namespace["live_stream_needs_upgrade"](
+            "t1", types.SimpleNamespace(method="GET")))
+        self.assertEqual(response.status_code, 426)
+        self.assertEqual(response.headers.get("Upgrade"), "websocket")
+        self.assertIn("Upgrade", response.content["detail"])
+        self.assertIn("proxy_http_version 1.1", response.content["detail"])
+        # Logged: the log is the only place an operator sees why no socket
+        # opened, and this request never reaches the WebSocket route.
+        self.assertTrue(messages)
+        self.assertIn("t1", messages[0])
+
+
+class AsrLanguagesUrlTests(unittest.TestCase):
+    """The token probe URL is derived from the socket URL, not configured twice.
+
+    asr-mcp's socket and its HTTP surface are one server. Two knobs would drift,
+    and the wrong one would be the one nobody edits.
+    """
+
+    def test_the_default_socket_url_maps_to_the_languages_route(self):
+        self.assertEqual(
+            ln.asr_languages_url(
+                "ws://host.docker.internal:8087/api/asr/ws/stream"),
+            "http://host.docker.internal:8087/api/asr/languages",
+        )
+
+    def test_a_secure_socket_maps_to_https(self):
+        self.assertEqual(
+            ln.asr_languages_url("wss://asr.example/api/asr/ws/stream"),
+            "https://asr.example/api/asr/languages",
+        )
+
+    def test_a_trailing_slash_does_not_produce_a_double_slash(self):
+        self.assertEqual(
+            ln.asr_languages_url("ws://asr:8087/api/asr/ws/stream/"),
+            "http://asr:8087/api/asr/languages",
+        )
+
+    def test_an_unconfigured_url_is_empty_so_the_caller_can_say_so(self):
+        self.assertEqual(ln.asr_languages_url(""), "")
+
+
+class _ProbeResponse:
+    def __init__(self, status_code):
+        self.status_code = status_code
+
+
+class _Handshake(Exception):
+    def __init__(self, status_code):
+        super().__init__(f"HTTP {status_code}")
+        self.status_code = status_code
+
+
+class AsrTokenProbeTests(unittest.TestCase):
+    """Checking a key must not load a model.
+
+    asr-mcp loads the recogniser when a socket opens, and the probe used to open
+    one -- on a 4 GB card Ollama is also using. These tests drive the shipping
+    probe, so the assertion is which URL it asked and whether a socket was
+    opened at all; neither is visible in the shape of the code.
+    """
+
+    TOKEN = "asr_secret_key"
+
+    def make(self, status=200, error=None, url="ws://asr:8087/api/asr/ws/stream",
+             install_ws=True):
+        import asyncio
+        import types
+        calls = []
+        connections = []
+
+        class Client:
+            def __init__(self, timeout=None):
+                self.timeout = timeout
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def get(self, target, headers=None):
+                calls.append((target, dict(headers or {}), self.timeout))
+                if error is not None:
+                    raise error
+                return _ProbeResponse(status)
+
+        class Connection:
+            async def close(self):
+                pass
+
+        async def connect(target, **kwargs):
+            connections.append((target, kwargs))
+            return Connection()
+
+        logger = types.SimpleNamespace(
+            info=lambda message: None,
+            warning=lambda message: None,
+        )
+        namespace = {
+            "asyncio": asyncio,
+            "httpx": types.SimpleNamespace(AsyncClient=Client),
+            "Optional": __import__("typing").Optional,
+            "mem": types.SimpleNamespace(
+                ASR_WS_URL=url,
+                # The real helper: the URL the probe asks is part of the
+                # property, and stubbing it would assume the answer.
+                asr_languages_url=ln.asr_languages_url,
+                logger=logger,
+            ),
+            "_ws_connect": connect if install_ws else None,
+            "_WS_HEADER_KWARG": "extra_headers",
+            "_asr_url_with_language": lambda base, language: base,
+        }
+        gui_functions({"_probe_asr_token", "_probe_asr_websocket"}, namespace)
+        return namespace["_probe_asr_token"], calls, connections
+
+    def run_probe(self, **kwargs):
+        import asyncio
+        probe, calls, connections = self.make(**kwargs)
+        return asyncio.run(probe(self.TOKEN, "alice")), calls, connections
+
+    def test_it_asks_the_cheap_authenticated_route_and_opens_no_socket(self):
+        result, calls, connections = self.run_probe(status=200)
+        self.assertEqual(result["status"], "accepted")
+        self.assertEqual(len(calls), 1)
+        url, headers, timeout = calls[0]
+        self.assertEqual(url, "http://asr:8087/api/asr/languages")
+        self.assertEqual(headers, {"X-API-Key": self.TOKEN})
+        self.assertIsNotNone(timeout, "the probe needs its own timeout")
+        self.assertEqual(connections, [],
+                         "validating a key must not load the recogniser")
+
+    def test_a_refusal_is_rejected_rather_than_unreachable(self):
+        result, _, connections = self.run_probe(status=401)
+        self.assertEqual(result["status"], "rejected")
+        self.assertIn("401", result["detail"])
+        self.assertEqual(connections, [])
+
+    def test_an_unreachable_server_is_not_reported_as_a_bad_key(self):
+        result, _, _ = self.run_probe(error=ConnectionError("no route to host"))
+        self.assertEqual(result["status"], "unreachable")
+        self.assertNotEqual(result["status"], "rejected")
+
+    def test_an_older_asr_mcp_falls_back_to_the_socket_handshake(self):
+        result, _, connections = self.run_probe(status=404)
+        self.assertEqual(result["status"], "accepted")
+        self.assertEqual(len(connections), 1,
+                         "a server without the languages route must still be able "
+                         "to have a working key saved")
+
+    def test_a_missing_websockets_client_does_not_block_the_http_probe(self):
+        result, calls, _ = self.run_probe(status=200, install_ws=False)
+        self.assertEqual(result["status"], "accepted")
+        self.assertEqual(len(calls), 1)
+
+    def test_an_unconfigured_server_is_named_as_such(self):
+        result, calls, _ = self.run_probe(url="")
+        self.assertEqual(result["status"], "unreachable")
+        self.assertIn("MEM_ASR_WS_URL", result["detail"])
+        self.assertEqual(calls, [])
 
 
 class AsrSegmentTests(unittest.TestCase):

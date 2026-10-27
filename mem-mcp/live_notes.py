@@ -30,7 +30,7 @@ import math
 import os
 import re
 import threading
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 # --- tunables -------------------------------------------------------------
 # Read at import, like the rest of the app's knobs. Every one of these is also
@@ -525,6 +525,33 @@ def origin_allowed(origin, base_url, request_origin="") -> bool:
         return False
     expected = _origin_of(base_url) or _origin_of(request_origin)
     return bool(expected) and value == expected
+
+
+def asr_languages_url(ws_url: str) -> str:
+    """The HTTP URL that validates an asr-mcp key without loading a model.
+
+    `MEM_ASR_WS_URL` points at the streaming socket, and asr-mcp loads the
+    recogniser when a socket opens: checking whether a key works therefore cost
+    a model load on a 4 GB card that Ollama is also using. `GET
+    /api/asr/languages` sits behind the same auth middleware and answers from a
+    static list, so a key can be verified for the price of an HTTP round trip.
+
+    Derived from the socket URL rather than configured separately -- two knobs
+    naming the same server drift, and the one that is wrong is the one nobody
+    edits. Returns `""` when no URL is configured, which the caller reports as
+    unreachable.
+    """
+    parts = urlsplit(str(ws_url or "").strip())
+    if not parts.netloc:
+        return ""
+    scheme = {"ws": "http", "wss": "https"}.get(parts.scheme, "http")
+    path = parts.path or "/"
+    if "/ws/" in path:
+        path = path.split("/ws/", 1)[0]
+    else:
+        path = path.rsplit("/", 1)[0]
+    path = path.rstrip("/") + "/languages"
+    return urlunsplit((scheme, parts.netloc, path, "", ""))
 
 
 class LivePriorityGate:

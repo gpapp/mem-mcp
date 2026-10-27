@@ -5,7 +5,43 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# Live notes — recording start, the proxy Upgrade, and a cheap ASR-key probe (2026-10-27)
+
+- **"Starting the recording failed" was nginx, not the app.** The handshake
+  arrived at uvicorn as a plain HTTP `GET` — `Upgrade`/`Connection` are
+  hop-by-hop headers, and the GUI location named only `Connection ""` — so no
+  `WebSocketRoute` matched, the request fell through to the catch-all mount and
+  the browser got **`McpAuthGuard`'s 401** about an access key it was never
+  meant to send. `nginx_snippet.conf` now has a dedicated
+  `location /mem-mcp/api/live/stream/` with `proxy_http_version 1.1`, the
+  `Upgrade`/`Connection "upgrade"` pair, `proxy_buffering off` and a 24h read
+  timeout. No `map` block: the snippet is included inside `server {}`.
+- **The app now diagnoses that misconfiguration itself.** A `GET` on the same
+  path answers **426 Upgrade Required** with a detail naming the two headers,
+  because a 401 sends an operator looking at the wrong credential.
+- **Reading the log is what found it, and one line was lying.** `[GUI] GET`
+  looked like proof the browser sent a plain GET; it is `log_gui_requests`
+  printing `request.url.path`, which includes `root_path`. The real defect is
+  that `auth_guard` compared the *same* value against `/gui` and `/api` — with
+  `root_path="/mem-mcp"` both prefixes are false, so the documented outer gate
+  was answering every request with a redirect and each handler's `_require_user`
+  was doing all the work. `_request_path()` strips the prefix and both
+  middlewares use it; `ApiAuthTests` drives the guard with `root_path` set.
+- **The key test no longer loads the ASR model.** `PUT /api/settings/asr-token`
+  proved a key by opening a throwaway transcription socket, which asr-mcp
+  answers by loading the model onto the 4 GB card — the exact contention the
+  priority gate exists to prevent. It now calls
+  `GET /api/asr/languages` (static list, no model), derived from
+  `MEM_ASR_WS_URL` by `asr_languages_url()` in `live_notes.py`, falling back to
+  the handshake only on `404` so an older asr-mcp still accepts a valid key.
+- **Both new guards were re-injected to check they bite.** Reverting
+  `auth_guard` to `request.url.path` fails the root-path test; deleting the
+  `Upgrade` directive fails the wiring test. Full suite: **1272 tests**, all
+  passing (170 in the two touched files, 11 of them new). `py_compile` clean on
+  every touched module; `git diff --check` clean with `cr-at-eol`.
+
 # Live notes — documentation, verification and epic close (2026-10-27)
+
 
 Shipped in `40c2330` on `feature/live-notes`.
 

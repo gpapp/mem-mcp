@@ -602,6 +602,28 @@ class WiringTests(unittest.TestCase):
         self.assertNotIn("remote-user", directives,
                          "$remote_user is empty now that nothing authenticates it")
 
+    def test_the_live_audio_route_forwards_the_websocket_upgrade(self):
+        """nginx strips `Upgrade` and `Connection` unless they are set.
+
+        Without this location the handshake reaches uvicorn as a plain GET,
+        matches no WebSocketRoute, falls through to the catch-all MCP mount and
+        is refused with a 401 naming an access key -- which is the report this
+        block exists to stop. The app's own 426 is a diagnosis, not a substitute
+        for forwarding the headers.
+        """
+        marker = "location /mem-mcp/api/live/stream/"
+        self.assertIn(marker, self.nginx,
+                      "the audio route needs its own location block")
+        block = self.nginx.split(marker, 1)[1].split("location ", 1)[0]
+        directives = "\n".join(
+            line.split("#")[0] for line in block.splitlines()
+        )
+        self.assertIn("proxy_pass http://localhost:8086/api/live/stream/",
+                      directives)
+        self.assertIn("proxy_http_version 1.1", directives)
+        self.assertIn("proxy_set_header Upgrade $http_upgrade", directives)
+        self.assertIn('proxy_set_header Connection "upgrade"', directives)
+
     def test_the_session_middleware_is_the_persistent_one(self):
         self.assertIn("VaultSessionMiddleware", self.gui)
         self.assertNotIn("starlette.middleware.sessions", self.gui,
@@ -922,10 +944,20 @@ def _leaky_extract(headers):
 
 
 class _Request:
-    """The three attributes auth_guard and _user actually touch."""
+    """The attributes auth_guard and _user actually touch."""
 
-    def __init__(self, path, headers=None, session=None):
-        self.url = types.SimpleNamespace(path=path)
+    def __init__(self, path, headers=None, session=None, root_path=""):
+        # `Request.url.path` is root_path + path, and uvicorn sets
+        # `scope["path"]` to the full request path too -- Starlette's *router*
+        # is what strips root_path. Modelling both is what makes a prefixed
+        # deployment testable: a stub carrying only the unprefixed path cannot
+        # reproduce the defect that silently disabled the gate.
+        self.scope = {
+            "type": "http",
+            "path": root_path + path,
+            "root_path": root_path,
+        }
+        self.url = types.SimpleNamespace(path=root_path + path)
         self.headers = headers or {}
         self.session = {} if session is None else session
         self.state = types.SimpleNamespace()
@@ -1365,6 +1397,10 @@ class ApiAuthTests(unittest.TestCase):
         cls.registered_checks = []
         ns = dict(namespace)
         ns["_verify_htpasswd"] = lambda u, p: ApiAuthTests._verify(u, p)
+        # The prefix helper the gate compares prefixes with. Lifted into the
+        # same namespace rather than stubbed: a stub here would decide the
+        # answer, and the root_path deployment is the case it exists for.
+        _lift("gui.py", "_request_path", ns)
         # _check_session_auth now calls _verify_account (gui.py), the two-store
         # check that consults the registered-account table before falling back to
         # htpasswd. The stub has to mirror that order rather than just call
@@ -1410,13 +1446,14 @@ class ApiAuthTests(unittest.TestCase):
         raw = base64.b64encode(f"{user}:{password}".encode()).decode()
         return {"Authorization": f"Basic {raw}"}
 
-    def run_guard(self, path="/api/memories", headers=None, session=None):
+    def run_guard(self, path="/api/memories", headers=None, session=None,
+                  root_path=""):
         """Run auth_guard over one request. Returns (verdict, request, reached).
 
         `verdict` is whatever the middleware returned instead of calling on —
         a _Response stub for a 401 or a redirect, None when it passed through.
         """
-        request = _Request(path, headers, session)
+        request = _Request(path, headers, session, root_path=root_path)
         reached = []
 
         async def call_next(_request):
@@ -1425,6 +1462,35 @@ class ApiAuthTests(unittest.TestCase):
 
         verdict = asyncio.run(self.auth_guard(request, call_next))
         return verdict, request, bool(reached)
+
+    def test_the_gate_still_runs_behind_a_base_url_path_prefix(self):
+        """`root_path` is `/mem-mcp` in the documented deployment, and it used
+        to turn this gate off without saying so.
+
+        `Request.url.path` is root_path + path, so `/api/memories` arrived as
+        `/mem-mcp/api/memories` and matched neither `/gui` nor `/api`: no
+        credential was checked and every route was reached through its handler's
+        own `_require_user`, which is not the gate this middleware is. Asserted
+        by outcome -- a credential-less request must be refused and must not
+        reach the route -- because that is what the prefix comparison is for.
+        """
+        verdict, _, reached = self.run_guard(
+            "/api/memories", root_path="/mem-mcp")
+        self.assertFalse(reached, "the gate must answer, not call the route")
+        self.assertEqual(verdict.status_code, 401)
+
+        _, request, reached = self.run_guard(
+            "/api/memories", session={"user": "alice"}, root_path="/mem-mcp")
+        self.assertTrue(reached)
+        self.assertEqual(request.state.user, "alice")
+
+        _, _, reached = self.run_guard("/api/auth/login", root_path="/mem-mcp")
+        self.assertTrue(reached, "the credential exchange stays open")
+
+        verdict, _, reached = self.run_guard("/gui/", root_path="/mem-mcp")
+        self.assertFalse(reached)
+        self.assertEqual(verdict.status_code, 302,
+                         "a browser path redirects rather than challenging")
 
     # -- the password is actually verified ---------------------------------
 

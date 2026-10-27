@@ -31,6 +31,8 @@ import urllib.parse
 from datetime import datetime, timedelta
 from typing import Optional
 
+import httpx
+
 import memory as mem
 import status_monitor
 from backup import list_savepoints, start_backup, start_restore, get_backup_status
@@ -387,14 +389,40 @@ def resolve_bearer_token(token: str) -> tuple:
     return None, "that is not a known credential"
 
 
+def _request_path(request) -> str:
+    """The path the router matched, without the deployment's path prefix.
+
+    `Request.url.path` is `root_path + path`, and this app sets root_path from
+    `BASE_URL`'s path -- `/mem-mcp` in the documented deployment. The gate below
+    compares *router-relative* prefixes (`/gui`, `/api`), so against
+    `/mem-mcp/api/...` both tests were false and the middleware answered by
+    doing nothing at all: every `/api/*` route was reachable with no credential
+    as far as this gate was concerned, and the only check left was the handler's
+    own `_require_user`. Nothing logged the difference.
+
+    `scope["path"]` is the value the router sees, and uvicorn sets it to the full
+    request path -- Starlette's router is what strips root_path -- so it may
+    arrive with or without the prefix depending on the server. Both are handled.
+    """
+    scope = getattr(request, "scope", None) or {}
+    root = str(scope.get("root_path") or "").rstrip("/")
+    path = scope.get("path") or ""
+    if not path:
+        path = getattr(getattr(request, "url", None), "path", "") or ""
+    if root and (path == root or path.startswith(root + "/")):
+        path = path[len(root):] or "/"
+    return path
+
+
 # Auth guard middleware - protect /gui routes
 @web_app.middleware("http")
 async def auth_guard(request: Request, call_next):
-    if request.url.path.startswith("/gui") or request.url.path.startswith("/api"):
+    path = _request_path(request)
+    if path.startswith("/gui") or path.startswith("/api"):
         user = _check_session_auth(request)
         if user:
             request.state.user = user # Set user in request state
-        elif request.url.path.startswith("/api/auth"):
+        elif path.startswith("/api/auth"):
             # Only the credential exchange itself is open. `/api/events` used to
             # be on this list, which is how an SSE stream was readable without a
             # session: the handler's own `_require_user` filtered events per
@@ -403,7 +431,7 @@ async def auth_guard(request: Request, call_next):
             # chosen vault's change feed. Filtering by a value the caller chose
             # is not access control. `/api/ping` was here too and has no route.
             pass
-        elif request.url.path.startswith("/api/"):
+        elif path.startswith("/api/"):
             return JSONResponse({"detail": "Not authenticated"}, status_code=401)
         else:
             return RedirectResponse(url=mem.BASE_URL or "/", status_code=302)
@@ -420,8 +448,9 @@ logging.getLogger("uvicorn.access").addFilter(EndpointFilter())
 @web_app.middleware("http")
 async def log_gui_requests(request: Request, call_next):
     # Log only interesting GUI/API requests
-    if request.url.path not in ["/", "/api/ping", "/favicon.ico"]:
-        print(f"[GUI] {request.method} {request.url.path}")
+    path = _request_path(request)
+    if path not in ["/", "/api/ping", "/favicon.ico"]:
+        print(f"[GUI] {request.method} {path}")
     return await call_next(request)
 
 # Allow both /path and /path/ for all routes
@@ -3014,13 +3043,13 @@ def _asr_handshake_status(exc: Exception) -> Optional[int]:
     return value if isinstance(value, int) else None
 
 
-async def _probe_asr_token(token: str, user_id: str) -> dict:
-    """Open one throwaway socket and classify the handshake.
+async def _probe_asr_websocket(token: str, user_id: str) -> dict:
+    """The socket handshake, kept as the fallback for an older asr-mcp.
 
-    A rejected key and an unreachable server are different remedies, so they
-    are different answers. Returning one `ok: false` for both would send an
-    operator to restart a service that is running fine and simply does not
-    know their token.
+    Versions that predate the languages route expose no authenticated endpoint
+    that is free to call, so the handshake is the only way to validate a key
+    there -- at the cost of a model load, which is why it is no longer the first
+    choice.
     """
     if _ws_connect is None:
         return {
@@ -3067,6 +3096,72 @@ async def _probe_asr_token(token: str, user_id: str) -> dict:
     except Exception:
         pass
     mem.logger.info(f"live notes: ASR token handshake accepted for user={user_id}")
+    return {"status": "accepted",
+            "detail": "asr-mcp accepted the token."}
+
+
+async def _probe_asr_token(token: str, user_id: str) -> dict:
+    """Classify a key against asr-mcp's cheap authenticated endpoint.
+
+    It used to open a throwaway socket, and asr-mcp loads the recogniser when a
+    socket opens: saving a key paid a model load on the 4 GB card Ollama is also
+    using, and testing it again paid another. `GET /api/asr/languages` sits
+    behind the same auth middleware and answers from a static list, so the check
+    costs one HTTP round trip.
+
+    A rejected key and an unreachable server are different remedies, so they are
+    different answers. Returning one `ok: false` for both would send an operator
+    to restart a service that is running fine and simply does not know their
+    token.
+    """
+    url = mem.asr_languages_url(mem.ASR_WS_URL)
+    if not url:
+        return {
+            "status": "unreachable",
+            "detail": (
+                "MEM_ASR_WS_URL is not configured, so there is no server to "
+                "check the token against."
+            ),
+        }
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(url, headers={"X-API-Key": token})
+    except Exception as exc:  # noqa: BLE001 - classified, then reported
+        mem.logger.warning(
+            f"live notes: ASR token test could not reach {url}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return {
+            "status": "unreachable",
+            "detail": f"Could not reach {url}: {exc}",
+        }
+    code = response.status_code
+    if code == 404:
+        # An asr-mcp older than the languages route. Fall back to the one check
+        # it does offer rather than refusing to store a key that works.
+        mem.logger.info(
+            f"live notes: {url} is not served by this asr-mcp; falling back "
+            "to a socket handshake"
+        )
+        return await _probe_asr_websocket(token, user_id)
+    if code in (401, 403):
+        mem.logger.warning(
+            f"live notes: ASR token rejected (HTTP {code}) for user={user_id}")
+        return {
+            "status": "rejected",
+            "detail": (
+                f"asr-mcp refused the token (HTTP {code}). Save the key "
+                "your asr-mcp server expects and try again."
+            ),
+        }
+    if code >= 400:
+        mem.logger.warning(
+            f"live notes: ASR token test got HTTP {code} from {url}")
+        return {
+            "status": "unreachable",
+            "detail": f"{url} answered HTTP {code}, so the token could not be checked.",
+        }
+    mem.logger.info(f"live notes: ASR token accepted for user={user_id}")
     return {"status": "accepted",
             "detail": "asr-mcp accepted the token."}
 
@@ -3204,6 +3299,35 @@ async def _unload_live_model() -> None:
         mem.logger.info(f"live notes: unloaded {wanted} for recording")
     except Exception as exc:  # noqa: BLE001 - never delay the microphone
         mem.logger.warning(f"live notes: could not unload {mem.LIVE_MODEL}: {exc}")
+
+
+@web_app.get("/api/live/stream/{transcription_id}", response_class=JSONResponse)
+async def live_stream_needs_upgrade(transcription_id: str, request: Request):
+    """Explain a handshake that reached the app as a plain HTTP GET.
+
+    A WebSocket route cannot match an http scope, so without this handler the
+    request falls through to the catch-all MCP mount and is answered with a 401
+    naming an access key -- a remedy for a problem the caller does not have. The
+    realistic cause is a reverse proxy that dropped `Upgrade`/`Connection`,
+    because nginx treats both as hop-by-hop and strips them unless they are set
+    explicitly on the location.
+    """
+    mem.logger.warning(
+        f"live notes: {request.method} /api/live/stream/{transcription_id} "
+        "arrived as plain HTTP -- the proxy is not forwarding the WebSocket "
+        "Upgrade headers (see nginx_snippet.conf)"
+    )
+    return JSONResponse(
+        {"detail": (
+            "This endpoint expects a WebSocket connection, but the request "
+            "arrived as a plain HTTP GET. A reverse proxy is dropping its "
+            "Upgrade headers: forward `Upgrade: $http_upgrade` and "
+            "`Connection: upgrade` with `proxy_http_version 1.1` on this route "
+            "(see nginx_snippet.conf)."
+        )},
+        status_code=426,
+        headers={"Upgrade": "websocket"},
+    )
 
 
 @web_app.websocket("/api/live/stream/{transcription_id}")

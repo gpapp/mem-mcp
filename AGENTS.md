@@ -121,9 +121,12 @@ then delete the section from `tasks.md`. A task that is partly done stays in
 
 ## Nginx Config
 
-**IMPORTANT**: Update `nginx_snippet.conf` before deploying. Two locations:
+**IMPORTANT**: Update `nginx_snippet.conf` before deploying. Three locations:
 
 - `/mem-mcp/mcp/` → MCP (**authenticated by the app**, see Authentication below)
+- `/mem-mcp/api/live/stream/` → live transcription audio (**WebSocket upgrade**;
+  nginx drops the hop-by-hop `Upgrade`/`Connection` headers without it — see
+  Live Notes → "The reverse proxy must forward the Upgrade headers")
 - `/mem-mcp/` → GUI/API (session auth via app, cookie passthrough)
 
 **Do not re-add `auth_basic` to the MCP location.** It used to be there, and
@@ -235,6 +238,23 @@ route behind it is an allow-list slot waiting for someone to implement a public
 health endpoint. `ApiAuthTests` pins the allow-list with an **AST walk, not a
 substring search** — the explanatory comment above it names `/api/events` on
 purpose, and a `#` comment is not in the tree.
+
+**The gate must compare a path without `root_path` in it, and both prefixes were
+false in the documented deployment.** `BASE_URL` carries `/mem-mcp`, so
+`server.py` passes `root_path="/mem-mcp"` to uvicorn — and Starlette builds
+`Request.url.path` as `root_path + path`. `startswith("/gui")` and
+`startswith("/api")` were therefore both False, the middleware fell to its
+final `else` and answered every GUI/API request with a redirect instead of
+running `_check_session_auth`. Nothing failed loudly: each handler's own
+`_require_user` still refused an anonymous caller, so the visible behaviour was
+"the gate that was documented is not the one doing the work". `_request_path()`
+strips `scope["root_path"]` when the path carries it and leaves an
+already-stripped path alone, and both `auth_guard` and `log_gui_requests` use it.
+**Do not reintroduce `request.url.path` for a prefix test**, and note the
+`[GUI] GET /mem-mcp/api/...` line in the access log is this same value before
+the fix — which is what made a WebSocket handshake look like an ordinary GET.
+`ApiAuthTests.test_the_gate_still_runs_behind_a_base_url_path_prefix` drives the
+guard with `root_path="/mem-mcp"` on `_Request` and fails on the old expression.
 
 **`_user` must not parse headers.** It ended with `mem.extract_user_from_headers(...)`,
 which made `_require_user` in every handler a "did somebody hand us a username"
@@ -2027,10 +2047,51 @@ a numbered path to Setup. The browser never holds the key.
 `host.docker.internal:host-gateway` extra host, and asr-mcp must be reachable on
 that address. The proxy appends `?language=` from the transcription.
 
+**The token is checked with a plain HTTP GET, not a WebSocket handshake.**
+`PUT /api/settings/asr-token` used to prove a key by opening a throwaway
+transcription socket, and asr-mcp answers a handshake by loading the ASR model —
+so "test my key" cost a full model load on the same 4 GB card, against the same
+rule the priority gate exists to enforce. It now calls `GET /api/asr/languages`
+with `X-API-Key`, which asr-mcp serves from a static list with no model. The URL
+is derived from `MEM_ASR_WS_URL` by `asr_languages_url()` in `live_notes.py`
+(ws→http, wss→https, `/ws/stream` → `/languages`), so there is one address to
+configure rather than two. `404` (an asr-mcp without that route) falls back to
+the old handshake rather than refusing a valid key, and the result contract is
+unchanged: `accepted` stores it, `rejected` (401/403) is a 400, everything else
+is a 503. The probe lives in `gui.py`, so `live_notes.py` still imports nothing
+but the stdlib.
+
 The proxy closes with `4401` unauthenticated, `1008` bad origin, `4403` not
 owned, `4409` token missing, and `4502` service unavailable or already
 recording. Those numbers are what the browser uses to clear the local token flag
 and show the right recovery step.
+
+### The reverse proxy must forward the Upgrade headers
+
+`/api/live/stream/{id}` is the only WebSocket route in the app, and nginx does
+not proxy it as one by default. `Upgrade` and `Connection` are **hop-by-hop**
+headers: nginx drops them unless a location names them explicitly, so the
+handshake arrived at uvicorn as an ordinary `GET`. No `WebSocketRoute` can match
+an http scope, the request fell through every route to the catch-all
+`web_app.mount("/", McpAuthGuard(mcp_app))`, and the browser got the **MCP
+guard's 401** — a message about an access key, for a request that carried a
+session cookie. This is why `nginx_snippet.conf` has a dedicated
+`location /mem-mcp/api/live/stream/` (longest prefix wins over `/mem-mcp/`)
+with `proxy_http_version 1.1`, `proxy_set_header Upgrade $http_upgrade` and
+`proxy_set_header Connection "upgrade"`, plus `proxy_buffering off` and a 24h
+read timeout because the connection is a live audio stream.
+
+Two consequences worth keeping:
+
+- **The app answers a plain GET with `426 Upgrade Required`.** A dedicated HTTP
+  route exists beside the WebSocket route purely to explain the misconfiguration,
+  and it logs the same thing. Without it the only symptom is the MCP guard's 401,
+  which points at the wrong credential and sends the operator looking in the
+  wrong file. Keep the route: a proxy mistake is undiagnosable from a 401 alone.
+- **No `map` block with `$connection_upgrade`.** The snippet is included inside
+  `server {}`, where a `map` is a syntax error, so the value is the literal
+  `"upgrade"`. That is correct here because the location matches one path that
+  is only ever a WebSocket.
 
 ### Files and tests
 
@@ -2047,3 +2108,11 @@ and show the right recovery step.
 - Run `python3 -m unittest ... test_live_notes.py` with the rest of the suites.
   The template script must pass the extraction + `node --check` harness after
   any edit; `py_compile` cannot see a JS syntax error.
+- Two guards live outside this file because the thing they protect is outside
+  it. `test_auth_guard.WiringTests.test_the_live_audio_route_forwards_the_websocket_upgrade`
+  reads `nginx_snippet.conf` and asserts the `Upgrade`/`Connection` directives,
+  since no Python test can see a proxy config that is deployed by hand.
+  `test_live_notes.AsrProxyTests.test_a_plain_http_handshake_is_answered_with_the_reason`
+  calls the 426 route, and `AsrTokenProbeTests` drives the probe against a fake
+  `httpx` client — including that a `200` never opens a socket, because the
+  socket is the model load the change exists to avoid.
