@@ -5,6 +5,46 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# Live notes — configuration, ASR token store, pure helpers (2026-10-27)
+
+Shipped in `06bd3f0` on `feature/live-notes`.
+
+- **L1 — configuration.** `websockets` is a direct dependency because uvicorn is
+  not installed with `[standard]`; it serves the browser socket and is the
+  outbound asr-mcp client. The mem-mcp service gained
+  `extra_hosts: host.docker.internal:host-gateway` (asr-mcp is on its own compose
+  network and publishes 8087 on the host), and all eight `MEM_LIVE_*` /
+  `MEM_ASR_WS_URL` knobs are both documented in `.env.example` and forwarded in
+  the compose `environment:` block. `MEM_LIVE_CONTEXT_TOKENS` must track
+  `OLLAMA_CONTEXT_LENGTH` (`16332`). `test_env_wiring` passes.
+
+- **L2 — per-user ASR token store.** `asr_tokens(user_id PK, token, updated_at)`
+  in `sessions.db`, with `set_asr_token` / `get_asr_token` / `clear_asr_token` /
+  `asr_token_hint`. The token is plaintext at rest because the proxy replays it
+  in `X-API-Key`; the database sits in the `MEM_SESSION_DIR` bind mount. `set`
+  returns only `{set, hint, updated_at}` and never the value; the hint is the
+  last four characters and cannot authenticate. `test_sessions` covers
+  round-trip, isolation, clear, empty/oversized refusal and a fresh-process read
+  (123 tests green).
+
+- **L3 — pure helpers and priority gate.** New `live_notes.py` is stdlib-only
+  and **called** by `test_live_notes.py` (62 tests). It owns the four-block
+  prompt (existing note, unconsumed segments, referenced titles, candidate
+  titles; no fact bodies), candidate ranking by title overlap, strict note-JSON
+  validation (unknown ids dropped, existing references unioned, over-long note
+  refused rather than sliced), the context-minus-prompt output budget with an
+  inclusive floor, segment batching that never splits a segment, ASR time-offset
+  maths, the `BASE_URL` origin check (absent Origin allowed, `null` refused),
+  and `LivePriorityGate`. The gate increments a per-user generation on
+  `begin_recording`, invokes and clears the **LLM-phase** cancel hook outside
+  its lock, and `assert_idle` raises `RecordingActiveError` for a 409.
+
+The lesson to carry: the prompt's four blocks are asserted as a **heading
+count**, not by looking for expected text. A block added later is invisible to
+`assertIn` over the block it did not touch, and the prompt is the one place a
+fact body can leak into the context window.
+
+---
 # Backup skip: timestamps instead of a content digest (2026-10-27)
 
 Superseded the content-digest fingerprint from `be36b29` per the operator's
