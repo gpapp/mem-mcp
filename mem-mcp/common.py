@@ -343,6 +343,12 @@ def get_neo4j():
                     s.run("CREATE INDEX fact_user_id_index IF NOT EXISTS FOR (f:Fact) ON (f.userId)")
                     s.run("CREATE INDEX fact_category_index IF NOT EXISTS FOR (f:Fact) ON (f.category)")
                     s.run("CREATE INDEX diary_date_index IF NOT EXISTS FOR (d:DiaryEntry) ON (d.date)")
+                    # Live notes: the segment list is always filtered by both
+                    # the transcription and the user, and a note deletion
+                    # finds segments by what consumed them.
+                    s.run("CREATE INDEX transcription_user_id_index IF NOT EXISTS FOR (t:Transcription) ON (t.userId)")
+                    s.run("CREATE INDEX segment_transcription_user_index IF NOT EXISTS FOR (s:TranscriptionSegment) ON (s.transcriptionId, s.userId)")
+                    s.run("CREATE INDEX segment_consumed_by_index IF NOT EXISTS FOR (s:TranscriptionSegment) ON (s.consumedBy)")
                     s.run("OPTIONAL MATCH (a)-[:MENTIONS]->(b) RETURN 1 LIMIT 0")
             except Exception as e:
                 logger.error(f"Neo4j init error: {e}")

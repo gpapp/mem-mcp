@@ -48,3 +48,15 @@ from client_manager import (
     resolve_write_scope,
     infer_scope_from_text
 )
+
+from live_manager import (
+    NOTE_CATEGORY, TRANSCRIPTION_STATUSES,
+    db_create_transcription, db_list_transcriptions, db_get_transcription,
+    db_update_transcription, db_set_transcription_scope,
+    db_delete_transcription,
+    db_append_segment, db_list_segments, db_transcription_state,
+    db_update_segment, db_delete_segment, db_mark_segments_consumed,
+    db_get_note_for_transcription, db_set_note_transcription,
+    db_get_note_references, db_set_note_references,
+    db_note_fact_candidates, release_note_segments,
+)

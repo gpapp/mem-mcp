@@ -368,5 +368,223 @@ class PriorityGateTests(unittest.TestCase):
             self.gate.begin_recording("")
 
 
+class _FakeResult:
+    def __init__(self, rows=None, single=None):
+        self._rows = rows or []
+        self._single = single
+
+    def single(self):
+        return self._single
+
+    def data(self):
+        return list(self._rows)
+
+
+class _FakeSession:
+    def __init__(self, handler):
+        self.handler = handler
+        self.queries = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def run(self, query, **params):
+        self.queries.append((query, params))
+        return self.handler(query, params)
+
+
+class _FakeDriver:
+    def __init__(self, handler):
+        self.handler = handler
+        self.sessions = []
+
+    def session(self):
+        session = _FakeSession(self.handler)
+        self.sessions.append(session)
+        return session
+
+    @property
+    def queries(self):
+        return [query for session in self.sessions for query, _ in session.queries]
+
+
+def _lift_manager_function(name, **extra_globals):
+    """Exec one function out of `live_manager.py` with stubs for its imports.
+
+    `live_manager` imports `common`, which imports `httpx`, so it cannot be
+    imported on a machine with no web dependencies. Lifting the single function
+    keeps the real body under test rather than a copy of it.
+    """
+    import ast
+    import os
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "live_manager.py")
+    with open(path, "r", encoding="utf-8") as handle:
+        source = handle.read()
+    tree = ast.parse(source)
+    node = next(n for n in tree.body
+                if isinstance(n, ast.FunctionDef) and n.name == name)
+    module = ast.Module(body=[node], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {"__builtins__": __builtins__}
+    namespace.update(extra_globals)
+    exec(compile(module, path, "exec"), namespace)
+    return namespace[name]
+
+
+class SegmentStorageTests(unittest.TestCase):
+    """The L4 invariants that are about *not* writing somewhere.
+
+    A segment edit must not rewrite the note, and deleting a segment must not
+    delete the note. Both are properties of which nodes a query names, so the
+    tests inspect the queries the real function issued.
+    """
+
+    def _node(self):
+        return {"id": "seg-1", "transcriptionId": "tr-1", "seq": 1,
+                "startSec": 0.0, "endSec": 4.0, "speaker": "Ana",
+                "text": "We should migrate PPC first."}
+
+    def test_a_segment_edit_never_touches_a_note_fact(self):
+        node = self._node()
+        driver = _FakeDriver(lambda query, params: _FakeResult(single={"seg": node}))
+        update = _lift_manager_function(
+            "db_update_segment",
+            _require_driver=lambda: driver,
+            _segment_dict=lambda value: value,
+            Optional=object,
+        )
+        result = update("tr-1", "seg-1", "alice",
+                        text="We should migrate PPC reports first.")
+        self.assertEqual(result["text"], "We should migrate PPC first.")
+        joined = "\n".join(driver.queries)
+        self.assertIn("seg.text = coalesce", joined)
+        self.assertIn("seg.editedAt", joined)
+        self.assertNotIn(":Fact", joined)
+        self.assertNotIn("REFERENCES", joined)
+        self.assertNotIn("consumedBy", joined)
+
+    def test_deleting_a_segment_cannot_delete_the_note(self):
+        driver = _FakeDriver(
+            lambda query, params: _FakeResult(single={"n": 1})
+            if "RETURN count(seg)" in query else _FakeResult()
+        )
+        delete = _lift_manager_function(
+            "db_delete_segment",
+            _require_driver=lambda: driver,
+            Optional=object,
+        )
+        self.assertTrue(delete("tr-1", "seg-1", "alice"))
+        joined = "\n".join(driver.queries)
+        self.assertIn("DETACH DELETE seg", joined)
+        self.assertNotIn(":Fact", joined)
+        self.assertNotIn("REFERENCES", joined)
+
+    def test_a_missing_segment_is_a_false_not_a_delete(self):
+        driver = _FakeDriver(lambda query, params: _FakeResult(single={"n": 0}))
+        delete = _lift_manager_function(
+            "db_delete_segment",
+            _require_driver=lambda: driver,
+            Optional=object,
+        )
+        self.assertFalse(delete("tr-1", "missing", "alice"))
+        self.assertFalse(any("DETACH DELETE" in query for query in driver.queries))
+
+
+class NoteStorageTests(unittest.TestCase):
+    def test_deleting_a_note_releases_its_segments_and_clears_the_link(self):
+        driver = _FakeDriver(lambda query, params: _FakeResult(single={"released": 3}))
+        release = _lift_manager_function(
+            "release_note_segments",
+            _require_driver=lambda: driver,
+        )
+        self.assertEqual(release("note-1", "alice"), 3)
+        joined = "\n".join(driver.queries)
+        self.assertIn("REMOVE seg.consumedBy, seg.consumedAt", joined)
+        self.assertIn("REMOVE t.noteId", joined)
+        self.assertIn("consumedBy: $noteId", joined)
+        self.assertNotIn(":Fact", joined)
+
+    def test_references_are_written_in_one_direction_only(self):
+        def handler(query, params):
+            if "RETURN count(n)" in query:
+                return _FakeResult(single={"n": 1})
+            if "RETURN referenced" in query:
+                return _FakeResult(single={"referenced": 2})
+            return _FakeResult()
+
+        driver = _FakeDriver(handler)
+        set_refs = _lift_manager_function(
+            "db_set_note_references",
+            _require_driver=lambda: driver,
+        )
+        self.assertEqual(set_refs("note-1", ["f1", "f2"], "alice"), 2)
+        joined = "\n".join(driver.queries)
+        self.assertIn("MERGE (n)-[:REFERENCES]->(f)", joined)
+        self.assertNotIn("(f)-[:REFERENCES]->(n)", joined)
+        self.assertIn("WHERE f.id <> n.id", joined)
+        # The old outgoing set is replaced, so a reference the user removed
+        # does not survive a later update.
+        self.assertIn("-[r:REFERENCES]->() DELETE r", joined)
+
+    def test_a_fact_delete_hook_only_releases_live_note_segments(self):
+        import os
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "fact_manager.py")
+        with open(path, "r", encoding="utf-8") as handle:
+            source = handle.read()
+        self.assertIn('note_source == "live_notes"', source)
+        self.assertIn("release_note_segments(memory_id, user_id)", source)
+
+
+class CandidateStorageTests(unittest.TestCase):
+    def _lift_candidates(self, handler, limit=2):
+        driver = _FakeDriver(handler)
+        candidates = _lift_manager_function(
+            "db_note_fact_candidates",
+            _require_driver=lambda: driver,
+            NOTE_CATEGORY="Notes",
+            LIVE_FACT_LIMIT=limit,
+            _CANDIDATE_SCAN_LIMIT=2000,
+            Optional=object,
+        )
+        return candidates, driver
+
+    def test_no_client_means_no_candidates_at_all(self):
+        candidates, driver = self._lift_candidates(
+            lambda query, params: _FakeResult(single={"clientId": None})
+        )
+        self.assertEqual(candidates("tr-1", "alice"), [])
+        joined = "\n".join(driver.queries)
+        self.assertNotIn("FOR_CLIENT", joined)
+        self.assertNotIn("IN_CONTEXT", joined)
+
+    def test_candidates_are_titles_only_and_capped(self):
+        def handler(query, params):
+            if "t.clientId AS clientId" in query:
+                return _FakeResult(single={"clientId": "c1", "contextId": None,
+                                           "noteId": None})
+            return _FakeResult(rows=[
+                {"id": "f1", "name": "PPC migration"},
+                {"id": "f1", "name": "PPC migration"},
+                {"id": "f2", "name": ""},
+                {"id": "f3", "name": "Jane Smith"},
+                {"id": "f4", "name": "Cutover checklist"},
+            ])
+
+        candidates, driver = self._lift_candidates(handler)
+        result = candidates("tr-1", "alice")
+        self.assertEqual([row["id"] for row in result], ["f1", "f3"])
+        joined = "\n".join(driver.queries)
+        self.assertIn("FOR_CLIENT", joined)
+        self.assertIn("<> $noteCategory", joined)
+        self.assertNotIn("f.text", joined)
+        # No project selected: no context branch is issued at all.
+        self.assertNotIn("IN_CONTEXT", joined)
+
+
 if __name__ == "__main__":
     unittest.main()

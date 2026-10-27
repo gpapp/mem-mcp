@@ -431,10 +431,12 @@ async def db_delete_memory(memory_id: str, user_id: str) -> bool:
     with neo4j_driver.session() as s:
         # Find category to check for orphans after deletion
         cat_res = s.run(
-            "MATCH (f:Fact {id: $id, userId: $userId})-[:IN_CATEGORY]->(c:Category) RETURN c.name as cat",
+            "MATCH (f:Fact {id: $id, userId: $userId})-[:IN_CATEGORY]->(c:Category) "
+            "RETURN c.name as cat, f.source as source",
             id=memory_id, userId=user_id
         ).single()
         category_to_check = cat_res["cat"] if cat_res else None
+        note_source = cat_res["source"] if cat_res else None
 
     with neo4j_driver.session() as s:
         result = s.run(
@@ -452,6 +454,26 @@ async def db_delete_memory(memory_id: str, user_id: str) -> bool:
         if deleted:
             # Delete from Qdrant only if found in Neo4j
             await _delete_fact_chunks(qdrant, memory_id)
+
+            # A note is an ordinary Fact, so deleting it from the Memories tab
+            # reaches this path. Its segments must become eligible again or
+            # the next pause would find nothing to summarise. Imported here
+            # because live_manager calls back into this module when a whole
+            # transcription is deleted with its note.
+            if note_source == "live_notes":
+                try:
+                    from live_manager import release_note_segments
+                    released = release_note_segments(memory_id, user_id)
+                    if released:
+                        logger.info(
+                            f"live notes: released {released} segment(s) from "
+                            f"deleted note {memory_id}"
+                        )
+                except Exception as exc:  # noqa: BLE001 - a delete must not fail here
+                    logger.warning(
+                        f"live notes: could not release segments for deleted note "
+                        f"{memory_id}: {exc}"
+                    )
 
             await publish_db_event(user_id, "memory_changed", {
                 "action": "delete",
