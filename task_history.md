@@ -5,6 +5,40 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# Live notes — the model answered with nothing after 85 s (2026-10-27)
+
+- **Reported as an empty 200**: `content:""`, `done_reason:"stop"`,
+  `eval_count:1`, `prompt_eval_count:2449` with `prompt_eval_duration` 85 s, then
+  `LLM returned no content` and `note job failed ... the model returned an empty
+  answer`. The model loaded, read the prompt and emitted one token.
+- **At temperature 0 an empty answer is a fixed point.** The same request
+  produces the same nothing, so the previous retry policy (repeat aborts only)
+  left this failure with no remedy but a manual retry. The empty answer is the
+  same diagnosis as the repeat abort one step further: the decoder, not the
+  prompt.
+- **`_call_live_llm` now retries an empty answer once with
+  `LIVE_SAMPLING_RETRY`** (temperature 0.35, penalty 1.4 over 64 tokens,
+  `top_p: 0.9`) and raises `LiveNoteError` after the second one. A
+  whitespace-only answer counts as empty — `answer or ""` used to let it through
+  to `parse_note_json`, which then failed with a message about the note body.
+- **The failure message now names the residency check.** 2449 prompt tokens in
+  85 s is ~29 tok/s, i.e. a card shared with the transcriber rather than a prompt
+  problem, so it says `docker exec ollama ollama ps` and `MEM_LIVE_MODEL` instead
+  of "Ollama returned HTTP 500". Nothing is consumed on a failed window.
+- Guards: `NoteCallRetryTests` **drives** the real `_call_live_llm` against a
+  scripted `get_llm_response` (lifted with `ast`, so `live_manager.py` itself
+  stays unimportable here) — empty-then-good retries with the retry set,
+  whitespace counts as empty, one abort retries, and the **call count** is
+  asserted for a timeout and a missing model, since "it raised" reads identically
+  whether it was retried first.
+- Mutations that bit: `if True: break` on the empty answer (two tests),
+  `(LIVE_SAMPLING, LIVE_SAMPLING)` for the retry set, and the earlier
+  retry-temperature/policy pair.
+- **1313 tests OK**; `py_compile`/`diff --check` clean.
+
+---
+
+
 # Live notes — the model looped until Ollama aborted the note (2026-10-27)
 
 - **Reported as an error, not a symptom**:

@@ -1465,12 +1465,132 @@ class RepeatAbortTests(unittest.TestCase):
         # Exactly one retry, and only when the abort is the repetition one:
         # `attempt or not is_repeat_abort(exc)` is the whole policy.
         self.assertIn("if attempt or not is_repeat_abort(exc):", body)
-        self.assertIn("raise", body.split("if attempt or not is_repeat_abort(exc):")[1][:80])
         self.assertEqual(body.count("get_llm_response("), 1,
                          msg="the call must happen once, inside the loop")
         # The second failure must name the remedy rather than the raw 500.
-        self.assertIn("MEM_LIVE_NOTE_MAX_CHARS", body)
         self.assertIn("MEM_LIVE_MODEL", body)
+        self.assertIn("ollama ps", body,
+                      msg="the empty answer is a residency symptom; say how to "
+                          "check it")
+
+
+class NoteCallRetryTests(unittest.TestCase):
+    """`_call_live_llm` drives one model call, and retries exactly once.
+
+    Production reported `content:"" done_reason:"stop" eval_count:1` after 85 s
+    of prompt evaluation -- the model loaded, read the prompt and emitted one
+    token. At temperature 0 that is a fixed point: the same request produces the
+    same nothing, so this is a case for different sampling rather than patience.
+    Driven rather than read, because the retry decision is a control-flow
+    property and the sources of a `continue` and a `break` are one character
+    apart.
+    """
+
+    PATH = "mem-mcp/live_manager.py"
+
+    def _lift(self, replies, warnings=None):
+        """`_call_live_llm` with a scripted `get_llm_response`."""
+        import ast
+        import asyncio
+        import test_share_endpoints
+
+        source = test_share_endpoints._read(self.PATH)
+        tree = ast.parse(source)
+        node = next(n for n in tree.body
+                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and n.name == "_call_live_llm")
+        module = ast.Module(body=[node], type_ignores=[])
+        ast.fix_missing_locations(module)
+
+        calls = []
+        scripted = list(replies)
+
+        async def fake_llm(prompt, system="", model="", num_predict=0,
+                           timeout=0.0, options=None):
+            calls.append(dict(options or {}))
+            value = scripted.pop(0)
+            if isinstance(value, BaseException):
+                raise value
+            return value
+
+        class NoteJobDeferred(RuntimeError):
+            pass
+
+        namespace = {
+            "asyncio": asyncio,
+            "LIVE_MODEL": "granite3.3:2b",
+            "LIVE_SAMPLING": ln.LIVE_SAMPLING,
+            "LIVE_SAMPLING_RETRY": ln.LIVE_SAMPLING_RETRY,
+            "is_repeat_abort": ln.is_repeat_abort,
+            "LiveNoteError": ln.LiveNoteError,
+            "NoteJobDeferred": NoteJobDeferred,
+            "get_llm_response": fake_llm,
+            "LIVE_GATE": types.SimpleNamespace(
+                register_llm_cancel=lambda user, cb: True,
+                clear_llm_cancel=lambda user, cb=None: None,
+            ),
+            "logger": types.SimpleNamespace(
+                warning=lambda *a, **k: (warnings if warnings is not None else []).append(a[0]),
+                error=lambda *a, **k: None,
+            ),
+        }
+        exec(compile(module, self.PATH, "exec"), namespace)
+        return namespace["_call_live_llm"], calls
+
+    def run_call(self, replies):
+        import asyncio
+        warnings = []
+        call, calls = self._lift(replies, warnings)
+        return asyncio.run(call({"userId": "alice"}, "prompt", "system", 900)), calls, warnings
+
+    def test_an_empty_answer_is_retried_with_different_sampling(self):
+        answer, calls, _ = self.run_call(["", '{"title":"T","text":"Body"}'])
+        self.assertEqual(answer, '{"title":"T","text":"Body"}')
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0], dict(ln.LIVE_SAMPLING),
+                         msg="the first attempt must be the deterministic one")
+        self.assertEqual(calls[1], dict(ln.LIVE_SAMPLING_RETRY),
+                         msg="a retry at the same settings is the same decode")
+
+    def test_whitespace_only_is_an_empty_answer(self):
+        _, calls, _ = self.run_call(["   ", "ok"])
+        self.assertEqual(len(calls), 2)
+
+    def test_two_empty_answers_fail_with_the_model_and_the_check(self):
+        with self.assertRaises(ln.LiveNoteError) as caught:
+            self.run_call(["", ""])
+        message = str(caught.exception)
+        self.assertEqual(len(self.run_call(["ok"])[1]), 1,
+                         msg="a usable answer costs exactly one call")
+        self.assertIn("granite3.3:2b", message)
+        self.assertIn("ollama ps", message,
+                      msg="the operator needs the residency check, not a 500")
+
+    def test_a_repeat_abort_is_retried(self):
+        abort = RuntimeError(
+            'Ollama returned HTTP 500 for model \'granite3.3:2b\': '
+            '{"error":"prediction aborted, token repeat limit reached"}'
+        )
+        answer, calls, _ = self.run_call([abort, "ok"])
+        self.assertEqual(answer, "ok")
+        self.assertEqual(len(calls), 2)
+
+    def test_any_other_failure_is_not_retried(self):
+        # The count is the property: a retryable abort consumes both calls, and
+        # anything else must fail on the first one. `expected_calls` is asserted
+        # rather than "it raised", because raising looks the same either way.
+        import asyncio
+        for label, error, expected_calls in (
+            ("timeout", RuntimeError("LLM call to 'granite3.3:2b' timed out"), 1),
+            ("missing model", RuntimeError("model 'nope' is not installed"), 1),
+            ("repeat abort", RuntimeError(
+                '{"error":"prediction aborted, token repeat limit reached"}'), 2),
+        ):
+            with self.subTest(case=label):
+                call, calls = self._lift([error, error])
+                with self.assertRaises(RuntimeError):
+                    asyncio.run(call({"userId": "alice"}, "p", "s", 900))
+                self.assertEqual(len(calls), expected_calls)
 
 
 if __name__ == "__main__":

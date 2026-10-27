@@ -2180,6 +2180,13 @@ default sampling is what invites it. **Every chat call here passes
 the extractors want, and wrong for the one call that rewrites a long Markdown
 document: greedy decoding re-emits a heading or a bullet until the guard fires.
 
+The same call then failed a second way, and it is the same diagnosis one step
+further: `content:"" done_reason:"stop" eval_count:1` after **85 s** of prompt
+evaluation (`prompt_eval_count=2449`). The model loaded, read the prompt and
+emitted a single token. At temperature 0 that is a fixed point — the identical
+request produces the identical nothing — so patience is not the remedy and only
+different sampling is.
+
 Three parts, and none of them replaces the others:
 
 - **`get_llm_response` takes an `options` dict** merged over the default
@@ -2190,23 +2197,29 @@ Three parts, and none of them replaces the others:
   only breaks the tie the loop needs broken. `LIVE_SAMPLING_RETRY` is *stronger
   and narrower* — penalty 1.4 over 64 tokens, temperature 0.35, `top_p: 0.9` —
   because a retry at the same settings is not a retry.
-- **Exactly one retry, and only for this abort.** `if attempt or not
-  is_repeat_abort(exc): raise` is the whole policy: a timeout, a missing model or
-  a 404 cannot improve by being asked twice, so those propagate on the first
-  attempt. `is_repeat_abort()` lives in `live_notes.py` (stdlib, callable by the
-  suite) because the remedy is unique — waiting does nothing, only different
-  sampling has a chance.
+- **Exactly one retry, and only for these two degenerate outcomes.** `if attempt
+  or not is_repeat_abort(exc): raise` handles the abort, `if attempt: break`
+  handles a second empty answer, and everything else (timeout, missing model,
+  HTTP error) propagates on the first attempt because being asked twice does not
+  improve it. `is_repeat_abort()` lives in `live_notes.py` (stdlib, callable by
+  the suite) because the remedy is unique — waiting does nothing.
 
-After the second abort the job raises `LiveNoteError` naming
-`MEM_LIVE_NOTE_MAX_CHARS` and `MEM_LIVE_MODEL`, because "Ollama returned HTTP
-500" tells the reader nothing they can act on. Nothing is consumed on a failed
-window, so the segments are still there for the next pause or **Rebuild note**.
+After the second failure the job raises `LiveNoteError` naming `MEM_LIVE_MODEL`
+and telling the operator to run `docker exec ollama ollama ps`: 2449 prompt tokens
+in 85 s is ~29 tok/s, which is a card shared with the transcriber rather than a
+prompt problem, and "Ollama returned HTTP 500" tells the reader none of that.
+Nothing is consumed on a failed window, so the segments are still there for the
+next pause or **Rebuild note**.
 
-`RepeatAbortTests` calls the predicate (the real abort string and three that must
-not match), pins the two sampling sets as a pair (deterministic first, different
-second) and reads the call site for the one-call-in-a-loop shape;
-`test_llm_reliability` drives the `options` merge through the recording fake
-client. Both mutations bit — `if True: raise`, and a retry temperature of 0.0.
+`NoteCallRetryTests` **drives** `_call_live_llm` against a scripted
+`get_llm_response` — empty-then-good retries with the retry set, whitespace-only
+counts as empty, one abort retries, and the call **count** is asserted for a
+timeout and a missing model, because "it raised" looks identical whether it was
+retried or not. `RepeatAbortTests` calls the predicate and pins the two sampling
+sets as a pair; `test_llm_reliability` drives the `options` merge through the
+recording fake client. Mutations that bit: `if True: raise`,
+`if True: break` on the empty answer, a retry set equal to the first, and a retry
+temperature of 0.0.
 
 
 ### The prompt is four blocks and the output is validated

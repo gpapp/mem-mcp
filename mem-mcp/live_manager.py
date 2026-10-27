@@ -1078,12 +1078,21 @@ async def _call_live_llm(job: dict, prompt: str, system: str,
     if not LIVE_GATE.register_llm_cancel(job["userId"], _cancel):
         raise NoteJobDeferred("recording started before the model call")
     try:
-        # One retry, and only for Ollama's repetition abort. That failure is the
-        # decoder, not the prompt: a note rewrite at temperature 0 can emit the
-        # same token run until Ollama gives up, and the answer is different
-        # sampling rather than another wait. Anything else propagates on the
-        # first attempt -- a timeout or a missing model does not improve because
-        # it was asked twice.
+        # One retry, and only for the two failures that are the DECODER rather
+        # than the prompt:
+        #
+        # - Ollama's repetition abort ("token repeat limit reached"), where a
+        #   greedy decode of a long Markdown rewrite re-emits the same run until
+        #   the guard fires;
+        # - an empty answer. Reported from production as
+        #   `content:"" done_reason:"stop" eval_count:1` after 85 s of prompt
+        #   eval: the model loaded, read the prompt and emitted a single token.
+        #   At temperature 0 that is a fixed point -- the same request produces
+        #   the same nothing -- so the only thing that can help is other
+        #   sampling, which is what the retry set is for.
+        #
+        # Anything else (timeout, missing model, HTTP error) propagates on the
+        # first attempt, because being asked twice does not improve it.
         for attempt, sampling in enumerate((LIVE_SAMPLING, LIVE_SAMPLING_RETRY)):
             try:
                 answer = await get_llm_response(
@@ -1093,7 +1102,6 @@ async def _call_live_llm(job: dict, prompt: str, system: str,
                     num_predict=max(1, int(num_predict)),
                     options=sampling,
                 )
-                return answer or ""
             except RuntimeError as exc:
                 if attempt or not is_repeat_abort(exc):
                     raise
@@ -1102,11 +1110,23 @@ async def _call_live_llm(job: dict, prompt: str, system: str,
                     f"aborted the note answer (attempt 1); retrying with a "
                     f"stronger repeat penalty -- {exc}"
                 )
+                continue
+            if answer and answer.strip():
+                return answer
+            if attempt:
+                break
+            logger.warning(
+                f"live notes: {LIVE_MODEL} answered with nothing (attempt 1, "
+                f"prompt_chars={len(prompt)}); retrying with temperature "
+                f"{LIVE_SAMPLING_RETRY['temperature']}"
+            )
         raise LiveNoteError(
-            f"{LIVE_MODEL} repeated itself until Ollama aborted the answer, "
-            "twice. The note was not changed. Retry the update; if it keeps "
-            "happening the note is too long for this model -- lower "
-            "MEM_LIVE_NOTE_MAX_CHARS or use a larger MEM_LIVE_MODEL."
+            f"{LIVE_MODEL} did not produce a usable answer twice -- either it "
+            "repeated itself until Ollama aborted, or it answered with nothing. "
+            "The note was not changed. Retry the update; if it keeps happening "
+            "the model is probably struggling for memory next to the "
+            "transcriber -- check `docker exec ollama ollama ps`, or use a "
+            "smaller or larger MEM_LIVE_MODEL."
         )
     finally:
         LIVE_GATE.clear_llm_cancel(job["userId"], _cancel)
