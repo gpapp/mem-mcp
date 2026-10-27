@@ -21,30 +21,6 @@ commit. Audio forwarding never waits on processing.
 
 ---
 
-## L4. Neo4j model, CRUD, indexes, note helpers
-
-- [ ] Add indexes in `common.get_neo4j()` for `:Transcription(userId)`,
-      `:TranscriptionSegment(userId)` and `:TranscriptionSegment(transcriptionId)`.
-- [ ] Create `mem-mcp/live_manager.py` and re-export its public functions through
-      `memory.py`.
-- [ ] Implement transcription CRUD: create, list, get, rename/update scope,
-      delete, all scoped by `userId`.
-- [ ] Implement segment append (server-side), edit text/speaker, delete, and
-      list ordered by `seq`.
-- [ ] Store one running note: `FROM_TRANSCRIPTION`, `REFERENCES` one-way,
-      `Transcription.noteId`, and `consumedBy`/`consumedAt` on segments.
-- [ ] Clear note links and consumption when the note Fact is deleted (hook in
-      `db_delete_memory`).
-- [ ] Stamp `updatedAt` on both endpoints of every new edge, and on every
-      create/update/delete, so the backup fingerprint sees the change.
-- [ ] Return `404`-shaped results for another user's ids; never leak existence.
-
-**Acceptance:** `test_cypher_safety.py` lints every new query (list parameters,
-`FOREACH` self-reference, aliases). Editing or deleting a segment leaves the note
-text untouched. Deleting the note releases its segments.
-
----
-
 ## L5. WebSocket proxy to asr-mcp
 
 - [ ] Add `WS /api/live/stream/{transcriptionId}` in `gui.py`.

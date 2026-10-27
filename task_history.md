@@ -5,6 +5,54 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# Live notes — transcription storage and note links (2026-10-27)
+
+Shipped in `8d43536` on `feature/live-notes`.
+
+- **L4 — graph model and CRUD.** New `live_manager.py` stores
+  `(:Transcription)-[:HAS_SEGMENT]->(:TranscriptionSegment)` in Neo4j only; raw
+  transcripts are deliberately not embedded. A note is an ordinary `:Fact` in
+  category `Notes`, linked one-way with `(:Fact)-[:FROM_TRANSCRIPTION]->(:Transcription)`
+  and `(:Fact)-[:REFERENCES]->(:Fact)`; `REFERENCES` is written directly rather
+  than through `db_link_facts`, which would create the reverse edge and put the
+  note on every referenced fact's card. `Transcription.noteId` and the segment
+  `consumedBy`/`consumedAt` markers are the state that stops a pause
+  re-summarising the whole transcript. Every create/update/delete and both ends
+  of every link stamp `updatedAt`, because the backup fingerprint reads only
+  that property and a count.
+
+- **Deletion is a two-way hook.** `fact_manager.db_delete_memory` checks
+  `f.source == "live_notes"` before calling `release_note_segments`, so an
+  ordinary fact deletion pays two queries for a note it never was. Deleting the
+  note clears every `consumedBy`/`consumedAt` and `Transcription.noteId`, which
+  makes those segments eligible again; without that, deleting a note would look
+  like losing the transcript. Deleting a transcription keeps the note by default
+  and removes its `FROM_TRANSCRIPTION` edge first, so the survivor is an ordinary
+  fact rather than a dangling live one.
+
+- **Candidates are the identified client only.** `db_note_fact_candidates`
+  returns `{id, name}` for facts with `FOR_CLIENT` to the session's client, plus
+  facts under the selected project, excluding `Notes`. It never returns a body
+  and never widens through another client's `RELEVANT_TO` edge. A session with
+  no client yields no candidates at all rather than the whole vault.
+
+- **Tests.** `test_live_notes.py` grew to 70 tests. The new L4 tests lift the
+  real functions out of `live_manager.py` (it cannot be imported without
+  `httpx`) and drive them against a fake Neo4j session, pinning that a segment
+  edit names only `seg`, a segment delete is `DETACH DELETE seg` with no Fact,
+  note deletion releases segments and clears `noteId`, and references are
+  written in one direction. `test_cypher_safety` adds its automatic lint to
+  every new query. The focused set (`test_live_notes`, `test_cypher_safety`,
+  `test_sessions`, `test_env_wiring`, `test_matching_regressions`) is 392 tests
+  green.
+
+The lesson to carry: a query that deletes two variables from an `OPTIONAL MATCH`
+(`DETACH DELETE seg, t`) can try to delete `null` when the optional side is
+empty. Split it into an unconditional segment delete and a separate
+transcription delete; the empty match simply deletes nothing.
+
+---
+
 # Live notes — configuration, ASR token store, pure helpers (2026-10-27)
 
 Shipped in `06bd3f0` on `feature/live-notes`.
