@@ -78,10 +78,10 @@ own body and a namespace entry cannot reach that.
 
 ```bash
 cd mem-mcp
-python3 -m unittest -v test_matching_regressions.py test_embedding_reliability.py test_chunking.py test_cypher_safety.py test_backup_compression.py test_people_extraction.py test_graph_scope.py test_mobile_layout.py test_llm_reliability.py test_env_wiring.py test_status_monitor.py test_sessions.py test_auth_guard.py test_google_auth.py test_registration.py test_vault_migration.py test_sharing.py test_share_endpoints.py test_sharing_readpaths.py
+python3 -m unittest -v test_matching_regressions.py test_embedding_reliability.py test_chunking.py test_cypher_safety.py test_backup_compression.py test_people_extraction.py test_graph_scope.py test_mobile_layout.py test_llm_reliability.py test_env_wiring.py test_status_monitor.py test_sessions.py test_auth_guard.py test_google_auth.py test_registration.py test_vault_migration.py test_sharing.py test_share_endpoints.py test_sharing_readpaths.py test_live_notes.py
 ```
 
-This was a Windows path (`C:/tools/miniconda3/python.exe`) with PowerShell `Push-Location`/`Pop-Location`, and it does not exist on the Linux host these files are edited from — every suite "failed" on an interpreter that is not there. Any `python`/`python3` on `PATH` runs all sixteen; none of them import a DB driver.
+This was a Windows path (`C:/tools/miniconda3/python.exe`) with PowerShell `Push-Location`/`Pop-Location`, and it does not exist on the Linux host these files are edited from — every suite "failed" on an interpreter that is not there. Any `python`/`python3` on `PATH` runs all of them; none of them import a DB driver.
 
 Run `git -c core.whitespace=cr-at-eol diff --check` after documentation or code edits (the `cr-at-eol` avoids false positives on the CRLF files). The suites use pure helpers and fake callbacks so they do not require Neo4j, Qdrant, or Ollama.
 
@@ -1900,3 +1900,150 @@ The prefix form is the one to avoid. It sent `content[:2000]`, so on a 40k-char 
 - `MEM_PEOPLE_WINDOW` (6000) and `MEM_PEOPLE_OVERLAP` (600) tune it.
 - **Do not cap the window count.** Capping would reintroduce exactly the silent tail-drop the windowing fixed. Above `PEOPLE_EXTRACT_WARN_WINDOWS` (6) the entry is expensive (one LLM call per window) and logs a WARNING naming the knob instead. This is chat traffic, so WARNING is the right level per the logging policy in "Embedding Reliability".
 - Each window is wrapped in its own `try/except` inside the loop, so one bad window cannot discard the names the other windows found. `clean_extracted_people_names(found)` dedupes the union, since a name spanning the overlap is found twice.
+
+## Live Notes
+
+Live notes turn microphone audio into one growing, enriched note per session. The
+browser captures 16 kHz mono audio with the vendored worklet, streams it through
+mem-mcp to `asr-mcp`, and every press of **Pause & summarise** updates a single
+`Fact` in category `Notes`.
+
+### The data model, and why the transcript is not in Qdrant
+
+| store | holds |
+|---|---|
+| Neo4j `:Transcription` | `userId`, name, language, status, optional `clientId`/`contextId`, timestamps |
+| Neo4j `:TranscriptionSegment` | `(transcriptionId)-[:HAS_SEGMENT]->(segment)`, `seq`, `startSec`/`endSec`, speaker, text, `consumedBy`/`consumedAt` |
+| Neo4j `:Fact` | the note itself, category `Notes`, `(fact)-[:FROM_TRANSCRIPTION]->(:Transcription)` |
+| Neo4j edge | one-way `(:Fact)-[:REFERENCES]->(:Fact)` for every fact the note cites |
+| Qdrant | the note only, through the ordinary fact write path |
+
+**The raw transcript is Neo4j-only and is never embedded.** It is evidence, not
+a summary: embedding every segment would make a search for a phrase return the
+transcript instead of the note, and the note is the durable artefact. A note is
+an ordinary fact, so it is searchable, visible in Memories and Graph, and
+included in every savepoint without a special case.
+
+**`REFERENCES` is one-way and deliberately not `db_link_facts`.** That helper
+creates a symmetric pair of edges, which would make every cited fact appear to
+cite the note. The note's reference set is replaced on each successful commit,
+so a fact the model stops citing disappears from the note's badges.
+
+### Audio always wins
+
+`LivePriorityGate` in `live_notes.py` is the in-process statement of the hard
+rule: **no LLM or embedding call may run while a recording socket is open.**
+
+- The WebSocket proxy calls `begin_recording` before it opens the upstream
+  connection and `end_recording` in its `finally`. **Pause releases the gate**
+  (after the segment writer has drained) and resume calls `begin_recording`
+  again — a resume is a recording start, not a reconnect. Leaving the gate set
+  across a pause made every pause-triggered job answer 409 while the microphone
+  looked closed.
+- `begin_recording` bumps a generation and invokes the registered LLM-phase
+  cancellation callback. `register_llm_cancel` is accepted only when no
+  recording is open, so a job that is already inside `get_llm_response` is
+  cancelled and one that is between windows is stopped by its own generation
+  check.
+- A note job captures the generation when it starts and re-checks it
+  **immediately before every commit**. A changed generation aborts with
+  `deferred`: the current window is not consumed, earlier windows stay
+  committed, and the transcript is untouched.
+- The commit itself is short, contains no LLM call, and runs under
+  `asyncio.shield` so a microphone that starts during the final Qdrant/Neo4j
+  write cannot tear the two stores apart. That is the one place where
+  processing briefly outlives the arrival of audio, and it is bounded by the
+  commit rather than the model call.
+- `MEM_LIVE_UNLOAD_ON_RECORD=1` evicts `MEM_LIVE_MODEL` when recording starts.
+  asr-mcp and Ollama share a 4 GB card; the task is never awaited, so the
+  microphone never waits on an HTTP round trip to Ollama.
+
+A note job is per-user serialised with its own `asyncio.Lock`, **not**
+`claim_maintenance`. Maintenance locks the vault for a reclassify or restore;
+holding one for the length of a meeting would block both and has nothing to do
+with the microphone.
+
+### The prompt is four blocks and the output is validated
+
+`build_live_prompt` emits exactly: the existing note (title + markdown), the
+unconsumed segments, the titles this note already references, and the candidate
+titles it may reference. **Fact bodies are never sent** — the note is supposed
+to be the user's summary, not a second copy of the vault.
+
+Candidates are scoped to the transcription's **primary client**: `FOR_CLIENT`
+edges to that client, plus `IN_CONTEXT` edges to the selected project. They
+never include `RELEVANT_TO` records, `Notes`, or the note itself. Ranking by
+title overlap happens **before** `MEM_LIVE_FACT_LIMIT` is applied; ranking after
+the cap would only reorder whatever the graph returned first. Already-referenced
+facts are always offered again so the model can keep or drop them.
+
+The model returns `{title, text, referencedFactIds}`. `parse_note_json` strips
+prose and fences, requires non-empty text, drops ids outside the allowed set,
+unions the note's existing references, and refuses an over-long note with
+`LiveNoteTooLong` rather than slicing it. An over-long answer gets one
+compaction pass driven by `build_compaction_prompt` with a numeric target (70%
+of `MEM_LIVE_NOTE_MAX_CHARS`); if it is still too long the window fails and
+nothing is consumed.
+
+`num_predict` is `live_output_budget(prompt_chars)` — the context window minus
+the estimated prompt — with `MEM_LIVE_MIN_NUM_PREDICT` as a **refusal floor**,
+not a fixed budget. A selection below the floor is refused with a 400 naming the
+segment count and the estimate; the request is not attempted.
+
+A long pause is split by `segment_windows` and processed **sequentially**, so
+each window sees the note the previous one produced. Consumption markers are
+written only after a successful commit, so a failure, a timeout or a recording
+start leaves the same segments eligible for the next attempt.
+
+### Status, rebuilds and restarts
+
+- Statuses are `idle`, `recording`, `paused`, `processing`, `deferred`,
+  `error`. `deferred` is the recording-preempted outcome and is not a failure.
+- Jobs live in memory. A restart loses the registry and therefore the status,
+  but **not** the note or the consumption markers: the graph is the truth, and
+  `/status` answers `idle` for an unknown transcription.
+- **Rebuild note** calls `reprocess {mode:"all"}`. It releases the old
+  consumption markers and rewrites the same `Fact` id in place, so links,
+  references and search history survive; manual edits are lost, which is what
+  the confirmation says. `mode:"unconsumed"` is the pause behaviour.
+- Deleting a summarised segment is allowed. The note keeps its text snapshot;
+  deletion only changes what a future rebuild sees.
+- The Live tab polls `/api/live/transcriptions/{id}/status` once when a job
+  starts and then only while the status is non-terminal. An idle tab makes no
+  requests.
+
+### The ASR token is per user and write-only
+
+The token is the user's own asr-mcp API key. It lives in `sessions.db`
+(`asr_tokens`) because the WebSocket proxy must replay it as `X-API-Key`; that
+is also why it is plaintext at rest. **No endpoint returns it.** `GET` answers
+`{set, hint}` with a short suffix, and `PUT` validates the value against
+asr-mcp before storing it, so "saved" means accepted. The Setup card explains
+that recording is disabled until a key exists, and the Live tab repeats it with
+a numbered path to Setup. The browser never holds the key.
+
+`MEM_ASR_WS_URL` defaults to
+`ws://host.docker.internal:8087/api/asr/ws/stream`; the container needs the
+`host.docker.internal:host-gateway` extra host, and asr-mcp must be reachable on
+that address. The proxy appends `?language=` from the transcription.
+
+The proxy closes with `4401` unauthenticated, `1008` bad origin, `4403` not
+owned, `4409` token missing, and `4502` service unavailable or already
+recording. Those numbers are what the browser uses to clear the local token flag
+and show the right recovery step.
+
+### Files and tests
+
+- `live_notes.py` is **stdlib-only** (`json`, `math`, `os`, `re`, `threading`,
+  `urllib.parse`) so every prompt, budget, validation, windowing, origin and
+  gate decision is called by `test_live_notes.py` on a machine with no DB
+  drivers. Do not import `common`, a logger or a database client into it.
+- `live_manager.py` owns transcription/segment CRUD, consumption markers, note
+  links, candidates and the job runner.
+- `gui.py` owns the WebSocket proxy, worklet route and REST surface.
+- `templates/dashboard.html` owns `LiveCapture`, the tab, panes and polling;
+  `templates/live-worklet.js` is vendored unchanged from asr-mcp and served by
+  an authenticated route, not a `StaticFiles` mount.
+- Run `python3 -m unittest ... test_live_notes.py` with the rest of the suites.
+  The template script must pass the extraction + `node --check` harness after
+  any edit; `py_compile` cannot see a JS syntax error.

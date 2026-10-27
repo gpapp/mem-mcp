@@ -555,6 +555,32 @@ class AsrProxyTests(unittest.TestCase):
         self.assertIn("finally:", route)
         self.assertIn("LIVE_GATE.end_recording(user_id)", route)
 
+    def test_pause_releases_the_gate_before_it_acknowledges(self):
+        """A paused microphone must allow the summarise it just triggered.
+
+        The gate used to stay set for the whole pause, so every
+        pause-triggered job answered 409 while the socket looked closed. The
+        release has to be before the `paused` message: the browser starts the
+        job from that message.
+        """
+        route = self._route_source()
+        pause = route.index('if kind == "pause":')
+        resume = route.index('elif kind == "resume":', pause)
+        branch = route[pause:resume]
+        self.assertIn("LIVE_GATE.end_recording(user_id)", branch)
+        self.assertLess(branch.index("LIVE_GATE.end_recording(user_id)"),
+                        branch.index('{"type": "paused"}'),
+                        "the paused acknowledgement would race the gate release")
+
+    def test_resume_acquires_the_gate_before_opening_upstream(self):
+        route = self._route_source()
+        resume = route.index('elif kind == "resume":')
+        branch = route[resume:resume + 1200]
+        self.assertIn("LIVE_GATE.begin_recording(user_id)", branch)
+        self.assertLess(branch.index("LIVE_GATE.begin_recording(user_id)"),
+                        branch.index("open_upstream("),
+                        "resume must preempt a queued note job before audio flows")
+
 
 class AsrSegmentTests(unittest.TestCase):
     def test_a_transcript_becomes_a_segment_with_the_connection_offset(self):

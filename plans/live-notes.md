@@ -1,8 +1,8 @@
 # Epic: Live notes — transcription to enriched notes
 
-**Status:** planned, implementation not started
+**Status:** shipped 2026-10-27 on `feature/live-notes`
 **Branch:** `feature/live-notes`
-**Task list:** [`tasks.md`](../tasks.md) → section **Epic: Live notes**
+**Task list:** completed — see [`task_history.md`](../task_history.md), sections L6–L11
 **Related:** `../asr-mcp` (live ASR), `AGENTS.md` (architecture and invariants)
 
 ---

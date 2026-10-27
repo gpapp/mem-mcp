@@ -2799,6 +2799,16 @@ async def api_update_live_transcription(request: Request,
         )
 
     if "clientId" in fields or "contextId" in fields:
+        # A running job is reading the current scope to choose candidates and
+        # may be about to commit. Changing it underneath mid-flight would let
+        # the note cite the previous client's facts.
+        job = await asyncio.to_thread(
+            mem.note_job_status, transcription_id, user_id)
+        if job and job.get("status") in ("queued", "running"):
+            raise HTTPException(
+                status_code=409,
+                detail="A note update is running. Wait for it to finish before changing the scope.",
+            )
         client_id = (fields["clientId"] if "clientId" in fields
                      else record.get("clientId"))
         if "contextId" in fields:
@@ -2854,6 +2864,13 @@ async def api_delete_live_transcription(request: Request,
         raise HTTPException(
             status_code=409,
             detail="Stop the recording before deleting a transcription.",
+        )
+    job = await asyncio.to_thread(
+        mem.note_job_status, transcription_id, user_id)
+    if job and job.get("status") in ("queued", "running"):
+        raise HTTPException(
+            status_code=409,
+            detail="A note update is running. Wait for it to finish before deleting the recording.",
         )
     try:
         result = await mem.db_delete_transcription(

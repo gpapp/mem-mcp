@@ -3264,7 +3264,9 @@
     contextSel.innerHTML = '<option value="">No project</option>' + contexts.map(c =>
       '<option value="' + escHtml(c.id) + '">' + escHtml(c.name) + '</option>').join('');
     contextSel.value = t.contextId || '';
-    const locked = liveRecording;
+    // A job reads the current scope to choose candidate facts, so a change
+    // mid-flight is refused by the server and should not look available here.
+    const locked = liveRecording || liveJobActive(liveJob);
     clientSel.disabled = locked;
     contextSel.disabled = locked;
     if (clientSel) clientSel.disabled = locked || !clients.length;
@@ -3288,9 +3290,10 @@
     if (pause) pause.disabled = !liveRecording || livePaused;
     if (resume) resume.disabled = !liveRecording || !livePaused;
     if (stop) stop.disabled = !liveRecording;
-    if (del) del.disabled = liveRecording;
-    if (update) update.disabled = liveRecording && !livePaused;
-    if (rebuild) rebuild.disabled = liveRecording;
+    const busy = liveJobActive(liveJob);
+    if (del) del.disabled = liveRecording || busy;
+    if (update) update.disabled = busy || (liveRecording && !livePaused);
+    if (rebuild) rebuild.disabled = liveRecording || busy;
     if (state) {
       if (liveRecording && livePaused) state.textContent = 'Paused — the current section is being summarised.';
       else if (liveRecording) state.textContent = 'Recording — audio is being transcribed.';
@@ -3463,7 +3466,12 @@
   async function updateLiveScope() {
     if (!liveDetail || !liveDetail.transcription) return;
     const clientId = document.getElementById('live-client').value || null;
-    const contextId = document.getElementById('live-context').value || null;
+    const previousClient = liveDetail.transcription.clientId || null;
+    // The old project belongs to the old client, so carrying its id into a
+    // client change asks the server for a cross-client pair and is refused.
+    const contextId = clientId === previousClient
+      ? (document.getElementById('live-context').value || null)
+      : null;
     try {
       const detail = await api.patch('live/transcriptions/' + encodeURIComponent(liveDetail.transcription.id), {
         clientId: clientId, contextId: clientId ? contextId : null,
