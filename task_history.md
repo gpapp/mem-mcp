@@ -5,6 +5,89 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# Live notes — capture client, note jobs and REST surface (2026-10-27)
+
+Shipped in `c053471` on `feature/live-notes`.
+
+- **L6 — browser capture.** `templates/live-worklet.js` is the 16 kHz mono
+  AudioWorklet, vendored unchanged from asr-mcp, and it is served by an
+  authenticated `GET /api/live/worklet.js`; there is no `StaticFiles` mount to
+  expose it by accident. `LiveCapture` in `dashboard.html` owns
+  `getUserMedia` → `AudioContext` → worklet → packed frames: an 8-byte
+  little-endian `(channel, sequence)` header followed by int16 LE PCM in one
+  binary message. It exposes `start(id, handlers)`, `pause()`, `resume()` and
+  `stop()`, reports permission and socket errors through the same handler
+  surface, and tears down every node and timer on stop. The worklet declares
+  `numberOfOutputs: 0` and is connected only to `node`, never to
+  `destination`; that is what keeps it a tap rather than a feedback path.
+
+- **L7 — one running note, updated per pause.** The prompt is exactly four
+  blocks: the existing note, the unconsumed windows, the titles this note
+  already references, and the candidate titles it may reference. Bodies are
+  never sent. `db_note_fact_candidates` filters to the transcription's primary
+  client (`FOR_CLIENT`, plus `IN_CONTEXT` when a project is selected), never
+  `RELEVANT_TO`, excludes `Notes` and the note itself, and ranks **before**
+  capping — ranking after the cap would just reorder whatever the graph
+  happened to return first.
+
+  A window's answer is validated against the allowed id set, unknown ids are
+  dropped, existing references are unioned, and an empty note is refused. An
+  answer over `MEM_LIVE_NOTE_MAX_CHARS` reaches one compaction pass with a
+  numeric target (70% of the limit); a note is never sliced. Long pauses run
+  `segment_windows` **sequentially**, so each window sees the previous note.
+
+  `num_predict` is `live_output_budget(prompt_chars)` — the context window
+  minus the estimated prompt — with `MEM_LIVE_MIN_NUM_PREDICT` as a refusal
+  floor, not a budget. The first window is preflighted before the job is
+  queued, so an over-budget selection is a 400 rather than a model failure.
+
+- **L7 — priority and commit.** `start_note_job` refuses with
+  `RecordingActiveError` while the gate is held. The job captures the gate
+  generation, re-checks it immediately before the first write, and commits
+  under `asyncio.shield`; the commit does no LLM work and keeps
+  Qdrant-before-Neo4j ordering. A recording that starts during the LLM phase
+  cancels the call, leaves the current window unconsumed, keeps earlier
+  windows committed, and reports `deferred`. `all` releases the consumption
+  markers first and rebuilds the **same** Fact id; a failed rebuild leaves the
+  unprocessed segments eligible.
+
+  Jobs are per transcription with a per-user `asyncio.Lock`, deliberately not
+  `claim_maintenance`: a reclassify is vault-wide, and a note update is not a
+  reason to block one. The registry is in memory and capped at 50 terminal
+  jobs; the graph's consumption markers are the durable truth across a restart.
+
+- **L7 — the pause/resume gate bug.** The proxy called `end_recording` only in
+  its `finally`, so a paused socket held the gate and every pause-triggered
+  summary answered 409. Pause now releases it after the writer queue drains and
+  before `{"type":"paused"}` is sent; resume calls `begin_recording` before
+  reconnecting, so a job queued by the pause is deferred rather than writing
+  while audio flows again.
+
+- **L8 — REST surface.** Transcriptions (`GET`/`POST`, `GET`/`PATCH`/`DELETE`
+  by id), segment edit/delete, `summarize`, `reprocess {mode}`, and `status`.
+  Every handler is `_require_user` and every foreign id is 404. `summarize`
+  calls `start_note_job` on the event-loop thread because it creates a task —
+  running it in `to_thread` would fail with no running loop. A scope change
+  re-scopes an existing note through `db_set_fact_scope`; deletion is refused
+  while any recording is open.
+
+  `PUT /api/settings/asr-token` validates the token with the same throwaway
+  handshake as `POST .../test` before storing it: a key saved unchecked fails
+  later as a recording that will not start, with nothing linking it to the
+  value. Rejected is a 400 naming asr-mcp's refusal; unreachable is a 503.
+  `GET` returns only `{set, hint}` (last four characters) and no endpoint ever
+  returns the token.
+
+- **Verification.** `py_compile` clean for every touched Python module; the
+  dashboard's last script block passes `node --check` with Jinja expressions
+  replaced by a bare token; `test_live_notes.py` (86 tests),
+  `test_sessions.py` and `test_env_wiring.py` pass. New compaction and job
+  contract tests pin the numeric target, the absence of slicing, the
+  generation check before the first write, the shield, sequential windows, and
+  `deferred` on cancellation.
+
+---
+
 ---
 
 # Live notes — ASR WebSocket proxy (2026-10-27)
