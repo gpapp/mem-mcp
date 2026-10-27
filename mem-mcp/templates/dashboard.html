@@ -3399,9 +3399,16 @@
       el.innerHTML = '<div class="empty">No segments yet. Start recording to capture speech.</div>';
       return;
     }
+    // One speaker run reads as a paragraph: the timestamp and the speaker name
+    // belong to the first turn of the run, not to every fragment. A live turn
+    // ends on 320ms of silence, so one spoken sentence arrives as several
+    // segments and repeating the label turned the pane into a list of captions.
+    let runSpeaker = null;
     el.innerHTML = segments.map(s => {
       const editing = s.id === liveEditingSegmentId;
-      const speaker = s.speaker ? '<div class="live-segment-speaker">' + escHtml(s.speaker) + '</div>' : '';
+      const continued = s.speaker === runSpeaker;
+      runSpeaker = s.speaker;
+      const speaker = (!continued && s.speaker) ? '<div class="live-segment-speaker">' + escHtml(s.speaker) + '</div>' : '';
       const body = editing
         ? '<textarea id="live-seg-edit-' + escHtml(s.id) + '">' + escHtml(s.text || '') + '</textarea>' +
           '<div style="margin-top:.35rem;display:flex;gap:.35rem;">' +
@@ -3412,8 +3419,10 @@
         '<div class="live-segment-actions">' +
         '<button class="btn" title="Edit segment" onclick="editLiveSegment(\'' + escHtml(s.id) + '\')">✏️</button>' +
         '<button class="btn" title="Delete segment" onclick="deleteLiveSegment(\'' + escHtml(s.id) + '\')">🗑</button></div>';
+      // The time cell stays in place but empty, so the text column does not
+      // shift left under the run it belongs to.
       return '<div class="live-segment">' +
-        '<div class="live-segment-time">' + fmtClock(s.startSec) + '</div>' +
+        '<div class="live-segment-time">' + (continued ? '' : fmtClock(s.startSec)) + '</div>' +
         '<div class="live-segment-body">' + speaker + body + '</div>' + actions + '</div>';
     }).join('');
   }

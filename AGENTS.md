@@ -2324,6 +2324,32 @@ gate event must clear `liveGatePending` *and* wake a waiter, and another
 recording's event must be ignored. Both mutations bit: removing `_announce` from
 `_set_job`, and removing the `sseOpen()` guard.
 
+**A live turn is not a sentence, so the transcript block is joined before the
+model reads it.** asr-mcp ends a turn on 320 ms of sub-threshold audio, not on
+punctuation, so one spoken sentence arrives as three segments and each one
+carries no full stop. `format_segments` used to render one line per segment
+(`[00:01] Speaker 1: over 300`), which reads like captions — and the note
+inherited it: run-on sentences, a number restated three times, and no sentence
+boundary to hang a decision on. `segment_paragraphs()` groups consecutive
+same-speaker turns into one line, with the timestamp and the speaker name once
+per run, and closes each piece properly: whitespace collapsed, an unterminated
+turn given a full stop after stripping a trailing `,;:—–-` (so `over 300,` does
+not become `300,.`), trailing quotes and brackets stepped over when deciding
+(`he said "yes."` must not become `yes.".'`), an already-terminated turn left
+alone, and the first letter capitalised unless it is a digit. A blank turn is
+skipped rather than splitting the run, because an `empty` turn is silence and a
+pause is not a change of speaker.
+
+This is a **rendering, not a rewrite**: the rows, their ids and their
+`consumedBy` markers are untouched, so "delete a summarised segment" still means
+what it says. The Live pane applies the same rule — a continuation turn drops
+its repeated speaker label and time (the time cell stays, empty, so the text
+column does not shift) — and each segment keeps its own ✏️ / 🗑 so editing a
+fragment still addresses one row. `ParagraphTests` calls both functions for the
+join, the per-run timestamp, the `,.` cleanup, the quote case, the empty turn and
+the capitalisation, and asserts `build_live_prompt` shows one line per run;
+re-injecting the per-segment render fails four of them.
+
 ### The prompt is four blocks and the output is validated
 
 `build_live_prompt` emits exactly: the existing note (title + markdown), the

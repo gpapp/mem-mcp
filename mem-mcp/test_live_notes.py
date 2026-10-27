@@ -48,7 +48,87 @@ def gui_functions(names, namespace):
     return namespace
 
 
+class ParagraphTests(unittest.TestCase):
+    """A live turn is a fragment, so the transcript must be joined before use.
+
+    asr-mcp ends a turn on 320 ms of silence, not at a sentence, so one spoken
+    sentence arrives as several segments with no punctuation. Rendered one line
+    per segment the model summarised captions and wrote run-on sentences with no
+    sentence boundary to hang a decision on. Joining is a rendering: the rows,
+    their ids and their `consumedBy` markers are untouched.
+    """
+
+    def test_consecutive_turns_from_one_speaker_become_one_paragraph(self):
+        text = ln.format_segments([
+            {"speaker": "Speaker 1", "startSec": 0,
+             "text": "the tlp process has 180 submissions per year"},
+            {"speaker": "Speaker 1", "startSec": 4,
+             "text": "while the arb process handles over 300"},
+        ])
+        self.assertEqual(
+            text,
+            "[00:00] Speaker 1: The tlp process has 180 submissions per year. "
+            "While the arb process handles over 300.")
+
+    def test_a_speaker_change_starts_a_new_paragraph_with_its_own_time(self):
+        runs = ln.segment_paragraphs([
+            {"speaker": "Speaker 1", "startSec": 0, "text": "first"},
+            {"speaker": "Speaker 2", "startSec": 7, "text": "second"},
+        ])
+        self.assertEqual([run[0] for run in runs], ["Speaker 1", "Speaker 2"])
+        self.assertEqual(runs[1][1], 7.0,
+                         msg="the second paragraph takes the time of its own "
+                             "first turn, not the run before it")
+
+    def test_a_trailing_comma_does_not_become_a_comma_full_stop(self):
+        # ASR leaves clauses hanging on a comma; joining them verbatim produced
+        # "over 300,. Because" in the prompt.
+        text = ln.format_segments([
+            {"speaker": "S", "startSec": 0, "text": "handles over 300,"},
+            {"speaker": "S", "startSec": 1, "text": "which is a lot"},
+        ])
+        self.assertIn("over 300. Which is a lot", text)
+        self.assertNotIn(",.", text)
+
+    def test_an_already_punctuated_turn_is_not_double_stopped(self):
+        text = ln.format_segments([
+            {"speaker": "S", "startSec": 0, "text": 'he said "yes."'},
+            {"speaker": "S", "startSec": 1, "text": "then left"},
+        ])
+        self.assertIn('"yes." Then left', text,
+                      msg="a quote after the full stop must not become yes.\".")
+
+    def test_a_silent_turn_does_not_split_the_run(self):
+        # `empty` turns are asr-mcp's silence; a pause is not a new speaker.
+        runs = ln.segment_paragraphs([
+            {"speaker": "S", "startSec": 0, "text": "one"},
+            {"speaker": "S", "startSec": 1, "text": "   "},
+            {"speaker": "S", "startSec": 2, "text": "two"},
+        ])
+        self.assertEqual(len(runs), 1)
+        self.assertIn("One. Two.", runs[0][2])
+
+    def test_the_prompt_gets_the_joined_form(self):
+        # The point of the change: the model reads prose, not captions.
+        prompt = ln.build_live_prompt(
+            None,
+            [{"speaker": "Speaker 1", "startSec": 0, "text": "first part"},
+             {"speaker": "Speaker 1", "startSec": 2, "text": "second part"}],
+            [], [],
+        )
+        self.assertIn("[00:00] Speaker 1: First part. Second part.", prompt)
+        self.assertEqual(prompt.count("Speaker 1:"), 1,
+                         msg="one line per speaker run, not per turn")
+
+    def test_a_leading_quote_or_digit_is_left_alone(self):
+        self.assertEqual(ln._capitalise('"quoted'), '"Quoted')
+        self.assertEqual(ln._capitalise("300 units"), "300 units",
+                         msg="capitalising a number would be a typo, not a fix")
+
+
 class PromptTests(unittest.TestCase):
+    """The prompt is the only instruction the model gets, so it is pinned."""
+
     def setUp(self):
         self.segments = [seg(0, "We should migrate the PPC reports first."),
                          seg(65, "Jane Smith will own the cutover.")]

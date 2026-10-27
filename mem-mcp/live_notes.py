@@ -205,21 +205,89 @@ def segment_speaker(segment) -> str:
     return str(value or "Speaker").strip() or "Speaker"
 
 
-def format_segments(segments) -> str:
-    """Render segments as `[mm:ss] Speaker: text`.
+_SENTENCE_ENDS = ".!?…"
 
-    A blank segment is dropped rather than rendered as an empty speaker line:
-    asr-mcp emits `empty` turns for silence, and forwarding those as content
-    teaches the model that a pause is speech.
+
+def ends_sentence(text: str) -> bool:
+    """True when a piece of transcript already closes with terminal punctuation.
+
+    Trailing quotes and brackets are stepped over: `he said "yes."` ends a
+    sentence, and appending another full stop to it produces `yes.".` on the
+    next join.
     """
-    lines = []
+    stripped = str(text or "").rstrip()
+    while stripped and stripped[-1] in "\"')]}”’":
+        stripped = stripped[:-1].rstrip()
+    return bool(stripped) and stripped[-1] in _SENTENCE_ENDS
+
+
+def _capitalise(text: str) -> str:
+    """Upper the first letter, leaving leading punctuation and digits alone."""
+    for index, char in enumerate(text):
+        if char.isalpha():
+            return text[:index] + char.upper() + text[index + 1:]
+        if char.isdigit():
+            return text
+    return text
+
+
+def _tidy_piece(text: str) -> str:
+    """One live turn as a sentence: collapsed space, closed, not double-stopped."""
+    piece = " ".join(str(text or "").split())
+    if not piece:
+        return ""
+    if not ends_sentence(piece):
+        piece = piece.rstrip(",;:—–-").rstrip()
+        piece += "."
+    return piece
+
+
+def segment_paragraphs(segments):
+    """Group consecutive same-speaker turns into one readable paragraph.
+
+    A live turn is a sentence fragment: asr-mcp ends a turn on 320 ms of
+    silence, so a single spoken sentence routinely arrives as three segments
+    with no punctuation anywhere. Rendered one line per segment the transcript
+    reads like a list of captions, and the note summarising it inherited that --
+    run-on sentences, and no sentence boundaries to tell a decision from a
+    remark. Joining a run costs nothing: the segments themselves are untouched
+    and `consumedBy` markers still name the same rows; this is a rendering of
+    the same text, used by the note prompt and the pane.
+
+    Returns `[(speaker, startSec, text), ...]`, one entry per speaker run. A
+    blank segment is skipped rather than splitting the run, because asr-mcp
+    emits `empty` turns for silence and a pause is not a change of speaker.
+    """
+    runs = []
     for segment in segments or []:
         text = segment_text(segment)
         if not text:
             continue
-        lines.append(f"[{format_timestamp(segment_start(segment))}] "
-                     f"{segment_speaker(segment)}: {text}")
-    return "\n".join(lines)
+        speaker = segment_speaker(segment)
+        piece = _tidy_piece(text)
+        if runs and runs[-1][0] == speaker:
+            runs[-1][2].append(piece)
+        else:
+            runs.append((speaker, segment_start(segment), [piece]))
+    return [
+        (speaker, start, " ".join(_capitalise(piece) for piece in pieces))
+        for speaker, start, pieces in runs
+    ]
+
+
+def format_segments(segments) -> str:
+    """Render segments as `[mm:ss] Speaker: text`, one line per speaker run.
+
+    A blank segment is dropped rather than rendered as an empty speaker line:
+    asr-mcp emits `empty` turns for silence, and forwarding those as content
+    teaches the model that a pause is speech. Consecutive turns from one
+    speaker are joined -- see `segment_paragraphs` for why that matters more
+    than it looks.
+    """
+    return "\n".join(
+        f"[{format_timestamp(start)}] {speaker}: {text}"
+        for speaker, start, text in segment_paragraphs(segments)
+    )
 
 
 def fact_title(fact) -> str:

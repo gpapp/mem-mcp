@@ -5,6 +5,36 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# Live notes — the model was summarising captions (2026-10-27)
+
+The note read like it had been written from a list of captions, because it had.
+asr-mcp ends a turn on 320 ms of sub-threshold audio rather than on punctuation,
+so one spoken sentence arrives as several segments with no full stop anywhere,
+and `format_segments` rendered one line per segment: `[00:01] Speaker 1: over
+300`. The model joined those fragments itself and produced run-on sentences with
+the same number stated three times and no sentence boundary to hang a decision
+on.
+
+`segment_paragraphs()` in `live_notes.py` groups consecutive same-speaker turns
+into one paragraph, timestamp and speaker once per run, and closes each piece:
+collapsed whitespace, a full stop after stripping a trailing `,;:—–-` (so
+`over 300,` does not become `300,.`), trailing quotes stepped over when deciding
+whether a sentence is already closed, and the first letter capitalised unless it
+is a digit. An `empty` turn is skipped rather than splitting the run — silence is
+not a change of speaker.
+
+Two things about the shape of the fix are worth keeping. It is a **rendering**:
+segments, ids and `consumedBy` markers are untouched, so deleting a summarised
+segment still addresses the words the note was built from. And it is used by
+both readers — `format_segments` for the prompt and `renderLiveSegments` for the
+pane, where a continuation turn drops its repeated speaker and time (the time
+cell stays empty so the column does not shift) while keeping its own ✏️ / 🗑.
+
+`ParagraphTests` (7) calls the helpers rather than reading them, and
+`build_live_prompt` is asserted to emit one line per run. Re-injecting the
+per-segment render fails four of them. 1342 tests, `node --check` clean,
+`py_compile` clean, `diff --check` clean.
+
 # The note described the garble instead of the meeting (2026-10-27)
 
 - **Reported as** a produced note whose own numbers appeared three times and
