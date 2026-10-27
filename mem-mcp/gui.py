@@ -2661,6 +2661,444 @@ async def share_landing(request: Request, token: str):
     return HTMLResponse(content=html)
 
 
+@web_app.get("/api/live/worklet.js", response_class=Response)
+async def get_live_worklet(request: Request):
+    """Serve the vendored microphone worklet from an authenticated route.
+
+    It is a static file, but there is no `StaticFiles` mount in this app and
+    adding one would expose a second unauthenticated surface just for a
+    processor. `auth_guard` covers `/api*`, and `_require_user` keeps the
+    handler honest when it is called directly.
+    """
+    _require_user(request)
+    path = os.path.join(os.path.dirname(__file__), "templates", "live-worklet.js")
+    with open(path, "rb") as handle:
+        body = handle.read()
+    return Response(
+        content=body,
+        media_type="application/javascript",
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Live notes — REST surface
+#
+# Everything here is scoped to the caller's own userId and a foreign id answers
+# 404, not 403: a transcription that belongs to somebody else must not be
+# distinguishable from one that does not exist. The WebSocket below is the only
+# path that handles audio; these routes only create sessions, edit what the
+# proxy already stored, and start the note jobs.
+# ---------------------------------------------------------------------------
+
+class LiveTranscriptionCreate(BaseModel):
+    name: Optional[str] = None
+    clientId: Optional[str] = None
+    contextId: Optional[str] = None
+    language: Optional[str] = "auto"
+
+
+class LiveTranscriptionUpdate(BaseModel):
+    name: Optional[str] = None
+    clientId: Optional[str] = None
+    contextId: Optional[str] = None
+    language: Optional[str] = None
+
+
+class LiveReprocessRequest(BaseModel):
+    mode: str = "unconsumed"
+
+
+class LiveSegmentUpdate(BaseModel):
+    text: Optional[str] = None
+    speaker: Optional[str] = None
+
+
+class AsrTokenRequest(BaseModel):
+    token: str = ""
+
+
+def _live_detail(transcription_id: str, user_id: str) -> Optional[dict]:
+    """One transcription with its transcript, note and job state."""
+    record = mem.db_get_transcription(transcription_id, user_id)
+    if not record:
+        return None
+    note = mem.db_get_note_for_transcription(transcription_id, user_id)
+    if note:
+        note["references"] = mem.db_get_note_references(note["id"], user_id)
+    return {
+        "transcription": record,
+        "segments": mem.db_list_segments(transcription_id, user_id),
+        "note": note,
+        "job": mem.note_job_status(transcription_id, user_id),
+    }
+
+
+@web_app.get("/api/live/transcriptions", response_class=JSONResponse)
+async def api_list_live_transcriptions(request: Request):
+    user_id = _require_user(request)
+    return {
+        "transcriptions": mem.db_list_transcriptions(user_id),
+        "recording": mem.LIVE_GATE.is_recording(user_id),
+    }
+
+
+@web_app.post("/api/live/transcriptions", response_class=JSONResponse)
+async def api_create_live_transcription(request: Request,
+                                        body: LiveTranscriptionCreate):
+    user_id = _require_user(request)
+    try:
+        record = await asyncio.to_thread(
+            mem.db_create_transcription, user_id, body.name, body.language,
+            body.clientId, body.contextId,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(status_code=201, content={"transcription": record})
+
+
+@web_app.get("/api/live/transcriptions/{transcription_id}",
+             response_class=JSONResponse)
+async def api_get_live_transcription(request: Request, transcription_id: str):
+    user_id = _require_user(request)
+    detail = await asyncio.to_thread(_live_detail, transcription_id, user_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="Transcription not found.")
+    return detail
+
+
+@web_app.patch("/api/live/transcriptions/{transcription_id}",
+               response_class=JSONResponse)
+async def api_update_live_transcription(request: Request,
+                                        transcription_id: str,
+                                        body: LiveTranscriptionUpdate):
+    user_id = _require_user(request)
+    fields = getattr(body, "model_dump", body.dict)(exclude_unset=True)
+    record = await asyncio.to_thread(
+        mem.db_get_transcription, transcription_id, user_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Transcription not found.")
+
+    if "name" in fields:
+        name = (fields.get("name") or "").strip()
+        if not name:
+            raise HTTPException(status_code=400,
+                                detail="A transcription name cannot be empty.")
+        await asyncio.to_thread(
+            mem.db_update_transcription, transcription_id, user_id, name,
+            None, None,
+        )
+    if "language" in fields:
+        language = (fields.get("language") or "").strip()
+        if not language:
+            raise HTTPException(status_code=400,
+                                detail="A language is required.")
+        await asyncio.to_thread(
+            mem.db_update_transcription, transcription_id, user_id, None,
+            language, None,
+        )
+
+    if "clientId" in fields or "contextId" in fields:
+        client_id = (fields["clientId"] if "clientId" in fields
+                     else record.get("clientId"))
+        if "contextId" in fields:
+            context_id = fields["contextId"]
+        elif "clientId" in fields:
+            # Changing the client invalidates the old project: it belongs to
+            # the client being replaced. A caller that wants to keep one on
+            # the same client sends both fields.
+            context_id = None
+        else:
+            context_id = record.get("contextId")
+        if not client_id:
+            context_id = None
+        try:
+            # db_set_transcription_scope is sync and may resolve names against
+            # the graph; keep it off the event loop so a slow Neo4j read does
+            # not delay audio writes on this worker.
+            scope = await asyncio.to_thread(
+                mem.db_set_transcription_scope,
+                transcription_id, user_id, client_id or None,
+                context_id or None,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        if scope is None:
+            raise HTTPException(status_code=404,
+                                detail="Transcription not found.")
+        note = await asyncio.to_thread(
+            mem.db_get_note_for_transcription, transcription_id, user_id)
+        if note:
+            # The running note is a normal Fact and carries the session's
+            # scope. Re-scoping only the transcription would leave the note
+            # searchable under the previous client.
+            try:
+                await mem.db_set_fact_scope(
+                    note["id"], scope.get("clientId"), scope.get("contextId"),
+                    user_id,
+                )
+            except (ValueError, PermissionError) as exc:
+                raise HTTPException(status_code=409, detail=str(exc))
+
+    detail = await asyncio.to_thread(_live_detail, transcription_id, user_id)
+    return detail
+
+
+@web_app.delete("/api/live/transcriptions/{transcription_id}",
+                response_class=JSONResponse)
+async def api_delete_live_transcription(request: Request,
+                                        transcription_id: str,
+                                        delete_note: bool = False):
+    user_id = _require_user(request)
+    if mem.LIVE_GATE.is_recording(user_id):
+        raise HTTPException(
+            status_code=409,
+            detail="Stop the recording before deleting a transcription.",
+        )
+    try:
+        result = await mem.db_delete_transcription(
+            transcription_id, user_id, delete_note=delete_note)
+    except RuntimeError as exc:
+        raise _service_unavailable(exc)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Transcription not found.")
+    return result
+
+
+@web_app.patch("/api/live/transcriptions/{transcription_id}/segments/{segment_id}",
+               response_class=JSONResponse)
+async def api_update_live_segment(request: Request, transcription_id: str,
+                                  segment_id: str, body: LiveSegmentUpdate):
+    user_id = _require_user(request)
+    try:
+        segment = await asyncio.to_thread(
+            mem.db_update_segment, transcription_id, segment_id, user_id,
+            body.text, body.speaker,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if segment is None:
+        raise HTTPException(status_code=404, detail="Segment not found.")
+    return {"segment": segment}
+
+
+@web_app.delete(
+    "/api/live/transcriptions/{transcription_id}/segments/{segment_id}",
+    response_class=JSONResponse,
+)
+async def api_delete_live_segment(request: Request, transcription_id: str,
+                                  segment_id: str):
+    user_id = _require_user(request)
+    deleted = await asyncio.to_thread(
+        mem.db_delete_segment, transcription_id, segment_id, user_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Segment not found.")
+    # Deliberately allowed even when the segment is already in a note: the
+    # note keeps its text snapshot, which the UI warns about before asking.
+    return {"deleted": True}
+
+
+@web_app.post("/api/live/transcriptions/{transcription_id}/summarize",
+              response_class=JSONResponse)
+async def api_summarize_live_transcription(request: Request,
+                                           transcription_id: str):
+    user_id = _require_user(request)
+    try:
+        # start_note_job schedules the background task, so it must run on the
+        # event-loop thread. Its graph reads happen before the task is created
+        # and are small; the LLM work is what the task exists to move off this
+        # request.
+        job = mem.start_note_job(transcription_id, user_id, "unconsumed")
+    except mem.RecordingActiveError:
+        raise HTTPException(
+            status_code=409,
+            detail="A recording is open. Pause it before summarising.",
+        )
+    except mem.LiveNoteTooLong as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        raise _service_unavailable(exc)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Transcription not found.")
+    return JSONResponse(status_code=202, content={"job": job})
+
+
+@web_app.post("/api/live/transcriptions/{transcription_id}/reprocess",
+              response_class=JSONResponse)
+async def api_reprocess_live_transcription(request: Request,
+                                           transcription_id: str,
+                                           body: LiveReprocessRequest):
+    user_id = _require_user(request)
+    mode = (body.mode or "").strip()
+    if mode not in ("unconsumed", "all"):
+        raise HTTPException(
+            status_code=400,
+            detail="mode must be 'unconsumed' or 'all'.",
+        )
+    try:
+        job = mem.start_note_job(transcription_id, user_id, mode)
+    except mem.RecordingActiveError:
+        raise HTTPException(
+            status_code=409,
+            detail="A recording is open. Pause it before rebuilding the note.",
+        )
+    except mem.LiveNoteTooLong as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        raise _service_unavailable(exc)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Transcription not found.")
+    return JSONResponse(status_code=202, content={"job": job})
+
+
+@web_app.get("/api/live/transcriptions/{transcription_id}/status",
+             response_class=JSONResponse)
+async def api_live_transcription_status(request: Request,
+                                        transcription_id: str):
+    user_id = _require_user(request)
+    job = await asyncio.to_thread(
+        mem.note_job_status, transcription_id, user_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Transcription not found.")
+    record = await asyncio.to_thread(
+        mem.db_get_transcription, transcription_id, user_id)
+    return {
+        "job": job,
+        "transcription": record,
+        "recording": mem.LIVE_GATE.is_recording(user_id),
+    }
+
+
+# --- ASR token -------------------------------------------------------------
+#
+# The value is written here and read only by the WebSocket proxy. No GET ever
+# returns it: `hint` is the last four characters, which is enough to recognise
+# which token is stored and not enough to authenticate with it.
+
+@web_app.get("/api/settings/asr-token", response_class=JSONResponse)
+async def api_get_asr_token(request: Request):
+    user_id = _require_user(request)
+    hint = await asyncio.to_thread(vault_sessions.asr_token_hint, user_id)
+    return {"set": bool(hint), "hint": hint}
+
+
+def _asr_handshake_status(exc: Exception) -> Optional[int]:
+    """The HTTP status of a rejected WebSocket handshake, across versions."""
+    for attr in ("status_code", "status"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, int):
+            return value
+    response = getattr(exc, "response", None)
+    value = getattr(response, "status_code", None)
+    return value if isinstance(value, int) else None
+
+
+async def _probe_asr_token(token: str, user_id: str) -> dict:
+    """Open one throwaway socket and classify the handshake.
+
+    A rejected key and an unreachable server are different remedies, so they
+    are different answers. Returning one `ok: false` for both would send an
+    operator to restart a service that is running fine and simply does not
+    know their token.
+    """
+    if _ws_connect is None:
+        return {
+            "status": "unreachable",
+            "detail": (
+                "The server is missing the websockets dependency. Rebuild "
+                "the mem-mcp container from requirements.txt."
+            ),
+        }
+    url = _asr_url_with_language(mem.ASR_WS_URL, "auto")
+    try:
+        connection = await asyncio.wait_for(
+            _ws_connect(url, **{_WS_HEADER_KWARG: {"X-API-Key": token}}),
+            timeout=10,
+        )
+    except asyncio.TimeoutError:
+        return {"status": "unreachable",
+                "detail": f"{mem.ASR_WS_URL} did not complete a handshake in 10s."}
+    except Exception as exc:  # noqa: BLE001 - classified, then reported
+        code = _asr_handshake_status(exc)
+        if code in (401, 403):
+            mem.logger.warning(
+                f"live notes: ASR token handshake rejected (HTTP {code}) "
+                f"for user={user_id}"
+            )
+            return {
+                "status": "rejected",
+                "detail": (
+                    f"asr-mcp refused the token (HTTP {code}). Save the key "
+                    "your asr-mcp server expects and try again."
+                ),
+            }
+        mem.logger.warning(
+            f"live notes: ASR token test could not reach {mem.ASR_WS_URL}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        suffix = f" (HTTP {code})" if code else ""
+        return {
+            "status": "unreachable",
+            "detail": f"Could not reach {mem.ASR_WS_URL}{suffix}: {exc}",
+        }
+    try:
+        await connection.close()
+    except Exception:
+        pass
+    mem.logger.info(f"live notes: ASR token handshake accepted for user={user_id}")
+    return {"status": "accepted",
+            "detail": "asr-mcp accepted the token."}
+
+
+@web_app.put("/api/settings/asr-token", response_class=JSONResponse)
+async def api_set_asr_token(request: Request, body: AsrTokenRequest):
+    user_id = _require_user(request)
+    token = (body.token or "").strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="an ASR token is required")
+    # Validate before storing: a token saved unchecked makes the failure show
+    # up as a recording that cannot start, with nothing connecting it to the
+    # value that caused it.
+    probe = await _probe_asr_token(token, user_id)
+    if probe["status"] == "rejected":
+        raise HTTPException(status_code=400, detail=probe["detail"])
+    if probe["status"] != "accepted":
+        raise HTTPException(status_code=503, detail=probe["detail"])
+    try:
+        saved = await asyncio.to_thread(
+            vault_sessions.set_asr_token, user_id, token)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    # The hint, never the token. The next request that needs the value is the
+    # WebSocket, and it reads the store directly.
+    return {"set": True, "hint": saved.get("hint")}
+
+
+@web_app.delete("/api/settings/asr-token", response_class=JSONResponse)
+async def api_clear_asr_token(request: Request):
+    user_id = _require_user(request)
+    cleared = await asyncio.to_thread(
+        vault_sessions.clear_asr_token, user_id)
+    return {"cleared": bool(cleared)}
+
+
+@web_app.post("/api/settings/asr-token/test", response_class=JSONResponse)
+async def api_test_asr_token(request: Request):
+    """Test the stored token without ever returning it to the page."""
+    user_id = _require_user(request)
+    token = await asyncio.to_thread(vault_sessions.get_asr_token, user_id)
+    if not token:
+        raise HTTPException(
+            status_code=400,
+            detail="No ASR token is stored. Save one before testing it.",
+        )
+    return await _probe_asr_token(token, user_id)
+
+
 # ---------------------------------------------------------------------------
 # Live notes — WebSocket proxy to asr-mcp
 #
@@ -2973,6 +3411,7 @@ async def live_stream(websocket: WebSocket, transcription_id: str):
             kind = command.get("type")
             if kind == "pause":
                 if upstream is None:
+                    mem.LIVE_GATE.end_recording(user_id)
                     await websocket.send_json({"type": "paused"})
                     continue
                 await close_upstream(wait_tail=True)
@@ -2983,6 +3422,11 @@ async def live_stream(websocket: WebSocket, transcription_id: str):
                     mem.db_update_transcription, transcription_id, user_id,
                     None, None, "paused",
                 )
+                # Pausing releases the priority gate: the whole point of a
+                # pause is that summarising may now run. Leaving the gate set
+                # would make every pause-triggered job answer 409 while the
+                # microphone still looks closed.
+                mem.LIVE_GATE.end_recording(user_id)
                 state = await asyncio.to_thread(
                     mem.db_transcription_state, transcription_id, user_id
                 )
@@ -2994,6 +3438,10 @@ async def live_stream(websocket: WebSocket, transcription_id: str):
             elif kind == "resume":
                 if upstream is not None:
                     continue
+                # Resuming is a recording start, not merely a reconnect: it
+                # bumps the generation so a note job queued by the pause is
+                # deferred instead of writing while audio flows again.
+                mem.LIVE_GATE.begin_recording(user_id)
                 upstream, offset = await open_upstream()
                 asr_quiet = {"value": False}
                 asr_task = asyncio.create_task(

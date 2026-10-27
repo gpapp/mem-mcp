@@ -1526,6 +1526,221 @@
   // Load session state immediately upon script parsing so globals are populated
   loadSessionState();
 
+  /* ── Live notes capture ────────────────────────────────────────────────
+     Browser half of the live-notes stream. The mic is captured by the
+     vendored AudioWorklet from asr-mcp, which resamples to 16 kHz and posts
+     Int16 blocks. Each block is wrapped in the legacy 8-byte frame header
+     (channel, sequence) and sent to /api/live/stream/<transcriptionId>, where
+     the server proxies it to asr-mcp and persists the returned segments.
+
+     The worklet declares numberOfOutputs: 0, so it is not connected to
+     ctx.destination -- connecting it would play the mic back. That is exactly
+     how asr-mcp's own live.js drives it.
+
+     Pause keeps the mic and the AudioContext alive but stops sending frames;
+     the server closes its upstream connection so asr-mcp flushes the current
+     turn, then replies {"type":"paused"}. Resume reuses the same microphone
+     and lets the server open a fresh upstream at the stored time offset. */
+  const LiveCapture = {
+    ws: null,
+    ctx: null,
+    stream: null,
+    source: null,
+    node: null,
+    seq: 0,
+    active: false,
+    paused: false,
+    handlers: {},
+
+    _emit(type, payload) {
+      const fn = this.handlers[type];
+      if (typeof fn === 'function') {
+        try { fn(payload); } catch (e) { console.warn('LiveCapture handler failed', type, e); }
+      }
+    },
+
+    _wsUrl(transcriptionId) {
+      const url = new URL(apiBase + '/live/stream/' + encodeURIComponent(transcriptionId),
+                          window.location.href);
+      url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+      return url.toString();
+    },
+
+    async start(transcriptionId, handlers) {
+      this.handlers = handlers || {};
+      if (this.active) await this.stop(true);
+      this.seq = 0;
+      this.paused = false;
+
+      try {
+        await this._ensureMic();
+        await this._openSocket(transcriptionId);
+        this._connectWorklet();
+        this.active = true;
+        this._emit('started', {});
+      } catch (e) {
+        await this.stop(true);
+        this._emit('error', e);
+        throw e;
+      }
+    },
+
+    async _ensureMic() {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error('This browser cannot capture a microphone (getUserMedia is unavailable).');
+      }
+      this.stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: false,
+        },
+        video: false,
+      });
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) throw new Error('This browser cannot capture audio (AudioContext is unavailable).');
+      this.ctx = new Ctx();
+      if (this.ctx.state === 'suspended') await this.ctx.resume();
+      await this.ctx.audioWorklet.addModule(apiBase + '/live/worklet.js');
+    },
+
+    _openSocket(transcriptionId) {
+      return new Promise((resolve, reject) => {
+        let settled = false;
+        const ws = new WebSocket(this._wsUrl(transcriptionId));
+        this.ws = ws;
+        const timer = setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          try { ws.close(); } catch (e) { /* already closed */ }
+          reject(new Error('The live transcription service did not answer in time.'));
+        }, 10000);
+
+        ws.onopen = () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          this._emit('open', {});
+          resolve();
+        };
+        ws.onerror = () => {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timer);
+            reject(new Error('Could not open the live transcription connection.'));
+          } else {
+            this._emit('error', new Error('The live transcription connection failed.'));
+          }
+        };
+        ws.onclose = (ev) => {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timer);
+            reject(new Error(ev.reason || 'The live transcription connection was refused.'));
+          }
+          const wasActive = this.active;
+          this.active = false;
+          this._teardownAudio();
+          this.ws = null;
+          this._emit('closed', {code: ev.code, reason: ev.reason, wasActive});
+        };
+        ws.onmessage = (ev) => {
+          let payload = ev.data;
+          if (typeof payload === 'string') {
+            try { payload = JSON.parse(payload); } catch (e) { return; }
+            if (payload && payload.type === 'paused') this.paused = true;
+            if (payload && payload.type === 'resumed') this.paused = false;
+          }
+          this._emit('message', payload);
+        };
+      });
+    },
+
+    _connectWorklet() {
+      this.source = this.ctx.createMediaStreamSource(this.stream);
+      this.node = new AudioWorkletNode(this.ctx, 'live-capture', {
+        numberOfInputs: 1,
+        numberOfOutputs: 0,
+        channelCount: 1,
+        channelCountMode: 'explicit',
+        processorOptions: {
+          sampleRate: this.ctx.sampleRate,
+          autoLevel: true,
+        },
+      });
+      this.node.port.onmessage = (ev) => {
+        const data = ev.data;
+        if (!data || !data.pcm || !data.pcm.length) return;
+        this._sendPcm(data.pcm);
+      };
+      this.source.connect(this.node);
+    },
+
+    _sendPcm(pcm) {
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+      if (this.paused || !this.active) return;
+      const bytes = new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength);
+      const packet = new Uint8Array(8 + bytes.byteLength);
+      const view = new DataView(packet.buffer);
+      view.setUint32(0, 0, true);                 // channel 0 = microphone
+      view.setUint32(4, (this.seq++ >>> 0), true); // sequence, little endian
+      packet.set(bytes, 8);
+      try {
+        this.ws.send(packet.buffer);
+      } catch (e) {
+        this._emit('error', new Error('Could not send microphone audio: ' + e.message));
+      }
+    },
+
+    pause() {
+      if (!this.active || this.paused) return false;
+      this.paused = true;
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({type: 'pause'}));
+      }
+      this._emit('pausing', {});
+      return true;
+    },
+
+    resume() {
+      if (!this.active || !this.paused) return false;
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({type: 'resume'}));
+      }
+      this._emit('resuming', {});
+      return true;
+    },
+
+    async stop(silent) {
+      const wasActive = this.active;
+      this.active = false;
+      const ws = this.ws;
+      this.ws = null;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        try { ws.send(JSON.stringify({type: 'stop'})); } catch (e) { /* closing */ }
+        // The server drains its segment writer before it closes. Give it a
+        // moment, then close the socket ourselves so a stuck connection cannot
+        // leave the recorder stuck.
+        setTimeout(() => { try { ws.close(); } catch (e) { /* closed */ } }, 2500);
+      }
+      this._teardownAudio();
+      if (!silent && wasActive) this._emit('stopped', {});
+    },
+
+    _teardownAudio() {
+      try { if (this.node) this.node.port.onmessage = null; } catch (e) { /* ignore */ }
+      try { if (this.source) this.source.disconnect(); } catch (e) { /* ignore */ }
+      try { if (this.node) this.node.disconnect(); } catch (e) { /* ignore */ }
+      try { if (this.stream) this.stream.getTracks().forEach(t => t.stop()); } catch (e) { /* ignore */ }
+      try { if (this.ctx && this.ctx.state !== 'closed') this.ctx.close(); } catch (e) { /* ignore */ }
+      this.node = null;
+      this.source = null;
+      this.stream = null;
+      this.ctx = null;
+    },
+  };
+
   function init() {
     loadMemories();
     loadDiary();

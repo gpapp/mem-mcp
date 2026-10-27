@@ -322,6 +322,42 @@ def parse_note_json(raw, allowed_ids, existing_ids=(), max_chars=None) -> dict:
     return {"title": title, "text": text, "referencedFactIds": ordered}
 
 
+COMPACT_SYSTEM_PROMPT = """You condense a live meeting note that has grown too long.
+
+Return one JSON object with exactly `title` and `text`.
+
+Rules:
+- Keep the note's headings, bullets and factual detail. This is a condensation,
+  not a new summary: do not drop decisions, owners, numbers or open questions.
+- Remove repetition and filler first. Merge bullets that say the same thing.
+- Never invent anything and never add a section that is not already present.
+- `title` must stay recognisable as the same meeting note.
+- `text` must be strictly shorter than the note you were given and must fit
+  inside the target length.
+- Return JSON only. No markdown fences, no commentary.
+"""
+
+
+def build_compaction_prompt(note, max_chars=None) -> str:
+    """The prompt for the one compaction pass, with its target stated.
+
+    Compaction is a separate call because a note at the character limit cannot
+    absorb another window: the summarise answer would be rejected as too long
+    and the window would be lost. The target is a real number rather than
+    "shorter", because a model asked to shorten by an unspecified amount
+    usually returns something a few characters shorter and the next window
+    fails for the same reason.
+    """
+    limit = LIVE_NOTE_MAX_CHARS if max_chars is None else max(1, int(max_chars))
+    title, text = _note_parts(note)
+    target = max(1, int(limit * 0.7))
+    return "\n\n".join([
+        f"Target length: at most {target} characters (the hard limit is {limit}).",
+        f"### NOTE TITLE\n{title or '(untitled)'}",
+        f"### NOTE TEXT\n{text or '(empty)'}",
+    ])
+
+
 def estimate_prompt_tokens(prompt_chars) -> int:
     """Conservative token estimate for a prompt, rounded up."""
     try:

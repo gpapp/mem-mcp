@@ -683,5 +683,69 @@ class CandidateStorageTests(unittest.TestCase):
         self.assertNotIn("IN_CONTEXT", joined)
 
 
+class CompactionPromptTests(unittest.TestCase):
+    """The compaction pass is a prompt, so its properties are text properties."""
+
+    def test_the_target_is_a_number_below_the_hard_limit(self):
+        prompt = ln.build_compaction_prompt({"title": "Weekly sync", "text": "a" * 5000},
+                                         max_chars=10000)
+        self.assertIn("at most 7000 characters", prompt)
+        self.assertIn("hard limit is 10000", prompt)
+        self.assertIn("### NOTE TITLE\nWeekly sync", prompt)
+        self.assertIn("### NOTE TEXT\na", prompt)
+
+    def test_it_never_slices_the_note(self):
+        note = {"title": "T", "text": "b" * 9000}
+        prompt = ln.build_compaction_prompt(note, max_chars=10000)
+        # The whole body reaches the model. A compaction that receives a
+        # prefix condenses a fragment and silently drops the tail.
+        self.assertIn("b" * 9000, prompt)
+
+    def test_a_missing_body_still_returns_a_prompt(self):
+        prompt = ln.build_compaction_prompt({}, max_chars=100)
+        self.assertIn("(untitled)", prompt)
+        self.assertIn("(empty)", prompt)
+
+
+class JobContractTests(unittest.TestCase):
+    """Pins the source-level contract of the background note job."""
+
+    @classmethod
+    def setUpClass(cls):
+        import ast
+        from pathlib import Path
+        source = Path(__file__).with_name("live_manager.py").read_text()
+        cls.tree = ast.parse(source)
+        cls.source = source
+
+    def _segment(self, name):
+        import ast
+        for node in ast.walk(self.tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+                return ast.get_source_segment(self.source, node) or ""
+        self.fail(f"{name} not found")
+
+    def test_commit_rechecks_the_generation_before_writing(self):
+        body = self._segment("_commit_note_window")
+        check = body.index("_still_current(job)")
+        first_write = body.index("db_update_memory")
+        self.assertLess(check, first_write,
+                        "the generation check must precede the first write")
+
+    def test_commit_is_shielded(self):
+        body = self._segment("_refresh_note")
+        self.assertIn("asyncio.shield(", body)
+
+    def test_a_recording_job_is_deferred_not_consumed(self):
+        body = self._segment("_run_note_job")
+        self.assertIn("deferred", body)
+        self.assertIn("RecordingActiveError", body)
+
+    def test_windows_are_processed_sequentially(self):
+        body = self._segment("_refresh_note")
+        self.assertNotIn("gather(", body)
+        self.assertIn("for window in", body)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -60,8 +60,12 @@ from live_manager import (
     db_get_note_for_transcription, db_set_note_transcription,
     db_get_note_references, db_set_note_references,
     db_note_fact_candidates, release_note_segments,
+    start_note_job, note_job_status, NoteJobDeferred, NoteJobBusy,
 )
 
 # The WebSocket origin check is a pure helper; keeping it in `live_notes.py`
 # means the rule can be tested without a running server.
-from live_notes import origin_allowed as live_notes_origin_allowed
+from live_notes import (
+    LiveNoteError, LiveNoteTooLong, RecordingActiveError,
+    origin_allowed as live_notes_origin_allowed,
+)
