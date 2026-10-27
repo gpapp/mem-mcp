@@ -990,5 +990,178 @@ class JobContractTests(unittest.TestCase):
         self.assertIn("for window in", body)
 
 
+class AudioWatchdogTests(unittest.TestCase):
+    """An open recorder that sends nothing must leave a line in the log.
+
+    This is the diagnostic for a suspended `AudioContext`: the socket is up,
+    the UI says "recording", and the browser is producing no audio at all. Every
+    other symptom of that is "no transcript yet", which is also what a quiet
+    room looks like, so the absence of audio has to be counted and reported
+    rather than inferred.
+    """
+
+    _route_source = AsrProxyTests._route_source
+
+    def test_forwarded_audio_is_counted_after_it_is_sent(self):
+        route = self._route_source()
+        send = route.index('await upstream.send(message["bytes"])')
+        count = route.index('audio_blocks["value"] += 1')
+        self.assertLess(send, count,
+                        msg="the block counter must account for audio that was "
+                            "actually forwarded, not for one that raised")
+
+    def test_a_silent_recording_warns_once_and_names_the_cause(self):
+        route = self._route_source()
+        self.assertIn("async def audio_watchdog()", route)
+        self.assertIn('if stopping or audio_blocks["value"]:', route,
+                      msg="the watchdog must not warn after audio arrived")
+        self.assertIn("mem.logger.warning(", route)
+        self.assertIn("AudioContext", route,
+                      msg="the warning has to name the cause, or the operator has "
+                          "the same puzzle with a log line attached")
+
+    def test_the_watchdog_is_started_and_cancelled(self):
+        route = self._route_source()
+        self.assertIn("audio_task = asyncio.create_task(audio_watchdog())", route)
+        self.assertIn("audio_task.cancel()", route,
+                      msg="an uncancelled watchdog leaks one task per recording")
+        self.assertIn("audioBlocks=", route,
+                      msg="the stopped line reports the count, so a completed "
+                          "recording with audioBlocks=0 explains itself")
+
+
+class LiveCaptureAudioOrderTests(unittest.TestCase):
+    """The audio context must be running before anything else awaits.
+
+    Chrome hands out a user activation that any `await` spends. A context
+    created after the permission prompt -- or after the WebSocket connect --
+    therefore starts `suspended`, a suspended context never runs the audio
+    graph, `process()` is never called, the worklet posts nothing and **not one
+    byte reaches the socket**. There is no exception and no console error
+    anywhere: the recorder simply looks live and silent. That is why `start()`
+    is driven here against a fake audio graph instead of being read.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import shutil
+        cls.node = shutil.which("node")
+        if not cls.node:
+            raise unittest.SkipTest("node is not installed; the JS is not executable here")
+        import test_share_endpoints
+        cls._share = test_share_endpoints
+
+    def _run(self, cases):
+        import json
+        import os
+        import re
+        import subprocess
+        import tempfile
+
+        share = self._share
+        source = share._read("mem-mcp/templates/dashboard.html")
+        blocks = re.findall(r"<script[^>]*>(.*?)</script>", source, re.S)
+        payload = "".join(
+            f"  try {{ out[{name!r}] = ({expr}); }} "
+            f"catch (e) {{ out[{name!r}] = 'THREW: ' + e.message; }}\n"
+            for name, expr in cases
+        )
+        harness = share._NODE_HARNESS.replace(
+            "__APP_JS__", "\n".join(blocks[2:])
+        ).replace("__CASES__", payload)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "live.js")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(harness)
+            proc = subprocess.run([self.node, path], capture_output=True,
+                                  text=True, timeout=120)
+        if proc.returncode != 0:
+            self.fail("the dashboard script did not load under the fake DOM: "
+                      + proc.stderr.strip()[:400])
+        return json.loads(proc.stdout)
+
+    # A fake graph that records the order in which it is touched. `stuck`
+    # models the autoplay policy: the context exists but never leaves
+    # `suspended`, which is exactly what the old code got.
+    _FAKES = r"""
+      const order = [];
+      const stuck = __STUCK__;
+      class FakeCtx {
+        constructor() {
+          this.state = stuck ? 'suspended' : 'running';
+          this.sampleRate = 48000;
+          this.audioWorklet = { addModule: async () => { order.push('module'); } };
+          order.push('ctx');
+        }
+        async resume() { order.push('resume'); if (!stuck) this.state = 'running'; }
+        createMediaStreamSource() { return { connect() {}, disconnect() {} }; }
+        close() { this.state = 'closed'; }
+      }
+      window.AudioContext = FakeCtx;
+      navigator.mediaDevices = {
+        getUserMedia: async () => {
+          order.push('mic');
+          return { getTracks: () => [{ stop() {} }] };
+        },
+      };
+      window.AudioWorkletNode = class {
+        constructor() { this.port = {}; order.push('worklet'); }
+        connect() {} disconnect() {}
+      };
+      class FakeWS {
+        constructor() {
+          order.push('ws');
+          this.readyState = 0;
+          setTimeout(() => {
+            this.readyState = 1;
+            if (this.onopen) this.onopen();
+          }, 0);
+        }
+        send() {}
+        close() {}
+      }
+      FakeWS.OPEN = 1;
+      window.WebSocket = FakeWS;
+    """
+
+    def _fakes(self, stuck):
+        return self._FAKES.replace("__STUCK__", "true" if stuck else "false")
+
+    def test_the_context_is_created_before_the_microphone_and_the_socket(self):
+        expr = ("(async () => { %s\n"
+                "  await LiveCapture.start('t1', {});\n"
+                "  LiveCapture._clearSilenceWatch();\n"
+                "  const out = { order: order, blocks: LiveCapture.blocksSent };\n"
+                "  await LiveCapture.stop(true);\n"
+                "  return out; })()" % self._fakes(False))
+        result = self._run([("started", expr)])["started"]
+        self.assertNotIsInstance(result, str, msg=result)
+        order = result["order"]
+        self.assertLess(order.index("ctx"), order.index("mic"),
+                        msg="the context was created after the permission prompt, "
+                            "which spends the click's activation and leaves it "
+                            "suspended in Chrome: nothing is ever captured")
+        self.assertLess(order.index("ctx"), order.index("ws"),
+                        msg="the context was created after the WebSocket connect")
+        self.assertEqual(result["blocks"], 0,
+                         msg="no worklet block has been seen yet, so the count "
+                             "must start at zero for the watchdog to mean anything")
+
+    def test_a_suspended_context_refuses_instead_of_recording_silence(self):
+        expr = ("(async () => { %s\n"
+                "  try { await LiveCapture.start('t2', {}); return {ok: true, order: order}; }\n"
+                "  catch (e) { return {ok: false, msg: e.message, order: order}; } })()"
+                % self._fakes(True))
+        result = self._run([("stuck", expr)])["stuck"]
+        self.assertNotIsInstance(result, str, msg=result)
+        self.assertFalse(result["ok"], msg="a suspended context started anyway")
+        self.assertIn("blocked audio", result["msg"])
+        self.assertIn("suspended", result["msg"])
+        self.assertNotIn("ws", result["order"],
+                         msg="the socket was opened for a recorder that can never "
+                             "send anything -- an open, silent connection is the "
+                             "symptom this check exists to prevent")
+
+
 if __name__ == "__main__":
     unittest.main()

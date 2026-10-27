@@ -3285,6 +3285,11 @@ async def api_test_asr_token(request: Request):
 
 _LIVE_PAUSE_HANGOVER_SECONDS = 0.8
 
+# How long a recording may run before the absence of any microphone audio is
+# worth a WARNING. The browser side has the same check for the user's benefit;
+# this one is what an operator reads in the log after "no transcript appeared".
+_LIVE_AUDIO_WARN_SECONDS = 20
+
 
 def _websocket_user(websocket: WebSocket) -> Optional[str]:
     session = websocket.scope.get("session")
@@ -3468,7 +3473,25 @@ async def live_stream(websocket: WebSocket, transcription_id: str):
     upstream = None
     asr_task = None
     asr_quiet = None
+    audio_task = None
     stopping = False
+    # Counted so a recorder that is open but silent can say so. A browser whose
+    # AudioContext began suspended sends nothing at all, and every other symptom
+    # of that is "no transcript yet" -- indistinguishable from a quiet room.
+    audio_blocks = {"value": 0}
+
+    async def audio_watchdog():
+        await asyncio.sleep(_LIVE_AUDIO_WARN_SECONDS)
+        if stopping or audio_blocks["value"]:
+            return
+        mem.logger.warning(
+            f"live notes: no microphone audio reached the proxy for "
+            f"{transcription_id} within {_LIVE_AUDIO_WARN_SECONDS}s -- the "
+            f"browser opened the recorder but is sending nothing. A suspended "
+            f"AudioContext is the usual cause; the browser tab's console will "
+            f"show it if audio capture failed outright."
+        )
+
 
     async def writer_loop():
         while True:
@@ -3580,6 +3603,7 @@ async def live_stream(websocket: WebSocket, transcription_id: str):
         upstream, offset = await open_upstream()
         asr_quiet = {"value": False}
         asr_task = asyncio.create_task(asr_reader(upstream, offset, asr_quiet))
+        audio_task = asyncio.create_task(audio_watchdog())
 
         while True:
             message = await websocket.receive()
@@ -3589,6 +3613,7 @@ async def live_stream(websocket: WebSocket, transcription_id: str):
                 if upstream is not None:
                     try:
                         await upstream.send(message["bytes"])
+                        audio_blocks["value"] += 1
                     except Exception as exc:  # noqa: BLE001
                         mem.logger.warning(
                             f"live notes: audio forward failed for "
@@ -3680,6 +3705,12 @@ async def live_stream(websocket: WebSocket, transcription_id: str):
                 await writer_task
             except Exception:
                 pass
+        if audio_task is not None:
+            audio_task.cancel()
+            try:
+                await audio_task
+            except Exception:
+                pass
         try:
             await asyncio.to_thread(
                 mem.db_update_transcription, transcription_id, user_id,
@@ -3690,7 +3721,7 @@ async def live_stream(websocket: WebSocket, transcription_id: str):
         mem.LIVE_GATE.end_recording(user_id)
         mem.logger.info(
             f"live notes: recording stopped user={user_id} "
-            f"transcription={transcription_id}"
+            f"transcription={transcription_id} audioBlocks={audio_blocks['value']}"
         )
         try:
             await websocket.close()

@@ -2001,6 +2001,38 @@ rule: **no LLM or embedding call may run while a recording socket is open.**
   asr-mcp and Ollama share a 4 GB card; the task is never awaited, so the
   microphone never waits on an HTTP round trip to Ollama.
 
+### The audio context must be created before any other await
+
+`LiveCapture.start()` calls `_ensureAudio()` **first**, before `getUserMedia` and
+before the WebSocket connect, and both of those waits are why. Chrome grants a
+page a *user activation* when the Start button is clicked, and any `await`
+spends it. An `AudioContext` created after the permission prompt therefore
+starts in the `suspended` state — and a suspended context never runs the audio
+graph, so the worklet's `process()` is never called, the worklet posts nothing,
+asr-mcp never sees a turn, and **not one byte reaches the socket**. There is no
+exception and no console error anywhere: the recorder looks live, the socket is
+open, and the transcript is empty forever. This is not a hypothesis — asr-mcp's
+own `static/live.js` documents it, and its `ensureAudio()` throws rather than
+proceeding on a context that is not `running`.
+
+Two habits keep it fixed, and neither is optional:
+
+- **`_ensureAudio()` throws when `state !== 'running'`** after `resume()`, with a
+  message naming the browser's audio permission. Refusing is the only behaviour
+  that produces a visible failure; continuing produces the silent one.
+- **Silence is counted, at both ends.** `blocksSent` is incremented in `_sendPcm`,
+  and `_watchForSilence()` emits `silent` after 12 s with no block, which
+  `startLiveRecording()` toasts. `gui.py` counts `audio_blocks` in the proxy's
+  receive loop and `audio_watchdog` logs a WARNING after
+  `_LIVE_AUDIO_WARN_SECONDS` (20) if none arrived, and the `recording stopped`
+  line carries `audioBlocks=` — so a recording that captured nothing explains
+  itself in the log rather than being indistinguishable from a quiet room.
+  `AudioWatchdogTests` pins the counter to the *forwarded* path and the
+  watchdog's start/cancel pair; `LiveCaptureAudioOrderTests` drives `start()`
+  against a fake audio graph and asserts the context is created before the
+  microphone and the socket, and that a stuck context refuses before the socket
+  opens. Both were mutation-checked by swapping the two calls back.
+
 A note job is per-user serialised with its own `asyncio.Lock`, **not**
 `claim_maintenance`. Maintenance locks the vault for a reclassify or restore;
 holding one for the length of a meeting would block both and has nothing to do
@@ -2128,6 +2160,12 @@ Two consequences worth keeping:
 - `templates/dashboard.html` owns `LiveCapture`, the tab, panes and polling;
   `templates/live-worklet.js` is vendored unchanged from asr-mcp and served by
   an authenticated route, not a `StaticFiles` mount.
+- `test_live_notes.LiveCaptureAudioOrderTests` drives the dashboard's own
+  `LiveCapture.start()` through the node fake-DOM harness borrowed from
+  `test_share_endpoints._NODE_HARNESS`, because the ordering it pins is invisible
+  in the source — two `await`s swapped look equally correct — and the failure it
+  prevents produces no exception to assert on. It skips when `node` is absent,
+  like the render tests that own the harness.
 - Run `python3 -m unittest ... test_live_notes.py` with the rest of the suites.
   The template script must pass the extraction + `node --check` harness after
   any edit; `py_compile` cannot see a JS syntax error.

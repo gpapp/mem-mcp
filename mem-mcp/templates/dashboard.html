@@ -1777,6 +1777,8 @@
     active: false,
     paused: false,
     handlers: {},
+    blocksSent: 0,
+    silenceTimer: null,
 
     _emit(type, payload) {
       const fn = this.handlers[type];
@@ -1797,18 +1799,40 @@
       if (this.active) await this.stop(true);
       this.seq = 0;
       this.paused = false;
+      this.blocksSent = 0;
 
       try {
+        // Audio first, and before any other await. See _ensureAudio(): the
+        // context has to be created and resumed while the click is still
+        // counting as user activation, or the browser starts it suspended and
+        // the worklet never runs -- an open socket with no audio, silently.
+        await this._ensureAudio();
         await this._ensureMic();
         await this._openSocket(transcriptionId);
         this._connectWorklet();
         this.active = true;
         this._emit('started', {});
+        this._watchForSilence();
       } catch (e) {
         await this.stop(true);
         this._emit('error', e);
         throw e;
       }
+    },
+
+    async _ensureAudio() {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) throw new Error('This browser cannot capture audio (AudioContext is unavailable).');
+      if (!this.ctx) this.ctx = new Ctx();
+      if (this.ctx.state === 'suspended') await this.ctx.resume();
+      if (this.ctx.state !== 'running') {
+        // A suspended context never runs the audio graph, so process() is never
+        // called and not one byte reaches the socket. There is no error to see
+        // anywhere else, so the refusal has to be said here.
+        throw new Error('The browser blocked audio (the audio context is ' + this.ctx.state +
+          '). Click Start again, or allow audio for this site in the address-bar permissions.');
+      }
+      await this.ctx.audioWorklet.addModule(apiBase + '/live/worklet.js');
     },
 
     async _ensureMic() {
@@ -1824,11 +1848,23 @@
         },
         video: false,
       });
-      const Ctx = window.AudioContext || window.webkitAudioContext;
-      if (!Ctx) throw new Error('This browser cannot capture audio (AudioContext is unavailable).');
-      this.ctx = new Ctx();
-      if (this.ctx.state === 'suspended') await this.ctx.resume();
-      await this.ctx.audioWorklet.addModule(apiBase + '/live/worklet.js');
+    },
+
+    _watchForSilence() {
+      this._clearSilenceWatch();
+      this.silenceTimer = setTimeout(() => {
+        this.silenceTimer = null;
+        if (!this.active || this.paused || this.blocksSent > 0) return;
+        this._emit('silent', new Error('No microphone audio has reached the server yet. '
+          + 'The browser may have started the audio context suspended -- stop and start '
+          + 'the recording again, and allow audio for this site.'));
+      }, 12000);
+    },
+
+    _clearSilenceWatch() {
+      if (!this.silenceTimer) return;
+      clearTimeout(this.silenceTimer);
+      this.silenceTimer = null;
     },
 
     _openSocket(transcriptionId) {
@@ -1914,6 +1950,7 @@
       packet.set(bytes, 8);
       try {
         this.ws.send(packet.buffer);
+        this.blocksSent += 1;
       } catch (e) {
         this._emit('error', new Error('Could not send microphone audio: ' + e.message));
       }
@@ -1955,6 +1992,7 @@
     },
 
     _teardownAudio() {
+      this._clearSilenceWatch();
       try { if (this.node) this.node.port.onmessage = null; } catch (e) { /* ignore */ }
       try { if (this.source) this.source.disconnect(); } catch (e) { /* ignore */ }
       try { if (this.node) this.node.disconnect(); } catch (e) { /* ignore */ }
@@ -3628,6 +3666,12 @@
         if (state) state.textContent = 'Reconnecting the microphone…';
       },
       stopped: () => { onLiveCaptureStopped(id); },
+      silent: (err) => {
+        // The socket is open and the recorder looks live, but nothing has been
+        // produced. Say so: this state is otherwise indistinguishable from "no
+        // one has spoken yet", and the cause is usually a suspended audio context.
+        toast('⚠️ ' + (err && err.message ? err.message : 'No microphone audio is being sent'));
+      },
       closed: (info) => {
         if (info && info.code === 4409) asrTokenSet = false;
         if (info && info.reason && info.code && info.code !== 1000 && info.code !== 1001 && info.code !== 1005) {

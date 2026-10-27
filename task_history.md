@@ -5,6 +5,45 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# Live notes — the microphone produced no audio at all (2026-10-27)
+
+- **The report was "recording starts but no transcription is happening", and the
+  cause was one swapped `await` in the browser.** `LiveCapture._ensureMic()`
+  called `getUserMedia` (a permission prompt) and only then constructed the
+  `AudioContext`. Chrome grants one *user activation* per click and any `await`
+  spends it, so the context was created without activation, started `suspended`,
+  and a suspended context never runs the audio graph — `process()` was never
+  called, the worklet posted nothing, and no byte ever reached the socket. The
+  recorder looked live, the socket was open, asr-mcp was healthy, and nothing
+  logged an error anywhere.
+- **asr-mcp's own client already knew this**, which is where the answer came
+  from rather than from another round of protocol reading:
+  `asr_mcp/static/live.js::ensureAudio()` carries a docstring describing exactly
+  this failure and throws when the context is not `running`. Our plan had read
+  the capture code for the *frame format* and copied the worklet, and skipped
+  the one function whose whole subject is the context's lifecycle.
+- **The fix is order plus a refusal.** `_ensureAudio()` now runs first (create,
+  `resume()` if suspended, **throw** naming the audio permission if the state is
+  still not `running`, then `addModule`), and only then the microphone and the
+  socket. A browser that blocks audio now says so instead of recording silence.
+- **Silence is counted at both ends, because "no transcript yet" is also what a
+  quiet room looks like.** `blocksSent` + `_watchForSilence()` toast after 12 s
+  in the browser; `audio_blocks` + `audio_watchdog` WARNING after 20 s in
+  `gui.py`, and `audioBlocks=` in the `recording stopped` line. This is the same
+  shape as asr-mcp's `packets: 0` diagnostic, and it is what would have made this
+  bug a one-line log read.
+- **Two guards, both mutation-checked.** `LiveCaptureAudioOrderTests` runs
+  `start()` against a fake audio graph through the `_NODE_HARNESS` borrowed from
+  `test_share_endpoints` and asserts the context precedes the microphone and the
+  socket (swapping the calls back fails with `1 not less than 0`), and that a
+  stuck context rejects before any socket exists (disabling the state check
+  fails with "a suspended context started anyway"). `AudioWatchdogTests` pins
+  the counter to the forwarded path and the watchdog's create/cancel pair.
+- 1282 tests pass; `node --check` on the extracted dashboard script, `py_compile`
+  and `git diff --check` are clean.
+
+---
+
 # Live notes — the session middleware was inside the gate it had to wrap (2026-10-27)
 
 - **The deploy after the path fix answered every request with a 500:**
