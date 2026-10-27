@@ -5,6 +5,39 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# Live notes — Live notes tab and mobile layout (2026-10-27)
+
+Shipped in `fca4fbf` on `feature/live-notes`.
+
+- **L10 — the tab exists, and the microphone is the primary control.** A new
+  top-level **🎙️ Live notes** tab owns a session rail plus a toolbar for name,
+  client, project and language, with Start / Pause & summarise / Resume / Stop.
+  Pause sends `{"type":"pause"}` and only starts the note job from the server's
+  `paused` acknowledgement, after the segment writer has drained and the
+  priority gate has been released. Resume is a recording start, not a
+  reconnect, so the gate bumps its generation and defers a queued note job.
+- **The token is write-only and Start knows it.** The page asks Setup's
+  `GET /api/settings/asr-token`; when no key is saved it renders numbered
+  asr-mcp instructions and disables Start rather than letting a socket fail
+  with 4409. A 4409 close also clears the local flag so the state is visible
+  immediately.
+- **Two panes, one poller.** **Transcription** lists time, speaker and text
+  with inline edit, delete-with-snapshot warning, and live placeholder segments
+  while audio arrives. **Notes** renders markdown, referenced-fact badges that
+  navigate through `showFactInMemories`, the job banner (`updating`,
+  `deferred`, `error`) and **Rebuild note** using `reprocess {mode:"all"}`.
+  `/status` is requested once when a job starts and then only while it is
+  non-terminal.
+- **Session state.** `activeLiveTranscriptionId` and `liveTab` are persisted in
+  `mem_vault_session_state` and validated on load; `switchTab` still resolves
+  the page element before dereferencing it.
+- **Mobile.** Below 900px the rail stacks above the workspace; `.live-panel`,
+  `.live-workspace` and `.live-panel-scroll` are released from their zero flex
+  bases with both halves (`flex: 0 0 auto` and `overflow-y: visible`), the
+  toolbar wraps, and controls get 40px targets. `LiveNotesLayoutTests` pins the
+  full-bleed page, the shared 100vh budget, the absence of inline display on a
+  layout container, and the stacked rules.
+
 # Live notes — Setup ASR-token card (2026-10-27)
 
 Shipped in `ef7d90a` on `feature/live-notes`.

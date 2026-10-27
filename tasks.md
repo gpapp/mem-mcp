@@ -21,35 +21,6 @@ commit. Audio forwarding never waits on processing.
 
 ---
 
-## L10. Live notes tab and mobile layout
-
-- [ ] Add the top-level **🎙️ Live notes** tab (`data-tab="live"`, `#page-live`).
-- [ ] Three-pane layout: session rail, toolbar with client/project/language and
-      record controls, then the two sub-tabs **Transcription** and **Notes**.
-- [ ] Token-unset empty state: numbered instructions and a button that switches
-      to Setup; Start disabled.
-- [ ] Segment list: time, speaker, text, inline edit and delete with the warning
-      that the note keeps its snapshot.
-- [ ] Notes pane: rendered markdown, referenced-fact badges that navigate to the
-      fact, **Rebuild note**, and the job status (`updating`, `deferred`,
-      `error`).
-- [ ] Poll `/status` only while a job is in flight; stop on a terminal state.
-- [ ] Persist `activeLiveTranscriptionId` and `liveTab` in
-      `mem_vault_session_state`; keep `switchTab`'s safe fallback.
-- [ ] Update `switchTab` lazy loading and `init()`; do not dereference a missing
-      page.
-- [ ] Mobile: stack rail and panes below 900px, release zero flex bases, one
-      scroll region per pane, no inline `display`/`width` that beats the media
-      query.
-- [ ] Wire capture controls to the L6 client and send `{"type":"pause"}` before
-      starting summarise.
-
-**Acceptance:** `node --check` passes on the template script; `test_mobile_layout.py`
-pins the new selectors; starting a recording while a note update is in flight
-shows "paused — recording resumed" rather than blocking the microphone.
-
----
-
 ## L11. Documentation, full verification, commit and push
 
 - [ ] Add a **Live notes** section to `AGENTS.md`: architecture, data model,
