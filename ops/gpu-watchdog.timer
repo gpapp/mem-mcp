@@ -1,0 +1,13 @@
+[Unit]
+Description=Run the GPU watchdog periodically
+
+[Timer]
+# Not at boot: docker.service and the ollama model pull own the first minutes,
+# and a probe that races them reports a failure that fixes itself.
+OnBootSec=5min
+OnUnitActiveSec=15min
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

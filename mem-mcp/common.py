@@ -488,6 +488,12 @@ STATUS_POLL_SECONDS = max(2.0, float(os.getenv("MEM_STATUS_POLL_SECONDS", "10"))
 # Long enough for Ollama to answer on a loaded GPU, short enough that a wedged
 # service shows up as "down" rather than as a widget frozen on the last answer.
 STATUS_HTTP_TIMEOUT = max(1.0, float(os.getenv("MEM_STATUS_HTTP_TIMEOUT", "8")))
+# Whether this host is supposed to run models on a GPU. When it is, a resident
+# model with no VRAM is a failure worth naming in the widget: the CUDA/Vulkan
+# driver died, llama-server silently fell back to the CPU, and every latency
+# figure is meaningless while the service still answers every request. On a
+# CPU-only deployment the same snapshot is correct, so the note is suppressed.
+GPU_EXPECTED = str(os.getenv("MEM_GPU_EXPECTED") or "1").strip().lower() in ("1", "true", "yes", "on")
 
 
 def configured_model_roles() -> list:
@@ -533,11 +539,13 @@ async def fetch_ollama_status() -> dict:
         return status_monitor.build_status(
             roles=roles, url=OLLAMA_URL, maintenance=active_maintenance(),
             error=f"{type(exc).__name__}: {exc}",
+            gpu_expected=GPU_EXPECTED,
         )
 
     return status_monitor.build_status(
         roles=roles, url=OLLAMA_URL, version=version, tags=tags, ps=ps,
         warnings=warnings, maintenance=active_maintenance(),
+        gpu_expected=GPU_EXPECTED,
     )
 
 

@@ -138,6 +138,46 @@ def processor_label(size: Any, size_vram: Any) -> str:
     return f"{100 - gpu}%/{gpu}% CPU/GPU"
 
 
+def cpu_fallback_warnings(
+    models: Optional[List[Dict[str, Any]]] = None,
+    gpu_expected: bool = True,
+) -> List[str]:
+    """Name the resident models Ollama is running with no GPU layers at all.
+
+    A model that loaded with ``size_vram == 0`` on a host that has a GPU is the
+    fingerprint of the failure that is otherwise only visible in the container
+    log: ``ggml_cuda_init: failed to initialize CUDA`` or a card the Vulkan
+    runner lost, after which llama-server falls back to the CPU entirely. The
+    model still answers every request and every latency figure looks plausible,
+    which is why it needs saying out loud. ``processor_label`` already states
+    the fact ("100% CPU"); this states *why it is wrong here* and where to
+    look, which is the difference between a fact and an explanation.
+
+    ``gpu_expected`` is the operator's assertion that this host has one. On a
+    CPU-only deployment the label is still true and there is nothing to
+    explain, so the warning is suppressed rather than shown forever — a warning
+    that fires on a correct configuration is one the reader learns to ignore.
+    """
+    if not gpu_expected:
+        return []
+    out: List[str] = []
+    for model in models or []:
+        if not isinstance(model, dict) or not model.get("resident"):
+            continue
+        # A resident model with no size reported is a payload shape we do not
+        # understand, not a CPU fallback — do not guess at it.
+        if _as_int(model.get("size")) <= 0:
+            continue
+        if _as_int(model.get("sizeVram")) > 0:
+            continue
+        out.append(
+            f"{model.get('name') or 'a model'} is resident with no GPU layers — "
+            "Ollama is running it on the CPU; check `docker exec ollama ollama ps` "
+            "and the ollama container log for `ggml_cuda_init` / `device lost`"
+        )
+    return out
+
+
 def _role_rank(model: Dict[str, Any]) -> int:
     for index, role in enumerate(ROLE_ORDER):
         if role in (model.get("roles") or ()):
@@ -155,6 +195,7 @@ def build_status(
     error: Optional[str] = None,
     warnings: Optional[List[str]] = None,
     maintenance: Optional[Dict[str, str]] = None,
+    gpu_expected: bool = True,
     now: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """Fold the three Ollama payloads into one snapshot.
@@ -210,6 +251,13 @@ def build_status(
     # is missing" at a glance.
     models.sort(key=lambda m: (not m["resident"], _role_rank(m), m["name"]))
 
+    # Degraded-state notes the module can derive itself, appended to whatever
+    # the caller reported, so a CPU fallback explains itself even when every
+    # HTTP route answered perfectly. `warnings` is in the fingerprint, so this
+    # is pushed once when it appears rather than on every poll.
+    notes = list(warnings or [])
+    notes.extend(cpu_fallback_warnings(models, gpu_expected))
+
     version_body = version if isinstance(version, dict) else {}
     answered = bool(version_body) or ps is not None or tags is not None
     return {
@@ -217,7 +265,7 @@ def build_status(
         "url": url,
         "version": version_body.get("version") or None,
         "error": error,
-        "warnings": list(warnings or []),
+        "warnings": notes,
         "checked": (now or datetime.now(timezone.utc)).isoformat(),
         "models": models,
         "installedCount": len(installed),

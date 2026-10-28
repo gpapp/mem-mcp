@@ -131,6 +131,78 @@ class ProcessorLabelTests(unittest.TestCase):
         self.assertEqual(sm.processor_label("nope", {}), "")
 
 
+class CpuFallbackWarningTests(unittest.TestCase):
+    """A resident model with no VRAM is a failure, not a preference.
+
+    On 2026-10-28 the scheduler read 3.6 GiB of VRAM over NVML and llama-server
+    then failed `cuInit`, loaded zero GPU layers and served every request from
+    the i5 at a plausible latency. `processor_label` already said "100% CPU";
+    the missing half is that on a host that *has* a GPU this is a fault, and
+    where to look for its cause. The warning is derived here rather than in the
+    caller so both the poller and the cold-path probe say the same thing.
+    """
+
+    def _models(self, **kwargs):
+        kwargs.setdefault("ps", {"models": [
+            _ps("nemotron-3-nano:4b", 2_630_000_000, 0)]})
+        kwargs.setdefault("tags", {"models": [
+            {"name": "nemotron-3-nano:4b", "size": 2_630_000_000}]})
+        kwargs.setdefault("version", {"version": "0.34.4"})
+        return sm.build_status(**kwargs)["models"]
+
+    def test_a_resident_model_with_no_vram_is_named_as_a_fallback(self):
+        models = self._models()
+        self.assertEqual(models[0]["processor"], "100% CPU",
+                         msg="the label alone is what the widget showed before")
+        notes = sm.cpu_fallback_warnings(models)
+        self.assertEqual(len(notes), 1, msg=notes)
+        self.assertIn("nemotron-3-nano:4b", notes[0])
+        self.assertIn("ollama ps", notes[0], msg="the warning has to name the check")
+        self.assertIn("ggml_cuda_init", notes[0],
+                      msg="and the log string, or it only restates the label")
+
+    def test_a_model_with_vram_is_not_reported(self):
+        models = self._models(ps={"models": [
+            _ps("nemotron-3-nano:4b", 2_630_000_000, 2_630_000_000)]})
+        self.assertEqual(sm.cpu_fallback_warnings(models), [])
+
+    def test_a_split_is_a_slow_card_not_a_fallback(self):
+        # 49%/51% is the documented gemma3-on-4GB case: working, just split.
+        # Alerting on it would fire on a healthy deployment with a large model.
+        models = self._models(ps={"models": [_ps("gemma3:4b", 100, 51)]})
+        self.assertEqual(sm.cpu_fallback_warnings(models), [])
+
+    def test_a_cold_model_is_not_reported(self):
+        # Not resident means nothing is running, so there is nothing to explain.
+        models = self._models(ps={"models": []})
+        self.assertEqual(sm.cpu_fallback_warnings(models), [])
+        self.assertEqual(models[0]["processor"], "")
+
+    def test_a_cpu_only_host_stays_quiet(self):
+        models = self._models()
+        self.assertEqual(sm.cpu_fallback_warnings(models, gpu_expected=False), [])
+
+    def test_the_warning_reaches_the_snapshot_alongside_the_callers_own(self):
+        snap = sm.build_status(
+            roles=sm.model_roles(query="nemotron-3-nano:4b"),
+            version={"version": "0.34.4"},
+            ps={"models": [_ps("nemotron-3-nano:4b", 100, 0)]},
+            warnings=["/api/tags returned HTTP 500: boom"],
+        )
+        self.assertEqual(len(snap["warnings"]), 2, msg=snap["warnings"])
+        self.assertEqual(snap["warnings"][0], "/api/tags returned HTTP 500: boom",
+                         msg="the caller's own warning keeps its place")
+        self.assertIn("no GPU layers", snap["warnings"][1])
+
+    def test_the_snapshot_honours_the_flag(self):
+        snap = sm.build_status(
+            version={"version": "0.34.4"},
+            ps={"models": [_ps("nemotron-3-nano:4b", 100, 0)]},
+            gpu_expected=False,
+        )
+        self.assertEqual(snap["warnings"], [])
+
+
 class SnapshotTests(unittest.TestCase):
     """The snapshot is the payload the browser draws, so its shape is the API."""
 
@@ -724,7 +796,7 @@ class StatusProbeTests(unittest.TestCase):
                 raise ValueError("no JSON body")
             return self._payload
 
-    def _runner(self, responses, raise_on=()):
+    def _runner(self, responses, raise_on=(), gpu_expected=True):
         """Lift both functions; `responses` maps endpoint -> _Response/Exception."""
         with open(os.path.join(HERE, "common.py"), encoding="utf-8") as handle:
             source = handle.read()
@@ -771,6 +843,10 @@ class StatusProbeTests(unittest.TestCase):
             "logger": type("L", (), {"warning": staticmethod(lambda *a: logs.append(a))})(),
             "active_maintenance": lambda: {"test-user": "reclassify"},
             "configured_model_roles": lambda: sm.model_roles(query="nemotron-3-nano:4b"),
+            # The lifted function reads this at module level. A missing name
+            # here is a NameError on every call, which is the "unbound global"
+            # class this suite exists to catch one layer up.
+            "GPU_EXPECTED": gpu_expected,
             "_ollama_detail": lambda resp: resp.text or "no detail",
         }
         exec(compile(ast.Module(body=funcs, type_ignores=[]), "common.py", "exec"), namespace)
@@ -793,6 +869,25 @@ class StatusProbeTests(unittest.TestCase):
         self.assertEqual(snap["residentCount"], 1)
         self.assertEqual(snap["maintenance"], {"test-user": "reclassify"})
         self.assertTrue(snap["checked"], msg="the settings page shows how old this is")
+
+    def test_the_configured_gpu_expectation_reaches_the_snapshot(self):
+        # The helper's own tests cannot see this: the warning is derived in
+        # status_monitor and only the caller's `gpu_expected=` decides whether
+        # it applies. Dropping that argument leaves every helper test green and
+        # the knob silently inert, which is the documented .env failure class.
+        cpu_bound = self._healthy()
+        cpu_bound["/api/ps"] = self._Response(200, {"models": [
+            {"name": "nemotron-3-nano:4b", "size": 100, "size_vram": 0}]})
+
+        probe, _, _, _ = self._runner(cpu_bound, gpu_expected=True)
+        on = asyncio.run(probe())
+        self.assertEqual(len(on["warnings"]), 1, msg=on["warnings"])
+        self.assertIn("no GPU layers", on["warnings"][0])
+
+        probe, _, _, _ = self._runner(cpu_bound, gpu_expected=False)
+        off = asyncio.run(probe())
+        self.assertEqual(off["warnings"], [],
+                         msg="MEM_GPU_EXPECTED=0 must silence a CPU-only host")
 
     # One route answering badly degrades the snapshot rather than emptying it:
     # a moved route and a proxy's login page are two ways the same rule fires,

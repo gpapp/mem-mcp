@@ -1,0 +1,16 @@
+[Unit]
+Description=Detect a silent Ollama CPU fallback (wedged GPU or dropped GPU overlay)
+Documentation=file:///opt/mem-mcp/ops/README.md
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+# Host-local settings: GPU_WATCHDOG_ACTION, GPU_WATCHDOG_PROBE_MODEL, ...
+EnvironmentFile=-/etc/default/gpu-watchdog
+ExecStart=/usr/local/bin/gpu-watchdog.sh
+# 1 (degraded, acted on) and 3 (Ollama unreachable) are findings, not unit
+# failures. Leaving them as failures makes the timer's state unreadable at a
+# glance, which is the one thing an operator checks first.
+SuccessExitStatus=0 1 3
+Nice=10

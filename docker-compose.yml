@@ -156,6 +156,9 @@ services:
       # status probe must never be what makes anything else slow.
       - MEM_STATUS_POLL_SECONDS=${MEM_STATUS_POLL_SECONDS:-10}
       - MEM_STATUS_HTTP_TIMEOUT=${MEM_STATUS_HTTP_TIMEOUT:-8}
+      # 1 means this host has a GPU, so a resident model with no VRAM is a CPU
+      # fallback worth naming in the widget. 0 silences it on a CPU-only box.
+      - MEM_GPU_EXPECTED=${MEM_GPU_EXPECTED:-1}
       # Empty default: no Service tab until an operator names the admin account.
       - MEM_ADMIN_USER=${MEM_ADMIN_USER:-}
 
