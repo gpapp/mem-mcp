@@ -63,6 +63,7 @@ asks the one question that has a single meaning:
 | observation | conclusion |
 |---|---|
 | `/dev/nvidia0` absent inside `ollama` | the GPU compose overlay was dropped — deploy with `-f docker-compose.yml -f docker-compose.gpu.yml` |
+| `/dev/nvidia0` present but `/dev/nvidia-uvm` absent | CUDA initialises through `nvidia-uvm`, so `cuInit` fails with the same `unknown error` as a wedged card. Warned, not failed: the load below is the real verdict, and this note explains it. `docker exec ollama ls -l /dev/nvidia*` is the manual form of both checks |
 | a resident model prints `… GPU` | healthy |
 | a resident model prints `… CPU` | **CPU fallback** — confirmed once more after `RECHECK_SECONDS`, because a model still being placed can briefly report 0 VRAM |
 | a resident model prints `… CPU/GPU` | a split: working, but the card is too small for the model. Logged, never alerted |

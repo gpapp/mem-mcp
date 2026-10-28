@@ -211,6 +211,17 @@ if ! docker exec "$OLLAMA_CONTAINER" test -e /dev/nvidia0 2>/dev/null; then
 fi
 
 rows="$(ps_rows)"
+
+# /dev/nvidia-uvm is the device CUDA actually initialises through, and a
+# container that has nvidia0 but not uvm fails cuInit with the same "unknown
+# error" as a wedged card. The overlay's explicit `devices:` list does not name
+# it -- the nvidia runtime injects it from the reservation -- so its absence is
+# a deploy problem, not a card problem. Warn rather than fail: the load probe
+# below is the real verdict, and this is the note that explains it.
+if ! docker exec "$OLLAMA_CONTAINER" test -e /dev/nvidia-uvm 2>/dev/null; then
+    warn "/dev/nvidia-uvm is missing from $OLLAMA_CONTAINER -- CUDA initialisation through it will fail; check that the deploy used the GPU overlay and that the nvidia runtime injects the device"
+fi
+
 if [[ -z "$rows" ]]; then
     # Nothing resident: the state of the card is unobservable, so observe it.
     if ! load_probe; then
