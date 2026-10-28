@@ -44,7 +44,7 @@ recorded in `AGENTS.md` (Task Tracking).
   clean; both new guards mutation-checked (dropping the `!reset` tag, and a
   second file declaring a reservation, each fail the class they belong to).
 
-Shipped in `dd25b2f` on `feature/live-notes`.
+Shipped in `d654e26` on `feature/live-notes`.
 
 ---
 
