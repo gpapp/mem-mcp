@@ -386,5 +386,114 @@ class EnvWiringTests(unittest.TestCase):
                               msg=f"{name} is not interpolated from .env")
 
 
+_RESET = object()
+
+try:
+    import yaml as _yaml
+except ImportError:  # pragma: no cover - this box has PyYAML
+    _yaml = None
+
+
+def _compose_files():
+    return sorted(
+        name for name in os.listdir(_ROOT)
+        if name.startswith("docker-compose") and name.endswith(".yml")
+    )
+
+
+def _load_compose(name):
+    """Parse a compose file, keeping `!reset` as a marker instead of crashing.
+
+    `!reset` is a compose-specific YAML tag, not part of the YAML spec, so a
+    plain SafeLoader raises on it. The marker is what the assertions below read:
+    "this key is reset by the overlay" is a different fact from "this key
+    appears in the overlay", and only the first one removes the inherited value.
+    """
+    if _yaml is None:
+        raise unittest.SkipTest("PyYAML is not installed")
+
+    class _Loader(_yaml.SafeLoader):
+        pass
+
+    _Loader.add_constructor("!reset", lambda loader, node: _RESET)
+    with open(os.path.join(_ROOT, name), "r", encoding="utf-8") as handle:
+        return _yaml.load(handle, Loader=_Loader)
+
+
+def _declares_gpu_reservation(document):
+    for service in (document.get("services") or {}).values():
+        if not isinstance(service, dict):
+            continue
+        deploy = service.get("deploy")
+        resources = deploy.get("resources") if isinstance(deploy, dict) else None
+        if isinstance(resources, dict) and resources.get("reservations"):
+            return True
+    return False
+
+
+class ComposeGpuDeploymentTests(unittest.TestCase):
+    """One GPU statement, in the base file, and a CPU host that removes it.
+
+    The reservation used to be a second file merged with `-f`, and the failure
+    that arrangement caused -- twice -- was a bare `docker compose up -d`
+    silently recreating ollama without it: every model still answered, on the
+    CPU, at a plausible-looking latency. Moving it into the base file inverts
+    that, because a host with no NVIDIA driver now refuses to create the
+    container instead of starting it quietly on the processor.
+
+    Three properties, none of which can be asked of docker here (there is no
+    daemon on this box) and each of which regresses silently:
+
+      * the reservation is present in the base file at all;
+      * no other compose file declares one, because a second GPU statement is
+        exactly the drift the old arrangement invited;
+      * the CPU overlay *resets* both keys rather than restating them, because
+        compose appends and overrides -- it never removes -- so an overlay that
+        merely omitted them would leave a CPU host with the reservation it was
+        supposed to shed. That is why the assertion reads the `!reset` tag: a
+        key that is present without it passes a naive check and does nothing.
+    """
+
+    def test_the_gpu_reservation_is_in_the_base_file(self):
+        ollama = _load_compose("docker-compose.yml")["services"]["ollama"]
+        devices = ollama["deploy"]["resources"]["reservations"]["devices"]
+        self.assertTrue(devices, msg="the ollama service requests no device")
+        self.assertEqual(devices[0]["driver"], "nvidia",
+                         msg="the reservation must name the nvidia driver, or the "
+                             "runtime is never asked for the card")
+        self.assertEqual(devices[0]["count"], "all",
+                         msg="`count: all` is what makes the card visible; without "
+                             "it Ollama reports 100% CPU and runs on the processor")
+        nodes = [str(entry) for entry in ollama["devices"]]
+        for node in ("/dev/nvidia0", "/dev/dri"):
+            with self.subTest(node=node):
+                self.assertTrue(any(node in entry for entry in nodes),
+                                msg=f"{node} is not bound into the container; "
+                                    f"bound nodes are {nodes}")
+
+    def test_no_other_compose_file_declares_a_gpu_reservation(self):
+        declaring = [name for name in _compose_files()
+                     if _declares_gpu_reservation(_load_compose(name))]
+        self.assertEqual(
+            declaring, ["docker-compose.yml"],
+            msg="the GPU reservation must be stated once. A second declaration is "
+                "the drift the old two-file split invited: the copies disagree, and "
+                "the one that is not used is the one somebody reads.",
+        )
+
+    def test_the_cpu_overlay_resets_the_device_request(self):
+        ollama = _load_compose("docker-compose.cpu.yml")["services"]["ollama"]
+        for key in ("deploy", "devices"):
+            with self.subTest(key=key):
+                self.assertIs(
+                    ollama.get(key), _RESET,
+                    msg=f"docker-compose.cpu.yml must `!reset` ollama's `{key}`. "
+                        f"Compose appends and overrides rather than removes, so "
+                        f"anything else leaves a CPU-only host with the device "
+                        f"request it cannot satisfy -- and `up` fails at create "
+                        f"time, which is the whole point of the overlay.",
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

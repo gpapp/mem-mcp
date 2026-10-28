@@ -24,6 +24,14 @@
 set -uo pipefail
 
 OLLAMA_CONTAINER="${GPU_WATCHDOG_CONTAINER:-ollama}"
+
+# Set to 0 on a host that is *deliberately* CPU-only (deployed with
+# docker-compose.cpu.yml). Every check below would otherwise report a correct
+# deployment as degraded on every run -- a watchdog that alerts on the intended
+# state is one an operator learns to ignore, which is the same failure as no
+# watchdog. The counterpart of MEM_GPU_EXPECTED=0 in the app.
+EXPECT_GPU="${GPU_WATCHDOG_EXPECT_GPU:-1}"
+
 PROBE_MODEL="${GPU_WATCHDOG_PROBE_MODEL:-}"
 RECHECK_SECONDS="${GPU_WATCHDOG_RECHECK_SECONDS:-20}"
 PROBE_TIMEOUT="${GPU_WATCHDOG_PROBE_TIMEOUT:-180}"
@@ -193,6 +201,11 @@ remedy() {
 }
 
 # --- main ------------------------------------------------------------------
+if [[ "$EXPECT_GPU" != "1" ]]; then
+    log "GPU_WATCHDOG_EXPECT_GPU=$EXPECT_GPU: this host is CPU-only, nothing to watch"
+    exit 0
+fi
+
 if ! docker inspect -f '{{.State.Running}}' "$OLLAMA_CONTAINER" 2>/dev/null | grep -q true; then
     increment_strikes
     remedy "container $OLLAMA_CONTAINER is not running" "$(read_count "$strikes_file")"
@@ -200,12 +213,16 @@ if ! docker inspect -f '{{.State.Running}}' "$OLLAMA_CONTAINER" 2>/dev/null | gr
 fi
 
 # The documented recurring failure, and a different remedy from a wedged card:
-# the GPU compose overlay is a SEPARATE file, so a bare `docker compose up -d`
-# recreates ollama with no device reservation and it looks identical from the
-# API (models answer, on the CPU).
+# the reservation used to live in a SEPARATE compose file, so a bare
+# `docker compose up -d` recreated ollama with no device and it looked identical
+# from the API (models answer, on the CPU). It is in docker-compose.yml now, so
+# this message has two plausible causes, and the second one is not a fault:
+# either the host has no NVIDIA driver (a deliberate CPU-only deployment --
+# deploy with `-f docker-compose.cpu.yml` and set GPU_WATCHDOG_EXPECT_GPU=0), or
+# the reservation did not take.
 if ! docker exec "$OLLAMA_CONTAINER" test -e /dev/nvidia0 2>/dev/null; then
     increment_strikes
-    remedy "no /dev/nvidia0 in $OLLAMA_CONTAINER -- the GPU overlay was dropped; deploy with -f docker-compose.yml -f docker-compose.gpu.yml" \
+    remedy "no /dev/nvidia0 in $OLLAMA_CONTAINER -- either this host has no NVIDIA driver (CPU-only deployment: add -f docker-compose.cpu.yml and set GPU_WATCHDOG_EXPECT_GPU=0) or the device reservation did not take" \
         "$(read_count "$strikes_file")"
     exit 1
 fi
@@ -214,12 +231,12 @@ rows="$(ps_rows)"
 
 # /dev/nvidia-uvm is the device CUDA actually initialises through, and a
 # container that has nvidia0 but not uvm fails cuInit with the same "unknown
-# error" as a wedged card. The overlay's explicit `devices:` list does not name
+# error" as a wedged card. The compose `devices:` list does not name
 # it -- the nvidia runtime injects it from the reservation -- so its absence is
 # a deploy problem, not a card problem. Warn rather than fail: the load probe
 # below is the real verdict, and this is the note that explains it.
 if ! docker exec "$OLLAMA_CONTAINER" test -e /dev/nvidia-uvm 2>/dev/null; then
-    warn "/dev/nvidia-uvm is missing from $OLLAMA_CONTAINER -- CUDA initialisation through it will fail; check that the deploy used the GPU overlay and that the nvidia runtime injects the device"
+    warn "/dev/nvidia-uvm is missing from $OLLAMA_CONTAINER -- CUDA initialisation through it will fail; check that the reservation took and that the nvidia runtime injects the device"
 fi
 
 if [[ -z "$rows" ]]; then

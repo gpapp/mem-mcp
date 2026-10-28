@@ -99,6 +99,58 @@ services:
       # this card holds; 1 if the device is lost again.
       - OLLAMA_MAX_LOADED_MODELS=${OLLAMA_MAX_LOADED_MODELS:-2}
       - OLLAMA_NUM_PARALLEL=${OLLAMA_NUM_PARALLEL:-1}
+      # GPU passthrough. This used to live in a second file,
+      # `docker-compose.gpu.yml`, merged in with `-f`, and it is here now on
+      # purpose. The failure that arrangement caused -- twice -- was a bare
+      # `docker compose up -d` silently recreating ollama with no reservation:
+      # every model still answers, on the CPU, at plausible-looking latency,
+      # and nothing says so. With the reservation in the base file that mistake
+      # is no longer possible on a GPU host, and a host with no NVIDIA driver
+      # fails at create time instead (`could not select device driver` /
+      # `error gathering device information ... /dev/nvidia0: no such file`),
+      # which is the safe direction for the mistake to happen in.
+      #
+      # A CPU-only host is still a supported deployment, and it is the one that
+      # carries the overlay now:
+      #   docker compose -f docker-compose.yml -f docker-compose.cpu.yml up -d
+      # Ollama's own CPU fallback happens after the container exists; compose
+      # refuses to create a container whose reservation names a device the host
+      # does not have, and it cannot omit a field conditionally, so the
+      # reservation has to be removed rather than left to fail at runtime.
+      #
+      # OLLAMA_VULKAN=1 and OLLAMA_IGPU_ENABLE=1 together make the Intel iGPU
+      # usable *alongside* CUDA, not instead of it. Verified: both devices are
+      # enumerated (CUDA0 compute=7.5 GTX 1650, Vulkan0 compute=0.0 HD 630), and
+      # OLLAMA_IGPU_ENABLE is required -- without it Ollama logs
+      # "dropping integrated GPU; to enable, set OLLAMA_IGPU_ENABLE=1" and the
+      # device is invisible.
+      #
+      # OLLAMA_LLM_LIBRARY is deliberately NOT set to vulkan. It forces the
+      # backend rather than offering a second one: measured with it, nemotron
+      # loaded on Vulkan0 and nvidia-smi reported 1 MiB used and no processes,
+      # i.e. the GTX 1650 was bypassed entirely. Leave it unset so each model
+      # lands on a device by its own fit.
+      - OLLAMA_VULKAN=1
+      - OLLAMA_IGPU_ENABLE=1
+      - NVIDIA_DRIVER_CAPABILITIES=all
+    # The reservation is what makes the card *visible*. Without it Ollama
+    # reports `100% CPU` and runs every call on the processor -- and with it,
+    # `gpu=0 library=CUDA total="3.6 GiB"` in the ollama log means the card was
+    # seen, which is a different fault from this one (see "Critical Config").
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, utility, compute]
+    # Direct device nodes for the iGPU. The whole DRM directory rather than one
+    # render node, because render node numbering is not stable across reboots.
+    devices:
+      - "/dev/dri:/dev/dri"
+      - "/dev/nvidia0:/dev/nvidia0"
+      - "/dev/nvidiactl:/dev/nvidiactl"
+      - "/dev/nvidia-modeset:/dev/nvidia-modeset"
 
   mem-mcp:
     build: ./mem-mcp

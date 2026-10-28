@@ -233,10 +233,11 @@ identity itself as `X-Vault-User` after stripping any inbound copy.
 ## Quick Start (Docker)
 
 1. **Configure secrets**: `cp .env.example .env` and set `MEM_NEO4J_PASSWORD`.
-2. **Launch (CPU)**: `docker-compose up -d`
-3. **Launch (GPU)**: `docker-compose -f docker-compose.yml -f docker-compose.gpu.yml up -d` (requires NVIDIA driver + NVIDIA Container Toolkit). **Verify Ollama actually got the card**: `docker exec ollama ls /dev/nvidia0` must succeed and `docker exec ollama ollama ps` must say `100% GPU`. Without that the app silently runs every LLM call on the CPU, and the symptom is wild latency variance rather than an error.
-4. **Initialize Embedder**: `docker exec ollama ollama pull nomic-embed-text`
-5. **Initialize the chat models**: the four roles are split across two models, and
+2. **Launch (GPU host — the default)**: `docker compose up -d`. The base file requests the NVIDIA device, so this needs an NVIDIA driver and the NVIDIA Container Toolkit.
+3. **Launch (CPU-only host)**: `docker compose -f docker-compose.yml -f docker-compose.cpu.yml up -d`, and set `MEM_GPU_EXPECTED=0` in `.env` so the status strip does not warn about the expected state. Ollama does fall back to the CPU by itself, but only once its container exists — compose refuses to create one whose device reservation names a device the host does not have — so on a machine with no NVIDIA driver the reservation is removed rather than left to fail at runtime. That overlay needs Compose ≥ 2.24 (`!reset`) and costs roughly tens of times the latency of the GPU path.
+4. **Verify Ollama actually got the card** (GPU hosts): `docker exec ollama ls /dev/nvidia0` must succeed and `docker exec ollama ollama ps` must say `100% GPU`. `100% CPU` on a GPU host means the model loaded with no GPU layers; see "Critical Config" in `AGENTS.md`, because that has two causes and only one of them is a deploy mistake.
+5. **Initialize Embedder**: `docker exec ollama ollama pull nomic-embed-text`
+6. **Initialize the chat models**: the four roles are split across two models, and
    the split is deliberate — see the model table below.
    ```bash
    docker exec ollama ollama pull nemotron-3-nano:4b   # scope + merge
@@ -251,7 +252,7 @@ identity itself as `X-Vault-User` after stripping any inbound copy.
    confidently name a project the record never mentions. On a 4 GB card these
    two cannot both stay resident, so expect a cold load when a search follows a
    reclassify.
-6. **After code changes**: rebuild the image with `docker-compose up -d --build mem-mcp` (dependency downloads are cached by BuildKit, so this is fast after the first build)
+7. **After code changes**: rebuild the image with `docker compose up -d --build mem-mcp` (dependency downloads are cached by BuildKit, so this is fast after the first build)
 
 Visit **http://localhost:8086/** for the interactive setup guide.
 

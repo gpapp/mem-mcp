@@ -62,7 +62,7 @@ asks the one question that has a single meaning:
 
 | observation | conclusion |
 |---|---|
-| `/dev/nvidia0` absent inside `ollama` | the GPU compose overlay was dropped — deploy with `-f docker-compose.yml -f docker-compose.gpu.yml` |
+| `/dev/nvidia0` absent inside `ollama` | the reservation does not cover this container. Two causes: this host has no NVIDIA driver (a deliberate CPU-only deployment — add `-f docker-compose.cpu.yml` and set `GPU_WATCHDOG_EXPECT_GPU=0`), or the reservation did not take. `docker exec ollama ls -l /dev/nvidia*` is the manual form |
 | `/dev/nvidia0` present but `/dev/nvidia-uvm` absent | CUDA initialises through `nvidia-uvm`, so `cuInit` fails with the same `unknown error` as a wedged card. Warned, not failed: the load below is the real verdict, and this note explains it. `docker exec ollama ls -l /dev/nvidia*` is the manual form of both checks |
 | a resident model prints `… GPU` | healthy |
 | a resident model prints `… CPU` | **CPU fallback** — confirmed once more after `RECHECK_SECONDS`, because a model still being placed can briefly report 0 VRAM |
@@ -73,6 +73,28 @@ asks the one question that has a single meaning:
 The probe costs one cold model load and is only paid when **no** model is
 resident. It is unloaded afterwards so the watchdog never competes for the 4 GB
 card (asr-mcp holds 1.25 GB of it during live notes).
+
+## CPU-only hosts
+
+Nothing here applies to a host with no GPU, and installing this watchdog there
+is worse than not installing it: every run would report a correct deployment as
+degraded, and a watchdog that alerts on the intended state is one an operator
+learns to ignore.
+
+- Deploy with `docker compose -f docker-compose.yml -f docker-compose.cpu.yml up -d`.
+  The GPU reservation lives in the base file now, and compose cannot omit a
+  field conditionally, so a host with no NVIDIA driver has to remove it —
+  otherwise the container is never created (`could not select device driver`,
+  or `error gathering device information ... /dev/nvidia0`). Ollama's own CPU
+  fallback only happens once the container exists, so it is not a substitute.
+- Set `MEM_GPU_EXPECTED=0` in `.env`, which stops the status strip naming every
+  resident model as a CPU fallback.
+- Either do not install the timer, or set `GPU_WATCHDOG_EXPECT_GPU=0` in
+  `/etc/default/gpu-watchdog`; the script then logs that the host is CPU-only
+  and exits 0 without probing.
+- Expect roughly tens of times the latency of the GPU path, and size
+  `MEM_LLM_TIMEOUT` / `MEM_SEARCH_LLM_TIMEOUT` for a cold model load on the
+  processor rather than on the card.
 
 ## Actions
 
@@ -116,6 +138,7 @@ cheap repair that does work when the driver is healthy.
 | variable | default | meaning |
 |---|---|---|
 | `GPU_WATCHDOG_CONTAINER` | `ollama` | container to inspect |
+| `GPU_WATCHDOG_EXPECT_GPU` | `1` | set `0` on a deliberately CPU-only host: the run logs that and exits 0 without looking, instead of reporting a correct deployment as degraded every 15 minutes |
 | `GPU_WATCHDOG_ACTION` | `alert` | `alert` / `restart` / `reset` / `reboot` |
 | `GPU_WATCHDOG_PROBE_MODEL` | first installed | model loaded when nothing is resident |
 | `GPU_WATCHDOG_RECHECK_SECONDS` | `20` | second sample before declaring a fallback |

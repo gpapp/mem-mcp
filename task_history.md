@@ -5,6 +5,49 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# The GPU reservation moved into the base compose file (2026-10-28)
+
+- **Reported as** "Please merge docker-compose.gpu.yml and add documentation to
+  support those without CUDA (it should fall back to CPU anyway)".
+- **Why the split existed, and why it stopped paying**: the reservation lived in
+  `docker-compose.gpu.yml` merged with `-f`, and the failure that caused was a
+  bare `docker compose up -d` recreating ollama without it. It started healthy,
+  answered every request, and produced entirely plausible latencies -- on the
+  CPU. That happened twice (2026-09-29 while reducing `OLLAMA_CONTEXT_LENGTH`,
+  and the 2026-10-27 note rewrite) and neither left a line in the log saying so.
+- **What changed**: the `deploy` reservation, the `/dev/dri` + `/dev/nvidia*`
+  nodes and the Vulkan/`NVIDIA_DRIVER_CAPABILITIES` env now sit in
+  `docker-compose.yml`, so the GPU host cannot lose the card by forgetting a
+  flag. `docker-compose.gpu.yml` is deleted.
+- **The CPU direction inverted, and that is the part worth remembering**: a
+  host with no NVIDIA driver now fails at *create* time
+  (`could not select device driver`, or `error gathering device information ...
+  /dev/nvidia0`), which is the safe direction for the mistake to happen in.
+  **Ollama's own CPU fallback does not rescue it** -- Ollama picks the CPU only
+  once its container exists, and compose cannot omit a field conditionally --
+  so the CPU host carries the overlay instead:
+  `docker compose -f docker-compose.yml -f docker-compose.cpu.yml up -d`, where
+  `docker-compose.cpu.yml` `!reset`s `deploy` and `devices` (Compose >= 2.24),
+  plus `MEM_GPU_EXPECTED=0` so the status strip stops reporting the intended
+  state as a fallback.
+- **What a future reader would otherwise rediscover**: compose merges by
+  appending and overriding, never by removing, so an overlay that merely *omits*
+  `devices` inherits it. The `!reset` tag is the whole mechanism, and a test that
+  asserts the key is present passes on an overlay that does nothing -- hence
+  `ComposeGpuDeploymentTests` asserts the tag itself, and that exactly one
+  compose file declares a reservation at all.
+- **Also** `GPU_WATCHDOG_EXPECT_GPU` (default 1): the host watchdog would
+  otherwise report a deliberately CPU-only host as degraded every 15 minutes,
+  which is the same failure as no watchdog.
+- **Verified**: `Ran 1373 tests ... OK`; `bash -n ops/gpu-watchdog.sh`;
+  both compose files parse with a `!reset`-aware loader; `git diff --check`
+  clean; both new guards mutation-checked (dropping the `!reset` tag, and a
+  second file declaring a reservation, each fail the class they belong to).
+
+Shipped in `dd25b2f` on `feature/live-notes`.
+
+---
+
 # Granite was not unresponsive, it was looping and nobody was told (2026-10-28)
 
 - **Reported as** "Granite seems to be unresponsive on name extraction".

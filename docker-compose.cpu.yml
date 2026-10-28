@@ -1,0 +1,31 @@
+# CPU-only deployment overlay.
+#
+# The base file requests the NVIDIA device and binds the DRM/nvidia nodes,
+# which is right for a host with a GPU and is a hard failure on one without:
+# compose refuses to create the container ("could not select device driver ""
+# with capabilities: [[gpu]]", or "error gathering device information while
+# adding custom device /dev/nvidia0: no such file or directory") rather than
+# starting it and letting Ollama pick the CPU.
+#
+# **That refusal is not a bug and is not Ollama's CPU fallback.** Ollama chooses
+# the CPU only once its container exists, and compose has no way to omit a
+# field conditionally, so a CPU host removes the reservation instead. Hence one
+# overlay, in this direction: the GPU host runs plain `docker compose up -d`
+# and cannot lose the card by forgetting a flag, which is the mistake that
+# actually happened (2026-09-29 and 2026-10-27, both silent).
+#
+#   docker compose -f docker-compose.yml -f docker-compose.cpu.yml up -d
+#
+# Also set MEM_GPU_EXPECTED=0 in `.env`: the status strip otherwise warns about
+# a resident model with no VRAM, which on this host is the correct and expected
+# state. Leave OLLAMA_VULKAN / OLLAMA_IGPU_ENABLE alone -- they are inert with
+# no device nodes to bind, and overriding them here would be a second copy of
+# the base file to keep in step.
+#
+# `!reset` (Compose >= 2.24) discards the value inherited from the base file;
+# without it the merge would keep the reservation, because compose appends and
+# overrides rather than removes.
+services:
+  ollama:
+    deploy: !reset null
+    devices: !reset null
