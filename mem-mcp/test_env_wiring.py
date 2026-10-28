@@ -171,12 +171,18 @@ class ModelRoleRoutingTests(unittest.TestCase):
     """
 
     def _call_sites(self, filename, needle):
-        """The get_llm_response(...) calls in a module, as source text."""
+        """The chat calls in a module, as source text.
+
+        Both entry points count: a role that routes through the extraction guard
+        (`get_extraction_response`, which retries a degenerate decode) is still
+        choosing a model, and matching only `get_llm_response` would report "no
+        calls found" for the people extractor the moment it was guarded.
+        """
         path = os.path.join(_HERE, filename)
         with open(path, "r", encoding="utf-8") as handle:
             src = handle.read().replace("\r\n", "\n")
         return [m.group() for m in re.finditer(
-            r"get_llm_response\((?:[^()]|\([^()]*\))*\)", src)]
+            r"(?:get_llm_response|get_extraction_response)\((?:[^()]|\([^()]*\))*\)", src)]
 
     def test_the_extraction_roles_pass_the_extract_model(self):
         """Diary keywords and people names are extraction roles.

@@ -262,7 +262,11 @@ class ExtractLoopTests(unittest.TestCase):
 
     def test_it_loops_over_windows(self):
         self.assertIn("for index, window in enumerate(windows):", self.body)
-        self.assertIn("get_llm_response(window", self.body)
+        self.assertIn("get_extraction_response(", self.body)
+        self.assertIn(
+            "window,", self.body,
+            msg="the window must be the prompt the guarded helper is handed",
+        )
 
     def test_it_no_longer_slices_the_content_to_2000_chars(self):
         self.assertFalse(
@@ -307,6 +311,144 @@ class ExtractLoopTests(unittest.TestCase):
 
     def test_the_old_whole_entry_debug_line_records_the_window_count(self):
         self.assertRegex(self.body, r"windows=\{len\(windows\)\}")
+
+
+# ---------------------------------------------------------------------------
+# The extraction call site
+# ---------------------------------------------------------------------------
+class PeopleExtractionCallSiteTests(unittest.TestCase):
+    """The extractor must use the decode guard, not the bare chat call.
+
+    ``get_extraction_response`` is covered behaviourally in
+    ``test_llm_reliability``, and on its own that is not enough: the defect it
+    exists for is a *wrong call site*. Reverting `_extract_people_names` to
+    `get_llm_response` restores the greedy decode that looped and leaves every
+    guard test green — the same lesson as `OllamaModelMatchTests`.
+    """
+
+    def _runner(self, llm, recorder=None):
+        recorder = recorder or _Recorder()
+
+        def dedupe_names(names):
+            # `clean_extracted_people_names` is imported from common rather than
+            # defined in diary_manager, so there is no source here to lift. The
+            # stub keeps the property these tests rely on and nothing else.
+            seen = set()
+            out = []
+            for name in names or []:
+                if not isinstance(name, str):
+                    continue
+                key = name.strip().lower()
+                if key and key not in seen:
+                    seen.add(key)
+                    out.append(name.strip())
+            return out
+
+        namespace = {
+            "logger": recorder,
+            # The lifted windowing helper resolves its own module constants, so
+            # they have to travel with it — a NameError here is indistinguishable
+            # from a broken extractor.
+            "people_extract_windows": _lift(
+                "people_extract_windows",
+                PEOPLE_EXTRACT_WINDOW=6000,
+                PEOPLE_EXTRACT_OVERLAP=600,
+            ),
+            "PEOPLE_EXTRACT_WINDOW": 6000,
+            "PEOPLE_EXTRACT_OVERLAP": 600,
+            "PEOPLE_EXTRACT_WARN_WINDOWS": 6,
+            "PEOPLE_EXTRACT_MAX_TOKENS": 800,
+            "_PEOPLE_EXTRACT_SYSTEM": "stub system prompt",
+            "EXTRACT_MODEL": "stub-extract-model",
+            "clean_extracted_people_names": dedupe_names,
+            "parse_people_name_array": parse_people_name_array,
+            "get_extraction_response": llm,
+        }
+        return _lift("_extract_people_names", **namespace), recorder
+
+    def test_the_extractor_calls_the_guarded_helper_not_the_bare_chat_call(self):
+        _source, _tree, _target, segment = _segment("_extract_people_names")
+        self.assertIn("get_extraction_response(", segment)
+        self.assertNotIn("get_llm_response(", segment,
+                         msg="the bare chat call is the greedy decode that looped")
+
+    def test_the_guard_gets_the_window_label_and_the_extraction_model(self):
+        calls = []
+
+        async def llm(prompt, **kw):
+            calls.append((prompt, kw))
+            return '["Anna Weber"]'
+
+        runner, _rec = self._runner(llm)
+        names = asyncio.run(runner("## Participants\nAnna Weber"))
+        self.assertEqual(names, ["Anna Weber"])
+        self.assertEqual(len(calls), 1)
+        _prompt, kw = calls[0]
+        self.assertEqual(kw["model"], "stub-extract-model")
+        self.assertIn("window 1/1", kw["label"])
+        # MEM_PEOPLE_EXTRACT_TOKENS bounds the answer, and an unbounded answer
+        # is how a loop runs to `done_reason: length` instead of being caught.
+        self.assertEqual(kw["num_predict"], 800)
+
+    def test_the_guard_is_told_what_a_usable_answer_looks_like(self):
+        """A genuine `[]` is an answer; `" A A A A"` is not. The predicate is
+        what tells the helper apart those two, so it has to be handed over."""
+        captured = {}
+
+        async def llm(prompt, **kw):
+            captured["is_good"] = kw.get("is_good")
+            return "[]"
+
+        runner, _rec = self._runner(llm)
+        self.assertEqual(asyncio.run(runner("some text")), [])
+        is_good = captured.get("is_good")
+        self.assertTrue(callable(is_good), msg="the helper cannot classify anything without it")
+        self.assertTrue(is_good("[]"), msg="no people in this window is a real answer")
+        self.assertTrue(is_good('["Anna Weber"]'))
+        self.assertFalse(is_good(" A" * 40), msg="the production degeneration must be rejected")
+
+    def test_one_failed_window_is_logged_at_warning_and_the_others_survive(self):
+        """The log line is the fix for the report: production runs at WARNING,
+        so a DEBUG line here is why `A A A` looked like a model that found no
+        names."""
+        calls = []
+
+        async def llm(prompt, **kw):
+            calls.append(prompt)
+            if len(calls) == 1:
+                raise RuntimeError("prediction aborted, token repeat limit reached")
+            return '["Tom Berg"]'
+
+        long_text = "x" * 6000 + "\n## Participants\nTom Berg"
+        runner, rec = self._runner(llm)
+        names = asyncio.run(runner(long_text))
+        self.assertEqual(names, ["Tom Berg"],
+                         msg="one bad window must not discard the other windows")
+        self.assertTrue(
+            any("window 1/2" in w and "failed" in w for w in rec.warnings),
+            msg=f"the failure was not logged at WARNING: {rec.warnings}",
+        )
+
+    def test_an_unparseable_answer_is_reported_rather_than_swallowed(self):
+        async def llm(prompt, **kw):
+            return " A" * 40
+
+        runner, rec = self._runner(llm)
+        self.assertEqual(asyncio.run(runner("Anna Weber and Tom Berg")), [])
+        self.assertTrue(
+            any("no JSON array" in w for w in rec.warnings),
+            msg=f"an answer that parsed to nothing must say so: {rec.warnings}",
+        )
+
+    def test_the_resolver_hop_is_guarded_too(self):
+        """The binder is the second LLM call per window, and it had the same
+        greedy decode. It must be the callable handed to the resolver, not
+        `get_llm_response`."""
+        _source, _tree, _target, segment = _segment("_auto_link_people")
+        self.assertIn("_bind_people_llm", segment)
+        _src2, _tree2, _target2, binder = _segment("_bind_people_llm")
+        self.assertIn("get_extraction_response(", binder)
+        self.assertNotIn("get_llm_response(", binder)
 
 
 # ---------------------------------------------------------------------------

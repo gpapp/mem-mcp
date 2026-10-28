@@ -14,7 +14,8 @@ from qdrant_client.models import PointStruct, Filter, FieldCondition, MatchValue
 import re
 from common import (
     get_qdrant, get_neo4j, logger, get_embedding, get_llm_response, publish_db_event,
-    DIARY_COLLECTION, QDRANT_URL, clean_extracted_people_names, EXTRACT_MODEL
+    DIARY_COLLECTION, QDRANT_URL, clean_extracted_people_names, EXTRACT_MODEL,
+    get_extraction_response, LLM_QUERY_MODEL,
 )
 from matching_utils import (
     parse_people_name_array,
@@ -295,20 +296,34 @@ async def _extract_people_names(content: str) -> list:
         )
     found = []
     for index, window in enumerate(windows):
+        label = f"extract_people_names window {index + 1}/{len(windows)}"
         try:
-            raw = await get_llm_response(window, system=_PEOPLE_EXTRACT_SYSTEM,
-                                         model=EXTRACT_MODEL,
-                                         num_predict=PEOPLE_EXTRACT_MAX_TOKENS)
+            raw = await get_extraction_response(
+                window,
+                system=_PEOPLE_EXTRACT_SYSTEM,
+                model=EXTRACT_MODEL,
+                num_predict=PEOPLE_EXTRACT_MAX_TOKENS,
+                label=label,
+                # A genuine `[]` means "no people in this window" and must not be
+                # retried; a sentence of `A A A` does not parse to an array and
+                # must be. That is why the predicate is the parse, not emptiness.
+                is_good=lambda text: parse_people_name_array(text) is not None,
+            )
             names = parse_people_name_array(raw)
             if names is None:
-                logger.debug(
-                    f"[extract_people_names] window {index + 1}/{len(windows)} had no JSON array"
+                logger.warning(
+                    f"[{label}] no JSON array in the answer — this window "
+                    f"contributes no names"
                 )
                 continue
             found.extend(clean_extracted_people_names(names))
         except Exception as exc:
             # One bad window must not discard the names the other windows found.
-            logger.debug(f"[extract_people_names] window {index + 1}/{len(windows)} failed: {exc}")
+            # Logged at WARNING, not DEBUG: production runs at WARNING, and a
+            # silent empty window is indistinguishable from "no people here" —
+            # which is how "granite is unresponsive on name extraction" was
+            # reported while the log held the 500 that caused it.
+            logger.warning(f"[{label}] failed: {type(exc).__name__}: {exc}")
 
     # clean_extracted_people_names already dedupes within a call, but each
     # window is a separate call and a name can span the overlap, so dedupe
@@ -316,6 +331,25 @@ async def _extract_people_names(content: str) -> list:
     extracted = clean_extracted_people_names(found)
     logger.debug(f"[extract_people_names] completed (count={len(extracted)})")
     return extracted
+
+
+async def _bind_people_llm(prompt: str, system: str = "", num_predict: int = 0) -> str:
+    """The resolver's own LLM hop, with the same decode guard as extraction.
+
+    `resolve_people_candidates` takes the callable, which is the seam that lets
+    this be one function instead of a second copy of the retry inside a pure,
+    dependency-light module. The model stays the judgement model — it is
+    disambiguating names, not extracting them — but the fault being guarded is
+    the same one: a greedy decode that loops and returns nothing to parse.
+    """
+    return await get_extraction_response(
+        prompt,
+        system=system,
+        model=LLM_QUERY_MODEL,
+        num_predict=num_predict,
+        label="resolve_people_candidates",
+        is_good=lambda text: "{" in str(text or ""),
+    )
 
 
 async def find_people_candidates(entry_id: str, content: str, user_id: str) -> list:
@@ -380,7 +414,7 @@ async def _auto_link_people(entry_id: str, content: str, user_id: str,
 
         people_matches = await db_find_people_matches(names, user_id)
         people_matches = await resolve_people_candidates(
-            names, content, people_matches, get_llm_response
+            names, content, people_matches, _bind_people_llm
         )
         person_ids = [person["id"] for person in people_matches]
         with neo4j_driver.session() as s:

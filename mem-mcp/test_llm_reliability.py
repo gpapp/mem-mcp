@@ -104,7 +104,7 @@ class FakeLogger:
         pass
 
 
-def _load(recorder, responder, **overrides):
+def _load(recorder, responder, extra=(), **overrides):
     """Exec the real get_llm_response against stubs. Returns a namespace."""
     with open(COMMON_PY, "r", encoding="utf-8") as handle:
         source = handle.read()
@@ -114,17 +114,26 @@ def _load(recorder, responder, **overrides):
     found = set()
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
-            node.name == _FUNCTION or node.name in _HELPERS
+            node.name == _FUNCTION or node.name in _HELPERS or node.name in extra
         ):
             chunks.append(ast.get_source_segment(source, node))
             found.add(node.name)
         if isinstance(node, (ast.Assign, ast.AnnAssign)):
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            if any(isinstance(t, ast.Name) and t.id in _ASSIGNMENTS for t in targets):
+            if any(
+                isinstance(t, ast.Name) and (t.id in _ASSIGNMENTS or t.id in extra)
+                for t in targets
+            ):
                 chunks.append(ast.get_source_segment(source, node))
+                for t in targets:
+                    if isinstance(t, ast.Name):
+                        found.add(t.id)
     if _FUNCTION not in found:
         raise AssertionError(f"common.py no longer defines {_FUNCTION}")
     for name in _HELPERS:
+        if name not in found:
+            raise AssertionError(f"common.py no longer defines {name}")
+    for name in extra:
         if name not in found:
             raise AssertionError(f"common.py no longer defines {name}")
 
@@ -796,6 +805,185 @@ class OllamaFailureHintTests(unittest.TestCase):
         for body in ('{"error":"model \\"nope\\" not found"}', "", "read timeout"):
             with self.subTest(body=body):
                 self.assertEqual(self._hint(body), "")
+
+
+# ---------------------------------------------------------------------------
+# The defect: extraction degenerates at temperature 0 and said nothing
+# ---------------------------------------------------------------------------
+_GUARD = (
+    "get_extraction_response",
+    "is_degenerate_answer",
+    "is_repeat_abort",
+    "EXTRACT_SAMPLING",
+    "EXTRACT_SAMPLING_RETRY",
+    "DEGENERATE_RUN_TOKENS",
+    "DEGENERATE_REPEAT_SHARE",
+)
+
+_REPEAT_BODY = '{"error":"prediction aborted, token repeat limit reached"}'
+
+
+def _guard_ns(recorder, responder, **overrides):
+    return _load(recorder, responder, extra=_GUARD, **overrides)
+
+
+class ExtractionDecodeGuardTests(unittest.TestCase):
+    """The people extractor's decode guard, driven against a scripted model.
+
+    Behavioural on purpose, for the reason this whole file exists: every defect
+    here is "the answer came back and nothing happened", which no source
+    assertion can see. The production record is one window that answered
+    `" A A A A A A ..."` to `done_reason: length`, one that answered `""` to
+    `done_reason: stop`, and two that aborted with `token repeat limit
+    reached` — and the extractor turned all four into "no people here".
+    """
+
+    def setUp(self):
+        self.rec = Recorder()
+
+    # -- the good path ----------------------------------------------------
+    def test_a_usable_answer_costs_one_call(self):
+        ns = _guard_ns(self.rec, _ok('["Anna Weber"]'))
+        answer = asyncio.run(ns["get_extraction_response"]("text", model="m"))
+        self.assertEqual(answer, '["Anna Weber"]')
+        self.assertEqual(len(self.rec.posts), 1,
+                         msg="a good answer must not be asked for twice")
+        self.assertEqual([w for w in self.rec.warnings if "degenerate" in w], [],
+                         msg="a good answer must not be reported as a loop")
+
+    def test_the_first_attempt_carries_a_repeat_penalty(self):
+        """Temperature 0 alone is what looped. The penalty is the fix, so it has
+        to be on the first attempt rather than only on the retry."""
+        ns = _guard_ns(self.rec, _ok('["Anna Weber"]'))
+        asyncio.run(ns["get_extraction_response"]("text", model="m"))
+        options = self.rec.posts[0][1]["options"]
+        self.assertEqual(options["temperature"], 0.0)
+        self.assertGreater(options["repeat_penalty"], 1.0)
+        self.assertGreater(options["repeat_last_n"], 0)
+
+    # -- the three degenerate shapes production produced ------------------
+    def test_an_empty_answer_is_retried(self):
+        def responder(url, body, n):
+            return FakeResponse(200, {"message": {"content": "" if n == 1 else '["Anna Weber"]'}})
+
+        ns = _guard_ns(self.rec, responder)
+        answer = asyncio.run(ns["get_extraction_response"]("text", model="granite3.3:2b"))
+        self.assertEqual(answer, '["Anna Weber"]')
+        self.assertEqual(len(self.rec.posts), 2)
+
+    def test_a_sentence_of_one_token_is_degenerate(self):
+        """`" A A A A ..."` is what the model actually sent: 80 tokens, not
+        empty, and unparseable — so it has to be classified here or the window
+        silently yields nothing."""
+        ns = _guard_ns(self.rec, _ok("ok"))
+        self.assertTrue(ns["is_degenerate_answer"](" A" * 40))
+
+    def test_a_real_answer_is_not_degenerate(self):
+        ns = _guard_ns(self.rec, _ok("ok"))
+        self.assertFalse(ns["is_degenerate_answer"]('["Anna Weber", "Tom Berg"]'))
+        self.assertFalse(ns["is_degenerate_answer"]("[]"),
+                         msg="a genuine empty array is an answer, not a loop")
+        self.assertFalse(ns["is_degenerate_answer"]("A"))
+        self.assertTrue(ns["is_degenerate_answer"]("   "))
+        self.assertTrue(ns["is_degenerate_answer"](None))
+
+    def test_the_degenerate_answer_is_retried_with_different_sampling(self):
+        def responder(url, body, n):
+            if n == 1:
+                return FakeResponse(200, {"message": {"content": " A" * 40}})
+            return FakeResponse(200, {"message": {"content": '["Anna Weber"]'}})
+
+        ns = _guard_ns(self.rec, responder)
+        answer = asyncio.run(ns["get_extraction_response"]("text", model="granite3.3:2b"))
+        self.assertEqual(answer, '["Anna Weber"]')
+        first = self.rec.posts[0][1]["options"]
+        second = self.rec.posts[1][1]["options"]
+        self.assertNotEqual(first, second,
+                            msg="a retry at the same sampling is the same decode again")
+        self.assertGreater(second["temperature"], 0.0)
+        self.assertGreater(second["repeat_penalty"], first["repeat_penalty"])
+
+    def test_a_repeat_abort_is_retried(self):
+        def responder(url, body, n):
+            if n == 1:
+                return FakeResponse(500, {"error": "prediction aborted, token repeat limit reached"},
+                                    text=_REPEAT_BODY, is_error=True)
+            return FakeResponse(200, {"message": {"content": '["Anna Weber"]'}})
+
+        ns = _guard_ns(self.rec, responder)
+        answer = asyncio.run(ns["get_extraction_response"]("text", model="granite3.3:2b"))
+        self.assertEqual(answer, '["Anna Weber"]')
+        self.assertEqual(len(self.rec.posts), 2)
+
+    def test_a_second_repeat_abort_is_not_a_third_attempt(self):
+        ns = _guard_ns(
+            self.rec,
+            lambda u, b, n: FakeResponse(500, {"error": "token repeat limit"},
+                                         text=_REPEAT_BODY, is_error=True),
+        )
+        with self.assertRaises(RuntimeError):
+            asyncio.run(ns["get_extraction_response"]("text", model="m"))
+        self.assertEqual(len(self.rec.posts), 2,
+                         msg="exactly one retry — a loop does not get a third try")
+
+    def test_a_timeout_is_not_retried(self):
+        """Being asked twice does not fix a budget, and the second call would
+        spend it again. Only the degenerate shapes get a second attempt."""
+        ns = _guard_ns(self.rec, lambda u, b, n: FakeTimeoutException("read timeout"))
+        with self.assertRaises(RuntimeError):
+            asyncio.run(ns["get_extraction_response"]("text", model="m"))
+        self.assertEqual(len(self.rec.posts), 1)
+
+    # -- what the caller and the log see ----------------------------------
+    def test_two_unusable_answers_return_the_last_one_rather_than_raising(self):
+        """Every caller has a deliberate "no names here" path. Raising would
+        turn a degraded window into a failed diary save, trading a recall loss
+        for an outage."""
+        ns = _guard_ns(self.rec, _ok(" A" * 40))
+        answer = asyncio.run(ns["get_extraction_response"]("text", model="granite3.3:2b"))
+        self.assertEqual(answer.strip(), (" A" * 40).strip(),
+                         msg="the last answer is returned as-is, not repaired")
+        blob = " ".join(self.rec.warnings)
+        self.assertIn("granite3.3:2b", blob)
+        self.assertIn("ollama ps", blob)
+
+    def test_the_caller_predicate_decides_whether_an_answer_is_usable(self):
+        """A genuine `[]` must pass: "no people in this window" is a real
+        answer, and retrying it doubles the cost of every quiet window."""
+        calls = []
+
+        def is_good(text):
+            calls.append(text)
+            return text.strip().startswith("[")
+
+        ns = _guard_ns(self.rec, _ok("[]"))
+        asyncio.run(ns["get_extraction_response"]("text", model="m", is_good=is_good))
+        self.assertEqual(len(self.rec.posts), 1)
+        self.assertEqual(calls, ["[]"])
+
+    def test_a_failing_predicate_retries_instead_of_crashing(self):
+        ns = _guard_ns(self.rec, _ok("nonsense"))
+        answer = asyncio.run(
+            ns["get_extraction_response"]("t", model="m", is_good=lambda t: 1 / 0)
+        )
+        self.assertEqual(answer, "nonsense")
+        self.assertEqual(len(self.rec.posts), 2)
+
+    def test_the_label_names_the_window_in_every_line(self):
+        """`extract_people_names window 3/7` is the difference between a log
+        that says "something failed" and one that says which part of a 40k
+        entry produced no names."""
+        ns = _guard_ns(self.rec, _ok(" A" * 40))
+        asyncio.run(ns["get_extraction_response"]("t", model="m", label="w 3/7"))
+        blob = " ".join(self.rec.warnings)
+        self.assertIn("w 3/7", blob)
+
+    def test_the_repeat_abort_predicate_ignores_case_and_empty_messages(self):
+        ns = _guard_ns(self.rec, _ok("ok"))
+        self.assertTrue(ns["is_repeat_abort"](_REPEAT_BODY))
+        self.assertTrue(ns["is_repeat_abort"](RuntimeError("TOKEN REPEAT LIMIT reached")))
+        self.assertFalse(ns["is_repeat_abort"](None))
+        self.assertFalse(ns["is_repeat_abort"]("read timeout"))
 
 
 if __name__ == "__main__":

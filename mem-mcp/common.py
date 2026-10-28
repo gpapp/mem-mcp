@@ -1037,6 +1037,143 @@ async def get_llm_response(prompt: str, system: str = "", model: str = "",
     return content
 
 # ---------------------------------------------------------------------------
+# Extraction decode guard
+# ---------------------------------------------------------------------------
+# Extraction calls ask a small model for a short answer out of a long prompt --
+# the people extractor is the one that matters, one call per window. Greedy
+# decoding (`temperature: 0.0`, the app's default) is the right choice for that
+# shape and is also the decode that can lock into a token loop: on 2026-10-28
+# `granite3.3:2b` answered a named-entity window with
+# `" A A A A A A ..."` to `done_reason: "length"`, answered another with `""`
+# and `done_reason: "stop"` after a single token, and aborted two more with
+# `{"error":"prediction aborted, token repeat limit reached"}` (HTTP 500).
+#
+# None of that is the model being "unresponsive" -- it answered every time, in
+# 15-70 s. What made it *look* dead is that each failure produced an empty
+# window, and the extractor swallowed the exception at DEBUG. So the guard here
+# is two things: a repeat penalty that breaks the loop at temperature 0, and one
+# retry with different sampling, which is the only remedy that has a chance when
+# the fault is the decoder rather than the input.
+EXTRACT_SAMPLING = {
+    "temperature": 0.0,
+    "repeat_penalty": 1.15,
+    "repeat_last_n": 256,
+}
+
+EXTRACT_SAMPLING_RETRY = {
+    "temperature": 0.35,
+    "repeat_penalty": 1.4,
+    "repeat_last_n": 64,
+    "top_p": 0.9,
+}
+
+# A run this long shares one token this often, and no answer to an extraction
+# prompt looks like that. Eight is low on purpose: a false positive costs one
+# retry, a false negative costs the whole window.
+DEGENERATE_RUN_TOKENS = 8
+DEGENERATE_REPEAT_SHARE = 0.6
+
+
+def is_repeat_abort(message) -> bool:
+    """True when Ollama aborted a prediction for repeating itself.
+
+    Worth its own predicate because the remedy differs from every other LLM
+    failure here: the prompt was read and the model answered, so waiting,
+    raising a timeout or resending the same body changes nothing. Only
+    different sampling has a chance.
+    """
+    return "token repeat limit" in str(message or "").lower()
+
+
+def is_degenerate_answer(text) -> bool:
+    """True when an extraction answer carries no information.
+
+    Empty is the obvious case. The one that took a log dive is a sentence-long
+    run of a single token (`" A A A A ..."`), which is not empty, is valid text,
+    and parses as "no JSON array" -- so every layer above it treated it as "the
+    model found no names" rather than "the model degenerated".
+    """
+    body = " ".join(str(text or "").split())
+    if not body:
+        return True
+    tokens = body.split(" ")
+    if len(tokens) < DEGENERATE_RUN_TOKENS:
+        return False
+    counts = {}
+    for token in tokens:
+        counts[token] = counts.get(token, 0) + 1
+    return max(counts.values()) / len(tokens) >= DEGENERATE_REPEAT_SHARE
+
+
+async def get_extraction_response(prompt: str, system: str = "", model: str = "",
+                                 num_predict: int = 0, label: str = "",
+                                 is_good=None, timeout: float = 0.0) -> str:
+    """One extraction call, retried once when the answer is degenerate.
+
+    `is_good` is the caller's own predicate over the raw answer -- the people
+    extractor passes "this parses to a JSON array", which is what lets a genuine
+    `[]` (no people in this window) pass without a retry while a sentence of
+    `A A A` does not.
+
+    Returns the last answer even when both attempts were unusable, rather than
+    raising: every caller already has a deliberate "no names here" path, and
+    turning a degraded window into a failed diary save would trade a recall loss
+    for an outage. What changes is that the failure is now logged at WARNING
+    with the label, so it is visible at the production log level instead of
+    being a DEBUG line nobody runs with.
+    """
+    tag = label or "extraction"
+
+    def acceptable(answer) -> bool:
+        if is_degenerate_answer(answer):
+            return False
+        if is_good is None:
+            return True
+        try:
+            return bool(is_good(answer))
+        except Exception:
+            return False
+
+    answer = ""
+    for attempt in (0, 1):
+        options = EXTRACT_SAMPLING if attempt == 0 else EXTRACT_SAMPLING_RETRY
+        try:
+            answer = await get_llm_response(
+                prompt, system=system, model=model, num_predict=num_predict,
+                timeout=timeout, options=options,
+            )
+        except Exception as exc:
+            if not is_repeat_abort(exc) or attempt:
+                logger.warning(
+                    f"[{tag}] extraction call failed: {type(exc).__name__}: {exc}"
+                )
+                raise
+            logger.warning(
+                f"[{tag}] model degenerated into a token loop "
+                f"({type(exc).__name__}) — retrying with different sampling"
+            )
+            continue
+        if acceptable(answer):
+            if attempt:
+                logger.warning(f"[{tag}] the retry recovered a usable answer")
+            return answer
+        if attempt:
+            break
+        logger.warning(
+            f"[{tag}] degenerate answer from {model or LLM_QUERY_MODEL} "
+            f"({len(str(answer))} chars, prompt {len(prompt)} chars) — "
+            f"retrying with different sampling"
+        )
+    logger.warning(
+        f"[{tag}] no usable answer after a retry — this window yields nothing. "
+        f"A repeated `A A A` run or an empty answer here is the decode looping, "
+        f"not a model that cannot read the text; check `docker exec ollama ollama ps` "
+        f"(`100% CPU` means no GPU) before blaming the prompt"
+    )
+    return answer
+
+
+# ---------------------------------------------------------------------------
 # User extraction
 # ---------------------------------------------------------------------------
 def extract_user_from_headers(headers: dict) -> str:
