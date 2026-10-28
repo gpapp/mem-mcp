@@ -5,6 +5,56 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# A 100% CPU label that was not the dropped overlay (2026-10-28)
+
+- **Reported as** "The service reports 100% CPU in ollama, when VULKAN is turned
+  off. Is that right?" — with the ollama log attached. It was right, and the
+  label was the one true thing in the picture.
+- **What the log actually said**: `updated VRAM based on existing loaded models
+  gpu=0 library=CUDA total="3.6 GiB" available="3.6 GiB"` — so the reservation
+  *was* applied and the scheduler saw the card through NVML — followed by
+  `ggml_cuda_init: failed to initialize CUDA: unknown error`, a `device_info`
+  carrying only the `CPU : Intel(R) Core(TM) i5-7600` row, a memory breakdown
+  with only `Host` and `CPU_REPACK`, and a llama-server command line with no
+  `--n-gpu-layers`. The subprocess never got a CUDA device, so the model loaded
+  on the CPU and `/api/ps` reported `size_vram = 0`. `OLLAMA_IGPU_ENABLE=0`
+  drops Vulkan0, so there was no second backend to fall back on either.
+- **The trap**: AGENTS.md's only reliable GPU check is "`ollama ps` must say
+  `100% GPU`", and its documented remedy for `100% CPU` is "the overlay was
+  dropped". Here the overlay was present and re-adding it would have changed
+  nothing. `cuInit` fails before any allocation, so over-commit is not the cause
+  either — `nvidia-smi` still answers, which is what makes this look like a
+  configuration problem rather than a wedged card.
+- **What shipped, app side**: `cpu_fallback_warnings()` in `status_monitor.py`,
+  called from `build_status`, appending one note per resident model with
+  `sizeVram == 0` that names the model, `docker exec ollama ollama ps` and the
+  `ggml_cuda_init` / `device lost` lines. Excluded on purpose: a split
+  (`49%/51%`) is a slow card, a cold model has no bytes in use, and an unknown
+  `size` is not evidence. `MEM_GPU_EXPECTED` (default 1) turns it off on a host
+  that genuinely has no GPU, because a warning that every CPU-only install sees
+  is noise. It is part of the snapshot and therefore of `signature()`, so it
+  pushes once rather than on every poll.
+- **What shipped, host side**: `ops/gpu-watchdog.sh` plus a `.service` and
+  `.timer` (15 min, `OnBootSec=5min`) for the ops team to install. Deliberately
+  **not** inside the container: there is no Docker socket and no `nvidia-smi`
+  there, and the fault is driver/card state, so a container-side reset is aimed
+  at the wrong layer. The probe is behavioural rather than NVML-based —
+  `size_vram` of a forced load — because on 2026-10-28 NVML answered happily
+  while `cuInit` failed. It re-classifies after `RECHECK_SECONDS` so a cold load
+  cannot fire it, defaults to `ACTION=alert`, and gates `restart`/`reboot`
+  behind strike counting and a minimum interval.
+- **What a future reader would otherwise rediscover**: `nvidia-smi --gpu-reset`
+  is generally refused on a GeForce (it is a data-centre feature) and would not
+  fix a `cuInit` failure anyway, so the escalation ladder is `ollama stop` →
+  `docker restart ollama` → host reboot. The cheap discriminator in the
+  meantime is to turn Vulkan back on: if a Vulkan model runs, the card is alive
+  and this is a CUDA/driver-layer fault; if it also dies, the device is wedged.
+- **Verified**: 1350 tests OK across all twenty suites, `py_compile` clean on
+  `status_monitor.py` / `common.py` / `test_status_monitor.py`, `bash -n` clean
+  on the watchdog, `diff --check` clean.
+
+Shipped in `0cfb57b` on `feature/live-notes`.
+
 # Live notes — the model was summarising captions (2026-10-27)
 
 The note read like it had been written from a list of captions, because it had.
