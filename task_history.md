@@ -5,6 +5,51 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# Granite was not unresponsive, it was looping and nobody was told (2026-10-28)
+
+- **Reported as** "Granite seems to be unresponsive on name extraction".
+- **What the log actually said**: three distinct failures on
+  `granite3.3:2b`, all of them a *degenerate decode* rather than a stuck
+  model. `content: ""` with `done_reason: "stop"` after `eval_count: 1`; a
+  named-entity window answered `" A A A A A A ..."` to `done_reason:
+  "length"` (59 repetitions of one token); and two
+  `{"error":"prediction aborted, token repeat limit reached"}` HTTP 500s.
+  The model answered every time, in 15-70 s, so "unresponsive" was the one
+  thing it was not.
+- **Why it looked dead instead**: `_extract_people_names` caught the 500 and
+  logged `logger.debug`, and an unparseable answer was `continue`d with
+  another DEBUG line. Production runs at `LOG_LEVEL=WARNING`, so a window
+  that produced nothing was indistinguishable from a window with no people
+  in it. A third of that day's extractor calls failed this way.
+- **The chronic part is not the GPU.** 138 `token repeat limit` aborts in the
+  log, the first granite one on 2026-10-08, with a 38-failure spike on
+  2026-10-17 -- three weeks before the card was wedged. Greedy decoding at
+  the app's hard `temperature: 0.0` default is the property; the CPU fallback
+  only made each retry cost 15-70 s and turned a quiet recall loss into a
+  visible stall.
+- **What shipped**: `get_extraction_response` in `common.py` -- a repeat
+  penalty at temperature 0, exactly one retry with stronger, narrower
+  sampling, `is_degenerate_answer` covering both the empty answer and the
+  token run, `is_repeat_abort` retrying that 500 and nothing else, and a
+  WARNING when a window yields nothing. Both hops take it: the extractor per
+  window, and the binding pass through `_bind_people_llm`, which was calling
+  `get_llm_response` bare and silently inheriting the judgement model.
+- **What a future reader would otherwise rediscover**: the guard returns the
+  last answer rather than raising. Raising would trade a recall loss for an
+  outage, because every caller already has a deliberate "nothing here" path.
+  And the `is_good` predicate is what keeps a real `[]` from being retried --
+  "no people in this window" is an answer, not a failure.
+- **Two deployment configs disagree with the documented split**, found in the
+  same `.env` while reading the log: `MEM_SCOPE_MODEL` and `MEM_LIVE_MODEL`
+  are both on `granite3.3:2b`, where AGENTS.md measured granite as the worst
+  choice for the judgement role (2 permanent scope nulls against nemotron's
+  0) and as the model that loses the thread on a 2.4k-token note rewrite.
+- **Verified**: 1370 tests OK across the twenty suites, `py_compile` clean on
+  the five touched files, `git diff --check` clean.
+- Shipped in `94251f3` on `feature/live-notes`.
+
+---
+
 # A 100% CPU label that was not the dropped overlay (2026-10-28)
 
 - **Reported as** "The service reports 100% CPU in ollama, when VULKAN is turned
