@@ -320,6 +320,14 @@ class RoleSamplingTests(unittest.TestCase):
         self.assertEqual(options["top_p"], 0.95)
         self.assertEqual(options["repeat_penalty"], 1.15)
 
+    def test_the_lfm_family_carries_its_own_generation_parameters(self):
+        """LFM2.5's card gives 0.1 / top_k 50 / repeat_penalty 1.1 and no greedy
+        mode, so a run of it at the app's 0.0 would measure the harness."""
+        name = "hf.co/LiquidAI/LFM2.5-2.6B-GGUF:Q4_K_M"
+        expected = {"temperature": 0.1, "top_k": 50, "repeat_penalty": 1.1}
+        self.assertEqual(mb.sampling_for(name, True, "scope"), expected)
+        self.assertEqual(mb.sampling_for(name, False, "scope"), expected)
+
     def test_every_role_the_runner_uses_resolves_to_options(self):
         for role in mb.ROLES:
             with self.subTest(role=role):

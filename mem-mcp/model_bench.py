@@ -96,6 +96,15 @@ _SAMPLING = {
         "think": {"temperature": 0.9, "top_p": 0.95, "min_p": 0.0},
         "nothink": {"temperature": 0.7, "top_p": 0.95, "min_p": 0.0},
     },
+    # LFM2.5-2.6B's card gives one set of generation parameters and says the
+    # model "always thinks before it answers" -- the chat template inserts the
+    # `<think>` tag itself -- so both entries are the same.  0.1 rather than 0.0
+    # because the vendor never asks for greedy, and `repeat_penalty` 1.1 for the
+    # same reason granite needs 1.15: a small model loops without it.
+    "lfm": {
+        "think": {"temperature": 0.1, "top_k": 50, "repeat_penalty": 1.1},
+        "nothink": {"temperature": 0.1, "top_k": 50, "repeat_penalty": 1.1},
+    },
     "default": {
         "think": {"temperature": 0.0},
         "nothink": {"temperature": 0.0},
@@ -221,7 +230,12 @@ def sampling_for(model: str, think: bool, role: str = "") -> dict:
     only on the keys it actually sets.  Dropping the role penalty is what made
     the first run report eight repeat-aborts as model failures.
     """
-    family = "minicpm" if "minicpm" in model.lower() else "default"
+    family = "default"
+    lowered = model.lower()
+    for name in ("minicpm", "lfm"):
+        if name in lowered:
+            family = name
+            break
     options = dict(_ROLE_SAMPLING.get(role, {}))
     options.update(_SAMPLING[family]["think" if think else "nothink"])
     return options
