@@ -363,6 +363,7 @@ class RoleSamplingTests(unittest.TestCase):
             "hf.co/LiquidAI/LFM2.5-2.6B-GGUF:Q4_K_M": "lfm",
             "nemotron-3-nano:4b": "nemotron",
             "batiai/gemma4-e2b:q4": "gemma",
+            "hf.co/ibm-granite/granite-4.2-3b-GGUF:Q4_K_M": "granite-4",
             "granite3.3:2b": "default",
         }
         for tag, family in expected.items():
@@ -376,6 +377,35 @@ class RoleSamplingTests(unittest.TestCase):
         expected = {"temperature": 0.1, "top_k": 50, "repeat_penalty": 1.1}
         self.assertEqual(mb.sampling_for(name, True, "scope"), expected)
         self.assertEqual(mb.sampling_for(name, False, "scope"), expected)
+
+    def test_granite_4_carries_the_temperature_its_card_requires(self):
+        """Granite 4.2's card is emphatic: 1.0 / top_p 0.95 "across all tasks
+        and serving backends".  Its 3.3 predecessor states nothing and stays
+        greedy, which is why the two need separate families."""
+        name = "hf.co/ibm-granite/granite-4.2-3b-GGUF:Q4_K_M"
+        expected = {"temperature": 1.0, "top_p": 0.95}
+        self.assertEqual(mb.sampling_for(name, True, "scope"), expected)
+        self.assertEqual(mb.sampling_for(name, False, "scope"), expected)
+        self.assertNotEqual(mb.family_for(name), mb.family_for("granite3.3:2b"))
+
+    def test_the_reasoning_allowance_is_the_number_the_cards_give(self):
+        """A thinking model spends `num_predict` inside its reasoning block
+        before it emits any content, and the production budgets are small on
+        purpose -- scope asks for 80.  At `THINK_BUDGET_BONUS` = 1500 the
+        harness reported `LFM2.5-2.6B` as failing `handover-epam` and
+        `generic-vector` when it had in fact spent 7,530 and 7,310 thinking
+        characters and been cut at `done_reason=length` with an empty answer.
+        Granite 4.2's card asks for 8192 output tokens in thinking mode, so
+        the constant carries that figure rather than a guess."""
+        self.assertEqual(mb.THINK_BUDGET_BONUS, 8192)
+        scope = mb.budget_for({"num_predict": 80}, think=True)
+        self.assertEqual(scope, 80 + 8192)
+        # The production budget is still what the *content* gets; a model that
+        # would overrun it in production still has to show that.
+        self.assertEqual(mb.budget_for({"num_predict": 80}, think=False), 80)
+        # `0` means "run to the context window", so a bonus must not impose a
+        # ceiling where production has none.
+        self.assertEqual(mb.budget_for({}, think=True), 0)
 
     def test_every_role_the_runner_uses_resolves_to_options(self):
         for role in mb.ROLES:

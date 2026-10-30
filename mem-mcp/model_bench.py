@@ -107,10 +107,16 @@ ROLES = ("scope", "keywords", "people", "people_bind", "search_rewrite",
 #                  reasoning trace, so it takes the 0.6 row -- the card's only
 #                  guidance for output that is not a reasoning trace.
 #   Gemma 4 E2B    temperature=1.0, top_p=0.95, top_k=64.
+#   Granite 4.2 3B temperature=1.0 and top_p=0.95 "across all tasks and serving
+#                  backends, including general chat, reasoning, and tool
+#                  calling".  It is a thinking model by default
+#                  (`enable_thinking=True`) and its card gives the output
+#                  budgets too: 8192 for thinking, 2048 for non-thinking --
+#                  see THINK_BUDGET_BONUS below.
 #   Granite 3.3 2B its README states **no sampling at all** -- no temperature,
 #                  top_p, top_k or penalty anywhere in it -- so `default` keeps
 #                  the app's greedy 0.0.  That is an app decision, not a vendor
-#                  value, and granite is now the only family run that way.
+#                  value, and granite3.3 is now the only family run that way.
 _SAMPLING = {
     "minicpm": {
         "think": {"temperature": 1.0, "top_p": 0.95, "min_p": 0.0},
@@ -127,6 +133,10 @@ _SAMPLING = {
     "gemma": {
         "think": {"temperature": 1.0, "top_p": 0.95, "top_k": 64},
         "nothink": {"temperature": 1.0, "top_p": 0.95, "top_k": 64},
+    },
+    "granite-4": {
+        "think": {"temperature": 1.0, "top_p": 0.95},
+        "nothink": {"temperature": 1.0, "top_p": 0.95},
     },
     "default": {
         "think": {"temperature": 0.0},
@@ -155,7 +165,37 @@ _ROLE_SAMPLING = {
 # the answer.  The bonus buys the reasoning room; the production budget is still
 # what the content itself is allowed to use, so a model that would overrun
 # `num_predict` in production still shows it.
-THINK_BUDGET_BONUS = 1500
+#
+# It is the reasoning allowance, not a tuning preference, and 1500 was measured
+# to be too small.  `LFM2.5-2.6B` spent **7,530** thinking characters on
+# `handover-epam` and **7,310** on `generic-vector` and was still cut at
+# `done_reason=length` with an empty content field, so those two scope cases
+# were reported as failures the model never had the room to commit.
+# `granite-4.2-3b`'s card states the same requirement in tokens outright:
+# "max_new_tokens=8192 (thinking mode)".  That is the number this constant now
+# carries, so a reasoning model is given the allowance its vendor asks for and
+# the vendor's own figure is the one written down.
+#
+# Raising it costs nothing on a model that finishes: the budget is a ceiling and
+# `done_reason=stop` still ends the call when the answer is complete.  It is paid
+# only by a model that actually reasons that long -- which is exactly the case
+# that was being misreported as a wrong answer.
+THINK_BUDGET_BONUS = 8192
+
+
+def budget_for(case, think):
+    """The `num_predict` this case is run with, in this mode.
+
+    The production budget stays the ceiling on the *answer*; think mode adds the
+    reasoning allowance on top of it, because the model spends both from one
+    counter and the reasoning block comes first.  A case with no budget at all
+    is left alone -- `0` means "run to the context window", and adding a bonus
+    to it would impose a limit where production has none.
+    """
+    budget = case.get("num_predict", 0)
+    if budget and think:
+        budget += THINK_BUDGET_BONUS
+    return budget
 
 
 # ---------------------------------------------------------------------------
@@ -241,7 +281,10 @@ def chat(base_url: str, model: str, system: str, prompt: str, *,
     }
 
 
-_FAMILIES = ("minicpm", "lfm", "nemotron", "gemma")
+# Order matters only for a tag that could match two names, and `granite-4` is
+# deliberately the hyphenated form: `granite3.3:2b` must NOT match it, because
+# that model's card states no sampling and it stays greedy.
+_FAMILIES = ("minicpm", "lfm", "nemotron", "gemma", "granite-4")
 
 
 def family_for(model: str) -> str:
@@ -1002,9 +1045,7 @@ def run(base_url: str, models: list, cases: dict, *, think_modes: list,
                     # A thinking model spends the budget in the reasoning block
                     # first, so the production budget starves it and the content
                     # comes back empty. The bonus applies to think mode only.
-                    budget = case.get("num_predict", 0)
-                    if budget and think:
-                        budget += THINK_BUDGET_BONUS
+                    budget = budget_for(case, think)
                     try:
                         answer = chat(
                             base_url, model, case["system"], case["prompt"],
