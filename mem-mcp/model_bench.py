@@ -86,24 +86,47 @@ DEFAULT_NUM_CTX = int(os.getenv("OLLAMA_CONTEXT_LENGTH", "16332"))
 ROLES = ("scope", "keywords", "people", "people_bind", "search_rewrite",
          "merge", "live")
 
-# Vendor guidance, not taste. MiniCPM5-2B's card says temperature 1.0 / top_p
-# 0.95 / min_p 0.0 for think and 0.7 / 0.95 for no-think, and warns that
-# llama.cpp's default min_p=0.05 causes repetition. Everything else in this
-# deployment is run greedily, because greed is what makes a short JSON answer
-# reproducible.
+# Vendor guidance, not taste -- and three of these five families disagree with
+# what this harness sent before the cards were read.  Every value below is
+# quoted from the model's own Hugging Face card (`/raw/main/README.md`); where a
+# card says nothing, the app's greedy decode is kept and marked as a decision
+# rather than a recommendation.
+#
+#   MiniCPM5-2B    "temperature=1.0, top_p=0.95, min_p=0.0" -- ONE set, with no
+#                  think / no-think distinction anywhere on the card.  The
+#                  0.9 / 0.7 this harness used appears nowhere in it.  The card
+#                  also warns that llama.cpp's default `min_p=0.05` "can lead to
+#                  repetitive output", so min_p is pinned to 0.0 explicitly.
+#   LFM2.5-2.6B    temperature=0.1, top_k=50, repetition_penalty=1.1, and
+#                  "always thinks before it answers" -- the chat template
+#                  inserts the `<think>` tag -- so both modes are the same.
+#   Nemotron-3-Nano-4B
+#                  temperature=1.0 + top_p=0.95 for *reasoning*, 0.6 + 0.95 for
+#                  *tool calling*.  It is never greedy.  think=True takes the
+#                  reasoning row; think=False is a direct answer rather than a
+#                  reasoning trace, so it takes the 0.6 row -- the card's only
+#                  guidance for output that is not a reasoning trace.
+#   Gemma 4 E2B    temperature=1.0, top_p=0.95, top_k=64.
+#   Granite 3.3 2B its README states **no sampling at all** -- no temperature,
+#                  top_p, top_k or penalty anywhere in it -- so `default` keeps
+#                  the app's greedy 0.0.  That is an app decision, not a vendor
+#                  value, and granite is now the only family run that way.
 _SAMPLING = {
     "minicpm": {
-        "think": {"temperature": 0.9, "top_p": 0.95, "min_p": 0.0},
-        "nothink": {"temperature": 0.7, "top_p": 0.95, "min_p": 0.0},
+        "think": {"temperature": 1.0, "top_p": 0.95, "min_p": 0.0},
+        "nothink": {"temperature": 1.0, "top_p": 0.95, "min_p": 0.0},
     },
-    # LFM2.5-2.6B's card gives one set of generation parameters and says the
-    # model "always thinks before it answers" -- the chat template inserts the
-    # `<think>` tag itself -- so both entries are the same.  0.1 rather than 0.0
-    # because the vendor never asks for greedy, and `repeat_penalty` 1.1 for the
-    # same reason granite needs 1.15: a small model loops without it.
     "lfm": {
         "think": {"temperature": 0.1, "top_k": 50, "repeat_penalty": 1.1},
         "nothink": {"temperature": 0.1, "top_k": 50, "repeat_penalty": 1.1},
+    },
+    "nemotron": {
+        "think": {"temperature": 1.0, "top_p": 0.95},
+        "nothink": {"temperature": 0.6, "top_p": 0.95},
+    },
+    "gemma": {
+        "think": {"temperature": 1.0, "top_p": 0.95, "top_k": 64},
+        "nothink": {"temperature": 1.0, "top_p": 0.95, "top_k": 64},
     },
     "default": {
         "think": {"temperature": 0.0},
@@ -218,6 +241,24 @@ def chat(base_url: str, model: str, system: str, prompt: str, *,
     }
 
 
+_FAMILIES = ("minicpm", "lfm", "nemotron", "gemma")
+
+
+def family_for(model: str) -> str:
+    """Which vendor-sampling family a model tag belongs to.
+
+    Its own function, and not inlined into `sampling_for`, because a family the
+    scan misses falls back to `"default"` -- greedy 0.0 -- silently.  That is the
+    one mistake here that reads as a model result rather than a harness bug, so
+    it has to be assertable on its own.
+    """
+    lowered = model.lower()
+    for name in _FAMILIES:
+        if name in lowered:
+            return name
+    return "default"
+
+
 def sampling_for(model: str, think: bool, role: str = "") -> dict:
     """The sampling this model would actually be run at, in this role.
 
@@ -226,16 +267,11 @@ def sampling_for(model: str, think: bool, role: str = "") -> dict:
     `granite3.3:2b` looping until Ollama aborts the prediction -- so it applies
     to every model, because every model would be handed it.  The family dict is
     what the *model* needs; it is merged last so a vendor requirement (MiniCPM5's
-    temperature 0.7/0.9) is not silently overridden by the penalty, and it wins
-    only on the keys it actually sets.  Dropping the role penalty is what made
-    the first run report eight repeat-aborts as model failures.
+    temperature 1.0, LFM2.5's 0.1) is not silently overridden by the penalty, and
+    it wins only on the keys it actually sets.  Dropping the role penalty is what
+    made the first run report eight repeat-aborts as model failures.
     """
-    family = "default"
-    lowered = model.lower()
-    for name in ("minicpm", "lfm"):
-        if name in lowered:
-            family = name
-            break
+    family = family_for(model)
     options = dict(_ROLE_SAMPLING.get(role, {}))
     options.update(_SAMPLING[family]["think" if think else "nothink"])
     return options

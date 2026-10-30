@@ -23,18 +23,28 @@ import model_bench as mb
 
 class SamplingTests(unittest.TestCase):
     def test_a_thinking_model_gets_its_vendor_sampling(self):
-        """MiniCPM5 is trained for 0.7-1.0; the app's 0.0 is not its setting."""
+        """MiniCPM5's card says 1.0 / top_p 0.95 / min_p 0.0; the app's 0.0 is not its setting."""
         think = mb.sampling_for("openbmb/minicpm5-2b:latest", True)
         nothink = mb.sampling_for("openbmb/minicpm5-2b:latest", False)
-        self.assertGreater(think["temperature"], 0.0)
-        self.assertGreater(nothink["temperature"], 0.0)
-        self.assertNotEqual(think["temperature"], nothink["temperature"])
+        self.assertEqual(think["temperature"], 1.0)
+        self.assertEqual(nothink["temperature"], 1.0)
         self.assertEqual(think["min_p"], 0.0)
+        # One set on the card, so there is deliberately no think/no-think split
+        # here; the families that *do* split are covered in RoleSamplingTests.
+        self.assertEqual(think, nothink)
 
-    def test_every_other_model_keeps_the_sampling_the_app_pins(self):
-        for model in ("granite3.3:2b", "nemotron-3-nano:4b", "batiai/gemma4-e2b:q4"):
+    def test_only_the_silent_card_keeps_greedy(self):
+        """Granite's README states no sampling; every other card does."""
+        for think in (True, False):
+            self.assertEqual(mb.sampling_for("granite3.3:2b", think),
+                             {"temperature": 0.0})
+        for model in ("nemotron-3-nano:4b", "batiai/gemma4-e2b:q4",
+                      "openbmb/minicpm5-2b:latest",
+                      "hf.co/LiquidAI/LFM2.5-2.6B-GGUF:Q4_K_M"):
             for think in (True, False):
-                self.assertEqual(mb.sampling_for(model, think), {"temperature": 0.0})
+                with self.subTest(model=model, think=think):
+                    self.assertNotEqual(
+                        mb.sampling_for(model, think), {"temperature": 0.0})
 
     def test_the_family_match_is_not_a_prefix_match_on_the_tag(self):
         """`minicpm` must be found in the model name, not in the harness's own URL."""
@@ -310,15 +320,54 @@ class RoleSamplingTests(unittest.TestCase):
                 self.assertEqual(options["repeat_last_n"], 256)
 
     def test_a_judgement_role_is_left_greedy(self):
-        options = mb.sampling_for("nemotron-3-nano:4b", False, "scope")
+        """Granite's card states no sampling, so it keeps the app's 0.0.
+
+        It is the only family still greedy -- see
+        `test_nemotron_uses_the_cards_reasoning_and_tool_rows`.
+        """
+        options = mb.sampling_for("granite3.3:2b", False, "scope")
         self.assertEqual(options, {"temperature": 0.0})
 
     def test_the_vendor_temperature_survives_the_role_penalty(self):
         """MiniCPM5 must not be run at 0.0 just because it also extracts keywords."""
         options = mb.sampling_for("openbmb/minicpm5-2b:latest", False, "people")
-        self.assertEqual(options["temperature"], 0.7)
+        self.assertEqual(options["temperature"], 1.0)
         self.assertEqual(options["top_p"], 0.95)
+        self.assertEqual(options["min_p"], 0.0)
         self.assertEqual(options["repeat_penalty"], 1.15)
+
+    def test_minicpm_makes_no_think_distinction_on_its_card(self):
+        """The card gives one set of parameters, so the 0.9/0.7 split was invented."""
+        name = "openbmb/minicpm5-2b:latest"
+        self.assertEqual(mb.sampling_for(name, True, "scope"),
+                         mb.sampling_for(name, False, "scope"))
+
+    def test_nemotron_uses_the_cards_reasoning_and_tool_rows(self):
+        """1.0/top_p 0.95 for reasoning, 0.6/top_p 0.95 for tool calling."""
+        name = "nemotron-3-nano:4b"
+        self.assertEqual(mb.sampling_for(name, True, "scope"),
+                         {"temperature": 1.0, "top_p": 0.95})
+        self.assertEqual(mb.sampling_for(name, False, "scope"),
+                         {"temperature": 0.6, "top_p": 0.95})
+
+    def test_gemma_carries_the_top_k_its_card_asks_for(self):
+        options = mb.sampling_for("batiai/gemma4-e2b:q4", False, "keywords")
+        self.assertEqual(options["temperature"], 1.0)
+        self.assertEqual(options["top_p"], 0.95)
+        self.assertEqual(options["top_k"], 64)
+
+    def test_every_installed_family_is_matched_by_its_ollama_tag(self):
+        """A family the scan misses silently falls back to greedy 0.0."""
+        expected = {
+            "openbmb/minicpm5-2b:latest": "minicpm",
+            "hf.co/LiquidAI/LFM2.5-2.6B-GGUF:Q4_K_M": "lfm",
+            "nemotron-3-nano:4b": "nemotron",
+            "batiai/gemma4-e2b:q4": "gemma",
+            "granite3.3:2b": "default",
+        }
+        for tag, family in expected.items():
+            with self.subTest(tag=tag):
+                self.assertEqual(mb.family_for(tag), family)
 
     def test_the_lfm_family_carries_its_own_generation_parameters(self):
         """LFM2.5's card gives 0.1 / top_k 50 / repeat_penalty 1.1 and no greedy
