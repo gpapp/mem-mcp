@@ -1022,10 +1022,24 @@ def score(role: str, case: dict, answer: str) -> dict:
 
 def run(base_url: str, models: list, cases: dict, *, think_modes: list,
         timeout: float, samples: int, roles: list,
-        num_ctx: int = DEFAULT_NUM_CTX, log=print) -> dict:
+        num_ctx: int = DEFAULT_NUM_CTX, log=print, on_result=None) -> dict:
     results = {"url": base_url, "started": time.strftime("%Y-%m-%d %H:%M:%S"),
                "num_ctx": num_ctx, "runs": [], "thinking_unsupported": []}
     unsupported = set()
+
+    def record(entry):
+        """Add one call's record, then let the caller persist what it has.
+
+        A run is hours of GPU time and the usual reason to stop it early is the
+        card, not the harness -- the first five-model pass was killed at 105 of
+        150 calls and wrote nothing at all, so every answer it had collected was
+        lost and the three questions it existed to answer were left unanswered.
+        Persisting per call costs one small rewrite and bounds the loss to the
+        call in flight.
+        """
+        results["runs"].append(entry)
+        if on_result is not None:
+            on_result(results)
     for model in models:
         for think in think_modes:
             # A model without a thinking mode answers the first `think: true`
@@ -1059,7 +1073,7 @@ def run(base_url: str, models: list, cases: dict, *, think_modes: list,
                             unsupported.add(model)
                             break
                         log(f"\r  {label} -> FAILED {exc}")
-                        results["runs"].append({
+                        record({
                             "model": model, "think": think, "role": role,
                             "case": case["id"], "options": options,
                             "error": str(exc), "answer": "", "score": {},
@@ -1068,7 +1082,7 @@ def run(base_url: str, models: list, cases: dict, *, think_modes: list,
                     scored = score(role, case, answer["content"])
                     scored["degenerate"] = scored.get("degenerate") or (
                         degenerate(answer["thinking"]) if answer["thinking"] else "")
-                    results["runs"].append({
+                    record({
                         "model": model, "think": think, "role": role,
                         "case": case["id"], "options": options,
                         "num_predict": budget,
@@ -1272,15 +1286,30 @@ def main(argv=None) -> int:
         print(f"plan:   {len(models)} models x {len(think_modes)} modes x "
               f"{sum(len(cases[r][:args.samples]) for r in args.roles)} cases "
               f"at num_ctx={args.num_ctx}")
+        # Created here rather than at the end, so the directory exists even if
+        # the run is stopped before its first answer lands.
+        if args.out:
+            os.makedirs(args.out, exist_ok=True)
+
+        def persist(current):
+            """Write what has been collected so far.
+
+            Called after every call, so a pass killed at the card's limit loses
+            the call in flight rather than every answer before it.
+            """
+            if not args.out:
+                return
+            with open(os.path.join(args.out, "bench.json"), "w",
+                      encoding="utf-8") as handle:
+                json.dump(current, handle, ensure_ascii=False, indent=1)
+
         results = run(args.url, models, cases, think_modes=think_modes,
                       timeout=args.timeout, samples=args.samples, roles=args.roles,
-                      num_ctx=args.num_ctx)
+                      num_ctx=args.num_ctx, on_result=persist)
 
     markdown = to_markdown(results)
     if args.out:
-        os.makedirs(args.out, exist_ok=True)
-        with open(os.path.join(args.out, "bench.json"), "w", encoding="utf-8") as handle:
-            json.dump(results, handle, ensure_ascii=False, indent=1)
+        persist(results)
         path = os.path.join(args.out, "bench.md")
         with open(path, "w", encoding="utf-8") as handle:
             handle.write(markdown)

@@ -454,6 +454,38 @@ class ThinkBudgetTests(unittest.TestCase):
         seen = self._run([False])
         self.assertTrue(all(budget == 80 for _, _, budget in seen))
 
+    def test_every_call_is_persisted_as_it_lands(self):
+        """A pass killed mid-run used to write nothing at all.
+
+        `bench-vendor2` reached 105 of 150 calls on a 4 GB card, was stopped,
+        and left no `bench.json` — the file was written once, after the final
+        call.  The three questions that run existed to answer were lost with it,
+        so the callback has to fire per call rather than per run.
+        """
+        prompts = mb.shipping_prompts()
+        cases = mb.build_cases(prompts)
+        depths = []
+
+        original = mb.chat
+
+        def fake_chat(url, model, system, prompt, **kwargs):
+            return {"content": "{}", "thinking": "", "seconds": 0.0,
+                    "prompt_tokens": 1, "answer_tokens": 1, "done_reason": "stop"}
+
+        mb.chat = fake_chat
+        try:
+            results = mb.run("http://stub", ["stub:1b"], cases,
+                             think_modes=[False], timeout=1.0, samples=2,
+                             roles=["scope"], log=lambda *a: None,
+                             on_result=lambda current: depths.append(
+                                 len(current["runs"])))
+        finally:
+            mb.chat = original
+        calls = len(results["runs"])
+        self.assertGreater(calls, 1)
+        # One callback per call, seeing every earlier one: 1, 2, 3, ... calls.
+        self.assertEqual(depths, list(range(1, calls + 1)))
+
 
 class PeopleBindScoringTests(unittest.TestCase):
     """The binding hop is the only role that runs on LLM_QUERY_MODEL."""
