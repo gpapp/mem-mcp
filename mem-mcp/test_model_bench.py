@@ -407,6 +407,17 @@ class RoleSamplingTests(unittest.TestCase):
         # ceiling where production has none.
         self.assertEqual(mb.budget_for({}, think=True), 0)
 
+    def test_a_model_slower_than_the_card_overrides_the_bonus_downwards(self):
+        """LFM2.5 answered all 15 think-mode cases at a 1,500 allowance and
+        timed out on all 15 at 8,192 on this card. The default is the vendor's
+        figure; an override is a measurement of this host."""
+        lfm = "hf.co/LiquidAI/LFM2.5-2.6B-GGUF:Q4_K_M"
+        self.assertEqual(mb.think_bonus_for(lfm), 2000)
+        self.assertEqual(mb.budget_for({"num_predict": 80}, True, lfm), 2080)
+        # Every other family keeps the card-independent default.
+        self.assertEqual(mb.think_bonus_for("granite3.3:2b"), mb.THINK_BUDGET_BONUS)
+        self.assertEqual(mb.think_bonus_for("nemotron-3-nano:4b"), mb.THINK_BUDGET_BONUS)
+
     def test_every_role_the_runner_uses_resolves_to_options(self):
         for role in mb.ROLES:
             with self.subTest(role=role):

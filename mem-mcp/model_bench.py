@@ -182,9 +182,27 @@ _ROLE_SAMPLING = {
 # that was being misreported as a wrong answer.
 THINK_BUDGET_BONUS = 8192
 
+# The allowance a *model* needs is not the allowance a *card* can pay for.
+# `LFM2.5-2.6B` answered every think-mode case in 3.8-27 s at a 1,500-token
+# allowance. At 8,192 it exceeded a 900 s timeout on all fifteen calls: a 2.0 GB
+# model at a 16k context on this 4 GB card spills to CPU, and a long generation
+# touches every page of that spill. The card, not the model, is what ran out.
+#
+# So the vendor's reasoning budget stays the default and a model that is slower
+# than the card can fund overrides it downwards. An entry here is a measurement
+# (this model, this card), never a preference.
+_THINK_BONUS_OVERRIDE = {
+    "lfm": 2000,
+}
 
-def budget_for(case, think):
-    """The `num_predict` this case is run with, in this mode.
+
+def think_bonus_for(model: str) -> int:
+    """The reasoning allowance this model gets on this host."""
+    return _THINK_BONUS_OVERRIDE.get(family_for(model), THINK_BUDGET_BONUS)
+
+
+def budget_for(case, think, model=""):
+    """The `num_predict` this case is run with, in this mode, for this model.
 
     The production budget stays the ceiling on the *answer*; think mode adds the
     reasoning allowance on top of it, because the model spends both from one
@@ -194,7 +212,7 @@ def budget_for(case, think):
     """
     budget = case.get("num_predict", 0)
     if budget and think:
-        budget += THINK_BUDGET_BONUS
+        budget += think_bonus_for(model)
     return budget
 
 
@@ -1059,7 +1077,7 @@ def run(base_url: str, models: list, cases: dict, *, think_modes: list,
                     # A thinking model spends the budget in the reasoning block
                     # first, so the production budget starves it and the content
                     # comes back empty. The bonus applies to think mode only.
-                    budget = budget_for(case, think)
+                    budget = budget_for(case, think, model)
                     try:
                         answer = chat(
                             base_url, model, case["system"], case["prompt"],
