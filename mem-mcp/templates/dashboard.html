@@ -1678,6 +1678,12 @@
   // Resolvers waiting for `live_gate_released`. A push wakes them; the timeout
   // in waitForLiveGate is what keeps a dropped stream from wedging the panel.
   let liveGateWaiters = [];
+  // The last `live_gate_released` seen, cleared when a pause, stop or start is
+  // asked for. The server ends the gate and publishes the release **before**
+  // the browser's own `stopped`/`paused` handler runs, so the event arrived
+  // while no waiter existed: without remembering it, every stop fell through
+  // to a `/status` poll of a value the push had already delivered.
+  let liveGateReleased = null;
   let liveEditingSegmentId = null;
   let liveOffset = 0;
   let selectedFactId = null;
@@ -3538,6 +3544,11 @@
     const id = data && data.transcriptionId;
     if (id && activeLiveTranscriptionId && id !== activeLiveTranscriptionId) return;
     liveGatePending = false;
+    // Remembered, not just delivered: the waiter for this release is usually
+    // registered a second or two later (the stop handler waits 1.8 s for the
+    // server's segment writer), and a push nobody was listening for is
+    // indistinguishable from a push that never came.
+    if (id) liveGateReleased = { id, at: Date.now() };
     // Wake anybody awaiting the release before re-rendering, so a click that
     // was queued behind the gate does not also trip the poll fallback.
     const waiters = liveGateWaiters;
@@ -3706,7 +3717,19 @@
   // The poll below is the fallback for a dropped stream, and it is the only
   // reason `/status` is still read from the client at all.
   async function settleLiveGate(id, attempts) {
+    // The push settles this, and it usually arrived before this was called.
+    // `liveGateReleased` is the event we kept for exactly that ordering.
+    if (liveGateReleased && liveGateReleased.id === id) {
+      liveGateReleased = null;
+      return true;
+    }
     if (await waitForLiveGate(1500)) return true;
+    if (sseOpen()) {
+      // Asking `/status` here would poll a value the push carries. A gate that
+      // is genuinely still shut answers 409 on the next click, which re-arms
+      // this wait -- so giving up is safer than polling behind a live stream.
+      return false;
+    }
     const tries = attempts || 12;
     for (let i = 0; i < tries; i++) {
       try {
@@ -3806,6 +3829,8 @@
   async function startLiveRecording() {
     if (!liveDetail || !liveDetail.transcription) return;
     if (liveRecording) return;
+    // A recording closes the gate: any remembered release is from before it.
+    liveGateReleased = null;
     if (!asrTokenSet) {
       await loadAsrToken({force: true});
       if (!asrTokenSet) {
@@ -3913,6 +3938,8 @@
     if (livePaused) { await summarizeLive(); return; }
     livePaused = true;
     liveGatePending = true;
+    // A new gate cycle: the release we remembered belongs to the previous one.
+    liveGateReleased = null;
     renderLiveControls(liveDetail && liveDetail.transcription);
     const state = document.getElementById('live-state');
     if (state) state.textContent = 'Finishing the current segment…';
@@ -3933,6 +3960,8 @@
 
   async function stopLiveRecording() {
     if (!liveRecording) return;
+    // The gate is about to close and reopen; the remembered release is stale.
+    liveGateReleased = null;
     const state = document.getElementById('live-state');
     if (state) state.textContent = 'Saving the final segments…';
     // LiveCapture.stop() emits `stopped` synchronously after teardown, and

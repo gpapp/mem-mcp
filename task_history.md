@@ -5,6 +5,26 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# Live notes: the gate release is remembered, so the panel stops polling (2026-11-03)
+
+- **Reported as**: the container log showing `GET /mem-mcp/api/live/transcriptions/<id>/status`
+  while the panel was supposed to be pushed to — *"these should be SSE"*.
+- **Cause**: the server publishes `live_gate_released` the moment the gate opens,
+  which is **before** the browser's `stopped` handler asks (it waits 1.8 s for the
+  server's segment writer). The event therefore arrived with no waiter registered,
+  `onLiveGateReleased` woke an empty resolver list, and `settleLiveGate` fell
+  through its 1.5 s timeout into twelve `/status` polls.
+- **What shipped**: `liveGateReleased` remembers `{id, at}` so a late waiter
+  settles at once; it is cleared when a pause, stop or start is asked for, because
+  a remembered release belongs to the previous gate cycle. `settleLiveGate` also
+  returns without polling when `sseOpen()`. With a healthy stream the panel now
+  makes no `/status` request at all; polling survives only for a stream that is
+  down.
+- **The one thing to know**: `LivePanelPushTests` counts only URLs containing
+  `/status` when it asserts zero polls — the node harness's own app init fetches
+  `memories` through the same `api.get`, and a plain call counter reported a poll
+  that never happened.
+
 # Live notes: the note is checked for structure, not trusted to be structured (2026-11-03)
 
 - **Reported as**: "I don't see the structure of the live notes. check logs"

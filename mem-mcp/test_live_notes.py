@@ -2385,6 +2385,65 @@ class LivePanelPushTests(unittest.TestCase):
         self.assertLess(body.index("sseOpen()"), body.index("setTimeout("),
                         msg="the stream check must be before the timer is armed")
 
+    def test_a_release_that_arrived_before_the_waiter_settles_it_at_once(self):
+        # The server publishes `live_gate_released` when the gate opens, and
+        # `onLiveCaptureStopped` only asks 1.8 s later -- so the event is
+        # delivered to nobody. Remembering it is what keeps `/status` out of
+        # the stop path.
+        out = self._run([("gate", """
+(async () => {
+  liveGateReleased = { id: 't1', at: Date.now() };
+  const started = Date.now();
+  const free = await settleLiveGate('t1');
+  return [free, Date.now() - started];
+})()
+""")])
+        free, elapsed = out["gate"]
+        self.assertTrue(free, msg=out.get("fatal", "the remembered release was ignored"))
+        self.assertLess(elapsed, 1000,
+                        msg="waiting means it fell through to the timeout")
+
+    def test_an_open_stream_is_never_bypassed_by_a_status_poll(self):
+        out = self._run([("gate", """
+(async () => {
+  liveGateReleased = null;
+  sseSource = { readyState: 1 };
+  let calls = 0;
+  const original = api.get;
+  api.get = (url) => {
+    if (String(url).indexOf('/status') !== -1) calls += 1;
+    return Promise.resolve({ recording: false });
+  };
+  const free = await settleLiveGate('t-open');
+  api.get = original;
+  sseSource = null;
+  return [free, calls];
+})()
+""")])
+        free, calls = out["gate"]
+        self.assertFalse(free)
+        self.assertEqual(calls, 0,
+                         msg="a live stream answers this; /status is the "
+                             "dead-stream fallback and nothing else")
+
+    def test_a_new_gate_cycle_forgets_the_previous_release(self):
+        for name in ("pauseLiveRecording", "stopLiveRecording",
+                     "startLiveRecording"):
+            body = self._body(name)
+            self.assertIn("liveGateReleased = null", body,
+                          msg=f"{name} starts a new gate cycle")
+
+    def test_the_release_is_remembered_not_only_delivered(self):
+        body = self._body("onLiveGateReleased")
+        self.assertIn("liveGateReleased = { id", body)
+
+    def test_the_remembered_release_is_checked_before_waiting(self):
+        body = self._body("settleLiveGate")
+        self.assertLess(body.index("liveGateReleased"), body.index("waitForLiveGate("),
+                        msg="checking after the wait would still time out")
+        self.assertLess(body.index("sseOpen()"), body.index("live/transcriptions/"),
+                        msg="the poll must be behind the stream check")
+
     def test_the_gate_wait_is_settled_by_the_push(self):
         body = self._body("settleLiveGate")
         self.assertLess(body.index("waitForLiveGate("),

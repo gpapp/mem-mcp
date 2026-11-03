@@ -2344,9 +2344,23 @@ Client side: `initSSE` registers both listeners; `scheduleLivePoll` returns
 early when `sseOpen()` — a live stream means no timer at all — and the
 `onerror` handler re-arms it, because a dropped stream would otherwise leave the
 toolbar disabled for a job whose terminal event never arrives. `onopen` disarms
-it again. `settleLiveGate` awaits `waitForLiveGate(1500)` (a resolver list the
-gate event wakes) and only then falls back to polling `/status`, which is the
-one thing that still has to exist for a proxy that keeps dropping the stream.
+it again.
+
+**The gate release is remembered, because the push arrives before the waiter
+exists.** The server ends the gate and publishes `live_gate_released` the moment
+the socket closes, while the browser's own `stopped` handler only asks 1.8 s
+later (`onLiveCaptureStopped` waits for the server's segment writer). So the
+event was delivered to **nobody** on every stop: `onLiveGateReleased` cleared
+`liveGatePending` and woke an empty resolver list, and `settleLiveGate` then
+timed out and polled `/status` up to twelve times — the request loop the user
+saw in the container log. `liveGateReleased` now keeps `{id, at}`, so a waiter
+that arrives afterwards settles at once, and it is cleared when a pause, stop or
+start is asked for, because a remembered release belongs to the previous gate
+cycle. `settleLiveGate` also returns without polling when `sseOpen()` — a live
+stream answers this, and a gate that is genuinely still shut answers 409 on the
+next click, which re-arms the wait. So with a healthy stream the panel makes
+**no `/status` request at all**; the poll survives only for a stream that is
+actually down.
 
 `onLiveJobEvent` and `onLiveGateReleased` guard their `renderLiveControls` call
 on an open transcription: an event can arrive before a pane is showing one, and
@@ -2358,8 +2372,13 @@ it exists for.
 fields, `user_id`, event name) and pins the two call sites a behavioural test
 cannot see; `LivePanelPushTests` drives the handlers through the fake DOM — a
 gate event must clear `liveGatePending` *and* wake a waiter, and another
-recording's event must be ignored. Both mutations bit: removing `_announce` from
-`_set_job`, and removing the `sseOpen()` guard.
+recording's event must be ignored. It also **paces** the late-waiter case: a
+remembered release must settle `settleLiveGate` in under a second, and with
+`sseOpen()` true and no push at all it must make zero `/status` calls. That
+second one counts only URLs containing `/status`, because the harness's own
+app init fetches `memories` through the same `api.get` and a plain counter
+reported a poll that never happened. Both mutations bit: removing `_announce`
+from `_set_job`, and removing the `sseOpen()` guard.
 
 **A live turn is not a sentence, so the transcript block is joined before the
 model reads it.** asr-mcp ends a turn on 320 ms of sub-threshold audio, not on
