@@ -2471,6 +2471,18 @@ can satisfy in its own way, so it wrote a summary.
   the call site — check, then repair, then commit — because a helper tested in
   isolation is not a test of its call site, and repairing after the write would
   fix a note the reader already has.
+- **The answer shape is stated, and an empty note is refused by name.** Two
+  failures came out of one first window: at temperature 0 the model answered
+  `"text": ""`, because *"If a new section adds nothing, return the note
+  unchanged"* is satisfied by returning the empty note it was given; and on the
+  retry at temperature 0.35 it answered `"text": [{"paragraphs": []}]`, because
+  "one paragraph per thought" invited a paragraph *structure* for a field that
+  has to be one string. The prompt now says **"An empty note is never the
+  answer"** and spells the JSON out — `title` and `text` are strings, `text` is
+  one string, never a list, never one entry per paragraph — and `PromptTests`
+  pins both sentences. `parse_note_json` already refused a non-string `text`
+  with the same "no note text" reason, and `ParseNoteTests` now pins that too,
+  so the shape the retry produced cannot be stored as a note.
 
 A long pause is split by `segment_windows` and processed **sequentially**, so
 each window sees the note the previous one produced. Consumption markers are

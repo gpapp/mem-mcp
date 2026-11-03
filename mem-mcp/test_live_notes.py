@@ -205,6 +205,26 @@ class PromptTests(unittest.TestCase):
         self.assertIn("one paragraph per thought", prompt)
         self.assertIn("single paragraph is not a note", prompt)
         self.assertIn("distinct thoughts", prompt)
+
+    def test_the_answer_shape_is_two_strings_and_a_list(self):
+        # Production answered `"text": [{"paragraphs": []}]` on the retry: the
+        # prompt said "one paragraph per thought" and the model built a
+        # paragraph *structure* for a field that has to be one string.
+        prompt = ln.LIVE_SYSTEM_PROMPT
+        self.assertIn("`title` and `text` are **strings**", prompt)
+        self.assertIn("never one entry per paragraph", prompt)
+        self.assertIn('{"title": "...", "text": "...", "referencedFactIds": ["<id>"]}',
+                      prompt)
+
+    def test_an_empty_note_is_refused_as_the_answer(self):
+        # The first window has no note, and "if a new section adds nothing,
+        # return the note unchanged" was satisfied by returning "" -- which is
+        # the note unchanged. The model returned an empty note twice and the
+        # job failed with nothing written.
+        prompt = ln.LIVE_SYSTEM_PROMPT
+        self.assertIn("An empty note is never the answer", prompt)
+        self.assertIn("when there is no note yet, these sections are what you "
+                      "write it from", prompt)
         self.assertIn("pause boundaries", prompt)
         # Reported symptom: the note carried the rambling. The old prompt said
         # "incorporate every new section", which mandates exactly that -- an
@@ -213,8 +233,8 @@ class PromptTests(unittest.TestCase):
         self.assertIn("meeting's topic", prompt)
         self.assertIn("small talk", prompt)
         self.assertIn("Summarise; do not transcribe", prompt)
-        self.assertIn("If a new section adds nothing, return the note unchanged",
-                      prompt)
+        self.assertIn("If a new section adds nothing and the note already has text, "
+                      "return the note unchanged", prompt)
 
     def test_the_candidate_list_is_not_a_checklist(self):
         # Reported symptom: a note linked its whole project scope. The list is
@@ -366,6 +386,14 @@ class ParseNoteTests(unittest.TestCase):
     def test_empty_text_is_refused(self):
         with self.assertRaises(ln.LiveNoteError):
             self.parse('{"title":"T","text":"   "}')
+
+    def test_a_structured_text_field_is_refused_with_the_same_reason(self):
+        # Production's retry answered `"text": [{"paragraphs": []}]`. The field
+        # is one string; a paragraph *structure* is not a note, and accepting
+        # it would store a JSON blob the reader then sees as text.
+        with self.assertRaises(ln.LiveNoteError) as caught:
+            self.parse('{"title":"T","text":[{"paragraphs":[]}]}')
+        self.assertIn("no note text", str(caught.exception))
 
     def test_over_long_text_is_refused_rather_than_sliced(self):
         with self.assertRaises(ln.LiveNoteTooLong):

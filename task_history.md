@@ -5,6 +5,25 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# Live notes: an empty note is never the answer (2026-11-03)
+
+- **Reported as**: the container log for a first `summarize` call — `"text": ""`
+  at temperature 0, then `"text": [{"paragraphs": []}]` on the retry, then
+  `note job failed ... the model answer had no note text`.
+- **Cause**: two prompt traps, both visible only on the first window. *"If a new
+  section adds nothing, return the note unchanged"* is satisfied by returning the
+  empty note the model was given; and *"one paragraph per thought"* invited a
+  paragraph **structure** for a field that has to be one string.
+- **What shipped**: the prompt now says **"An empty note is never the answer"**
+  and spells out the JSON — `title` and `text` are strings, `text` is one string
+  holding the Markdown note, never a list and never one entry per paragraph.
+  `PromptTests` pins both sentences, and `ParseNoteTests` pins that a non-string
+  `text` is refused with the same "no note text" reason rather than stored.
+- **The one thing to know**: the retry after a failed parse only changes
+  sampling. It cannot repair a shape the prompt asked for, so the contract has
+  to be right in the system prompt — a second attempt at 0.35 answered a
+  different unusable shape, not a better one.
+
 # Live notes: the gate release is remembered, so the panel stops polling (2026-11-03)
 
 - **Reported as**: the container log showing `GET /mem-mcp/api/live/transcriptions/<id>/status`

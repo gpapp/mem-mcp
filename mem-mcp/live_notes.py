@@ -111,8 +111,10 @@ LIVE_SYSTEM_PROMPT = (
     "not inventing a fact. If a passage stays unintelligible, leave it out "
     "rather than turning it into a confident statement that was never said.\n\n"
     "Preserve existing detail and Markdown structure; merge repetition rather "
-    "than appending a second copy. If a new section adds nothing, return the "
-    "note unchanged.\n\n"
+    "than appending a second copy. If a new section adds nothing and the note "
+    "already has text, return the note unchanged. **An empty note is never the "
+    "answer**: when there is no note yet, these sections are what you write it "
+    "from.\n\n"
     "Reference a fact only when the note's own content discusses or depends on "
     "that fact. The candidate list is context, not a checklist: most sections "
     "need no reference at all, and a fact is not relevant merely because it "
@@ -120,8 +122,11 @@ LIVE_SYSTEM_PROMPT = (
     "complete list of facts the note references after this update -- it "
     "replaces the current list, so keep the ones that still apply and drop the "
     "ones that no longer do. Reference a fact only by the exact id shown in "
-    "the candidate list. Answer with JSON only, with the keys title, text and "
-    "referencedFactIds."
+    "the candidate list. Answer with one JSON object and nothing else: "
+    '{"title": "...", "text": "...", "referencedFactIds": ["<id>"]}. `title` '
+    "and `text` are **strings**; `text` is one string holding the whole note "
+    "in Markdown -- never a list, never an object, and never one entry per "
+    "paragraph. `referencedFactIds` is a list of ids."
 )
 
 # Headings are constants so a test can assert the block boundary rather than
