@@ -1722,6 +1722,25 @@ LLM call to arrive at the same string.
   turns and a real save never happens. `DiarySaveEntryRoutingTests` drives it
   with fakes and pins both directions, plus that the old entry is *not* deleted
   (this is an update, not a move).
+- **An `entryId` with a new body is a fourth shape, and it used to have no valid
+  call at all.** A caller holding a new body and an id but no stored
+  `name`/`timestamp` was refused by the create-path guard, and the
+  metadata-only path above it refuses real content — so the only remedy the
+  error could name ("pass its id as entryId with an empty content") was the one
+  thing that caller could not do. The id already *names* the entry, so
+  `db_get_diary_entry(entry_id, user_id)` reads the two identity fields out of
+  the row and the call becomes an ordinary update. Two properties make it safe
+  rather than merely permitted: the timestamp comes back unchanged, and the id
+  is **derived from it** (`_diary_id`), so the `if entryId: new_id = …` move
+  branch above matches and deletes nothing; and a blank stored name falls back
+  to the same `Untitled Diary Entry` literal `fix_diary_entries` repairs to, so
+  the repair's spelling is not duplicated here. An id matching nothing is an
+  **error, not a create** — omitting `entryId` is what creates, and silently
+  creating on a stale id is a second entry nobody asked for.
+  `DiarySaveEntryRoutingTests` pins all three (fill-in, blank-name fallback,
+  unknown-id refusal) by driving the tool, because the ordering — fill-in
+  *before* the guard — is the whole property and is invisible in a source
+  assertion.
 
 **`list_diary_entries` reads scope from the edges, and every `OPTIONAL MATCH`
 is closed by an aggregating `WITH`.** Both are the documented diary bugs, and

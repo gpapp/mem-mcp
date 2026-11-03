@@ -5,6 +5,27 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# Diary: an `entryId` with a new body had no valid call (2026-11-03)
+
+- **Reported as**: the production traceback from `diary_save_entry`, ending
+  `ValueError: name and timestamp are required for a new entry; to change
+  metadata on an existing one pass its id as entryId with an empty content
+  instead.`
+- **What shipped**:
+  - `diary_manager.db_get_diary_entry(entry_id, user_id)` reads an entry's
+    `name`/`timestamp` (or `None` when it is not the caller's), re-exported from
+    `memory.py`.
+  - `mcp_tools.diary_save_entry` fills those two fields from that row when an
+    `entryId` arrives without them, **before** the create-path guard; an id that
+    matches nothing is an error rather than a new entry. The docstring gained a
+    "Replacing the body of an existing entry" section.
+  - `DiarySaveEntryRoutingTests` gained three cases: the fill-in, the blank-name
+    fallback to `Untitled Diary Entry`, and the unknown-id refusal.
+- **The one thing to know**: the id is derived from the timestamp, so reading
+  the stored timestamp back is what keeps the `if entryId: new_id = …` branch
+  above from treating the call as a move and deleting the entry first. Fill the
+  fields, never re-derive them.
+
 # Live notes: real tool calling and pause boundaries (2026-11-03)
 
 - **Reported as**: "process each boundary individualy, provide it with context of

@@ -913,6 +913,40 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
     return entries[:limit]
 
 
+def db_get_diary_entry(entry_id: str, user_id: str) -> Optional[dict]:
+    """One diary entry's identity fields, or None when it is not the caller's.
+
+    Exists for `diary_save_entry`. An `entryId` already names the entry, so the
+    name and timestamp that encode its identity can be **read** instead of
+    demanded back from a caller that never had them — and demanding them left a
+    caller holding a new body and no stored name with no valid call at all: the
+    metadata-only path refuses real content, and the create path wanted fields
+    the server already had.
+
+    Scoped to the caller's own vault because `db_save_diary` writes under the
+    caller too. A grantee's write goes through `db_update_diary`, which resolves
+    the owner and enforces the grant itself.
+    """
+    neo4j_driver = get_neo4j()
+    if not neo4j_driver:
+        raise RuntimeError("Neo4j not connected.")
+    with neo4j_driver.session() as s:
+        row = s.run(
+            """
+            MATCH (d:DiaryEntry {id: $id, userId: $userId})
+            RETURN d.name as name, d.timestamp as timestamp
+            """,
+            id=entry_id, userId=user_id,
+        ).single()
+    if not row:
+        return None
+    return {
+        "id": entry_id,
+        "name": row["name"] or "",
+        "timestamp": row["timestamp"] or "",
+    }
+
+
 async def db_update_diary(entry_id: str, user_id: str, content: Optional[str] = None, name: Optional[str] = None, timestamp: Optional[str] = None, metadata: Optional[dict] = None, linked_facts: Optional[list] = None, client_id: Optional[str] = None, context_id: Optional[str] = None) -> bool:
     """Update a diary entry's content, name, timestamp, metadata, and optionally replace linked facts.
     If linked_facts is provided, existing MENTIONS relationships are cleared and new ones are created.

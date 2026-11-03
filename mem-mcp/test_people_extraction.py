@@ -1506,6 +1506,55 @@ class DiarySaveEntryRoutingTests(unittest.TestCase):
         self.assertTrue(result["metadataOnly"])
         self.assertEqual(result["id"], "e1")
 
+    def test_a_new_body_with_an_id_reads_the_identity_it_was_not_sent(self):
+        # Production hit the create-path guard with an id in hand: the
+        # metadata-only path above refuses real content, and that guard demanded
+        # `name`/`timestamp` the server already had under `entryId`. Reading
+        # them keeps the id (it is derived from the timestamp) and turns the
+        # call into an ordinary update.
+        async def db_get_diary_entry(entry_id, user):
+            return {"id": entry_id, "name": "Standup",
+                    "timestamp": "2026-11-03T09:00:00"}
+
+        fn, recorded = self._lift(db_get_diary_entry=db_get_diary_entry)
+        result = self._run(fn, recorded, content="new body",
+                           entryId="id-2026-11-03T09:00:00")
+        self.assertEqual([entry["name"] for entry in recorded["saved"]],
+                         ["Standup"])
+        self.assertEqual([entry["timestamp"] for entry in recorded["saved"]],
+                         ["2026-11-03T09:00:00"])
+        self.assertEqual([entry["content"] for entry in recorded["saved"]],
+                         ["new body"])
+        self.assertEqual(recorded["deleted"], [],
+                         "the id came from the stored timestamp, so this is an "
+                         "update and not a move")
+        self.assertEqual(result["id"], "id-2026-11-03T09:00:00")
+
+    def test_a_stored_blank_name_does_not_dead_end_here(self):
+        # `fix_diary_entries` repairs a blank name to this same literal, so
+        # using it here is the repair's spelling rather than a second one.
+        async def db_get_diary_entry(entry_id, user):
+            return {"id": entry_id, "name": "",
+                    "timestamp": "2026-11-03T09:00:00"}
+
+        fn, recorded = self._lift(db_get_diary_entry=db_get_diary_entry)
+        self._run(fn, recorded, content="new body",
+                  entryId="id-2026-11-03T09:00:00")
+        self.assertEqual([entry["name"] for entry in recorded["saved"]],
+                         ["Untitled Diary Entry"])
+
+    def test_an_unknown_id_is_an_error_rather_than_a_new_entry(self):
+        async def db_get_diary_entry(entry_id, user):
+            return None
+
+        fn, recorded = self._lift(db_get_diary_entry=db_get_diary_entry)
+        with self.assertRaises(ValueError) as caught:
+            asyncio.run(fn(content="new body", entryId="gone"))
+        self.assertIn("gone", str(caught.exception))
+        self.assertEqual(recorded["saved"], [],
+                         "silently creating on a stale id is a second entry "
+                         "nobody asked for")
+
     def test_the_merged_metadata_comes_back_so_the_caller_can_see_it(self):
         fn, _ = self._lift()
         result = asyncio.run(fn(content="", entryId="e1",

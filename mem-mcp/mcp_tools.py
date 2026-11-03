@@ -432,6 +432,21 @@ async def diary_save_entry(content: str, name: Optional[str] = None, timestamp: 
     is refused, because a call that changes nothing and reports success is a
     write you cannot see the result of. **Do not do this for a new entry** — an
     empty body with no `entryId` is rejected rather than stored as a blank entry.
+
+    ## Replacing the body of an existing entry
+
+    An `entryId` with **non-empty** `content` rewrites that entry's body:
+
+        diary_save_entry(content="...", entryId="...")
+
+    `name` and `timestamp` are read from the stored row when you do not send
+    them, because the id already names the entry and those two fields *encode*
+    it — demanding them back left a caller holding a new body and no stored name
+    with no valid call at all. Send either only to change it.
+
+    An `entryId` that matches none of your entries is an error, not a new entry:
+    a create is what you get by omitting `entryId`, and silently creating on a
+    stale id is a second entry nobody asked for.
     """
     user = _current_user()
     metadata_only = entryId is not None and not (content or "").strip()
@@ -460,6 +475,23 @@ async def diary_save_entry(content: str, name: Optional[str] = None, timestamp: 
             links = len(linked_facts)
         return {"id": entryId, "timestamp": None, "metadataOnly": True,
                 "metadata": merged, "mentions": links}
+
+    if entryId and (not name or not timestamp):
+        # An `entryId` already names the entry, so its identity fields can be
+        # read instead of demanded back. Without this a caller holding a new
+        # body and no stored name had **no valid call at all**: the
+        # metadata-only path above refuses real content, and this guard wanted
+        # fields the server already had. The id is derived from the timestamp,
+        # so filling them from the row keeps it and turns the call into an
+        # ordinary update rather than the delete-and-recreate below.
+        stored = await mem.db_get_diary_entry(entryId, user)
+        if not stored:
+            raise ValueError(
+                f"No diary entry with id {entryId!r}. Omit entryId to create a "
+                "new entry."
+            )
+        name = name or stored["name"] or "Untitled Diary Entry"
+        timestamp = timestamp or stored["timestamp"]
 
     if not name or not timestamp:
         raise ValueError(
