@@ -628,7 +628,7 @@ which cannot be imported here, and holds two guards worth knowing about:
 - Query rewrite cache: `MEM_QUERY_CACHE_TTL` (default 900s) and `MEM_QUERY_CACHE_MAX` (default 256 entries); either `0` disables the cache — see "Query Rewrite Cache"
 - Embedding retries: `MEM_EMBED_RETRIES` (default 2) and `MEM_EMBED_RETRY_BACKOFF` (default 1.5, in seconds), `MEM_EMBED_MAX_CHARS` (default 8000) — see "Embedding Reliability"
 - Server status widget: `MEM_STATUS_POLL_SECONDS` (default 10), `MEM_STATUS_HTTP_TIMEOUT` (default 8) and `MEM_GPU_EXPECTED` (default 1 — 0 silences the CPU-fallback warning on a host with no GPU) — see "Server Status Widget"
-- Live notes: `MEM_ASR_WS_URL`, `MEM_LIVE_MODEL` (defaults to `MEM_EXTRACT_MODEL`), `MEM_LIVE_FACT_LIMIT` (100), `MEM_LIVE_REFERENCE_LIMIT` (12, the backstop on a note's links — see "The note is about the topic"), `MEM_LIVE_CONTEXT_TOKENS` (must track `OLLAMA_CONTEXT_LENGTH`), `MEM_LIVE_MIN_NUM_PREDICT` (1500, a refusal floor), `MEM_LIVE_NOTE_MAX_CHARS` (12000), `MEM_LIVE_WINDOW` (6000), `MEM_LIVE_TAIL_SILENCE_MS` (480, the pause tail — see "A pause ends the stream") and `MEM_LIVE_UNLOAD_ON_RECORD` — see "Live Notes"
+- Live notes: `MEM_ASR_WS_URL`, `MEM_LIVE_MODEL` (defaults to `MEM_EXTRACT_MODEL`), `MEM_LIVE_FACT_LIMIT` (100), `MEM_LIVE_REFERENCE_LIMIT` (12, the backstop on a note's links — see "The note is about the topic"), `MEM_LIVE_CONTEXT_TOKENS` (must track `OLLAMA_CONTEXT_LENGTH`), `MEM_LIVE_MIN_NUM_PREDICT` (1500, a refusal floor), `MEM_LIVE_NOTE_MAX_CHARS` (12000), `MEM_LIVE_WINDOW` (6000), `MEM_LIVE_TOOL_ROUNDS` (3, the tool-round ceiling — see "A pause is a thought"), `MEM_LIVE_TAIL_SILENCE_MS` (480, the pause tail — see "A pause ends the stream") and `MEM_LIVE_UNLOAD_ON_RECORD` — see "Live Notes"
 - User vault resolved from a session cookie, `Authorization: Basic`, an access key, or proxy headers — see Authentication
 - Sessions and access keys: `MEM_SESSION_DIR` (must be the bind mount, or a container rebuild logs everyone out) and `MEM_SESSION_SECURE` (adds `Secure` to the session cookie; only enable when the app is reached over HTTPS, since the process cannot detect the proxy's scheme and a `Secure` cookie on a plain-HTTP visit is silently dropped). `MEM_SESSION_SECRET` is no longer used to sign anything.
 - Admin surface: `MEM_ADMIN_USER` names the one account that may reach the **Service** tab
@@ -2399,6 +2399,76 @@ A long pause is split by `segment_windows` and processed **sequentially**, so
 each window sees the note the previous one produced. Consumption markers are
 written only after a successful commit, so a failure, a timeout or a recording
 start leaves the same segments eligible for the next attempt.
+
+### A pause is a thought, and the tools exist because the prompt is a snapshot
+
+`segment` rows carry a `boundary` flag, written by the WebSocket proxy through
+`db_set_segment_boundary` when the user pauses and once more when the stream
+stops. It is stored rather than derived, and that is not a preference: asr-mcp
+restarts its clock on every connection, so a gap in `startSec` is an artefact of
+reconnecting. A heuristic over timestamps would therefore put a thought boundary
+wherever the network hiccupped and none where the speaker actually stopped.
+
+Three readers, and they must agree:
+
+- `segment_windows` closes a window on a boundary as well as on the character
+  budget. The budget is a transport limit (`LIVE_WINDOW`, the model's context);
+  the pause is the unit the note is *written* in. Windows cut purely on
+  characters merged unrelated thoughts and split one argument in half, which is
+  what "a wall of short text" described.
+- `segment_paragraphs` / `_paragraph_runs` end a speaker run at a boundary even
+  when the speaker has not changed — a person resuming the same point after a
+  pause has started a new paragraph — and `format_segments` renders that as a
+  blank line, the only way a pause survives into the prompt. `segment_paragraphs`
+  stays a three-tuple: the fourth element (`closed`) is only for the renderer.
+- `LIVE_SYSTEM_PROMPT` says a blank line is a pause and one paragraph is one
+  thought, in both directions: do not split one argument, do not merge two.
+
+**The note model now has a real tool channel**, which it did not have before:
+`/api/chat` accepts `tools`, but nothing sent any and nothing read `tool_calls`,
+so a model answering with a call got its own request retried as an unusable
+answer — the capability was assumed, never present.
+
+- `common.get_llm_response` grew `tools=`, `history=` and `return_message=`.
+  `history` is used *instead of* rebuilding system+user, because the tool loop
+  holds the assistant turn that carries the call and a rebuilt message list
+  drops it. `return_message` returns `{role, content, tool_calls}`; every other
+  caller still gets a string and never learns the channel exists. An empty
+  `content` with tool calls present is **not** the empty-answer ERROR — asking
+  for a tool is a successful answer.
+- `LIVE_TOOLS` (schemas) is in `live_notes.py`, which stays stdlib-only;
+  the executors are in `live_manager._refresh_note`. Four tools:
+  `lookup_fact` (the prompt carries titles only, so this is the one read that
+  puts a body in front of the model, scoped to ids it was already offered and to
+  the caller's own vault), `get_note_block`, `replace_note_block`,
+  `append_note_block`.
+- **The note is shown with `[1]`, `[2]` paragraph numbers, and the numbering is
+  a tool address, not content.** `strip_block_markers` removes it in
+  `parse_note_json`, because a model that echoes the marker back would store it.
+- **The prompt is rebuilt after every tool round** (`refresh_prompt`): a
+  `replace_note_block` shifts the numbering, so answering against the previous
+  prompt would put the model's next edit on the wrong paragraph.
+- `MEM_LIVE_TOOL_ROUNDS` (3) caps the loop. Each round is a full prompt
+  evaluation on a card ASR shares, and a small model will otherwise ask for
+  another lookup indefinitely.
+- **A tool failure is reported to the model, not raised.** The note still has to
+  be written; only `NoteJobDeferred` / `LiveNoteError` escape, because those mean
+  the job is over rather than that one lookup went wrong.
+- **The JSON `text` is still the commit; the tool edits are a scratchpad.** The
+  one exception is pinned: if a tool edited the note and the model then echoed
+  the note it was given *unchanged*, the edited text wins — otherwise the tool
+  would be a no-op that reported success.
+- `_turns`, `_run_tool_call` and the executors are all **nested inside** the
+  functions `test_live_notes.py` lifts, for the same reason `_unload_asr` is.
+  That harness needed `LIVE_TOOL_ROUNDS`/`json` added to its namespace and its
+  fake LLM taught the `return_message` shape — a lift harness is a client of the
+  function's surface, so a new module-level name it reads is a new name in the
+  namespace.
+
+`PauseBoundaryTests`, `NoteBlockTests`, `ToolSchemaTests` and the two
+`NoteCallRetryTests` tool cases drive all of it; the schema test also asserts the
+prompt names every tool, because a tool the prompt does not mention is one the
+model will not call.
 
 ### Status, rebuilds and restarts
 

@@ -444,6 +444,141 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(windows[0][0]["text"], "x" * 5000)
 
 
+class PauseBoundaryTests(unittest.TestCase):
+    """A thought ends where the speaker stopped, not where the characters ran out.
+
+    asr-mcp ends a turn on 320 ms of sub-threshold audio, so its boundaries are
+    sentencing, not thoughts. The only boundary that means anything to a note is
+    the one the user made by pressing pause, and it is stored on the row by the
+    WebSocket proxy (`db_set_segment_boundary`) because it cannot be derived
+    afterwards: asr-mcp restarts its clock on every connection, so a gap in the
+    timestamps is an artefact of reconnecting rather than evidence.
+    """
+
+    def test_a_pause_splits_a_paragraph_even_for_one_speaker(self):
+        runs = ln.segment_paragraphs([
+            {"speaker": "S", "startSec": 0, "text": "first thought",
+             "boundary": True},
+            {"speaker": "S", "startSec": 30, "text": "second thought"},
+        ])
+        self.assertEqual([run[2] for run in runs],
+                         ["First thought.", "Second thought."],
+                         msg="the same person starting a new thought is a new "
+                             "paragraph; a speaker change is not required")
+
+    def test_a_pause_shows_as_a_blank_line_in_the_transcript(self):
+        text = ln.format_segments([
+            {"speaker": "S", "startSec": 0, "text": "first", "boundary": True},
+            {"speaker": "S", "startSec": 30, "text": "second"},
+        ])
+        self.assertIn("\n\n", text,
+                      msg="a blank line is the only way a pause survives into "
+                          "the prompt")
+
+    def test_no_pause_means_no_blank_line(self):
+        text = ln.format_segments([
+            {"speaker": "S", "startSec": 0, "text": "first"},
+            {"speaker": "S", "startSec": 4, "text": "second"},
+        ])
+        self.assertNotIn("\n\n", text)
+
+    def test_a_pause_closes_a_window(self):
+        segments = [dict(seg(0, "one"), boundary=True), seg(10, "two")]
+        windows = ln.segment_windows(segments, window=10000)
+        self.assertEqual(windows, [[segments[0]], [segments[1]]],
+                         msg="the character budget had room for both; the "
+                             "pause is what closed the window")
+
+    def test_a_window_without_a_pause_stays_one_window(self):
+        segments = [seg(0, "one"), seg(10, "two"), seg(20, "three")]
+        self.assertEqual(ln.segment_windows(segments, window=10000), [segments])
+
+
+class NoteBlockTests(unittest.TestCase):
+    """The note is addressed by paragraph number, which is what the tools edit."""
+
+    def test_paragraphs_are_the_blocks(self):
+        self.assertEqual(ln.note_blocks("one\n\ntwo\n\nthree"),
+                         ["one", "two", "three"])
+
+    def test_rendering_numbers_the_paragraphs_for_the_model(self):
+        self.assertEqual(ln.render_note_blocks("one\n\ntwo"),
+                         "[1] one\n\n[2] two")
+
+    def test_an_empty_note_says_so(self):
+        self.assertEqual(ln.render_note_blocks(""), "(no note yet)")
+
+    def test_a_replaced_block_leaves_the_others_alone(self):
+        text = ln.replace_note_block("one\n\ntwo\n\nthree", 2, "TWO")
+        self.assertEqual(ln.note_blocks(text), ["one", "TWO", "three"])
+
+    def test_replacing_a_block_that_does_not_exist_is_refused(self):
+        # "change paragraph 7 of a four-paragraph note" is a mistake; turning it
+        # into an append would be a wrong edit dressed as a success.
+        with self.assertRaises(ln.LiveNoteError) as caught:
+            ln.replace_note_block("one", 7, "x")
+        self.assertIn("1 paragraph", str(caught.exception))
+
+    def test_an_empty_replacement_is_refused(self):
+        with self.assertRaises(ln.LiveNoteError):
+            ln.replace_note_block("one", 1, "   ")
+
+    def test_appending_adds_one_paragraph(self):
+        self.assertEqual(ln.append_note_block("one", "two"), "one\n\ntwo")
+
+    def test_block_markers_are_stripped_before_storage(self):
+        # The numbering is a tool address, not content: a model echoing it back
+        # must not write `[2]` into the note.
+        self.assertEqual(ln.strip_block_markers("[1] one\n[2] two"),
+                         "one\ntwo")
+
+    def test_parse_strips_markers_from_the_returned_note(self):
+        result = ln.parse_note_json(
+            '{"title": "T", "text": "[1] first\\n\\n[2] second",'
+            ' "referencedFactIds": []}', set())
+        self.assertEqual(result["text"], "first\n\nsecond")
+
+    def test_the_prompt_shows_the_numbered_blocks(self):
+        prompt = ln.build_live_prompt(
+            {"name": "T", "text": "one\n\ntwo"}, [], [], [])
+        self.assertIn("[1] one", prompt)
+        self.assertIn("[2] two", prompt)
+
+
+class ToolSchemaTests(unittest.TestCase):
+    """The schemas are text here; the executors live in `live_manager`."""
+
+    def test_the_four_tools_are_offered(self):
+        names = [tool["function"]["name"] for tool in ln.LIVE_TOOLS]
+        self.assertEqual(sorted(names), [
+            "append_note_block", "get_note_block", "lookup_fact",
+            "replace_note_block",
+        ])
+
+    def test_every_schema_names_its_own_required_arguments(self):
+        for tool in ln.LIVE_TOOLS:
+            function = tool["function"]
+            self.assertEqual(tool["type"], "function")
+            self.assertTrue(function["description"])
+            properties = function["parameters"]["properties"]
+            for name in function["parameters"]["required"]:
+                self.assertIn(name, properties,
+                              msg=f"{function['name']} requires an argument "
+                                  "it does not describe")
+
+    def test_the_tool_round_budget_is_bounded(self):
+        self.assertGreaterEqual(ln.LIVE_TOOL_ROUNDS, 1)
+        self.assertLessEqual(ln.LIVE_TOOL_ROUNDS, 10,
+                             msg="every round is a full prompt evaluation on a "
+                                 "card ASR shares")
+
+    def test_the_prompt_describes_every_tool(self):
+        # A tool the prompt does not mention is a tool the model will not call.
+        for name in ("lookup_fact", "get_note_block", "replace_note_block",
+                     "append_note_block"):
+            self.assertIn(name, ln.LIVE_SYSTEM_PROMPT)
+
+
 class OffsetTests(unittest.TestCase):
     def test_offset_is_added_to_both_ends(self):
         result = ln.with_time_offset(seg(10, "hello", end=14), 100)
@@ -1608,6 +1743,7 @@ class NoteCallRetryTests(unittest.TestCase):
         """`_call_live_llm` with a scripted `get_llm_response`."""
         import ast
         import asyncio
+        import json
         import test_share_endpoints
 
         source = test_share_endpoints._read(self.PATH)
@@ -1622,7 +1758,8 @@ class NoteCallRetryTests(unittest.TestCase):
         scripted = list(replies)
 
         async def fake_llm(prompt, system="", model="", num_predict=0,
-                           timeout=0.0, options=None):
+                           timeout=0.0, options=None, tools=None,
+                           history=None, return_message=False):
             calls.append(dict(options or {}))
             if not scripted:
                 # A missing retry must read as the property under test, not as
@@ -1633,6 +1770,15 @@ class NoteCallRetryTests(unittest.TestCase):
             value = scripted.pop(0)
             if isinstance(value, BaseException):
                 raise value
+            if isinstance(value, dict):
+                # A scripted tool turn: this is the whole message shape, which
+                # a string reply cannot express.
+                return value
+            # The tool loop asks for the whole message; a plain string is what
+            # every other caller gets, so the two shapes are both real.
+            if return_message:
+                return {"role": "assistant", "content": value,
+                        "tool_calls": []}
             return value
 
         class NoteJobDeferred(RuntimeError):
@@ -1640,9 +1786,11 @@ class NoteCallRetryTests(unittest.TestCase):
 
         namespace = {
             "asyncio": asyncio,
+            "json": json,
             "LIVE_MODEL": "granite3.3:2b",
             "LIVE_SAMPLING": ln.LIVE_SAMPLING,
             "LIVE_SAMPLING_RETRY": ln.LIVE_SAMPLING_RETRY,
+            "LIVE_TOOL_ROUNDS": ln.LIVE_TOOL_ROUNDS,
             "is_repeat_abort": ln.is_repeat_abort,
             "LiveNoteError": ln.LiveNoteError,
             "LiveNoteTooLong": ln.LiveNoteTooLong,
@@ -1681,6 +1829,79 @@ class NoteCallRetryTests(unittest.TestCase):
         _, calls, _ = self.run_call(["   ", "ok"])
         self.assertEqual(len(calls), 2)
 
+    # -- the tool channel -------------------------------------------------
+    #
+    # Tools were the one capability the note model was assumed to have and
+    # never did: `/api/chat` accepts `tools`, but nothing sent any and nothing
+    # read `tool_calls`, so a model that asked for a lookup got its own request
+    # retried as an unusable answer. Driven through the lifted function because
+    # the round count, the prompt rebuild and the message order are all
+    # control-flow properties.
+
+    def _tool_turn(self, name="append_note_block", arguments='{"markdown": "new"}'):
+        return {"role": "assistant", "content": "",
+                "tool_calls": [{"function": {"name": name,
+                                             "arguments": arguments}}]}
+
+    def test_a_tool_round_is_executed_and_the_prompt_rebuilt(self):
+        import asyncio
+        call, calls = self._lift([self._tool_turn(), "done"])
+        seen, rebuilt = [], []
+
+        async def run_tool(name, args):
+            seen.append((name, args))
+            return "appended"
+
+        answer = asyncio.run(call(
+            {"userId": "alice"}, "prompt", "system", 900,
+            tools=ln.LIVE_TOOLS, run_tool=run_tool,
+            refresh_prompt=lambda: rebuilt.append(1) or "refreshed",
+        ))
+        self.assertEqual(answer, "done")
+        self.assertEqual(seen, [("append_note_block", {"markdown": "new"})],
+                         msg="the arguments arrived as a JSON string and must "
+                             "be decoded before the executor sees them")
+        self.assertEqual(rebuilt, [1],
+                         msg="an edit tool changes the paragraph numbering, so "
+                             "the prompt the model answers against is rebuilt")
+        self.assertEqual(len(calls), 2,
+                         msg="one call to ask, one to answer -- not a retry")
+
+    def test_the_tool_rounds_are_bounded(self):
+        # A small model can ask for another lookup forever, and every round is
+        # a full prompt evaluation on a card that ASR shares.
+        import asyncio
+        call, calls = self._lift(
+            [self._tool_turn()] * ln.LIVE_TOOL_ROUNDS + ["final"])
+
+        async def run_tool(name, args):
+            return "ok"
+
+        answer = asyncio.run(call(
+            {"userId": "alice"}, "prompt", "system", 900,
+            tools=ln.LIVE_TOOLS, run_tool=run_tool,
+            refresh_prompt=lambda: "refreshed",
+        ))
+        self.assertEqual(answer, "final")
+        self.assertEqual(len(calls), ln.LIVE_TOOL_ROUNDS + 1)
+
+    def test_a_failing_tool_is_reported_to_the_model_rather_than_raised(self):
+        import asyncio
+        call, _ = self._lift([self._tool_turn(), "done"])
+
+        async def run_tool(name, args):
+            raise ValueError("that paragraph does not exist")
+
+        answer = asyncio.run(call(
+            {"userId": "alice"}, "prompt", "system", 900,
+            tools=ln.LIVE_TOOLS, run_tool=run_tool,
+            refresh_prompt=lambda: "refreshed",
+        ))
+        self.assertEqual(answer, "done",
+                         msg="the note still has to be written; a tool that "
+                             "failed is something the model is told, not a "
+                             "reason to lose the window")
+
     def test_garbage_is_retried_and_a_too_long_answer_is_not(self):
         # A non-empty but unusable answer is the same class as an empty one: the
         # decoder, not the prompt. Production got 62 tokens of word salad where
@@ -1694,6 +1915,7 @@ class NoteCallRetryTests(unittest.TestCase):
             return {"text": text}
 
         import asyncio
+        import json
         import test_share_endpoints
         import ast
 
@@ -1708,19 +1930,26 @@ class NoteCallRetryTests(unittest.TestCase):
         scripted = ["Pro Ad Access At S", '{"title":"T","text":"Body"}']
 
         async def fake_llm(prompt, system="", model="", num_predict=0,
-                           timeout=0.0, options=None):
+                           timeout=0.0, options=None, tools=None,
+                           history=None, return_message=False):
             calls.append(dict(options or {}))
             if not scripted:
                 raise AssertionError(
                     f"unexpected call {len(calls)}: the scripted replies are used up"
                 )
-            return scripted.pop(0)
+            value = scripted.pop(0)
+            if return_message:
+                return {"role": "assistant", "content": value,
+                        "tool_calls": []}
+            return value
 
         namespace = {
             "asyncio": asyncio,
+            "json": json,
             "LIVE_MODEL": "granite3.3:2b",
             "LIVE_SAMPLING": ln.LIVE_SAMPLING,
             "LIVE_SAMPLING_RETRY": ln.LIVE_SAMPLING_RETRY,
+            "LIVE_TOOL_ROUNDS": ln.LIVE_TOOL_ROUNDS,
             "is_repeat_abort": ln.is_repeat_abort,
             "LiveNoteError": ln.LiveNoteError,
             "LiveNoteTooLong": ln.LiveNoteTooLong,

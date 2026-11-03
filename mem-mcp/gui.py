@@ -3726,6 +3726,15 @@ async def live_stream(websocket: WebSocket, transcription_id: str):
                 # on the way past. So this join is what lets the UI summarise
                 # with the end of the sentence already stored.
                 await queue.join()
+                # The pause is the note's thought boundary: `segment_windows`
+                # cuts a window here and `segment_paragraphs` starts a new
+                # paragraph here, even if the same person keeps talking after
+                # the resume. It has to be stored, because asr-mcp restarts its
+                # clock on every connection, so a timestamp gap is an artefact
+                # of reconnecting rather than evidence of a pause.
+                await asyncio.to_thread(
+                    mem.db_set_segment_boundary, transcription_id, user_id,
+                )
                 await asyncio.to_thread(
                     mem.db_update_transcription, transcription_id, user_id,
                     None, None, "paused",
@@ -3788,6 +3797,18 @@ async def live_stream(websocket: WebSocket, transcription_id: str):
             await asyncio.wait_for(queue.join(), timeout=5)
         except Exception:
             pass
+        # Stopping ends the last thought too: the segments written by the tail
+        # flush are already stored, and without this the final sentence joins
+        # whatever came before it into one paragraph.
+        try:
+            await asyncio.to_thread(
+                mem.db_set_segment_boundary, transcription_id, user_id,
+            )
+        except Exception as exc:  # noqa: BLE001 -- stopping must still finish
+            mem.logger.warning(
+                f"live notes: could not mark the final segment boundary for "
+                f"{transcription_id}: {exc}"
+            )
         if writer_task is not None:
             writer_task.cancel()
             try:

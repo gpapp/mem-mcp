@@ -72,7 +72,26 @@ LIVE_SYSTEM_PROMPT = (
     "Structure the note into multiple paragraphs representing separate thoughts, "
     "topics, and pause boundaries, rather than a wall of short text. No points "
     "made in the discussion should be omitted or forgotten. Respect pause "
-    "boundaries and segment groupings as distinct thoughts and paragraphs.\n\n"
+    "boundaries and segment groupings as distinct thoughts and paragraphs. A "
+    "blank line in the transcript is a pause the speaker took: the thought "
+    "before it and the thought after it are separate paragraphs, even when the "
+    "same person is talking. One paragraph is one thought -- do not split a "
+    "single argument across two, and do not merge two arguments into one.\n\n"
+    "The existing note shows its paragraphs numbered `[1]`, `[2]`, ... Those "
+    "numbers are for the tools only; never write them into the note. You have "
+    "these tools, and you should call one when the answer is not already in the "
+    "prompt:\n"
+    "- `lookup_fact(factId)` reads a fact's full text. Only titles are listed "
+    "below, so use it before citing a fact whose detail matters, and to re-read "
+    "one this note already references.\n"
+    "- `get_note_block(block)` reads one paragraph of the current note.\n"
+    "- `replace_note_block(block, markdown)` replaces one paragraph -- use it to "
+    "fold a new point into an existing thought instead of appending a near "
+    "duplicate.\n"
+    "- `append_note_block(markdown)` adds a new paragraph for a thought that "
+    "does not belong in any existing one.\n"
+    "A tool call is not the answer. When you have what you need, answer with "
+    "the complete note as JSON, exactly as described below.\n\n"
     "Every sentence you write must carry something a reader would act on: a "
     "decision, a requirement, a number, a date, an owner, a risk or an open "
     "question. Delete a sentence that only restates another one, and do not "
@@ -209,6 +228,24 @@ def segment_speaker(segment) -> str:
     return str(value or "Speaker").strip() or "Speaker"
 
 
+def segment_boundary(segment) -> bool:
+    """True when the speaker stopped talking after this segment.
+
+    This is the *user's* pause -- the one where the microphone was paused --
+    not asr-mcp's 320 ms turn boundary. asr-mcp ends a turn on silence no human
+    would call a pause, so a note windowed on asr turns is windowed on sentence
+    fragments; a thought ends where the speaker stopped, and that is the only
+    boundary the note is allowed to break on. The flag is written by the pause
+    handler in `gui.py` (`db_set_segment_boundary`) and stays on the row, so it
+    survives a rebuild.
+    """
+    if isinstance(segment, dict):
+        value = segment.get("boundary")
+    else:
+        value = getattr(segment, "boundary", False)
+    return bool(value)
+
+
 _SENTENCE_ENDS = ".!?…"
 
 
@@ -262,6 +299,17 @@ def segment_paragraphs(segments):
     blank segment is skipped rather than splitting the run, because asr-mcp
     emits `empty` turns for silence and a pause is not a change of speaker.
     """
+    return [(speaker, start, text)
+            for speaker, start, text, _closed in _paragraph_runs(segments)]
+
+
+def _paragraph_runs(segments):
+    """Speaker runs with the pause flag: `(speaker, start, text, closed)`.
+
+    Split out of `segment_paragraphs` so the transcript renderer can put a blank
+    line where the speaker actually stopped, without changing the three-tuple
+    the pane and the tests consume.
+    """
     runs = []
     for segment in segments or []:
         text = segment_text(segment)
@@ -269,13 +317,18 @@ def segment_paragraphs(segments):
             continue
         speaker = segment_speaker(segment)
         piece = _tidy_piece(text)
-        if runs and runs[-1][0] == speaker:
+        closed = segment_boundary(segment)
+        # A pause ends the run even when the speaker has not changed: the whole
+        # point of the flag is that the same person started a new thought.
+        if runs and runs[-1][0] == speaker and not runs[-1][3]:
             runs[-1][2].append(piece)
+            runs[-1][3] = closed
         else:
-            runs.append((speaker, segment_start(segment), [piece]))
+            runs.append([speaker, segment_start(segment), [piece], closed])
     return [
-        (speaker, start, " ".join(_capitalise(piece) for piece in pieces))
-        for speaker, start, pieces in runs
+        (speaker, start, " ".join(_capitalise(piece) for piece in pieces),
+         closed)
+        for speaker, start, pieces, closed in runs
     ]
 
 
@@ -288,10 +341,16 @@ def format_segments(segments) -> str:
     speaker are joined -- see `segment_paragraphs` for why that matters more
     than it looks.
     """
-    return "\n".join(
-        f"[{format_timestamp(start)}] {speaker}: {text}"
-        for speaker, start, text in segment_paragraphs(segments)
-    )
+    lines = []
+    previous_closed = False
+    for speaker, start, text, closed in _paragraph_runs(segments):
+        if lines and previous_closed:
+            # A blank line is what the model reads as "a new thought started
+            # here", and it is the only way a pause survives into the prompt.
+            lines.append("")
+        lines.append(f"[{format_timestamp(start)}] {speaker}: {text}")
+        previous_closed = closed
+    return "\n".join(lines)
 
 
 def fact_title(fact) -> str:
@@ -365,6 +424,166 @@ def _note_parts(note) -> tuple:
             str(getattr(note, "text", "") or "").strip())
 
 
+NOTE_BLOCK_MARKER = re.compile(r"^\[(\d+)\]\s+", re.M)
+
+
+def note_blocks(text) -> list:
+    """The note split into its paragraphs -- the units a tool can address."""
+    body = str(text or "").strip()
+    if not body:
+        return []
+    return [part.strip() for part in re.split(r"\n\s*\n", body) if part.strip()]
+
+
+def render_note_blocks(text) -> str:
+    """Numbered paragraph view of the note, so a block can be named by number.
+
+    The numbers exist only in the prompt: a model that echoes `[2]` back into
+    its answer would store the marker in the note, so `strip_block_markers`
+    removes them again before anything is written.
+    """
+    blocks = note_blocks(text)
+    if not blocks:
+        return "(no note yet)"
+    return "\n\n".join(f"[{index}] {block}"
+                       for index, block in enumerate(blocks, start=1))
+
+
+def strip_block_markers(text) -> str:
+    """Drop a leading `[N]` from each line of a note the model returned."""
+    return NOTE_BLOCK_MARKER.sub("", str(text or ""))
+
+
+def replace_note_block(text, block, markdown) -> str:
+    """Replace one numbered paragraph, leaving every other one untouched.
+
+    Indexes are 1-based paragraph numbers of the *current* note, which is what
+    the prompt shows the model. An out-of-range index is refused rather than
+    appended: "change paragraph 7 of a four-paragraph note" is a mistake, and
+    silently turning it into an append is a wrong edit dressed as a success.
+    """
+    blocks = note_blocks(text)
+    try:
+        index = int(block)
+    except (TypeError, ValueError):
+        raise LiveNoteError("block must be a paragraph number from the note")
+    if index < 1 or index > len(blocks):
+        raise LiveNoteError(
+            f"the note has {len(blocks)} paragraph(s); paragraph {index} "
+            "does not exist"
+        )
+    body = strip_block_markers(markdown).strip()
+    if not body:
+        raise LiveNoteError("a replaced paragraph cannot be empty")
+    blocks[index - 1] = body
+    return "\n\n".join(blocks)
+
+
+def append_note_block(text, markdown) -> str:
+    """Add one paragraph at the end of the note."""
+    body = strip_block_markers(markdown).strip()
+    if not body:
+        raise LiveNoteError("an appended paragraph cannot be empty")
+    return "\n\n".join(note_blocks(text) + [body])
+
+
+# The tool surface the note model is given. Defined here, executed in
+# `live_manager.py` -- this module stays dependency-free, and a schema is text.
+# Four tools, all of them about the two things the model genuinely cannot do
+# from the prompt alone: read a fact's *body* (only titles are sent) and change
+# one paragraph of a note it has already written (the prompt shows a snapshot).
+LIVE_TOOL_ROUNDS = int(os.getenv("MEM_LIVE_TOOL_ROUNDS") or 3)
+
+LIVE_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "lookup_fact",
+            "description": (
+                "Read the full text of one fact. Use it when a candidate "
+                "title looks relevant and you need the detail before citing "
+                "it, or to re-read a fact this note already references."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "factId": {
+                        "type": "string",
+                        "description": "An exact id from the candidate or "
+                                       "reference list.",
+                    },
+                },
+                "required": ["factId"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_note_block",
+            "description": (
+                "Read one paragraph of the current note by its number."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "block": {
+                        "type": "integer",
+                        "description": "1-based paragraph number of the note.",
+                    },
+                },
+                "required": ["block"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "replace_note_block",
+            "description": (
+                "Replace one paragraph of the current note. Use it to merge a "
+                "new point into an existing thought, or to correct a paragraph "
+                "an earlier update got wrong. Other paragraphs are untouched."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "block": {
+                        "type": "integer",
+                        "description": "1-based paragraph number to replace.",
+                    },
+                    "markdown": {
+                        "type": "string",
+                        "description": "The paragraph's new Markdown text.",
+                    },
+                },
+                "required": ["block", "markdown"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "append_note_block",
+            "description": (
+                "Add a new paragraph at the end of the note, for a thought "
+                "that does not belong in an existing one."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "markdown": {
+                        "type": "string",
+                        "description": "The new paragraph in Markdown.",
+                    },
+                },
+                "required": ["markdown"],
+            },
+        },
+    },
+]
+
+
 def build_live_prompt(note, segments, referenced, candidates,
                       client="", context="") -> str:
     """The exact user prompt for one summarise call.
@@ -377,7 +596,8 @@ def build_live_prompt(note, segments, referenced, candidates,
     body into the window by passing a full record.
     """
     title, text = _note_parts(note)
-    note_block = f"{title}\n\n{text}".strip() if (title or text) else "(no note yet)"
+    note_block = (f"{title}\n\n{render_note_blocks(text)}".strip()
+                  if (title or text) else "(no note yet)")
     transcript_block = format_segments(segments) or "(no new speech)"
 
     reference_lines = [f"- {fact_title(fact)}"
@@ -450,7 +670,9 @@ def parse_note_json(raw, allowed_ids, existing_ids=(), max_chars=None) -> dict:
     text = data.get("text")
     if not isinstance(text, str) or not text.strip():
         raise LiveNoteError("the model answer had no note text")
-    text = text.strip()
+    # A model that echoed the prompt's `[N]` paragraph numbers back into its
+    # answer must not store them: the numbering is a tool address, not content.
+    text = strip_block_markers(text).strip()
     if len(text) > limit:
         raise LiveNoteTooLong(
             f"the note is {len(text)} chars, over the {limit}-char limit; "
@@ -569,22 +791,31 @@ def segment_windows(segments, window=None):
     failure mode windowing exists to prevent. Overlap is deliberately absent --
     unlike free text, a segment is a complete unit, so repeating one would make
     the model write the same paragraph into the note twice.
+
+    **A window also closes on a pause.** The character budget is a transport
+    limit -- it exists because the model has a context -- but the boundary the
+    note is *written* on is the point where the speaker stopped talking, and
+    `segment_boundary` is the only thing that knows where that was. Windows cut
+    purely on characters produced notes that merged two unrelated thoughts and
+    split one in half, which is what "a wall of short text" was describing.
     """
     size = LIVE_WINDOW if window is None else max(1, int(window))
     batches = []
     current = []
     used = 0
+    pending_close = False
     for segment in segments or []:
         text = segment_text(segment)
         if not text:
             continue
         line_length = len(text) + len(segment_speaker(segment)) + 12
-        if current and used + line_length > size:
+        if current and (pending_close or used + line_length > size):
             batches.append(current)
             current = []
             used = 0
         current.append(segment)
         used += line_length
+        pending_close = segment_boundary(segment)
     if current:
         batches.append(current)
     return batches

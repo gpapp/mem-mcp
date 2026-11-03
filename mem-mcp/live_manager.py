@@ -27,6 +27,7 @@ a cycle. The one import is function-local, where it is needed.
 """
 
 import asyncio
+import json
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -46,17 +47,22 @@ from live_notes import (
     LIVE_SAMPLING,
     LIVE_SAMPLING_RETRY,
     LIVE_SYSTEM_PROMPT,
+    LIVE_TOOL_ROUNDS,
+    LIVE_TOOLS,
     LiveNoteError,
     LiveNoteTooLong,
     LivePriorityGate,
     RecordingActiveError,
+    append_note_block,
     asr_unload_url,
     build_compaction_prompt,
     build_live_prompt,
     is_repeat_abort,
     live_output_budget,
+    note_blocks,
     parse_note_json,
     rank_fact_candidates,
+    replace_note_block,
     segment_windows,
 )
 
@@ -139,6 +145,7 @@ def _segment_dict(node) -> dict:
         "editedAt": _stamp(node.get("editedAt")),
         "consumedBy": node.get("consumedBy"),
         "consumedAt": _stamp(node.get("consumedAt")),
+        "boundary": bool(node.get("boundary")),
     }
 
 
@@ -441,6 +448,54 @@ def db_list_segments(transcription_id: str, user_id: str,
             onlyUnconsumed=bool(only_unconsumed),
         ).data()
     return [_segment_dict(row["seg"]) for row in rows]
+
+
+def db_set_segment_boundary(transcription_id: str, user_id: str,
+                            segment_id: Optional[str] = None) -> int:
+    """Mark the last segment -- or a named one -- as where the speaker paused.
+
+    The pause is the only boundary the note is written on, and it cannot be
+    derived after the fact: asr-mcp restarts its clock on every connection, so
+    a gap in `startSec` is an artefact of reconnecting, not evidence of a
+    thought ending. The WebSocket proxy writes this when the user pauses or
+    stops, and `segment_windows` / `segment_paragraphs` read it.
+    """
+    driver = _require_driver()
+    with driver.session() as s:
+        row = s.run(
+            """
+            MATCH (t:Transcription {id: $id, userId: $userId})
+                  -[:HAS_SEGMENT]->(seg:TranscriptionSegment {userId: $userId})
+            WHERE $segmentId = '' OR seg.id = $segmentId
+            WITH seg ORDER BY seg.seq DESC LIMIT 1
+            SET seg.boundary = true, seg.updatedAt = datetime()
+            RETURN count(seg) AS marked
+            """,
+            id=transcription_id, userId=user_id,
+            segmentId=str(segment_id or ""),
+        ).single()
+    return int((row or {}).get("marked") or 0)
+
+
+def db_get_fact_body(fact_id: str, user_id: str) -> Optional[dict]:
+    """One fact's title and text, for the note's `lookup_fact` tool.
+
+    The prompt carries titles only -- a body is the thing a tool exists to
+    fetch -- so this is the one read that can put prose in front of the model
+    mid-answer, and it is scoped to the caller's own vault.
+    """
+    driver = _require_driver()
+    with driver.session() as s:
+        row = s.run(
+            """
+            MATCH (f:Fact {id: $id, userId: $userId})
+            RETURN f.name AS name, f.text AS text
+            """,
+            id=fact_id, userId=user_id,
+        ).single()
+    if not row:
+        return None
+    return {"name": row["name"] or "", "text": row["text"] or ""}
 
 
 def db_transcription_state(transcription_id: str, user_id: str) -> Optional[dict]:
@@ -1098,7 +1153,8 @@ def note_job_status(transcription_id: str, user_id: str) -> Optional[dict]:
 
 
 async def _call_live_llm(job: dict, prompt: str, system: str,
-                         num_predict: int, parse=None):
+                         num_predict: int, parse=None, tools=None,
+                         run_tool=None, refresh_prompt=None):
     """One model call whose LLM phase the priority gate can cancel.
 
     The cancellation hook is registered **only around this call** and cleared
@@ -1141,6 +1197,73 @@ async def _call_live_llm(job: dict, prompt: str, system: str,
 
     if not LIVE_GATE.register_llm_cancel(job["userId"], _cancel):
         raise NoteJobDeferred("recording started before the model call")
+
+    async def _run_tool_call(call) -> str:
+        """Execute one tool call and render its result for the model.
+
+        A failing tool is reported *to the model* rather than raised: it asked
+        for something that did not work, and the note still has to be written.
+        The only exception that stops this is the job being torn down.
+        """
+        function = (call or {}).get("function") or {}
+        name = str(function.get("name") or "").strip()
+        raw = function.get("arguments")
+        if isinstance(raw, str):
+            try:
+                args = json.loads(raw) if raw.strip() else {}
+            except (ValueError, TypeError):
+                return f"{name}: the arguments were not valid JSON"
+        elif isinstance(raw, dict):
+            args = raw
+        else:
+            args = {}
+        if not isinstance(args, dict):
+            args = {}
+        try:
+            return await run_tool(name, args)
+        except (NoteJobDeferred, LiveNoteError):
+            raise
+        except Exception as exc:  # noqa: BLE001 -- the model is told, not crashed
+            logger.warning(f"live notes: tool {name} failed: {exc}")
+            return f"{name} failed: {exc}"
+
+    async def _turns(history, sampling, budget_tokens):
+        """Run the model until it answers instead of calling a tool.
+
+        Bounded by `LIVE_TOOL_ROUNDS` because a small model can otherwise ask
+        for a lookup forever, and each round is a full prompt evaluation. The
+        prompt is rebuilt after every round: a `replace_note_block` changes the
+        paragraph numbering, and answering against stale numbering would put an
+        edit on the wrong thought.
+        """
+        rounds = max(0, LIVE_TOOL_ROUNDS)
+        for round_index in range(rounds + 1):
+            message = await get_llm_response(
+                prompt,
+                model=LIVE_MODEL,
+                num_predict=budget_tokens,
+                options=sampling,
+                tools=tools or None,
+                history=history,
+                return_message=True,
+            )
+            calls = message.get("tool_calls") or []
+            if calls and run_tool is not None and round_index < rounds:
+                history.append({
+                    "role": "assistant",
+                    "content": message.get("content") or "",
+                    "tool_calls": calls,
+                })
+                for call in calls:
+                    history.append({"role": "tool",
+                                    "content": await _run_tool_call(call)})
+                if refresh_prompt is not None:
+                    history[1 if system else 0] = {
+                        "role": "user", "content": refresh_prompt()}
+                continue
+            return message.get("content") or "", history
+        return "", history
+
     last_error = None
     try:
         await _unload_asr()
@@ -1159,12 +1282,15 @@ async def _call_live_llm(job: dict, prompt: str, system: str,
         # first attempt, because being asked twice does not improve it.
         for attempt, sampling in enumerate((LIVE_SAMPLING, LIVE_SAMPLING_RETRY)):
             try:
-                answer = await get_llm_response(
-                    prompt,
-                    system=system,
-                    model=LIVE_MODEL,
-                    num_predict=max(1, int(num_predict)),
-                    options=sampling,
+                # A fresh conversation per attempt: a retry that inherited the
+                # failed attempt's tool turns would answer against a transcript
+                # of a call that is not the one being judged.
+                history = []
+                if system:
+                    history.append({"role": "system", "content": system})
+                history.append({"role": "user", "content": prompt})
+                answer, _history = await _turns(
+                    history, sampling, max(1, int(num_predict)),
                 )
             except RuntimeError as exc:
                 if attempt or not is_repeat_abort(exc):
@@ -1374,6 +1500,68 @@ async def _refresh_note(job: dict) -> None:
         allowed_ids = {item["id"] for item in candidates}
         allowed_ids.update(item["id"] for item in referenced)
 
+        # The tools the model may call during this window. `lookup_fact` reads a
+        # body the prompt deliberately does not carry; the three block tools
+        # edit a scratchpad copy of the note, and `refresh_prompt` shows the
+        # model the result on its next turn so "change paragraph 2" is something
+        # it can actually do rather than something it has to simulate in one
+        # answer.
+        note_state = {"text": (working or {}).get("text") or "",
+                      "edited": False}
+        note_before_tools = note_state["text"]
+
+        async def run_tool(name, args, _allowed=allowed_ids):
+            if name == "lookup_fact":
+                fact_id = str(args.get("factId") or "").strip()
+                if fact_id not in _allowed:
+                    return ("that id is not in the candidate or reference "
+                            "list; use an id exactly as it is listed")
+                record = await asyncio.to_thread(
+                    db_get_fact_body, fact_id, user_id,
+                )
+                if not record:
+                    return f"fact {fact_id} is not available"
+                return (f"{record['name'] or '(untitled)'}\n\n"
+                        f"{record['text'] or '(no text)'}")
+            if name == "get_note_block":
+                blocks = note_blocks(note_state["text"])
+                try:
+                    index = int(args.get("block"))
+                except (TypeError, ValueError):
+                    return "block must be an integer paragraph number"
+                if index < 1 or index > len(blocks):
+                    return (f"the note has {len(blocks)} paragraph(s); "
+                            f"paragraph {index} does not exist")
+                return blocks[index - 1]
+            if name == "replace_note_block":
+                note_state["text"] = replace_note_block(
+                    note_state["text"], args.get("block"),
+                    args.get("markdown") or "",
+                )
+                note_state["edited"] = True
+                return ("replaced; the note now has "
+                        f"{len(note_blocks(note_state['text']))} paragraph(s)")
+            if name == "append_note_block":
+                note_state["text"] = append_note_block(
+                    note_state["text"], args.get("markdown") or "",
+                )
+                note_state["edited"] = True
+                return ("appended; the note now has "
+                        f"{len(note_blocks(note_state['text']))} paragraph(s)")
+            return f"there is no tool called {name}"
+
+        def refresh_prompt(_window=window, _cands=candidates, _refs=referenced):
+            # Rebuilt rather than patched: a block edit renumbers the note, and
+            # answering `replace_note_block(3, ...)` against the old numbering
+            # would put the text on the wrong thought.
+            return build_live_prompt(
+                {"name": (working or {}).get("name") or "",
+                 "text": note_state["text"]},
+                _window, _refs, _cands,
+                client=transcription.get("clientName") or "",
+                context=transcription.get("contextName") or "",
+            )
+
         def parse_answer(text, _allowed=allowed_ids, _refs=referenced):
             # Parse without the limit first so an over-long answer can be
             # compacted. Parsing with the limit would raise and throw away the
@@ -1387,7 +1575,15 @@ async def _refresh_note(job: dict) -> None:
         result = await _call_live_llm(
             job, prompt, LIVE_SYSTEM_PROMPT, budget["budget"],
             parse=parse_answer,
+            tools=LIVE_TOOLS, run_tool=run_tool,
+            refresh_prompt=refresh_prompt,
         )
+        if (note_state["edited"]
+                and result["text"].strip() == note_before_tools.strip()):
+            # The model changed a paragraph with a tool and then answered with
+            # the note it was given, unchanged. The edit is the answer; dropping
+            # it would make the tool a no-op that reported success.
+            result["text"] = note_state["text"]
         if len(result["text"]) > LIVE_NOTE_MAX_CHARS:
             result = await _compact_note(job, result, allowed_ids)
             if len(result["text"]) > LIVE_NOTE_MAX_CHARS:

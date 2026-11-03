@@ -56,6 +56,7 @@ from live_manager import (
     db_update_transcription, db_set_transcription_scope,
     db_delete_transcription,
     db_append_segment, db_list_segments, db_transcription_state,
+    db_set_segment_boundary,
     db_update_segment, db_delete_segment, db_mark_segments_consumed,
     db_get_note_for_transcription, db_set_note_transcription,
     db_get_note_references, db_set_note_references,

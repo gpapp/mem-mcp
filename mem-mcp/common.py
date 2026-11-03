@@ -909,7 +909,10 @@ def _ollama_failure_hint(body) -> str:
 
 async def get_llm_response(prompt: str, system: str = "", model: str = "",
                            num_predict: int = 0, timeout: float = 0.0,
-                           options: Optional[dict] = None) -> str:
+                           options: Optional[dict] = None,
+                           tools: Optional[list] = None,
+                           history: Optional[list] = None,
+                           return_message: bool = False):
     """Call Ollama /api/chat and return the assistant's text response.
 
     Uses LLM_QUERY_MODEL (default: qwen3.5:0.8b) unless overridden by `model`.
@@ -927,10 +930,17 @@ async def get_llm_response(prompt: str, system: str = "", model: str = "",
     deliberate fallbacks for it.
     """
     resolved_model = model or LLM_QUERY_MODEL
-    messages: list = []
-    if system:
-        messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": prompt})
+    if history is not None:
+        # The caller already holds the conversation -- the live note's tool loop
+        # is the only caller that does -- and rebuilding it here would drop the
+        # assistant turns that carry the tool calls, which is exactly the part
+        # the model needs to see its own request answered.
+        messages: list = list(history)
+    else:
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
     body_options: dict = {"temperature": 0.0}
     if options:
         # Caller-supplied keys win, including temperature: a caller that names a
@@ -946,6 +956,12 @@ async def get_llm_response(prompt: str, system: str = "", model: str = "",
         "think": False,
         "options": body_options,
     }
+    if tools:
+        # Ollama's /api/chat takes OpenAI-shaped function schemas. Whether a
+        # given model *uses* them is the model's business; sending them is what
+        # makes the capability possible at all, and the loop that answers a call
+        # lives in the caller that supplied the executors.
+        request_body["tools"] = list(tools)
     budget = timeout or LLM_TIMEOUT
     url = f"{OLLAMA_URL}/api/chat"
     logger.warning(
@@ -1001,7 +1017,11 @@ async def get_llm_response(prompt: str, system: str = "", model: str = "",
             f"{detail[:500]}" + (f". {hint}" if hint else "")
         )
     try:
-        content = resp.json()["message"]["content"]
+        message = resp.json()["message"]
+        if not isinstance(message, dict):
+            raise TypeError("the chat message was not an object")
+        content = str(message.get("content") or "")
+        tool_calls = message.get("tool_calls") or []
     except (ValueError, KeyError, TypeError) as exc:
         logger.error(
             f"LLM response was not a chat message: model={resolved_model}, "
@@ -1014,7 +1034,7 @@ async def get_llm_response(prompt: str, system: str = "", model: str = "",
     # Strip any residual <think>…</think> blocks just in case
     import re as _re
     content = _re.sub(r"<think>.*?</think>", "", content, flags=_re.DOTALL).strip()
-    if not content:
+    if not content and not tool_calls:
         # Logged hard, but still returned as "". A model that loaded and produced
         # nothing used to be completely invisible -- the caller fell back to the
         # raw query or to no keywords and the vault just quietly got worse.
@@ -1032,8 +1052,14 @@ async def get_llm_response(prompt: str, system: str = "", model: str = "",
         )
     logger.warning(
         f"Ollama result: chat model={resolved_model} content_chars={len(content)} "
-        f"content={_llm_excerpt(content)}"
+        f"tool_calls={len(tool_calls)} content={_llm_excerpt(content)}"
     )
+    if return_message:
+        # The tool loop needs the calls, which `content` alone discards. Only
+        # the live-note rewrite asks for this; every other caller gets a string
+        # and never learns a tool channel exists.
+        return {"role": "assistant", "content": content,
+                "tool_calls": tool_calls}
     return content
 
 # ---------------------------------------------------------------------------
