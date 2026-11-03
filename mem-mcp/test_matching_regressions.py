@@ -1713,7 +1713,7 @@ class RewriteSearchQueryCallSiteTests(unittest.TestCase):
 
         Measured on the live logs: 69 of 469 rewrites returned the filter line as
         a keyword, `"People category"` for 102 distinct queries, all on one day.
-        The prompt puts `SEARCH FILTERS: category=People` in front of the query
+        The prompt puts `FILTERS: category=People` in front of the query
         and a small model reads that as content to preserve, so the keyword
         passes every existing filter -- it is a string, it is short, it differs
         from the query -- and is appended at weight 0.85 next to the real name.

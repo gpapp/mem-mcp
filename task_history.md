@@ -5,6 +5,18 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# Small/Tiny LLM Prompt Optimizations & Cache Alignment (2026-11-01)
+
+- **Reported as**: Ensure prompts work well with tiny LLM models, ensure the KV cache is properly utilized so prompts don't need to be re-run unnecessarily per call, and review corresponding skills and tool descriptions.
+- **What changed**:
+  - Tightened and simplified the search rewriter prompt (`fact_manager.py`) to reduce filter echo and work better with tiny models.
+  - Aligned keyword extraction prompt (`diary_manager.py`) and people extraction prompt for clarity and brevity.
+  - Updated MCP tool descriptions (`search_facts`) to explicitly document direct ≤2-word keyword search bypassing LLM rewrites and session-level query rewrite caching.
+  - Updated transcription skill (`skills/process-transcription.md`) to note cache utilization for repeated people resolution queries.
+- **Verified**: 1373 unit tests passed across all regression suites; `py_compile` clean; `git diff --check` clean.
+
+---
+
 # The GPU reservation moved into the base compose file (2026-10-28)
 
 - **Reported as** "Please merge docker-compose.gpu.yml and add documentation to

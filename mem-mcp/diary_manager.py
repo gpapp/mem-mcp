@@ -128,10 +128,11 @@ async def _delete_diary_chunks(entry_id: str) -> None:
 
 
 _KEYWORD_EXTRACT_SYSTEM = (
-    "You are a keyword extractor. Given a diary entry, extract the most important "
-    "searchable keywords and short phrases (people, places, projects, topics, events). "
-    "Return ONLY a JSON object: {\"keywords\": [\"kw1\", \"kw2\", ...]}. "
-    "Max 10 items, lowercase, 1-3 words each, no generic words like 'meeting' or 'today'."
+    "Extract searchable keywords from a diary entry excerpt. "
+    "Return ONLY JSON: {\"keywords\": [\"kw1\", \"kw2\", ...]}. "
+    "Up to 10 items per excerpt, lowercase, 1-3 words each. "
+    "Include: people names, places, projects, technologies, topics. "
+    "Exclude generic words like 'meeting', 'today', 'discussed', 'update'."
 )
 
 # The old implementation sent text[:1500], so a 40k transcription got keywords
@@ -221,13 +222,12 @@ async def extract_diary_keywords(name: str, content: str) -> list:
 # MENTIONS edges to matching People facts.
 # ---------------------------------------------------------------------------
 _PEOPLE_EXTRACT_SYSTEM = (
-    "You are a named-entity extractor. Extract the full names of every person "
-    "explicitly mentioned in the text. "
-    "Return ONLY a JSON array of strings, e.g. [\"Alice Smith\", \"Bob Jones\"]. "
-    "Return [] if no people are mentioned. Never add explanations. "
-    "Ignore speaker labels such as SPEAKER1, SPEAKER 2, and SPEAKER#3; they are not names. "
-    "IMPORTANT: ignore anything in parentheses — it is a role or description, not part of the name. "
-    "For example, 'Alice Smith (host)' → extract only 'Alice Smith'."
+    "Extract full names of people explicitly mentioned in the text. "
+    "Return ONLY a JSON array: [\"Alice Smith\", \"Bob Jones\"]. "
+    "Return [] if none. No explanations. "
+    "Ignore: speaker labels (SPEAKER1, SPEAKER 2, SPEAKER#3). "
+    "Ignore: anything in parentheses — it is a role, not part of the name. "
+    "Example: 'Alice Smith (host)' → 'Alice Smith'."
 )
 
 # Name extraction runs per window, so these control both the coverage of a long
@@ -787,9 +787,15 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
         for v in all_results.values():
             p = v["point"].payload or {}
             cname = (p.get("clientName") or (p.get("metadata") or {}).get("clientName", "") or "").lower()
-            if not cname or cname == (want_client or "").lower():
-                continue
-            if status_map.get(cname) is False:
+            xname = (p.get("contextName") or (p.get("metadata") or {}).get("contextName", "") or "").lower()
+            penalize = False
+            if cname and cname != (want_client or "").lower():
+                if status_map.get(cname) is False:
+                    penalize = True
+            if xname and xname != (want_context or "").lower():
+                if status_map.get(f"{cname}/{xname}") is False or status_map.get(xname) is False:
+                    penalize = True
+            if penalize:
                 v["score"] -= INACTIVE_PENALTY
 
     # Query-inferred scope is a score boost, not a ranking signal: it fires only

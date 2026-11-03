@@ -2856,15 +2856,18 @@
     const pinned = c.statusPinned ? ' 📌' : '';
     const sharedBadge = c.shared ? ` <span title="Shared by ${escHtml(c.owner || '')}" style="font-size:.75rem;color:var(--muted);">🔗 shared by ${escHtml(c.owner || '')} (${escHtml(c.permission || 'read')})</span>` : '';
     const ctxRows = (c.contexts || []).map(x => {
+      const xon = x.effectiveActive !== false;
+      const xpinned = x.statusPinned ? ' 📌' : '';
       const xshared = x.shared ? ` <span title="Shared by ${escHtml(x.owner || '')}" style="font-size:.75rem;color:var(--muted);">🔗 shared (${escHtml(x.permission || 'read')})</span>` : '';
       const xactions = x.shared ? '' : `
+          <button class="btn btn-sm btn-ghost" onclick="toggleContext('${x.id}', ${xon ? 'false' : 'true'})">${xon ? 'Deactivate' : 'Activate'}</button>
           <button class="btn btn-sm btn-ghost" onclick="renameContext('${x.id}')">✏️ Rename</button>
           <button class="btn btn-sm btn-danger" onclick="deleteContext('${x.id}')">🗑️</button>`;
       const xshare = (x.shared || !SHARING_ENABLED) ? '' : `<button class="btn btn-sm btn-ghost" onclick="openShareDialog('context','${x.id}','${escHtml(x.name)}')">🔗 Share</button>`;
       return `
       <div class="scope-card" style="margin:.3rem 0 0 1.2rem;">
         <div class="scope-card-header" onclick="toggleScopeItems('ctx-${x.id}', 'context', '${x.id}')">
-          <span class="scope-card-name" style="font-size:.83rem;">📁 ${escHtml(x.name)}${xshared}</span>
+          <span class="scope-card-name" style="font-size:.83rem;">${xon ? '🟢' : '⚪'} ${escHtml(x.name)}${xpinned}${xshared}</span>
           <div class="scope-card-actions" onclick="event.stopPropagation()">
             ${xshare}${xactions}
           </div>
@@ -3038,6 +3041,16 @@
       await loadClients();
       await loadMemories();
     } catch(e) { toast('⚠️ Could not delete project'); }
+  }
+
+  async function toggleContext(id, active) {
+    try {
+      await api.put('contexts/' + id, {active});
+      toast(active ? 'Project activated 📌' : 'Project deactivated 📌');
+      await loadClients();
+      renderMemories();
+      renderCategorySidebar();
+    } catch(e) { toast('⚠️ Could not update project'); }
   }
 
   async function toggleClient(id, active) {

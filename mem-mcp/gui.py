@@ -1521,22 +1521,31 @@ async def api_update_client(client_id: str, request: Request, body: ClientUpdate
 
 
 class ContextUpdate(BaseModel):
-    name: str
+    name: Optional[str] = None
+    active: Optional[bool] = None
 
 
 @web_app.put("/api/contexts/{context_id}", response_class=JSONResponse)
-async def api_rename_context(context_id: str, request: Request, body: ContextUpdate):
-    """Rename a project (Context node) within its client."""
+async def api_update_context(context_id: str, request: Request, body: ContextUpdate):
+    """Pin a project as active/inactive and/or rename it."""
     try:
         user_id = _require_user(request)
         _require_owner(user_id, context_id)
-        try:
-            renamed = await mem.db_rename_context(context_id, body.name, user_id)
-        except ValueError as e:
-            raise _conflict(e)
-        if not renamed:
-            raise HTTPException(status_code=404, detail="Project not found or access denied.")
-        return {"id": context_id, "name": body.name.strip()}
+        result = {"id": context_id}
+        if body.active is not None:
+            found = await mem.db_set_context_active(context_id, body.active, user_id)
+            if not found:
+                raise HTTPException(status_code=404, detail="Project not found or access denied.")
+            result.update({"active": body.active, "pinned": True})
+        if body.name is not None:
+            try:
+                renamed = await mem.db_rename_context(context_id, body.name, user_id)
+            except ValueError as e:
+                raise _conflict(e)
+            if not renamed:
+                raise HTTPException(status_code=404, detail="Project not found or access denied.")
+            result["name"] = body.name.strip()
+        return result
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
     except RuntimeError as e:

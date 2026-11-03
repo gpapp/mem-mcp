@@ -69,6 +69,10 @@ LIVE_SYSTEM_PROMPT = (
     "what does not: small talk, side conversations, unrelated work, and speech "
     "that adds nothing to the note. Summarise; do not transcribe. Never invent "
     "names, decisions, numbers or facts.\n\n"
+    "Structure the note into multiple paragraphs representing separate thoughts, "
+    "topics, and pause boundaries, rather than a wall of short text. No points "
+    "made in the discussion should be omitted or forgotten. Respect pause "
+    "boundaries and segment groupings as distinct thoughts and paragraphs.\n\n"
     "Every sentence you write must carry something a reader would act on: a "
     "decision, a requirement, a number, a date, an owner, a risk or an open "
     "question. Delete a sentence that only restates another one, and do not "
@@ -708,6 +712,21 @@ def asr_languages_url(ws_url: str) -> str:
     else:
         path = path.rsplit("/", 1)[0]
     path = path.rstrip("/") + "/languages"
+    return urlunsplit((scheme, parts.netloc, path, "", ""))
+
+
+def asr_unload_url(ws_url: str) -> str:
+    """The HTTP URL that unloads the ASR model from GPU memory."""
+    parts = urlsplit(str(ws_url or "").strip())
+    if not parts.netloc:
+        return ""
+    scheme = {"ws": "http", "wss": "https"}.get(parts.scheme, "http")
+    path = parts.path or "/"
+    if "/ws/" in path:
+        path = path.split("/ws/", 1)[0]
+    else:
+        path = path.rsplit("/", 1)[0]
+    path = path.rstrip("/") + "/unload"
     return urlunsplit((scheme, parts.netloc, path, "", ""))
 
 

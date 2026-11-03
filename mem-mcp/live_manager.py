@@ -32,7 +32,10 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
+import httpx
+import sessions as vault_sessions
 from common import (
+    ASR_WS_URL,
     LIVE_MODEL, get_llm_response, get_neo4j, logger, publish_db_event,
 )
 from client_manager import _resolve_client_by_id, _resolve_context_by_id
@@ -47,6 +50,7 @@ from live_notes import (
     LiveNoteTooLong,
     LivePriorityGate,
     RecordingActiveError,
+    asr_unload_url,
     build_compaction_prompt,
     build_live_prompt,
     is_repeat_abort,
@@ -1115,6 +1119,20 @@ async def _call_live_llm(job: dict, prompt: str, system: str,
     the compaction pass. Retrying it would ask the same model to ignore its own
     instruction and produce the same length again.
     """
+    async def _unload_asr():
+        try:
+            token = await asyncio.to_thread(vault_sessions.get_asr_token, job["userId"])
+            if not token or not ASR_WS_URL:
+                return
+            url = asr_unload_url(ASR_WS_URL)
+            if not url:
+                return
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.post(url, headers={"X-API-Key": token})
+            await asyncio.sleep(0.5)
+        except Exception as exc:  # noqa: BLE001 -- best effort unload
+            logger.warning("live notes: could not unload asr-mcp model: %s", exc)
+
     loop_task = asyncio.current_task()
 
     def _cancel():
@@ -1125,6 +1143,7 @@ async def _call_live_llm(job: dict, prompt: str, system: str,
         raise NoteJobDeferred("recording started before the model call")
     last_error = None
     try:
+        await _unload_asr()
         # One retry, and only for the failures that are the DECODER rather than
         # the prompt:
         #

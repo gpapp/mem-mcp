@@ -1435,7 +1435,7 @@ class ReadOnlyGatingTests(unittest.TestCase):
         html = self._render([("card", f"_renderClientCard({json.dumps(shared)})")])["card"]
         self.assertNotIn("THREW", html)
         for handler in ("renameClient(", "deleteClient(", "toggleClient(",
-                        "toggleCrossClient(", "renameContext(", "deleteContext("):
+                        "toggleCrossClient(", "renameContext(", "deleteContext(", "toggleContext("):
             self.assertNotIn(handler, html,
                              msg=f"a shared client card still renders {handler}")
         self.assertIn("🔗 shared by alice", html)
@@ -1445,7 +1445,7 @@ class ReadOnlyGatingTests(unittest.TestCase):
                  "contexts": [{"id": "x1", "name": "Own"}]}
         html = self._render([("card", f"_renderClientCard({json.dumps(owned)})")])["card"]
         for handler in ("renameClient(", "deleteClient(", "toggleClient(",
-                        "renameContext(", "deleteContext("):
+                        "renameContext(", "deleteContext(", "toggleContext("):
             self.assertIn(handler, html,
                           msg=f"an owned client card no longer offers {handler}")
 

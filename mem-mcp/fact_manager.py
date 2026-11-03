@@ -1166,15 +1166,12 @@ async def rewrite_search_query(query: str, category: Optional[str] = None,
         ) if value
     ) or "none"
     system = (
-        "You are a search query rewriter. Given a natural language query, "
-        "extract 2-4 short keyword phrases optimised for vector similarity search. "
-        "Return ONLY a JSON object with this exact structure: "
-        "{\"keywords\": [\"phrase1\", \"phrase2\"]}. "
-        "Rules: max 3 words per phrase, use nouns and proper nouns, "
-        "omit stop words, no questions, most specific terms first. "
-        "Preserve names and terms that may be exact identifiers."
+        "Extract 2-4 keyword phrases for vector search. "
+        "Return ONLY JSON: {\"keywords\": [\"phrase1\", \"phrase2\"]}. "
+        "Rules: max 3 words each, nouns and proper nouns only, no stop words, "
+        "most specific first, preserve exact names and identifiers."
     )
-    prompt = f"SEARCH FILTERS: {filters}\nQUERY: {q}"
+    prompt = f"QUERY: {q}\nFILTERS: {filters}"
     try:
         import json as _json
         raw = await get_llm_response(prompt, system=system, model=EXTRACT_MODEL,
@@ -1821,9 +1818,15 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
     if status_map:
         for r in final_list:
             cname = (r.get("clientName") or (r.get("metadata") or {}).get("clientName", "") or "").lower()
-            if not cname or cname == (want_client or "").lower():
-                continue
-            if status_map.get(cname) is False:
+            xname = (r.get("contextName") or (r.get("metadata") or {}).get("contextName", "") or "").lower()
+            penalize = False
+            if cname and cname != (want_client or "").lower():
+                if status_map.get(cname) is False:
+                    penalize = True
+            if xname and xname != (want_context or "").lower():
+                if status_map.get(f"{cname}/{xname}") is False or status_map.get(xname) is False:
+                    penalize = True
+            if penalize:
                 r["score"] -= INACTIVE_PENALTY
 
     # Query-inferred scope is a score boost, not a ranking signal: it fires when

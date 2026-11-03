@@ -857,7 +857,7 @@ def build_cases(prompts: dict, long_people: bool = True) -> dict:
         ],
         "search_rewrite": [
             {"id": f"rewrite-{i}", "system": prompts["search_rewrite"],
-             "prompt": (f"SEARCH FILTERS: {filters or 'none'}\nQUERY: {query}"),
+             "prompt": (f"QUERY: {query}\nFILTERS: {filters or 'none'}"),
              "num_predict": 200, "expect": {"query": query}}
             for i, (category, query, client, context) in enumerate(REWRITE_CASES)
             for filters in [", ".join(v for v in (

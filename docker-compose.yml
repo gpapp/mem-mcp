@@ -131,7 +131,7 @@ services:
       # i.e. the GTX 1650 was bypassed entirely. Leave it unset so each model
       # lands on a device by its own fit.
       - OLLAMA_VULKAN=1
-      - OLLAMA_IGPU_ENABLE=1
+      - OLLAMA_IGPU_ENABLE=0
       - NVIDIA_DRIVER_CAPABILITIES=all
     # The reservation is what makes the card *visible*. Without it Ollama
     # reports `100% CPU` and runs every call on the processor -- and with it,

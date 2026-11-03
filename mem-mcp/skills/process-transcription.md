@@ -62,7 +62,7 @@ Other metadata:
 - Identify meeting name, topic, and context (internal/client/etc.)
 - Capture the **original file identity** — pass through all phases for diary metadata and the local save filename
 - **Cross-machine rule:** the memory server never opens local files. `metadata.original_file` must be a **stable id, not an absolute path**: `<basename> (<bytes> bytes)` — or a content hash if the file may move between machines.
-- Apply stored corrections: `search_facts("correction")` → fix recurring misspellings of names and terms before proceeding.
+- Apply stored corrections: `search_facts("correction")` → fix recurring misspellings of names and terms before proceeding. ("correction" is ≤2 words, so this goes straight to the vector index.)
 
 ### 2. Transcript Format Recognition
 
@@ -172,6 +172,8 @@ For **each** name from step 2, search memory. Use **liberal matching** — the v
 search_facts("<Full Name>", category="People", top_p=0.4)
 search_facts("<First Name>", category="People", top_p=0.4)
 ```
+
+Queries of ≤2 words (like a single first name) bypass the LLM rewriter entirely and go straight to the vector index — they are the fastest path. Longer full-name queries are rewritten once and cached for the session, so repeating the same search (e.g. when cross-checking during Phase 3) costs nothing.
 
 If the person's first+last name doesn't match, try querying by their first or last name individually before falling back to broader terms.
 

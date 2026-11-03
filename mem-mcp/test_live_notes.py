@@ -194,7 +194,11 @@ class PromptTests(unittest.TestCase):
         self.assertIn("Real speech", prompt)
         self.assertNotIn("[00:00] Ana:  \n", prompt)
 
-    def test_the_prompt_tells_the_note_to_ignore_off_topic_speech(self):
+    def test_the_prompt_structures_into_multiple_paragraphs_and_thoughts(self):
+        prompt = ln.LIVE_SYSTEM_PROMPT
+        self.assertIn("multiple paragraphs", prompt)
+        self.assertIn("separate thoughts", prompt)
+        self.assertIn("pause boundaries", prompt)
         # Reported symptom: the note carried the rambling. The old prompt said
         # "incorporate every new section", which mandates exactly that -- an
         # instruction to summarise by topic has to say what to leave out.
@@ -837,6 +841,12 @@ class AsrLanguagesUrlTests(unittest.TestCase):
 
     def test_an_unconfigured_url_is_empty_so_the_caller_can_say_so(self):
         self.assertEqual(ln.asr_languages_url(""), "")
+
+    def test_asr_unload_url(self):
+        self.assertEqual(
+            ln.asr_unload_url("ws://host.docker.internal:8087/api/asr/ws/stream"),
+            "http://host.docker.internal:8087/api/asr/unload",
+        )
 
 
 class _ProbeResponse:

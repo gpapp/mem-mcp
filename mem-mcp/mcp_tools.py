@@ -207,6 +207,10 @@ async def search_facts(query: str, category: Optional[str] = None, limit: int = 
             "things I need to follow up on" (abstract),
             "what am I passionate about" (no matching facts)
 
+    Short queries (≤2 words) go direct to the vector index — no LLM rewrite.
+    Longer queries are rewritten by a tiny LLM (cached per unique query+filters,
+    so repeating the same search within a session is free).
+
     The search combines Neo4j substring matching (fast, exact) with Qdrant
     vector similarity (semantic), then re-scores every hit as a normalized
     confidence in 0-1. Each result shows `confidence` and `evidence`:

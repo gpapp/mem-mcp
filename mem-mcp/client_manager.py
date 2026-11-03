@@ -165,7 +165,13 @@ def db_list_clients(user_id: str) -> list:
         for r in result:
             c_node = r["c"]
             contexts = [
-                {"id": ctx["id"], "name": ctx["name"], "active": ctx.get("active", True)}
+                {
+                    "id": ctx["id"],
+                    "name": ctx["name"],
+                    "active": ctx.get("active", True),
+                    "statusPinned": ctx.get("statusPinned", False),
+                    "effectiveActive": _effective_active(dict(ctx)),
+                }
                 for ctx in r["contexts"] if ctx.get("id")
             ]
             clients.append({
@@ -222,6 +228,8 @@ def _shared_client_entries(neo4j_session, owners: dict) -> list:
                 contexts = [
                     {"id": ctx["id"], "name": ctx["name"],
                      "active": ctx.get("active", True),
+                     "statusPinned": ctx.get("statusPinned", False),
+                     "effectiveActive": _effective_active(dict(ctx)),
                      **_shared_stamp(owner, granted["clients"][cid])}
                     for ctx in r["contexts"] if ctx.get("id")
                 ]
@@ -266,7 +274,10 @@ def _shared_client_entries(neo4j_session, owners: dict) -> list:
             for ctx, perm in ctx_rows:
                 parent_pid = parents.get(ctx["id"], (None,))[0]
                 xentry = {"id": ctx["id"], "name": ctx["name"],
-                          "active": ctx.get("active", True), **_shared_stamp(owner, perm)}
+                          "active": ctx.get("active", True),
+                          "statusPinned": ctx.get("statusPinned", False),
+                          "effectiveActive": _effective_active(dict(ctx)),
+                          **_shared_stamp(owner, perm)}
                 # The parent's permission stays navigation-only ("read")
                 # unless a real client grant says otherwise: a context
                 # grant covers the context and its records, never the
@@ -359,7 +370,7 @@ def db_owner_of_target(target_id: str) -> Optional[str]:
 
 
 def db_get_client_status_map(user_id: str) -> dict:
-    """Return {lower_client_name: effectiveActive} for all clients of a user.
+    """Return status map for clients and contexts of a user.
 
     Single query used by search functions to demote inactive-scope results.
     """
@@ -369,14 +380,25 @@ def db_get_client_status_map(user_id: str) -> dict:
     status = {}
     with neo4j_driver.session() as s:
         result = s.run(
-            "MATCH (c:Client {userId: $userId}) RETURN c",
+            """
+            MATCH (c:Client {userId: $userId})
+            OPTIONAL MATCH (c)-[:HAS_CONTEXT]->(ctx:Context)
+            RETURN c, collect(ctx) as contexts
+            """,
             userId=user_id
         )
         for r in result:
             c = r["c"]
-            name = (c.get("name") or "")
-            if name:
-                status[name.lower()] = _effective_active(dict(c))
+            c_name = (c.get("name") or "").lower()
+            if c_name:
+                status[c_name] = _effective_active(dict(c))
+            for ctx in r["contexts"]:
+                if ctx and ctx.get("id"):
+                    x_name = (ctx.get("name") or "").lower()
+                    if x_name:
+                        status[x_name] = _effective_active(dict(ctx))
+                    if c_name and x_name:
+                        status[f"{c_name}/{x_name}"] = _effective_active(dict(ctx))
     return status
 
 
@@ -420,6 +442,27 @@ async def db_set_client_active(client_id: str, active: bool, user_id: str) -> bo
             RETURN count(c) AS n
             """,
             clientId=client_id, userId=user_id, active=bool(active)
+        )
+        rec = result.single()
+        return bool(rec and rec["n"] > 0)
+
+
+async def db_set_context_active(context_id: str, active: bool, user_id: str) -> bool:
+    """Manually pin a context's active status. Pinned status wins over staleness.
+
+    Returns True if the context was found.
+    """
+    neo4j_driver = get_neo4j()
+    if not neo4j_driver:
+        raise RuntimeError("Neo4j not connected.")
+    with neo4j_driver.session() as s:
+        result = s.run(
+            """
+            MATCH (ctx:Context {id: $contextId, userId: $userId})
+            SET ctx.active = $active, ctx.statusPinned = true, ctx.updatedAt = datetime()
+            RETURN count(ctx) AS n
+            """,
+            contextId=context_id, userId=user_id, active=bool(active)
         )
         rec = result.single()
         return bool(rec and rec["n"] > 0)
