@@ -5,6 +5,32 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# Live notes: the note is checked for structure, not trusted to be structured (2026-11-03)
+
+- **Reported as**: "I don't see the structure of the live notes. check logs"
+- **What the logs said** (`mem-mcp-data/logs/memory-vault.log`, 15:07-15:08): the
+  deployed container already had the tool-calling code, the note job ran once,
+  the model made **no tool call**, and its `text` was **1023 characters with no
+  newline in it** — one dense paragraph, which `marked.parse` correctly rendered
+  as a single `<p>`. The session had one speaker and no pause boundary, so the
+  transcript arrived as a single 7k line and the prompt's only structural cue
+  never appeared.
+- **What shipped**:
+  - `LIVE_SYSTEM_PROMPT` now states a format instead of an adjective: a `## `
+    heading per topic, one paragraph per thought, and "A note that is a single
+    paragraph is not a note".
+  - `live_notes.note_structure_problem()` (pure, stdlib) decides whether an
+    answer actually has structure; `build_structure_prompt` and
+    `STRUCTURE_SYSTEM_PROMPT` drive one repair pass that is told it is a
+    formatting pass and given the note alone, not the transcript.
+  - `live_manager._reformat_note()` runs that pass when the check fires, before
+    the commit; an over-long repair, a parse failure or a still-unstructured
+    answer keeps the original and logs a WARNING.
+- **The one thing to know**: the prompt is not the guard. A 4b model answers
+  "structure this into paragraphs" with a summary paragraph, so the answer's
+  shape is checked in code — and a failed repair must return the note untouched
+  rather than risk a rewrite nobody can verify.
+
 # Diary: an `entryId` with a new body had no valid call (2026-11-03)
 
 - **Reported as**: the production traceback from `diary_save_entry`, ending

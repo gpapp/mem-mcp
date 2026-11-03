@@ -42,6 +42,7 @@ from common import (
 from client_manager import _resolve_client_by_id, _resolve_context_by_id
 from live_notes import (
     COMPACT_SYSTEM_PROMPT,
+    STRUCTURE_SYSTEM_PROMPT,
     LIVE_FACT_LIMIT,
     LIVE_NOTE_MAX_CHARS,
     LIVE_SAMPLING,
@@ -57,9 +58,11 @@ from live_notes import (
     asr_unload_url,
     build_compaction_prompt,
     build_live_prompt,
+    build_structure_prompt,
     is_repeat_abort,
     live_output_budget,
     note_blocks,
+    note_structure_problem,
     parse_note_json,
     rank_fact_candidates,
     replace_note_block,
@@ -1363,6 +1366,49 @@ async def _compact_note(job: dict, note: dict, allowed_ids) -> dict:
     )
 
 
+async def _reformat_note(job: dict, note: dict, allowed_ids) -> dict:
+    """One re-formatting pass for a note that came back as a single block.
+
+    The prompt asks for Markdown paragraphs and the model answers one block of
+    prose anyway -- a production note was 1023 characters with no newline in
+    it, which renders as a wall no matter that the dashboard uses
+    `marked.parse`. The pass is given the note **alone**, not the transcript,
+    and is told to change no facts: a formatting failure must not become a
+    content rewrite.
+
+    The original comes back when the repair does not take. A note that is a
+    wall is still worth reading; a note that lost a decision is not, and this
+    pass has no way to prove it kept one.
+    """
+    _set_job(job, phase="formatting")
+    prompt = build_structure_prompt(note)
+    budget = live_output_budget(len(prompt))
+    if not budget["ok"]:
+        return note
+    try:
+        repaired = await _call_live_llm(
+            job, prompt, STRUCTURE_SYSTEM_PROMPT, budget["budget"],
+            parse=lambda text: parse_note_json(
+                text,
+                allowed_ids,
+                existing_ids=note.get("referencedFactIds") or [],
+            ),
+        )
+    except LiveNoteTooLong:
+        # A re-format that grew past the limit is a rewrite, not a re-format.
+        return note
+    except LiveNoteError as exc:
+        logger.warning("live notes: re-formatting the note failed: %s", exc)
+        return note
+    if note_structure_problem(repaired["text"]):
+        logger.warning(
+            "live notes: the re-formatted note is still a single block; "
+            "keeping the original"
+        )
+        return note
+    return repaired
+
+
 async def _commit_note_window(job: dict, note: dict, note_id,
                               segment_ids: list) -> dict:
     """Write one window's note, references and consumption marker.
@@ -1584,6 +1630,16 @@ async def _refresh_note(job: dict) -> None:
             # the note it was given, unchanged. The edit is the answer; dropping
             # it would make the tool a no-op that reported success.
             result["text"] = note_state["text"]
+        # The model answers a single dense paragraph often enough that the note
+        # reached the reader as a wall. The prompt is not a guard: check the
+        # answer, and re-format it once when it has no structure to render.
+        problem = note_structure_problem(result["text"])
+        if problem:
+            logger.warning(
+                "live notes: %s; re-formatting the note for %s",
+                problem, transcription_id,
+            )
+            result = await _reformat_note(job, result, allowed_ids)
         if len(result["text"]) > LIVE_NOTE_MAX_CHARS:
             result = await _compact_note(job, result, allowed_ids)
             if len(result["text"]) > LIVE_NOTE_MAX_CHARS:

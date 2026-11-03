@@ -69,10 +69,14 @@ LIVE_SYSTEM_PROMPT = (
     "what does not: small talk, side conversations, unrelated work, and speech "
     "that adds nothing to the note. Summarise; do not transcribe. Never invent "
     "names, decisions, numbers or facts.\n\n"
-    "Structure the note into multiple paragraphs representing separate thoughts, "
-    "topics, and pause boundaries, rather than a wall of short text. No points "
-    "made in the discussion should be omitted or forgotten. Respect pause "
-    "boundaries and segment groupings as distinct thoughts and paragraphs. A "
+    "Write the note as Markdown, and structure it rather than compressing it "
+    "into one block of prose. Give each topic its own `## ` heading, and under "
+    "a heading write one paragraph per thought, with a blank line between "
+    "paragraphs. A note that is a single paragraph is not a note: split it "
+    "even when the transcript did not, and never answer with the whole note "
+    "as one block. No points made in the discussion should be omitted or "
+    "forgotten. Respect pause boundaries and segment groupings as distinct "
+    "thoughts and paragraphs. A "
     "blank line in the transcript is a pause the speaker took: the thought "
     "before it and the thought after it are separate paragraphs, even when the "
     "same person is talking. One paragraph is one thought -- do not split a "
@@ -738,6 +742,72 @@ def build_compaction_prompt(note, max_chars=None) -> str:
         f"Target length: at most {target} characters (the hard limit is {limit}).",
         f"### NOTE TITLE\n{title or '(untitled)'}",
         f"### NOTE TEXT\n{text or '(empty)'}",
+    ])
+
+
+NOTE_MIN_BLOCKS = 2
+NOTE_SINGLE_BLOCK_CHARS = 400
+
+
+def note_structure_problem(text) -> str:
+    """Why a note reads as one block, or "" when it has structure.
+
+    The live note is read one thought at a time; a single dense paragraph is
+    the wall of text the note exists to replace. The model is **told** to write
+    Markdown, and a 4b model answers one block anyway -- measured in production
+    as a 1023-character `text` with no newline in it at all -- so the result is
+    checked rather than assumed. Trusting the prompt is how a single paragraph
+    reached the reader while every test above it was green.
+
+    A short note is not a problem: two sentences have nothing to split. The
+    check only fires on a block long enough that splitting it would have
+    changed how it reads.
+    """
+    body = (text or "").strip()
+    if not body:
+        return "the note is empty"
+    paragraphs = [part.strip() for part in re.split(r"\n\s*\n", body) if part.strip()]
+    blocks = [part for part in paragraphs if not part.startswith("#")]
+    if len(blocks) >= NOTE_MIN_BLOCKS:
+        return ""
+    if blocks and len(blocks[0]) <= NOTE_SINGLE_BLOCK_CHARS:
+        return ""
+    return (
+        f"the note is {len(blocks) or 1} block(s) of prose at {len(body)} "
+        "chars; it reads as a wall of text rather than paragraphs"
+    )
+
+
+STRUCTURE_SYSTEM_PROMPT = """You re-format one live meeting note.
+
+Return one JSON object with exactly `title` and `text`.
+
+Rules:
+- This is a formatting pass, not a summary. Keep every sentence, name, number,
+  date, owner and decision exactly as it is. Do not shorten, merge or drop
+  anything.
+- Split the prose into paragraphs, one per thought, separated by a blank line.
+- Give each topic its own `## ` heading. There must be more than one paragraph.
+- Keep existing headings, bullets and checklists as they are; only split prose
+  that runs together.
+- Return JSON only. No markdown fences, no commentary.
+"""
+
+
+def build_structure_prompt(note) -> str:
+    """The prompt for the one re-formatting pass.
+
+    The note alone is sent, not the transcript: this pass has to change the
+    shape of the text and nothing else, and a model handed the transcript again
+    rewrites the note's content instead of its paragraphs. That also keeps the
+    call cheap, which matters because it is a second call per window.
+    """
+    title, text = _note_parts(note)
+    return "\n\n".join([
+        f"### NOTE TITLE\n{title or '(untitled)'}",
+        f"### NOTE TEXT\n{text or '(empty)'}",
+        "Re-format this note: the same words, split into paragraphs under "
+        "`## ` headings.",
     ])
 
 

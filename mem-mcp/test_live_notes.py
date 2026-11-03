@@ -194,10 +194,17 @@ class PromptTests(unittest.TestCase):
         self.assertIn("Real speech", prompt)
         self.assertNotIn("[00:00] Ana:  \n", prompt)
 
-    def test_the_prompt_structures_into_multiple_paragraphs_and_thoughts(self):
+    def test_the_prompt_demands_markdown_sections_and_paragraphs(self):
+        # The old sentence said "structure the note into multiple paragraphs",
+        # and production returned a 1023-character text with no newline in it:
+        # an adjective the model could satisfy in its own way. The contract is
+        # now a format -- a heading per topic, one paragraph per thought.
         prompt = ln.LIVE_SYSTEM_PROMPT
-        self.assertIn("multiple paragraphs", prompt)
-        self.assertIn("separate thoughts", prompt)
+        self.assertIn("Write the note as Markdown", prompt)
+        self.assertIn("`## ` heading", prompt)
+        self.assertIn("one paragraph per thought", prompt)
+        self.assertIn("single paragraph is not a note", prompt)
+        self.assertIn("distinct thoughts", prompt)
         self.assertIn("pause boundaries", prompt)
         # Reported symptom: the note carried the rambling. The old prompt said
         # "incorporate every new section", which mandates exactly that -- an
@@ -1256,6 +1263,150 @@ class CompactionPromptTests(unittest.TestCase):
         self.assertIn("(empty)", prompt)
 
 
+class NoteStructureTests(unittest.TestCase):
+    """A note that renders as one paragraph is the reported defect.
+
+    Production returned `{"text": "The HAL Context Layer will ... "}` -- 1023
+    characters with no newline in it at all -- and `renderLiveNote` handed it
+    to `marked.parse`, which correctly rendered one `<p>`. The model had been
+    asked for "multiple paragraphs" and answered a summary; a prompt is not a
+    guard, so the shape of the answer is now checked.
+    """
+
+    def test_a_long_single_paragraph_is_a_problem(self):
+        problem = ln.note_structure_problem("The layer will generate " * 40)
+        self.assertTrue(problem)
+        self.assertIn("block", problem)
+
+    def test_two_paragraphs_are_structure(self):
+        text = "First thought about the migration.\n\nSecond thought about the owner."
+        self.assertEqual(ln.note_structure_problem(text), "")
+
+    def test_a_short_single_paragraph_is_left_alone(self):
+        # Nothing to split, and forcing a break into two sentences would be
+        # editorial rather than structural.
+        self.assertEqual(ln.note_structure_problem("Short note."), "")
+
+    def test_a_heading_does_not_rescue_one_long_paragraph(self):
+        text = "## Decisions\n\n" + "The same dense block of prose. " * 30
+        self.assertTrue(ln.note_structure_problem(text))
+
+    def test_a_heading_with_paragraphs_under_it_is_structure(self):
+        text = "## Decisions\n\nOne decision.\n\n## Actions\n\nOne action."
+        self.assertEqual(ln.note_structure_problem(text), "")
+
+    def test_an_empty_note_is_reported_rather_than_read_as_structure(self):
+        self.assertIn("empty", ln.note_structure_problem("   "))
+
+    def test_the_repair_prompt_carries_the_note_and_no_transcript(self):
+        prompt = ln.build_structure_prompt(
+            {"title": "Weekly sync", "text": "One long block."})
+        self.assertIn("### NOTE TITLE\nWeekly sync", prompt)
+        self.assertIn("### NOTE TEXT\nOne long block.", prompt)
+        self.assertIn("Re-format this note", prompt)
+
+    def test_the_repair_system_prompt_forbids_rewriting_content(self):
+        prompt = ln.STRUCTURE_SYSTEM_PROMPT
+        self.assertIn("not a summary", prompt)
+        self.assertIn("Do not shorten, merge or drop", prompt)
+
+
+class NoteStructureRepairTests(unittest.TestCase):
+    """The repair pass is driven, because keeping the original is the property.
+
+    A re-format that fails must return the note unchanged: a wall of text is
+    still worth reading, and a rewrite with a decision dropped is not something
+    this pass can detect.
+    """
+
+    PATH = "mem-mcp/live_manager.py"
+
+    def _lift(self, reply):
+        import ast
+        import asyncio
+        import json
+        import types
+        import test_share_endpoints
+
+        source = test_share_endpoints._read(self.PATH)
+        tree = ast.parse(source)
+        node = next(n for n in tree.body
+                    if isinstance(n, ast.AsyncFunctionDef)
+                    and n.name == "_reformat_note")
+        module = ast.Module(body=[node], type_ignores=[])
+        ast.fix_missing_locations(module)
+
+        calls = []
+        logs = []
+
+        async def fake_call(job, prompt, system, num_predict, parse=None):
+            calls.append({"prompt": prompt, "system": system,
+                          "num_predict": num_predict})
+            if isinstance(reply, BaseException):
+                raise reply
+            return parse(reply) if parse else reply
+
+        namespace = {
+            "asyncio": asyncio,
+            "json": json,
+            "logger": types.SimpleNamespace(
+                warning=lambda *a, **k: logs.append(a[0] % a[1:])),
+            "_set_job": lambda job, **kwargs: None,
+            "live_output_budget": ln.live_output_budget,
+            "build_structure_prompt": ln.build_structure_prompt,
+            "note_structure_problem": ln.note_structure_problem,
+            "parse_note_json": ln.parse_note_json,
+            "STRUCTURE_SYSTEM_PROMPT": ln.STRUCTURE_SYSTEM_PROMPT,
+            "LiveNoteError": ln.LiveNoteError,
+            "LiveNoteTooLong": ln.LiveNoteTooLong,
+            "_call_live_llm": fake_call,
+        }
+        exec(compile(module, "<lift:_reformat_note>", "exec"), namespace)
+        return namespace["_reformat_note"], calls, logs
+
+    NOTE = {"title": "Weekly sync", "text": "One long block of prose. " * 30,
+            "referencedFactIds": ["f1"]}
+
+    def test_a_structured_answer_is_used(self):
+        import asyncio
+        import json
+        answer = json.dumps({
+            "title": "Weekly sync",
+            "text": "## Decisions\n\nOne decision.\n\n## Actions\n\nOne action.",
+        })
+        reformat, calls, _logs = self._lift(answer)
+        result = asyncio.run(reformat({}, dict(self.NOTE), {"f1"}))
+        self.assertIn("## Decisions", result["text"])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["system"], ln.STRUCTURE_SYSTEM_PROMPT)
+        self.assertIn("One long block of prose.", calls[0]["prompt"])
+
+    def test_an_answer_that_is_still_one_block_keeps_the_original(self):
+        import asyncio
+        import json
+        answer = json.dumps({"title": "Weekly sync",
+                             "text": "Still one block. " * 60})
+        reformat, _calls, logs = self._lift(answer)
+        note = dict(self.NOTE)
+        result = asyncio.run(reformat({}, note, {"f1"}))
+        self.assertEqual(result["text"], note["text"])
+        self.assertTrue(logs, "a repair that did not take must say so")
+
+    def test_a_failed_repair_keeps_the_original(self):
+        import asyncio
+        reformat, _calls, _logs = self._lift(ln.LiveNoteError("unusable answer"))
+        note = dict(self.NOTE)
+        result = asyncio.run(reformat({}, note, {"f1"}))
+        self.assertEqual(result["text"], note["text"])
+
+    def test_an_over_long_repair_keeps_the_original(self):
+        import asyncio
+        reformat, _calls, _logs = self._lift(ln.LiveNoteTooLong("too long"))
+        note = dict(self.NOTE)
+        result = asyncio.run(reformat({}, note, {"f1"}))
+        self.assertEqual(result["text"], note["text"])
+
+
 class JobContractTests(unittest.TestCase):
     """Pins the source-level contract of the background note job."""
 
@@ -1294,6 +1445,19 @@ class JobContractTests(unittest.TestCase):
         body = self._segment("_refresh_note")
         self.assertNotIn("gather(", body)
         self.assertIn("for window in", body)
+
+    def test_an_unstructured_note_is_reformatted_before_it_is_committed(self):
+        # Checking after the commit would repair a note the reader already has.
+        # The check and the repair are a pair, so both are pinned here: a
+        # helper that is tested in isolation is not a test of its call site.
+        body = self._segment("_refresh_note")
+        check = body.index("note_structure_problem(")
+        repair = body.index("_reformat_note(")
+        commit = body.index("_commit_note_window")
+        self.assertLess(check, repair,
+                        "the structure check must be what decides to repair")
+        self.assertLess(repair, commit,
+                        "the note must be re-formatted before it is written")
 
 
 class AudioWatchdogTests(unittest.TestCase):

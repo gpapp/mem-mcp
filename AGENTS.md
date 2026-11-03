@@ -2414,6 +2414,45 @@ the estimated prompt — with `MEM_LIVE_MIN_NUM_PREDICT` as a **refusal floor**,
 not a fixed budget. A selection below the floor is refused with a 400 naming the
 segment count and the estimate; the request is not attempted.
 
+### A prompt is not a guard: the note's shape is checked
+
+`LIVE_SYSTEM_PROMPT` used to say *"Structure the note into multiple paragraphs
+representing separate thoughts"*, and production returned a note whose `text`
+was **1023 characters with no newline in it at all**. `renderLiveNote` hands
+`note.text` to `marked.parse`, which rendered it correctly as exactly one `<p>`
+— so the complaint "I don't see the structure of the live notes" was a content
+defect, not a rendering one. Two things conspired, and both are worth keeping:
+the session had **no pause boundary and a single speaker**, so `format_segments`
+produced one 7k-char line and the prompt's only structural cue (a blank line is
+a pause) never appeared; and "multiple paragraphs" is an adjective a small model
+can satisfy in its own way, so it wrote a summary.
+
+- **The prompt now states a format, not a preference.** A `## ` heading per
+  topic, one paragraph per thought, blank line between paragraphs, and the
+  sentence *"A note that is a single paragraph is not a note"*.
+  `PromptTests` pins those words, because a prompt is text and nothing else in
+  the suite notices when a sentence changes.
+- **`note_structure_problem(text)` decides whether the answer has structure**,
+  and the answer is checked rather than assumed. It splits on blank lines,
+  ignores headings when counting blocks, and only complains when the single
+  block is longer than `NOTE_SINGLE_BLOCK_CHARS` (400) — two sentences have
+  nothing to split, and forcing a break into them would be editorial rather
+  than structural.
+- **`_reformat_note` is one repair call for an unstructured answer**, driven by
+  `build_structure_prompt` (the note alone, never the transcript) and
+  `STRUCTURE_SYSTEM_PROMPT`, which says *"This is a formatting pass, not a
+  summary. Keep every sentence, name, number, date, owner and decision"*. Sending
+  the transcript again makes the model rewrite the content instead of its
+  paragraphs, and the pass is cheap precisely because it receives one note.
+- **A repair that does not take keeps the original.** An over-long repair, a
+  parse failure and an answer that is still one block all return the note
+  unchanged and log a WARNING. A wall of text is still worth reading; a rewrite
+  this pass cannot verify kept every decision is not. `NoteStructureRepairTests`
+  drives the function against each of those three, and `JobContractTests` pins
+  the call site — check, then repair, then commit — because a helper tested in
+  isolation is not a test of its call site, and repairing after the write would
+  fix a note the reader already has.
+
 A long pause is split by `segment_windows` and processed **sequentially**, so
 each window sees the note the previous one produced. Consumption markers are
 written only after a successful commit, so a failure, a timeout or a recording
