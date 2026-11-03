@@ -5,6 +5,32 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# Live notes: real tool calling and pause boundaries (2026-11-03)
+
+- **Reported as**: "process each boundary individualy, provide it with context of
+  the previous bounded context. provide the processsing llm with tools to look
+  up/alter previous blocks. Notes should be MD formatted and displayed."
+- **What shipped** (commit `8937a8e`):
+  - `common.get_llm_response` gained `tools=`, `history=` and `return_message=`;
+    the note model now genuinely has a tool channel, and an empty `content` with
+    `tool_calls` present is no longer logged as an empty answer.
+  - `live_notes.LIVE_TOOLS` (four schemas) + executors in
+    `live_manager._refresh_note`: `lookup_fact` (bodies, not titles),
+    `get_note_block`, `replace_note_block`, `append_note_block`. The prompt is
+    rebuilt after every round because an edit shifts the paragraph numbering;
+    the loop is bounded by `MEM_LIVE_TOOL_ROUNDS` (3).
+  - `:TranscriptionSegment.boundary`, written by the WebSocket proxy on pause and
+    on stop via `db_set_segment_boundary`; `segment_windows` closes a window on
+    it and `_paragraph_runs` closes a paragraph on it, rendered as a blank line.
+- **The one thing to know**: the boundary is *stored*, not derived — asr-mcp
+  restarts its clock on every connection, so a timestamp gap is a reconnect
+  artefact and a gap heuristic would put thought boundaries where the network
+  hiccupped and none where the speaker stopped.
+- **Verified**: 176 live-notes tests (22 new) and 1396 across the suites, all
+  green; `py_compile` clean; `git diff --check` clean.
+
+---
+
 # Small/Tiny LLM Prompt Optimizations & Cache Alignment (2026-11-01)
 
 - **Reported as**: Ensure prompts work well with tiny LLM models, ensure the KV cache is properly utilized so prompts don't need to be re-run unnecessarily per call, and review corresponding skills and tool descriptions.
