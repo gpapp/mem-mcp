@@ -5,6 +5,26 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# Live notes: Stop works even when the capture never became active (2026-11-04)
+
+- **Reported as**: "recording seems to be on, but stop is not working", alongside
+  a console `runtime.lastError: Could not establish connection`.
+- **Cause**: `LiveCapture.stop()` ends with
+  `if (!silent && wasActive) this._emit('stopped', …)`, and `liveRecording` is
+  only cleared by the `stopped`/`closed` handlers. `startLiveRecording` sets
+  `liveRecording = true` **before** awaiting `LiveCapture.start()`, so a Stop
+  pressed while the microphone permission or the socket was still opening
+  cleared nothing: the pane kept saying Recording and the button stayed alive
+  with nothing behind it.
+- **What shipped**: `stopLiveRecording` now calls `onLiveCaptureStopped` when the
+  flag is still set after `stop()` returns, and `liveStartToken` makes a stop
+  beat the start still in flight — otherwise that start lands, sets
+  `active = true`, and puts the panel straight back into Recording.
+- **The one thing to know**: the `Could not establish connection. Receiving end
+  does not exist.` line is Chrome extension messaging (`chrome.runtime.sendMessage`
+  with no listener). The dashboard uses no `chrome.*` API, so it is console noise
+  and not the cause; do not chase it.
+
 # Live notes: the note links the facts it names (2026-11-04)
 
 - **Reported as**: "The live transcriptions are not linked to the corresponding

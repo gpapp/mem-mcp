@@ -2391,6 +2391,24 @@ on an open transcription: an event can arrive before a pane is showing one, and
 caught that as a thrown `null.segmentCount`, which is exactly the class of defect
 it exists for.
 
+**`LiveCapture.stop()` only announces a capture it believed was active, so Stop
+could do nothing at all.** `stop()` ends with
+`if (!silent && wasActive) this._emit('stopped', …)`, and `liveRecording` is
+only cleared by the `stopped`/`closed` handlers. A Stop pressed while `start()`
+was still waiting on `getUserMedia` or the socket (`liveRecording` is set
+**before** `LiveCapture.start()` is awaited) therefore cleared nothing, left the
+button enabled and left the pane saying Recording — reported as *"recording seems
+to be on, but stop is not working"*. Two fixes, and both are needed:
+`stopLiveRecording` calls `onLiveCaptureStopped` itself when the flag is still
+set after `stop()` returns, and `liveStartToken` makes the click beat the start
+that is still in flight — otherwise the pending `start()` lands, sets
+`active = true`, and puts the panel back into Recording. `LivePanelPushTests`
+drives the first one through the fake DOM with `LiveCapture.active = false`.
+(The `Uncaught (in promise) Error: Could not establish connection. Receiving end
+does not exist.` reported alongside it is Chrome extension messaging —
+`chrome.runtime.sendMessage` with no listener. The dashboard uses no `chrome.*`
+API, so it is noise in the console, not a cause.)
+
 `LiveJobEventTests` **calls** `_announce` against a recording bus (payload
 fields, `user_id`, event name) and pins the two call sites a behavioural test
 cannot see; `LivePanelPushTests` drives the handlers through the fake DOM — a

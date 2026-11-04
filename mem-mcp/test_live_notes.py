@@ -2544,6 +2544,38 @@ class LivePanelPushTests(unittest.TestCase):
         self.assertLess(body.index("sseOpen()"), body.index("live/transcriptions/"),
                         msg="the poll must be behind the stream check")
 
+    def test_stop_settles_a_capture_that_never_became_active(self):
+        # Reported as "recording seems to be on, but stop is not working".
+        # `LiveCapture.stop()` emits `stopped` only when it believed the capture
+        # was active, so a Stop pressed while the microphone or the socket was
+        # still opening cleared nothing and the panel stayed in Recording.
+        out = self._run([("stop", """
+(async () => {
+  liveRecording = true;
+  livePaused = false;
+  LiveCapture.active = false;
+  LiveCapture.ws = null;
+  activeLiveTranscriptionId = 't1';
+  const seen = [];
+  const real = onLiveCaptureStopped;
+  onLiveCaptureStopped = (id) => { seen.push(id); liveRecording = false; };
+  await stopLiveRecording();
+  onLiveCaptureStopped = real;
+  return { seen, liveRecording };
+})()
+""")])
+        result = out["stop"]
+        self.assertEqual(result["seen"], ["t1"],
+                         msg=out.get("fatal", "the panel was never settled"))
+        self.assertFalse(result["liveRecording"])
+
+    def test_a_stop_during_start_wins_over_the_start(self):
+        self.assertIn("liveStartToken", self._body("stopLiveRecording"))
+        self.assertIn("startToken !== liveStartToken",
+                      self._body("startLiveRecording"),
+                      msg="a start that lands after the click must not put the "
+                          "panel back into Recording")
+
     def test_the_gate_wait_is_settled_by_the_push(self):
         body = self._body("settleLiveGate")
         self.assertLess(body.index("waitForLiveGate("),

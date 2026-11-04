@@ -1668,6 +1668,10 @@
   let sseSource = null;
   let liveRecording = false;
   let livePaused = false;
+  // Bumped by every Start and every Stop. A Start that is still waiting on the
+  // microphone or the socket is not a recording yet, and without this a Stop
+  // pressed in that window is overwritten by the start that lands after it.
+  let liveStartToken = 0;
   // True while the SERVER still holds the audio gate: from the moment a pause
   // or stop is asked for until it answers that nothing is being transcribed.
   // The local liveRecording/livePaused flags are a guess made a second early,
@@ -3839,6 +3843,7 @@
       }
     }
     stopLivePoll();
+    const startToken = ++liveStartToken;
     liveRecording = true;
     livePaused = false;
     renderLiveControls(liveDetail.transcription);
@@ -3903,6 +3908,13 @@
     };
     try {
       await LiveCapture.start(id, handlers);
+      if (startToken !== liveStartToken) {
+        // Stop was pressed while the microphone or the socket was still
+        // opening. The capture that just landed is not one the user asked
+        // for, and leaving it running would put the panel back into Recording
+        // with a Stop they already pressed.
+        await LiveCapture.stop(true);
+      }
     } catch (e) {
       liveRecording = false;
       livePaused = false;
@@ -3960,6 +3972,9 @@
 
   async function stopLiveRecording() {
     if (!liveRecording) return;
+    // Invalidate a start that is still in flight: it must not set the panel
+    // back to Recording when it lands after this click.
+    liveStartToken += 1;
     // The gate is about to close and reopen; the remembered release is stale.
     liveGateReleased = null;
     const state = document.getElementById('live-state');
@@ -3968,7 +3983,17 @@
     // onLiveCaptureStopped refreshes the transcript after the server has had
     // time to drain its writer. Clearing the flags here would enable Start
     // while the server socket is still open, which it refuses with 4502.
-    await LiveCapture.stop();
+    try {
+      await LiveCapture.stop();
+    } catch (e) {
+      console.warn('LiveCapture.stop failed', e);
+    }
+    // `stop()` announces `stopped` only when it believed the capture was
+    // active. When it was not -- a start still waiting for the microphone, or
+    // a socket the server already closed -- nothing else would ever clear the
+    // flag, and the panel would keep saying Recording with a Stop button that
+    // does nothing.
+    if (liveRecording) onLiveCaptureStopped(activeLiveTranscriptionId);
   }
 
   async function deleteLiveTranscription() {
