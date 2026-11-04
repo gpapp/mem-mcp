@@ -149,6 +149,21 @@ async def lifespan(app):
                 print(f"Sessions: dropped {removed} expired", flush=True)
         except Exception as exc:
             print(f"Sessions: could not purge expired sessions: {exc}", flush=True)
+        # Live notes: a restart or a dropped socket removes the WS route's
+        # `finally` that writes `paused` on close, so the row it guarded
+        # outlives the socket. `recording` rows with no live gate and
+        # `processing` rows whose job registry died with the process are the
+        # two statuses a boot can prove dead, and they are what made a dead
+        # session report "Recording" with a Start button that answered 409.
+        try:
+            dead = mem.db_reset_dead_session_statuses()
+            if dead.get("recordingReset") or dead.get("processingReset"):
+                print(f"Live notes: reset {dead.get('recordingReset', 0)} stale "
+                      f"recording and {dead.get('processingReset', 0)} stale "
+                      f"processing session statuses", flush=True)
+        except Exception as exc:
+            print("Live notes: could not reset dead session statuses: "
+                  f"{exc}", flush=True)
         await mem.ensure_ollama_models()
         await migrate_client_context()
         await sync_qdrant_scope()

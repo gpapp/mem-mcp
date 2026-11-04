@@ -5,6 +5,43 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# Live notes: stale Recording statuses repaired on read and at boot (2026-11-04)
+
+- **Reported as**: "The transcription status in live notes says 'Recording'.
+  Start button stays clickable when recording is started. Pressing it says a
+  transcription is already recording for this account and stops
+  automatically", plus "ensure the startup cleans up dead sockets" and a
+  production `TypeError: object dict can't be used in 'await' expression` at
+  `mcp_tools.py:487` in `diary_save_entry`.
+- **Cause 1 — stale rows**: the WS route writes `recording` after
+  `begin_recording` and `paused` in its own `finally`; a reload, restart or
+  dropped socket removes exactly the code that would correct the row, leaving
+  week-old transcripts labelled Recording with the gate free behind them.
+- **What shipped**: gate-as-truth lazy repair (`_repair_stale_recording` /
+  `repair_stale_recording_status` in live_manager.py, wrapped into
+  `_live_detail` and `api_list_live_transcriptions` — a `recording` row under
+  a free gate is provably dead, rewrites to `paused`, logs a WARNING, and a
+  held gate leaves the row alone); boot-time vault-wide
+  `db_reset_dead_session_statuses()` in the lifespan (`recording`→`paused`,
+  `processing`→`error`, `ok: False` + WARNING instead of a failed startup when
+  the graph is unreachable); Start disabled on `t.status === 'recording'` in
+  `renderLiveControls` and refused with a toast in `startLiveRecording`
+  instead of the guaranteed 409.
+- **Cause 2 — the await**: `db_get_diary_entry` (diary_manager.py) is the
+  diary module's ONE plain-sync helper; the tool awaited its dict return
+  (`await mem.db_get_diary_entry(entryId, user)`), so every fill-in-path call
+  crashed in production. Await removed; the call site is pinned twice in
+  `test_people_extraction.py` (`DiaryGetEntryCallSiteTests`), and the three
+  routing-test stubs were changed from `async` to sync — an
+  awaitable-tolerant stub is exactly why the suite stayed green on the bug.
+- **The one thing to remember**: every fix appends. New test surface =
+  `StaleRecordingRepairTests`, `DeadSessionStatusResetTests`, two new
+  `LiveGateRaceTests` entries (all in test_live_notes.py, lifting
+  `live_manager.py` functions so the graph fakes can drive them), plus
+  `DiaryGetEntryCallSiteTests` (test_people_extraction.py). 1443 tests OK.
+
+---
+
 # Live notes: Stop works even when the capture never became active (2026-11-04)
 
 - **Reported as**: "recording seems to be on, but stop is not working", alongside

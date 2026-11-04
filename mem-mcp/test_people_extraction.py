@@ -1512,7 +1512,10 @@ class DiarySaveEntryRoutingTests(unittest.TestCase):
         # `name`/`timestamp` the server already had under `entryId`. Reading
         # them keeps the id (it is derived from the timestamp) and turns the
         # call into an ordinary update.
-        async def db_get_diary_entry(entry_id, user):
+        def db_get_diary_entry(entry_id, user):
+            # Sync, like the real helper: awaiting its dict return was the
+            # production TypeError this suite once accepted from a stub that
+            # tolerated awaitables.
             return {"id": entry_id, "name": "Standup",
                     "timestamp": "2026-11-03T09:00:00"}
 
@@ -1533,7 +1536,8 @@ class DiarySaveEntryRoutingTests(unittest.TestCase):
     def test_a_stored_blank_name_does_not_dead_end_here(self):
         # `fix_diary_entries` repairs a blank name to this same literal, so
         # using it here is the repair's spelling rather than a second one.
-        async def db_get_diary_entry(entry_id, user):
+        def db_get_diary_entry(entry_id, user):
+            # Sync, like the real helper (see the first stub's note).
             return {"id": entry_id, "name": "",
                     "timestamp": "2026-11-03T09:00:00"}
 
@@ -1544,7 +1548,8 @@ class DiarySaveEntryRoutingTests(unittest.TestCase):
                          ["Untitled Diary Entry"])
 
     def test_an_unknown_id_is_an_error_rather_than_a_new_entry(self):
-        async def db_get_diary_entry(entry_id, user):
+        def db_get_diary_entry(entry_id, user):
+            # Sync, like the real helper (see the first stub's note).
             return None
 
         fn, recorded = self._lift(db_get_diary_entry=db_get_diary_entry)
@@ -2004,6 +2009,64 @@ class DedupToolDescriptionTests(unittest.TestCase):
         self.assertNotIn("embeddings similarity ranking", doc,
                          msg="that phrasing both misdescribes the tool and "
                              "reads as an unedited first draft")
+
+
+class DiaryGetEntryCallSiteTests(unittest.TestCase):
+    """`mem.db_get_diary_entry` is sync, and the tool must not await it.
+
+    The helper (diary_manager.py) is the diary module's one plain-sync
+    function, so `await`ing the dict it returns shipped
+    `TypeError: object dict can't be used in 'await' expression` -- and every
+    behavioural test here slept through the defect, because its stub was
+    `async` and quietly tolerated the await. A test of a helper is not a test
+    of its call site; the call site is pinned twice, once by shape and once
+    by being driven through a stub with the real (sync) shape.
+    """
+
+    def test_the_tool_does_not_await_the_sync_helper(self):
+        with open(MCP_TOOLS, "r", encoding="utf-8") as handle:
+            source = handle.read()
+        tree = ast.parse(source)
+        target = next(
+            node for node in tree.body
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "diary_save_entry"
+        )
+        segment = ast.get_source_segment(source, target)
+        self.assertNotIn("await mem.db_get_diary_entry", segment,
+                         msg="db_get_diary_entry is the one sync diary "
+                             "helper; awaiting its dict return is the "
+                             "TypeError that shipped")
+
+    def test_the_call_site_drives_a_real_sync_helper(self):
+        saved = []
+
+        def db_get_diary_entry(entry_id, user):
+            # The real helper's shape: plain sync, plain dict.
+            return {"id": entry_id, "name": "Standup",
+                    "timestamp": "2026-11-03T09:00:00"}
+
+        async def db_save_diary(content, user, timestamp, name, **kw):
+            saved.append((name, timestamp))
+            return timestamp
+
+        mem = type(sys)("mem")
+        mem._current_user_value = "alice"
+        mem._diary_id = lambda user, ts: f"id-{ts}"
+        mem.db_get_diary_entry = db_get_diary_entry
+        mem.db_save_diary = db_save_diary
+        fn = _lift_tool("diary_save_entry", {
+            "mem": mem,
+            "_current_user": lambda: "alice",
+            "Optional": typing.Optional,
+        })
+        result = asyncio.run(fn(content="new body",
+                                entryId="id-2026-11-03T09:00:00"))
+        self.assertEqual(
+            saved, [("Standup", "2026-11-03T09:00:00")],
+            msg="the fill-in path must read the stored identity fields "
+                "through the sync helper and save the filled values")
+        self.assertEqual(result["id"], "id-2026-11-03T09:00:00")
 
 
 class DiarySaveScopeRoutingTests(unittest.TestCase):

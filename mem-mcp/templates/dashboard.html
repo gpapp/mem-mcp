@@ -3415,7 +3415,11 @@
     const token = document.getElementById('live-token-missing');
     const state = document.getElementById('live-state');
     if (token) token.classList.toggle('show', !asrTokenSet);
-    if (start) start.disabled = !asrTokenSet || liveRecording;
+    // `t.status === 'recording'` is the other half of the Start guard: the
+    // local flag is cleared the instant a capture ends (including when one
+    // never became active), and a row the server has not yet repaired still
+    // names a recording. Starting against it is a guaranteed 409.
+    if (start) start.disabled = !asrTokenSet || liveRecording || (t && t.status === 'recording');
     if (pause) pause.disabled = !liveRecording || livePaused;
     if (resume) resume.disabled = !liveRecording || !livePaused;
     if (stop) stop.disabled = !liveRecording;
@@ -3855,6 +3859,14 @@
   async function startLiveRecording() {
     if (!liveDetail || !liveDetail.transcription) return;
     if (liveRecording) return;
+    // The row can outlive the socket that set it (a reload, a restart, a
+    // dropped stream): the server repairs such rows on read, but a client
+    // that looks free while the row is still `recording` would send every
+    // press into the server's 409. Ask again instead of proceeding.
+    if (liveDetail.transcription.status === 'recording') {
+      toast('⚠️ The server still shows this recording as active — wait a moment and try again');
+      return;
+    }
     // A recording closes the gate: any remembered release is from before it.
     liveGateReleased = null;
     if (!asrTokenSet) {

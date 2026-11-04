@@ -2813,7 +2813,8 @@ class AsrTokenRequest(BaseModel):
 
 def _live_detail(transcription_id: str, user_id: str) -> Optional[dict]:
     """One transcription with its transcript, note and job state."""
-    record = mem.db_get_transcription(transcription_id, user_id)
+    record = mem.repair_stale_recording_status(
+        mem.db_get_transcription(transcription_id, user_id), user_id)
     if not record:
         return None
     note = mem.db_get_note_for_transcription(transcription_id, user_id)
@@ -2831,7 +2832,8 @@ def _live_detail(transcription_id: str, user_id: str) -> Optional[dict]:
 async def api_list_live_transcriptions(request: Request):
     user_id = _require_user(request)
     return {
-        "transcriptions": mem.db_list_transcriptions(user_id),
+        "transcriptions": mem.repair_stale_recording_status(
+            mem.db_list_transcriptions(user_id), user_id),
         "recording": mem.LIVE_GATE.is_recording(user_id),
     }
 

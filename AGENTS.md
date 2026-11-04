@@ -1742,6 +1742,20 @@ LLM call to arrive at the same string.
   *before* the guard — is the whole property and is invisible in a source
   assertion.
 
+  **The helper is sync, and the tool must not await it.**
+  `db_get_diary_entry` (diary_manager.py) is every other diary helper's
+  exception: it is the module's one plain-`def` function, all of its siblings
+  (`sync_diary_mentions`, `db_save_diary`, `db_update_diary_metadata`,
+  `db_delete_diary`, `resolve_write_scope`) being `async def`. The tool shipped
+  `await mem.db_get_diary_entry(...)` and every call through the fill-in path
+  died with `TypeError: object dict can't be used in 'await' expression`. The
+  call site is pinned twice in `test_people_extraction.py`: the source must
+  contain no `await mem.db_get_diary_entry`, and the tool is driven through a
+  stub with the helper's real (sync) shape. The defect survived the behavioural
+  suite because that suite's stubs were written `async` — an awaitable-tolerant
+  stub turns a wrong call site into a green run — see "A test of a helper is
+  not a test of its call site".
+
 **`list_diary_entries` reads scope from the edges, and every `OPTIONAL MATCH`
 is closed by an aggregating `WITH`.** Both are the documented diary bugs, and
 both fail in the same direction — silently. No `DiaryEntry` node carries a
@@ -2623,6 +2637,48 @@ model will not call.
 - The Live tab polls `/api/live/transcriptions/{id}/status` once when a job
   starts and then only while the status is non-terminal. An idle tab makes no
   requests.
+
+### Stale statuses repair themselves, and the boot resets the rest
+
+A status is a property of the *row*, and the code that would correct it lives
+in paths a crash can skip. The WS route writes `recording` after
+`begin_recording` and writes `paused` in its own `finally` — so a tab reload,
+a dropped socket or a server restart removes exactly the code that would have
+corrected the row, which is why a week-old transcript still said **Recording**
+while Start looked free and every press answered 409.
+
+- **The gate is the truth about whether a socket is open.**
+  `LIVE_GATE.is_recording(user_id)` is what the route itself refuses a second
+  connection on, so a `recording` row read while the gate is free is
+  *provably* stale. `_repair_stale_recording` /
+  `repair_stale_recording_status` (live_manager.py) rewrite exactly that shape
+  to `paused` and log a WARNING — a silent rewrite of a status this visible
+  would be undiagnosable later. **Both read paths repair lazily**: `_live_detail`
+  and `api_list_live_transcriptions` wrap every row they return, so the repair
+  costs nothing unless a stale row is actually read. A `recording` row under a
+  *held* gate is left alone — the socket is real.
+- **A `processing` row is dead by a different mechanism.** The restart that
+  strands it also deleted the in-memory job registry it points at, so
+  `/status` answers `idle` below a row that still claims a note is being
+  written.
+- **Boot resets both, vault-wide.** `db_reset_dead_session_statuses()` runs in
+  the lifespan (`recording`→`paused`, `processing`→`error`), before the app is
+  serving: no gate can be open while it starts, so there is no per-user
+  question to ask and no maintenance lock to hold. The function returns
+  `{ok, recordingReset, processingReset}` (`ok: False` + a WARNING when the
+  graph is unreachable — a boot that cannot see the graph must not turn into a
+  failed startup) and the lifespan prints the counts when either is non-zero.
+- **Start is disabled by the row, and refused by the row.**
+  `renderLiveControls` disables Start on `t.status === 'recording'` in
+  addition to the local `liveRecording` flag — the flag is cleared the instant
+  a capture ends, but a row the server has not repaired yet still names a
+  recording, and starting against it is a guaranteed 409. `startLiveRecording`
+  then refuses with a toast when `liveDetail.transcription.status ===
+  'recording'` instead of sending the request, turning the old "an error
+  happened" into "the server still shows this recording as active — wait a
+  moment and try again". `StaleRecordingRepairTests` and
+  `DeadSessionStatusResetTests` drive the lifted helpers; the client half is
+  pinned in `LiveGateRaceTests`.
 
 ### The ASR token is per user and write-only
 

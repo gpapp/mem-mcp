@@ -1028,6 +1028,106 @@ def _safe_transcription_status(transcription_id: str, user_id: str,
                        transcription_id, status, exc)
 
 
+def _repair_stale_recording(transcription: dict, user_id: str) -> dict:
+    """Overwrite a ``recording`` row whose socket is provably long gone.
+
+    The WS route writes ``recording`` after the gate opens and writes
+    ``paused`` in its own ``finally`` — so a browser reload, a container
+    restart or a dropped socket can skip that ``finally`` and leave the row
+    saying ``recording`` forever. Worse, the row is what the sidebar and the
+    workspace state line read, which is how a dead session reported
+    "Recording" while the Start button looked free and every press then hit
+    the route's 409 ("a transcription is already recording for this
+    account").
+
+    ``LIVE_GATE.is_recording()`` is the truth about whether a socket is
+    open — it is exactly what the WS route refuses a second connection on.
+    A ``recording`` row seen while the gate is free is therefore stale, not
+    evidence of a live capture, and is repaired to ``paused`` — the status a
+    session that was recording but is not on the wire sits in.
+
+    The repair is logged, because a silent rewrite of a status this visible
+    is undiagnosable later: the log line is the only record that the row and
+    the gate ever disagreed.
+    """
+    if not isinstance(transcription, dict):
+        return transcription
+    if transcription.get("status") != "recording":
+        return transcription
+    if LIVE_GATE.is_recording(user_id):
+        return transcription
+    transcription_id = transcription.get("id")
+    _safe_transcription_status(transcription_id, user_id, "paused")
+    logger.warning(
+        "live notes: transcription %s said recording with no active socket "
+        "-- status repaired to paused", transcription_id)
+    transcription["status"] = "paused"
+    return transcription
+
+
+def repair_stale_recording_status(transcription, user_id: str):
+    """Repair stale ``recording`` rows for one dict or a list of them.
+
+    The read paths wrap the record — or the whole list — in this before the
+    payload is built, so every response either carries the gate's verdict or
+    no stale row at all. A ``recording`` row under an OPEN gate is left
+    alone (the socket is real), which also makes the list call a no-op
+    while a recording is live.
+    """
+    if isinstance(transcription, list):
+        return [_repair_stale_recording(t, user_id) for t in transcription]
+    return _repair_stale_recording(transcription, user_id)
+
+
+def db_reset_dead_session_statuses() -> dict:
+    """Boot-time cleanup of the statuses a dead process left behind.
+
+    The WS route writes ``recording`` after the gate opens and writes
+    ``paused`` in its own ``finally`` -- so a restart or a dropped socket
+    removes exactly the code that would have corrected the row. The same
+    restart deletes the in-memory job registry that backs a ``processing``
+    status, leaving ``/status`` to answer idle for a row that still claims
+    a note is being written.
+
+    Every status this boot can prove dead is rewritten, vault-wide:
+
+    - ``recording`` -> ``paused``. No socket exists to resume; Start on a
+      paused session is the ordinary way back into it, and the first read
+      after this will not have to repair it again.
+    - ``processing`` -> ``error``. A note job that was mid-window cannot be
+      continued, its segments are still unconsumed, and the next Update now
+      reads them; the label says the honest thing instead of a stale
+      Updating note.
+
+    Boot-only by design: no gate can be open while the lifespan is still
+    starting, so there is no per-user question to ask and no lock to hold.
+    """
+    report = {"recordingReset": 0, "processingReset": 0}
+    try:
+        driver = _require_driver()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("live notes: graph unavailable at boot -- dead session "
+                       "statuses not reset: %s", exc)
+        return {**report, "ok": False}
+    with driver.session() as s:
+        row = s.run(
+            "MATCH (t:Transcription) WHERE t.status = 'recording' "
+            "SET t.status = 'paused' RETURN count(t) AS n").single()
+        report["recordingReset"] = int(row["n"] or 0) if row else 0
+        row = s.run(
+            "MATCH (t:Transcription) WHERE t.status = 'processing' "
+            "SET t.status = 'error' RETURN count(t) AS n").single()
+        report["processingReset"] = int(row["n"] or 0) if row else 0
+    if report["recordingReset"] or report["processingReset"]:
+        logger.warning(
+            "live notes: boot reset %s dead session status(es) "
+            "(recording->paused: %s, processing->error: %s) -- from before "
+            "the restart",
+            report["recordingReset"] + report["processingReset"],
+            report["recordingReset"], report["processingReset"])
+    return {**report, "ok": True}
+
+
 def _preflight_prompt(transcription: dict, note, segments: list,
                       referenced: list, candidates: list,
                       rebuilding: bool = False) -> dict:

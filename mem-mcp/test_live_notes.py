@@ -866,6 +866,131 @@ class SegmentStorageTests(unittest.TestCase):
         self.assertFalse(any("DETACH DELETE" in query for query in driver.queries))
 
 
+class StaleRecordingRepairTests(unittest.TestCase):
+    """A `recording` row no socket backs is stale, and the read paths repair it.
+
+    The WS route writes `recording` after the gate opens and writes `paused`
+    in its own ``finally`` — a reload, a restart or a dropped socket can skip
+    that ``finally``, and the row then said "Recording" forever while the
+    Start button looked free and every press answered 409. The gate is the
+    truth about whether a socket is open (it is what the route refuses a
+    second connection on), so a `recording` row under a free gate is
+    provably dead and is rewritten to `paused` -- with a log line, because a
+    silent rewrite of a status this visible is undiagnosable later.
+    """
+
+    def _repair(self, calls, gate_open):
+        logger_warnings = []
+        warn = lambda *a, **k: logger_warnings.append(
+            (a[0] % a[1:]) if len(a) > 1 else a)  # noqa: E731
+        return _lift_manager_function(
+            "_repair_stale_recording",
+            LIVE_GATE=types.SimpleNamespace(
+                is_recording=lambda user_id: gate_open),
+            _safe_transcription_status=lambda tid, user, status: calls.append(
+                (tid, user, status)),
+            logger=types.SimpleNamespace(warning=warn),
+        ), logger_warnings
+
+    def test_a_recording_row_under_a_free_gate_is_repaired(self):
+        calls = []
+        repair, warnings = self._repair(calls, gate_open=False)
+        row = {"id": "t1", "status": "recording"}
+        out = repair(row, "alice")
+        self.assertEqual(out["status"], "paused")
+        self.assertEqual(calls, [("t1", "alice", "paused")])
+        self.assertTrue(warnings, msg="a silent repair of a visible status "
+                                      "is undiagnosable later")
+
+    def test_a_recording_row_under_an_open_gate_is_left_alone(self):
+        calls = []
+        repair, _ = self._repair(calls, gate_open=True)
+        row = {"id": "t1", "status": "recording"}
+        out = repair(row, "alice")
+        self.assertEqual(out["status"], "recording")
+        self.assertEqual(calls, [], msg="the socket is real when the gate "
+                                        "is held; rewriting it would lie")
+        self.assertEqual(row["status"], "recording",
+                         msg="the row must not be mutated either")
+
+    def test_a_non_recording_row_is_untouched(self):
+        calls = []
+        repair, _ = self._repair(calls, gate_open=False)
+        row = {"id": "t1", "status": "paused"}
+        out = repair(row, "alice")
+        self.assertEqual(out["status"], "paused")
+        self.assertEqual(calls, [])
+        self.assertIs(out, row)
+
+    def test_a_non_dict_passes_through(self):
+        calls = []
+        repair, _ = self._repair(calls, gate_open=False)
+        self.assertIsNone(repair(None, "alice"))
+        self.assertEqual(calls, [])
+
+    def test_the_wrapper_repairs_a_list(self):
+        calls = []
+        helper, _ = self._repair(calls, gate_open=False)
+        wrapper = _lift_manager_function(
+            "repair_stale_recording_status",
+            _repair_stale_recording=helper,
+        )
+        out = wrapper([{"id": "t1", "status": "recording"},
+                       {"id": "t2", "status": "idle"}], "alice")
+        self.assertEqual([r.get("status") for r in out], ["paused", "idle"])
+        self.assertEqual(calls, [("t1", "alice", "paused")],
+                         msg="every row is threaded through the repair, and "
+                             "only the stale one is written")
+
+
+class DeadSessionStatusResetTests(unittest.TestCase):
+    """Boot resets the statuses a restart can strand in the graph.
+
+    A restart deletes the in-memory job registry that `processing` rows
+    point at, and the WS ``finally`` that would clear `recording` never ran
+    for a session alive when the process died. Both are provably dead at
+    boot -- no gate can be open while the lifespan starts -- so the reset is
+    vault-wide, makes no per-user question, and takes no maintenance lock.
+    """
+
+    def test_both_dead_statuses_are_reset_vault_wide(self):
+        driver = _FakeDriver(
+            lambda query, params: _FakeResult(single={"n": 2})
+            if "recording" in query else _FakeResult(single={"n": 1}))
+        reset = _lift_manager_function(
+            "db_reset_dead_session_statuses",
+            _require_driver=lambda: driver,
+            logger=types.SimpleNamespace(warning=lambda *a, **k: None),
+        )
+        report = reset()
+        joined = "\n".join(driver.queries)
+        self.assertEqual(report.get("ok"), True)
+        self.assertEqual(report.get("recordingReset"), 2)
+        self.assertEqual(report.get("processingReset"), 1)
+        self.assertIn("recording", joined)
+        self.assertIn("'paused'", joined)
+        self.assertIn("processing", joined)
+        self.assertIn("'error'", joined)
+        self.assertNotIn("$userId", joined,
+                         msg="the reset is vault-wide: a restart strands "
+                             "rows for every user at once")
+
+    def test_an_unreachable_graph_is_skipped_not_failed(self):
+        driver = _FakeDriver(lambda query, params: None)
+        warnings = types.SimpleNamespace(warning=lambda *a, **k: None)
+        reset = _lift_manager_function(
+            "db_reset_dead_session_statuses",
+            _require_driver=lambda: (_ for _ in ()).throw(
+                RuntimeError("no graph")),
+            logger=warnings,
+        )
+        report = reset()
+        self.assertEqual(report.get("ok"), False)
+        self.assertEqual(report.get("recordingReset"), 0)
+        self.assertEqual(report.get("processingReset"), 0)
+        self.assertEqual(driver.queries, [])
+
+
 class AsrProxyTests(unittest.TestCase):
     """The parts of the proxy that can be exercised without a socket."""
 
@@ -1927,6 +2052,25 @@ class LiveGateRaceTests(unittest.TestCase):
         stopped = self._js("templates/dashboard.html", "onLiveCaptureStopped")
         self.assertIn("liveGatePending = true", stopped)
         self.assertIn("awaitLiveGate(id)", stopped)
+
+    def test_start_is_disabled_while_the_row_still_says_recording(self):
+        # A `recording` row the gate does not back kept the sidebar label on
+        # "Recording" while Start looked free, and every press answered 409.
+        body = self._js("templates/dashboard.html", "renderLiveControls")
+        start = body.index("if (start) start.disabled")
+        self.assertIn("t.status === 'recording'", body[start:body.index(";", start)],
+                      msg="Start must not look free while the row names a "
+                          "recording the server has not repaired yet")
+
+    def test_start_refuses_a_stale_recording_row_instead_of_hitting_the_409(self):
+        body = self._js("templates/dashboard.html", "startLiveRecording")
+        guard = body.index("liveDetail.transcription.status === 'recording'")
+        self.assertLess(guard, body.index("LiveCapture.start"),
+                        msg="the stale-row guard must run before any capture "
+                            "is opened")
+        toast = body.index("toast(", guard)
+        self.assertLess(toast, body.index("LiveCapture.start"),
+                        msg="the refusal must say why, not die silently")
 
 
 class RepeatAbortTests(unittest.TestCase):

@@ -484,7 +484,11 @@ async def diary_save_entry(content: str, name: Optional[str] = None, timestamp: 
         # fields the server already had. The id is derived from the timestamp,
         # so filling them from the row keeps it and turns the call into an
         # ordinary update rather than the delete-and-recreate below.
-        stored = await mem.db_get_diary_entry(entryId, user)
+        # `db_get_diary_entry` is a plain sync read (the only diary helper that
+        # is not a coroutine), so this call must not be awaited -- shipping it
+        # as `await …` blew up in production with
+        # "TypeError: object dict can't be used in 'await' expression".
+        stored = mem.db_get_diary_entry(entryId, user)
         if not stored:
             raise ValueError(
                 f"No diary entry with id {entryId!r}. Omit entryId to create a "

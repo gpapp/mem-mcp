@@ -63,6 +63,7 @@ from live_manager import (
     db_get_note_references, db_set_note_references,
     db_note_fact_candidates, release_note_segments,
     start_note_job, note_job_status, NoteJobDeferred, NoteJobBusy,
+    repair_stale_recording_status, db_reset_dead_session_statuses,
 )
 
 # The WebSocket origin check is a pure helper; keeping it in `live_notes.py`
