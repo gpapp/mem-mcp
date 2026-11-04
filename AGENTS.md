@@ -2406,8 +2406,15 @@ that is still in flight — otherwise the pending `start()` lands, sets
 drives the first one through the fake DOM with `LiveCapture.active = false`.
 (The `Uncaught (in promise) Error: Could not establish connection. Receiving end
 does not exist.` reported alongside it is Chrome extension messaging —
-`chrome.runtime.sendMessage` with no listener. The dashboard uses no `chrome.*`
-API, so it is noise in the console, not a cause.)
+`chrome.runtime.sendMessage` with no listener, called from a script an extension
+injected into the page's **main world**, which is why DevTools attributes it to
+`gui:1`. The string appears in no file in this repository and the dashboard uses
+no `chrome.*` API. `isExtensionMessagingError()` is the predicate behind an
+`unhandledrejection` listener that downgrades exactly that message to a labelled
+`console.warn`, because an "Uncaught (in promise)" line makes the console look
+like the app is broken; every other rejection still surfaces. To confirm the
+source, load `/gui` in a private window with extensions disabled — the line
+disappears. `LivePanelPushTests` calls the predicate in both directions.)
 
 `LiveJobEventTests` **calls** `_announce` against a recording bus (payload
 fields, `user_id`, event name) and pins the two call sites a behavioural test

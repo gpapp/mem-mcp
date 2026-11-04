@@ -1782,6 +1782,28 @@
   // Load session state immediately upon script parsing so globals are populated
   loadSessionState();
 
+  /* ── Browser-extension noise ────────────────────────────────────────────
+     Chrome reports an extension's own failure as an unhandled rejection
+     attributed to the page it injected into: "Could not establish connection.
+     Receiving end does not exist." is `chrome.runtime.sendMessage` with no
+     listener. No page script can call that API and the string appears nowhere
+     in this repository, so it is not ours to fix -- but an "Uncaught (in
+     promise)" line makes the console look like the app is broken. Downgraded
+     to a labelled warning rather than hidden: the extension that owns it is
+     the only place it can be fixed, and any other rejection still surfaces. */
+  function isExtensionMessagingError(message) {
+    return /Could not establish connection|Receiving end does not exist/i
+      .test(String(message || ''));
+  }
+  window.addEventListener('unhandledrejection', (event) => {
+    const reason = event && event.reason;
+    const message = (reason && (reason.message || reason)) || '';
+    if (!isExtensionMessagingError(message)) return;
+    if (event.preventDefault) event.preventDefault();
+    console.warn('[gui] browser-extension messaging error ignored (not from this app):',
+                 message);
+  });
+
   /* ── Live notes capture ────────────────────────────────────────────────
      Browser half of the live-notes stream. The mic is captured by the
      vendored AudioWorklet from asr-mcp, which resamples to 16 kHz and posts

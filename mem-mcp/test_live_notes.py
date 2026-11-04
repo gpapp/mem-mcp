@@ -2576,6 +2576,22 @@ class LivePanelPushTests(unittest.TestCase):
                       msg="a start that lands after the click must not put the "
                           "panel back into Recording")
 
+    def test_only_the_extension_error_is_recognised(self):
+        # Chrome attributes an extension's `chrome.runtime.sendMessage` failure
+        # to the page it injected into, where it reads as "Uncaught (in
+        # promise)". The string is in no file we ship, so the listener is a
+        # downgrade -- and it must not swallow a real rejection.
+        out = self._run([
+            ("chrome", "isExtensionMessagingError("
+                       "'Could not establish connection. Receiving end does not exist.')"),
+            ("ours", "isExtensionMessagingError('Live transcription failed')"),
+            ("empty", "isExtensionMessagingError('')"),
+        ])
+        self.assertTrue(out["chrome"])
+        self.assertFalse(out["ours"],
+                         msg="a real app rejection must still surface")
+        self.assertFalse(out["empty"])
+
     def test_the_gate_wait_is_settled_by_the_push(self):
         body = self._body("settleLiveGate")
         self.assertLess(body.index("waitForLiveGate("),

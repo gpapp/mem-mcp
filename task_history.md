@@ -22,8 +22,11 @@ recorded in `AGENTS.md` (Task Tracking).
   `active = true`, and puts the panel straight back into Recording.
 - **The one thing to know**: the `Could not establish connection. Receiving end
   does not exist.` line is Chrome extension messaging (`chrome.runtime.sendMessage`
-  with no listener). The dashboard uses no `chrome.*` API, so it is console noise
-  and not the cause; do not chase it.
+  with no listener, called from a script an extension injected into the page's
+  main world — hence `gui:1`). The string is in no file in this repository, so
+  `isExtensionMessagingError()` + an `unhandledrejection` listener downgrade that
+  one message to a labelled `console.warn`; every other rejection still surfaces.
+  A private window with extensions disabled makes it disappear.
 
 # Live notes: the note links the facts it names (2026-11-04)
 
