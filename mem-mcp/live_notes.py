@@ -115,10 +115,12 @@ LIVE_SYSTEM_PROMPT = (
     "already has text, return the note unchanged. **An empty note is never the "
     "answer**: when there is no note yet, these sections are what you write it "
     "from.\n\n"
-    "Reference a fact only when the note's own content discusses or depends on "
-    "that fact. The candidate list is context, not a checklist: most sections "
-    "need no reference at all, and a fact is not relevant merely because it "
-    "belongs to the same client or project. `referencedFactIds` must be the "
+    "Reference a fact whenever the note discusses or depends on that record -- "
+    "that is what the link is for, and a note that keeps naming a listed "
+    "record should link it. The candidate list is still context rather than a "
+    "checklist: do not cite a fact merely because it belongs to the same "
+    "client or project, and do not cite the whole list. "
+    "`referencedFactIds` must be the "
     "complete list of facts the note references after this update -- it "
     "replaces the current list, so keep the ones that still apply and drop the "
     "ones that no longer do. Reference a fact only by the exact id shown in "
@@ -421,6 +423,43 @@ def rank_fact_candidates(candidates, segments, referenced_ids=(), limit=None):
 
     scored.sort(key=lambda item: (item[0], item[1]))
     return [entry for _, _, entry in scored[:cap]]
+
+
+def note_reference_fallback(text, candidates, limit=None):
+    """Ids of candidate facts whose title the note names by name.
+
+    The model is asked to choose its references, and a 4b model answers
+    `referencedFactIds: []` for a note that is plainly about a listed record —
+    production wrote a note on the HAL context layer with no links at all. The
+    complaint that follows is exactly "not linked to the corresponding facts,
+    only the metadata is added", and a note whose text names a record is a note
+    about that record with no inference involved.
+
+    Whole titles only, case-insensitive, and longer titles win the cap. A
+    substring match on a short generic title ("Status") would link a record the
+    note never mentioned, which is the over-linking this prompt was first
+    corrected for.
+    """
+    body = (text or "").lower()
+    if not body:
+        return []
+    cap = LIVE_REFERENCE_LIMIT if limit is None else max(0, int(limit))
+    hits = []
+    for candidate in candidates or []:
+        cid = fact_id(candidate)
+        title = fact_title(candidate).strip()
+        if not cid or len(title) < NOTE_REFERENCE_MIN_TITLE:
+            continue
+        if title.lower() in body:
+            hits.append((len(title), cid))
+    hits.sort(key=lambda item: (-item[0], item[1]))
+    ordered = []
+    for _length, cid in hits:
+        if len(ordered) >= cap:
+            break
+        if cid not in ordered:
+            ordered.append(cid)
+    return ordered
 
 
 def _note_parts(note) -> tuple:
@@ -752,6 +791,9 @@ def build_compaction_prompt(note, max_chars=None) -> str:
 
 NOTE_MIN_BLOCKS = 2
 NOTE_SINGLE_BLOCK_CHARS = 400
+# A title shorter than this is a word, not a name: linking a record because
+# the note contains "Status" or "AI" is the over-linking the prompt forbids.
+NOTE_REFERENCE_MIN_TITLE = 3
 
 
 def note_structure_problem(text) -> str:

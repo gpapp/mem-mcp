@@ -5,6 +5,31 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# Live notes: the note links the facts it names (2026-11-04)
+
+- **Reported as**: "The live transcriptions are not linked to the corresponding
+  facts only the metadata is added."
+- **Cause**: the reference instruction over-corrected. After the over-linking
+  fix the prompt said *"most sections need no reference at all"*, and the model
+  answered `referencedFactIds: []` for a note that was plainly about a listed
+  record — so the fact carried `source`/`transcriptionId`/`segmentIds` metadata
+  and no `REFERENCES` edge. `_commit_note_window` was always calling
+  `db_set_note_references`; it was being handed an empty list.
+- **What shipped**:
+  - The prompt pairs the "not a checklist" rule with the affirmative one:
+    reference a fact whenever the note discusses or depends on that record, and
+    a note that keeps naming a listed record should link it.
+  - `live_notes.note_reference_fallback()` is the deterministic floor: when the
+    answer has no ids, a candidate whose **whole title** appears in the note text
+    is linked (case-insensitive, longer titles first, capped by
+    `MEM_LIVE_REFERENCE_LIMIT`, and titles under 3 characters ignored so "AI"
+    cannot link a record).
+  - An empty candidate list now logs a WARNING — a session with no client, or a
+    client with no facts, is the one thing that made this undiagnosable.
+- **The one thing to know**: the fallback is a floor, not a replacement for the
+  model's answer — it only runs when the answer carries no ids, so a note that
+  deliberately drops a link keeps that decision.
+
 # Live notes: an empty note is never the answer (2026-11-03)
 
 - **Reported as**: the container log for a first `summarize` call — `"text": ""`

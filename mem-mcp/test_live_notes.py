@@ -240,10 +240,21 @@ class PromptTests(unittest.TestCase):
         # Reported symptom: a note linked its whole project scope. The list is
         # the scope; the prompt has to say that being in it is not evidence.
         prompt = ln.LIVE_SYSTEM_PROMPT
-        self.assertIn("context, not a checklist", prompt)
-        self.assertIn("not relevant merely because it belongs to the same "
+        self.assertIn("context rather than a checklist", prompt)
+        self.assertIn("do not cite a fact merely because it belongs to the same "
                       "client or project", prompt)
-        self.assertIn("most sections need no reference at all", prompt)
+        self.assertIn("do not cite the whole list", prompt)
+
+    def test_the_prompt_asks_for_the_link_the_note_earns(self):
+        # The opposite complaint followed: "most sections need no reference at
+        # all" produced a note with `referencedFactIds: []` on a meeting that
+        # was plainly about a listed record, so the fact carried metadata and
+        # no links. The discouragement has to be paired with an instruction to
+        # link what the note actually discusses.
+        prompt = ln.LIVE_SYSTEM_PROMPT
+        self.assertIn("Reference a fact whenever the note discusses or depends "
+                      "on that record", prompt)
+        self.assertIn("naming a listed record should link it", prompt)
 
     def test_the_answer_replaces_the_reference_list(self):
         # Without this sentence the model cannot know that pruning is allowed,
@@ -1339,6 +1350,59 @@ class NoteStructureTests(unittest.TestCase):
         self.assertIn("Do not shorten, merge or drop", prompt)
 
 
+class NoteReferenceFallbackTests(unittest.TestCase):
+    """A note that names a record must link it, even when the model says [].
+
+    Production wrote a note on the HAL context layer with `referencedFactIds:
+    []`, so the fact carried metadata (`source: live_notes`, `transcriptionId`,
+    `segmentIds`) and no `REFERENCES` edge at all -- "not linked to the
+    corresponding facts, only the metadata is added". The model is asked to
+    choose; this is the floor underneath the choice.
+    """
+
+    CANDS = [
+        {"id": "f1", "name": "HAL Context Layer architecture"},
+        {"id": "f2", "name": "Jane Smith"},
+        {"id": "f3", "name": "AI"},
+    ]
+
+    def test_a_title_the_note_names_is_linked(self):
+        text = "## Design\n\nThe HAL Context Layer architecture was agreed."
+        self.assertEqual(ln.note_reference_fallback(text, self.CANDS), ["f1"])
+
+    def test_matching_is_case_insensitive(self):
+        text = "jane smith will own the cutover."
+        self.assertEqual(ln.note_reference_fallback(text, self.CANDS), ["f2"])
+
+    def test_a_short_title_is_not_a_name(self):
+        # "AI" is a word, not a record title. Linking on it would put the note
+        # on a fact it never mentioned, which is the over-linking the prompt
+        # was first corrected for.
+        self.assertEqual(ln.note_reference_fallback("the AI work", self.CANDS), [])
+
+    def test_nothing_named_links_nothing(self):
+        self.assertEqual(ln.note_reference_fallback("Unrelated text.", self.CANDS), [])
+
+    def test_an_empty_note_links_nothing(self):
+        self.assertEqual(ln.note_reference_fallback("", self.CANDS), [])
+
+    def test_the_reference_limit_is_honoured(self):
+        cands = [{"id": "g%d" % i, "name": "Project Alpha %d" % i}
+                 for i in range(30)]
+        text = " ".join(c["name"] for c in cands)
+        self.assertEqual(len(ln.note_reference_fallback(text, cands)),
+                         ln.LIVE_REFERENCE_LIMIT)
+
+    def test_longer_titles_win_the_cap(self):
+        # With one slot, the more specific record is the one the note is about.
+        cands = [{"id": "short", "name": "Alpha"},
+                 {"id": "long", "name": "Alpha Beta Gamma"}]
+        self.assertEqual(
+            ln.note_reference_fallback("Alpha Beta Gamma and Alpha", cands,
+                                       limit=1),
+            ["long"])
+
+
 class NoteStructureRepairTests(unittest.TestCase):
     """The repair pass is driven, because keeping the original is the property.
 
@@ -1486,6 +1550,14 @@ class JobContractTests(unittest.TestCase):
                         "the structure check must be what decides to repair")
         self.assertLess(repair, commit,
                         "the note must be re-formatted before it is written")
+
+    def test_references_the_model_dropped_are_linked_from_the_note(self):
+        # The note is written with `db_set_note_references`, so the fallback has
+        # to run before the commit or the fact keeps its metadata and no links.
+        body = self._segment("_refresh_note")
+        fallback = body.index("note_reference_fallback(")
+        commit = body.index("_commit_note_window")
+        self.assertLess(fallback, commit)
 
 
 class AudioWatchdogTests(unittest.TestCase):

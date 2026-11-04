@@ -2186,10 +2186,33 @@ The link half had two causes, and the code one mattered as much as the prose:
   what is there — "unchanged" is a legitimate answer and must not unlink
   everything. An explicit `[]` clears it.
 - **The candidate list is the whole client scope**, and a small model reads a
-  list in front of it as a checklist. The prompt now says the list is *context,
-  not a checklist*: refer to a fact only when the note's own content discusses or
-  depends on it, "most sections need no reference at all", and a fact is "not
-  relevant merely because it belongs to the same client or project".
+  list in front of it as a checklist. The prompt says the list is *context
+  rather than a checklist*: do not cite a fact merely because it belongs to the
+  same client or project, and do not cite the whole list.
+- **"Most sections need no reference at all" over-corrected to *no references
+  at all*.** That sentence produced a note on the HAL context layer with
+  `referencedFactIds: []`, so the fact carried its metadata (`source:
+  live_notes`, `transcriptionId`, `segmentIds`) and **no `REFERENCES` edge** —
+  reported as "the live transcriptions are not linked to the corresponding
+  facts, only the metadata is added". The discouragement is now paired with the
+  affirmative rule — reference a fact whenever the note discusses or depends on
+  that record, and a note that keeps naming a listed record should link it.
+- **`note_reference_fallback` is the deterministic floor under the model's
+  choice.** When the answer carries no ids at all, any candidate whose **whole
+  title** appears in the note text (case-insensitive) is linked, up to
+  `MEM_LIVE_REFERENCE_LIMIT`, longer titles first. A record the note names
+  verbatim is one the note is about and no inference is involved; a title under
+  `NOTE_REFERENCE_MIN_TITLE` (3 chars) is a word rather than a name, so "AI" or
+  "Status" cannot link a record the note never mentioned. The model's answer is
+  respected when it *does* answer — the fallback only runs on an empty list.
+  `NoteReferenceFallbackTests` calls it; `JobContractTests` pins that it runs
+  before `_commit_note_window`, because the note is written by
+  `db_set_note_references` and a fallback after the commit would leave the
+  reported symptom in place.
+- **An empty candidate list is logged at WARNING**, because that is the one
+  thing that makes "the note has no links" undiagnosable: a session with no
+  client scope, or a client with no facts, gives the model nothing to choose
+  from.
 
 `MEM_LIVE_REFERENCE_LIMIT` (default 12) is the **backstop, not a target**: more
 than a dozen citations is a note describing the project rather than the meeting.

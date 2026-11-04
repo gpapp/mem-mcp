@@ -62,6 +62,7 @@ from live_notes import (
     is_repeat_abort,
     live_output_budget,
     note_blocks,
+    note_reference_fallback,
     note_structure_problem,
     parse_note_json,
     rank_fact_candidates,
@@ -1532,6 +1533,16 @@ async def _refresh_note(job: dict) -> None:
             segments=window,
             referenced_ids=[item["id"] for item in referenced],
         )
+        if not candidates:
+            # Not an error, but the one thing that makes "the note has no
+            # links" undiagnosable: a session with no client scope, or a client
+            # with no facts, has nothing to reference and the model is given an
+            # empty list.
+            logger.warning(
+                "live notes: no candidate facts for %s -- the session has no "
+                "client, or that client has no facts to reference",
+                transcription_id,
+            )
         prompt = build_live_prompt(
             working, window, referenced, candidates,
             client=transcription.get("clientName") or "",
@@ -1640,6 +1651,19 @@ async def _refresh_note(job: dict) -> None:
                 problem, transcription_id,
             )
             result = await _reformat_note(job, result, allowed_ids)
+        # The model chooses references, and a 4b model often answers [] for a
+        # note that plainly names a listed record -- the note then carries
+        # metadata but no links at all, which is the reported symptom. A record
+        # the note names verbatim is one the note is about, so that is the
+        # deterministic floor, not an inference.
+        if not result["referencedFactIds"]:
+            linked = note_reference_fallback(result["text"], candidates)
+            if linked:
+                result["referencedFactIds"] = linked
+                logger.info(
+                    "live notes: linked %d fact(s) the note names for %s",
+                    len(linked), transcription_id,
+                )
         if len(result["text"]) > LIVE_NOTE_MAX_CHARS:
             result = await _compact_note(job, result, allowed_ids)
             if len(result["text"]) > LIVE_NOTE_MAX_CHARS:
