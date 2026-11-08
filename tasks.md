@@ -181,17 +181,140 @@ only trace of one today.
 
 ---
 
+## Skills: improve discovery, then add the ones that are missing
+
+The skills system is the right home for every one of the features above — a
+skill is Markdown, costs no runtime, and is addressable by an MCP client that
+has never seen this repo. But it currently only covers **getting data in**.
+
+**Current inventory** (`mem-mcp/skills/`): `process-transcription.md` (452
+lines), `process-directory.md` (136), `memory-deduplication.md` (87). All three
+are ingestion or maintenance. Nothing covers *using* the vault, which is what a
+consultant does all day.
+
+### 8. `find_skills` must return descriptions, not bare filenames
+
+`find_skills` (mcp_tools.py:866) is
+`[f[:-3] for f in os.listdir(skills_dir) if f.endswith(".md")]`. Discovery
+returns three opaque strings, so an agent must load all three to learn that none
+of them answers its question — the one tool whose purpose is *not* loading
+things forces loading everything.
+
+**Acceptance criteria**
+- Two of the three skills already carry YAML front matter (`name`,
+  `description`); parse it and return `[{name, description}]`, falling back to
+  the filename when a file has none.
+- Deterministic only — no model call on a discovery path.
+- `memory-deduplication.md` gains the front matter the other two have.
+
+**Effort:** S. It is on the first call every new client makes.
+
+### 9. Every skill must be resource-addressable, including `process-directory`
+
+`register_skills` hand-registers `skill://process-transcription` and
+`skill://memory-deduplication`. **`process-directory` has neither a resource nor
+a prompt**, yet the `process-transcription` prompt tells the reader to "load
+skill 'process-directory' instead" — so the recommended path is the one path a
+client cannot address by URI. The documented promise that adding a `.md` file
+needs "no server restart" is also true only for `get_skill_workflow`.
+
+**Acceptance criteria**
+- Resources registered by iterating `skills/*.md`, not one decorator per skill
+  (bind the name with a default argument so the closure is not late-bound).
+- A prompt for `process-directory` alongside the existing two.
+- A test asserting every `.md` in `skills/` has a matching `skill://` URI — the
+  asymmetry is invisible until someone adds the fourth skill.
+
+**Effort:** S.
+
+### 10. `search-and-recall` — how to query this vault, not how to fill it
+
+The highest-value skill in this list, and the cheapest: it is pure Markdown over
+behaviour that already exists but is nowhere documented for a client.
+`search_facts`'s docstring does not mention that `score` is a ranking number
+that must never be thresholded, that `confidence` is the gate, that
+`scopeStrength` is a third axis, or that ordering is `(scopeStrength, score,
+confidence)`.
+
+**Acceptance criteria** — the skill states, in the order a reader needs them:
+- Ask for `client` and `context` whenever you know them; scope **prioritises and
+  never excludes**, so a filter cannot cause an empty result.
+- `score` ranks, `confidence` gates, `evidence` explains. Never threshold
+  `score`.
+- A weak-identity name query is deliberate: follow with `get_fact_neighborhood`
+  rather than assuming a miss.
+- Long records are chunked; a hit returns the whole record, so a fragment is
+  never the answer.
+- `find_patterns` is for "what recurs", not for "what is true of X".
+- When the vault disagrees with the user, say so rather than smoothing it over.
+
+**Effort:** S. Pairs with feature #6.
+
+### 11. `meeting-prep` — the read-side skill for feature #2
+
+Walks a client or project and produces the brief: roster, open actions,
+decisions since a date, recent diary headlines, highest-signal linked facts.
+Written now as a *manual* workflow over existing tools, so it is useful before
+feature #2 lands and becomes the spec for that endpoint.
+
+**Effort:** S to write, and it makes features #1/#3/#4 usable on the day they
+ship.
+
+### 12. `client-context-hygiene` — the scope maintenance workflow
+
+The reclassify machinery is subtle and its rules live in `AGENTS.md`, aimed at
+developers: a null scope is **permanent** (`scopeCheckedSig`), `scopeManual`
+protects a hand-set scope from a bulk reclassify but not from a single-item one,
+a context the text never names is dropped in code, an unresolvable name is a
+real null rather than a retry. An agent asked to "tidy up my clients" will
+otherwise guess.
+
+**Acceptance criteria**
+- Review order: list clients → find unclassified records → reclassify → verify,
+  with the manual-scope rule stated at the point it matters.
+- Explicit that creating a client on a near-miss is the wrong fix (it mints a
+  duplicate the classifier will never link to).
+- Never instruct a bulk reclassify over a manually scoped item.
+
+**Effort:** S.
+
+### 13. `vault-orientation` — the first-hour skill
+
+What is in here, what the shapes mean (facts vs diary vs live notes, clients vs
+contexts, categories are global and carry no owner), how scope is attached, and
+the three or four questions a new user should try. Turns an empty-looking vault
+into a legible one.
+
+**Effort:** S.
+
+### 14. `weekly-review` — the cadence surface
+
+"What happened across all clients this week, what is still open, who have I not
+spoken to." Composes `list_diary_entries`, action items (#1) and roster
+staleness (#3); before those exist it is a diary digest.
+
+**Effort:** S once #1/#3 exist.
+
+---
+
 ### Suggested sequence
 
 | order | item | why here |
 |---|---|---|
-| 1 | #6 time/person search | small, and every later item is easier to verify with it |
-| 2 | #1 commitments register | the gap that defines the product's usefulness |
-| 3 | #2 meeting-prep brief | turns #1 into something read daily |
-| 4 | #3 stakeholder roster | reuses edges already written, no migration |
-| 5 | #4 decision log | shares #1's extraction machinery |
-| 6 | #5 engagement timeline | needs #1 and #4 to have something to show |
-| 7 | #7 deliverables | lowest urgency, no dependency |
+| 1 | #8 `find_skills` descriptions | 15 lines, and every client's first call sees it |
+| 2 | #10 `search-and-recall` skill | pure Markdown, changes answer quality immediately |
+| 3 | #6 time/person search | small, and every later item is easier to verify with it |
+| 4 | #9 skill resource loop | fixes `process-directory` and makes "add a file" true |
+| 5 | #1 commitments register | the gap that defines the product's usefulness |
+| 6 | #2/#11 prep brief | turns #1 into something read daily |
+| 7 | #3 stakeholder roster | reuses edges already written, no migration |
+| 8 | #4 decision log | shares #1's extraction machinery |
+| 9 | #5 engagement timeline | needs #1 and #4 to have something to show |
+| 10 | #12/#13/#14 remaining skills | cheap, and better once the data they describe exists |
+| 11 | #7 deliverables | lowest urgency, no dependency |
+
+Items 1, 2 and 4 together are roughly a day and they improve every session after
+them, which is why they come before the headline feature rather than with it.
 
 Explicitly out of scope for now: calendaring integration (the vault should not
 become a calendar), per-user task assignment across accounts (that is sharing
