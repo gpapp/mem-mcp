@@ -5,6 +5,50 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# Commitments: an `:ActionItem` register fed by the diary
+
+Every meeting produces commitments, and until now they existed only as bullets
+inside a diary body. `## Actions` and `## Open Questions` were already in the
+diary format, and Live Notes already told the model to keep "owners, numbers,
+dates, risks and open questions" — but nothing parsed them, so the only way to
+find out what was outstanding was to reread the meeting. That is the consultant's
+dominant failure mode: a dropped thread.
+
+**Why a new node type.** A fact is a statement about the world; an obligation is
+owed, has an owner, may have a deadline, and moves through open → done or
+dropped. Putting that on `:Fact` would give a node type a property it has no
+concept of.
+
+**Why deterministic first.** `- [ ] Tim: send the architecture doc by 2026-05-31`
+needs no model, and the one field that must be exact — the date — is the field a
+model is most willing to invent. `parse_action_items`, `parse_due_date` and
+`split_owner` live in `matching_utils.py` so they are pure and callable from a
+suite with no database.
+
+**What shipped.**
+- `action_manager.py` — `db_sync_action_items` (reconcile, not append),
+  `db_list_action_items` (filters, does not rank), `db_update_action_item`,
+  `db_create_action_item`, `sync_actions_from_text`, `describe_action_item`.
+- `matching_utils.py` — the parser: section allow-list, `[x]` as `done`,
+  `split_owner` refusing labels, `parse_due_date` resolving only what the text
+  named, `normalise_action_text` as the reconciliation key.
+- Hooks in `db_save_diary` and `db_update_diary`, passing the entry's own date as
+  the weekday reference.
+- Three MCP tools, three GUI routes, a **My actions** card on the Clients page,
+  and an "Open items" block in each client/project panel.
+
+**Tests.** 1519 OK across the full suite (`test_action_items.py` is new, 21
+tests; `ActionItemParsingTests` adds 12 to `test_matching_regressions.py`).
+
+**The one thing to remember.** `authoritative=False` is what stops a meeting
+minutes file re-saved with a different heading from emptying the register: a
+document that says nothing about actions has not withdrawn them. And
+`normalise_action_text` is the matching key rather than the id, because an
+edited bullet is the same commitment — get that wrong and every save either
+duplicates the list or closes work that is still open.
+
+---
+
 # Search: dates and people narrow, and a window widens the fetch
 
 - **Why**: `search_facts` and `diary_search_entries` could rank by scope but not

@@ -1188,7 +1188,21 @@
 
 <!-- ═══ CLIENTS PAGE ═══ -->
 <div id="page-clients" class="page">
-  <div class="card">
+  <div class="card" id="my-actions-card">
+    <h2 style="margin-top:0;">✅ My actions</h2>
+    <p style="font-size:.85rem;color:var(--muted);margin-bottom:.6rem;">
+      Open commitments, extracted from every meeting's <code>## Actions</code>
+      and <code>## Open Questions</code> bullets. Overdue first.
+    </p>
+    <div style="display:flex;gap:.5rem;margin-bottom:.6rem;flex-wrap:wrap;">
+      <input id="new-action-text" type="text" placeholder="What is owed…" style="max-width:320px;width:auto;flex:1;" onkeydown="if(event.key==='Enter') createActionItem()">
+      <input id="new-action-owner" type="text" placeholder="Owner" style="max-width:120px;width:auto;">
+      <input id="new-action-due" type="date" style="max-width:150px;width:auto;">
+      <button class="btn btn-primary btn-sm" onclick="createActionItem()">＋ Add</button>
+    </div>
+    <div id="my-actions-list"><p class="empty">Loading…</p></div>
+  </div>
+  <div class="card" style="margin-top:.75rem;">
     <h2 style="margin-top:0;">🏢 Clients</h2>
     <p style="font-size:.85rem;color:var(--muted);margin-bottom:.75rem;">
       Inactive clients are deprioritized in unscoped search. Toggle pins the status.
@@ -2867,6 +2881,7 @@
 
 
   async function loadClients() {
+    loadMyActions();
     const el = document.getElementById('client-list');
     if (!el) return;
     try {
@@ -2996,11 +3011,23 @@
         ? await api.get('clients/' + id + '/items')
         : await api.get('contexts/' + id + '/items');
       panel.dataset.loaded = '1';
+      let actions = [];
+      try {
+        const params = type === 'client'
+          ? 'clientId=' + encodeURIComponent(id)
+          : 'contextId=' + encodeURIComponent(id);
+        const ai = await api.get('action-items?' + params + '&status=open');
+        actions = (ai && ai.items) || [];
+      } catch(e) { actions = []; }
+      const actionsHtml = actions.length
+        ? `<div style="padding:.35rem .4rem;font-size:.72rem;color:var(--muted);border-bottom:1px solid var(--border);">Open items</div>`
+          + renderActionRows(actions, {})
+        : '';
       const rows = [];
       (data.facts || []).forEach(f => rows.push({kind:'fact', id: f.id, name: f.name, cat: f.category}));
       (data.diary || []).forEach(d => rows.push({kind:'diary', id: d.id, name: d.name, ts: d.timestamp}));
-      if (!rows.length) { panel.innerHTML = '<p style="padding:.4rem;font-size:.8rem;color:var(--muted);">No items linked yet.</p>'; return; }
-      panel.innerHTML = rows.map(r => {
+      if (!rows.length) { panel.innerHTML = actionsHtml + '<p style="padding:.4rem;font-size:.8rem;color:var(--muted);">No items linked yet.</p>'; return; }
+      panel.innerHTML = actionsHtml + rows.map(r => {
         if (r.kind === 'fact') {
           // The ✏️ is withheld on a record the caller may read but not write.
           // The row carries `readOnly` only on a shared panel, so an own panel
@@ -3021,6 +3048,61 @@
         }
       }).join('');
     } catch(e) { panel.innerHTML = '<p style="padding:.4rem;font-size:.8rem;color:var(--muted);">⚠️ Could not load items.</p>'; }
+  }
+
+  // Commitments. The register is filled by the diary save path; this is the
+  // surface that makes it usable, and the only place a person can close one.
+  function renderActionRows(items, options) {
+    const opts = options || {};
+    if (!items.length) return '<p class="empty" style="font-size:.8rem;">Nothing outstanding.</p>';
+    return items.map(a => {
+      const due = a.dueAt ? String(a.dueAt).slice(0,10) : '';
+      const overdue = a.overdue && a.status === 'open';
+      const dueTxt = due ? `<span class="scope-item-type" style="color:${overdue ? '#e5484d' : 'var(--muted)'};">${overdue ? '⚠️ ' : ''}${due}</span>` : '';
+      const owner = a.owner ? `<span class="scope-item-type">${escHtml(a.owner)}</span>` : '';
+      const scope = opts.showScope && a.clientName ? `<span class="scope-item-type">${escHtml(a.clientName)}</span>` : '';
+      const done = a.status !== 'open' ? '' :
+        `<button class="btn btn-sm btn-ghost" style="padding:.1rem .4rem;font-size:.7rem;" title="Mark done" onclick="event.stopPropagation(); completeActionItem('${a.id}')">✓</button>`;
+      return `<div class="scope-item-row">
+        ${owner}${scope}${dueTxt}
+        <span class="scope-item-name">${escHtml(a.text || '')}</span>
+        ${done}
+      </div>`;
+    }).join('');
+  }
+
+  async function loadMyActions() {
+    const el = document.getElementById('my-actions-list');
+    if (!el) return;
+    try {
+      const data = await api.get('action-items');
+      el.innerHTML = renderActionRows((data && data.items) || [], {showScope: true});
+    } catch(e) { el.innerHTML = '<p class="empty">⚠️ Could not load actions.</p>'; }
+  }
+
+  async function createActionItem() {
+    const text = (document.getElementById('new-action-text') || {}).value || '';
+    if (!text.trim()) { toast('What is owed?'); return; }
+    const owner = (document.getElementById('new-action-owner') || {}).value || '';
+    const due = (document.getElementById('new-action-due') || {}).value || '';
+    try {
+      await api.post('action-items', {text: text.trim(), owner: owner.trim() || null,
+                                      dueAt: due || null});
+      ['new-action-text','new-action-owner','new-action-due'].forEach(id => {
+        const box = document.getElementById(id); if (box) box.value = '';
+      });
+      toast('✅ Action recorded');
+      await loadMyActions();
+    } catch(e) { toastApiError(e, 'Could not record the action'); }
+  }
+
+  async function completeActionItem(id) {
+    try {
+      await api.post('action-items/' + id, {status: 'done'});
+      await loadMyActions();
+      const panel = document.querySelector('.scope-items-panel.open');
+      if (panel) { panel.dataset.loaded = ''; panel.classList.remove('open'); }
+    } catch(e) { toastApiError(e, 'Could not update the action'); }
   }
 
   async function createClient() {

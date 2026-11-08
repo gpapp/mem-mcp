@@ -1613,6 +1613,62 @@ async def api_client_items(client_id: str, request: Request):
         raise _service_unavailable(e)
 
 
+@web_app.get("/api/action-items", response_class=JSONResponse)
+async def api_list_action_items(request: Request, clientId: str = "", contextId: str = "",
+                                status: str = "", dueBefore: str = ""):
+    """Commitments, filtered by engagement.
+
+    ``clientId`` / ``contextId`` **filter** here, unlike search scope: the panel
+    asks a closed question, so an item from another engagement is a wrong answer
+    rather than a lower-ranked one. `dueBefore` and `status` narrow further.
+    """
+    user_id = _require_user(request)
+    try:
+        rows = mem.db_list_action_items(user_id, client_id=clientId or None,
+                                        context_id=contextId or None,
+                                        status=status or None,
+                                        due_before=dueBefore or None)
+        return {"items": [mem.describe_action_item(r) for r in rows]}
+    except RuntimeError as e:
+        raise _service_unavailable(e)
+
+
+class _ActionItemBody(BaseModel):
+    text: str = ""
+    owner: Optional[str] = None
+    dueAt: Optional[str] = None
+    clientId: Optional[str] = None
+    contextId: Optional[str] = None
+    status: Optional[str] = None
+
+
+@web_app.post("/api/action-items", response_class=JSONResponse)
+async def api_create_action_item(body: _ActionItemBody, request: Request):
+    user_id = _require_user(request)
+    if not (body.text or "").strip():
+        raise HTTPException(status_code=400, detail="An action item needs text.")
+    result = mem.db_create_action_item(user_id, body.text, owner=body.owner,
+                                       due_at=body.dueAt, client_id=body.clientId,
+                                       context_id=body.contextId,
+                                       status=body.status or "open")
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("reason") or "Could not save.")
+    await mem.publish_db_event(user_id, "actions_changed", {"action": "add"})
+    return result["item"]
+
+
+@web_app.post("/api/action-items/{item_id}", response_class=JSONResponse)
+async def api_update_action_item(item_id: str, body: _ActionItemBody, request: Request):
+    user_id = _require_user(request)
+    result = mem.db_update_action_item(item_id, user_id, status=body.status,
+                                       due_at=body.dueAt, owner=body.owner,
+                                       text=(body.text or None))
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail=result.get("reason") or "No such action item.")
+    await mem.publish_db_event(user_id, "actions_changed", {"action": "update", "id": item_id})
+    return result["item"]
+
+
 @web_app.get("/api/contexts/{context_id}/items", response_class=JSONResponse)
 async def api_context_items(context_id: str, request: Request):
     """Facts + diary entries linked to a project."""

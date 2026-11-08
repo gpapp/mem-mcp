@@ -975,6 +975,189 @@ async def list_share_grants(targetType: str, targetId: str):
 
 
 # ---------------------------------------------------------------------------
+# Action items
+#
+# Commitments are the one thing a consultant is actually measured on, and until
+# now they existed only as bullets inside a diary body. These three tools are
+# the read and write halves of the register the diary save path fills.
+# ---------------------------------------------------------------------------
+
+def _action_scope_ids(client, context, user):
+    """Resolve client/context *names* to ids, without creating anything.
+
+    A typo must not mint a Client (the duplicate is permanent: the classifier
+    only ever picks from existing names, so the near-miss copy never gets
+    linked), so an unknown name resolves to no id and the filter widens rather
+    than silently matching nothing.
+    """
+    if not client and not context:
+        return None, None
+    wanted_client = (client or "").strip().lower()
+    wanted_context = (context or "").strip().lower()
+    client_id = context_id = None
+    for row in mem.db_list_clients(user) or ():
+        name = str(row.get("name") or "").strip().lower()
+        if wanted_client and (name == wanted_client or wanted_client in name):
+            client_id = row.get("id")
+        if wanted_context:
+            for ctx in row.get("contexts") or ():
+                if str(ctx.get("name") or "").strip().lower() == wanted_context:
+                    context_id = ctx.get("id")
+                    client_id = client_id or row.get("id")
+    return client_id, context_id
+
+
+def _format_action_items(rows, heading="Action Items"):
+    if not rows:
+        return "_No action items._"
+    lines = [f"## {heading}\n"]
+    buckets = (("Overdue", []), ("This week and later", []), ("No due date", []))
+    for row in rows:
+        item = mem.describe_action_item(row)
+        due = item.get("dueAt")
+        if not due:
+            buckets[2][1].append(item)
+        elif item.get("overdue"):
+            buckets[0][1].append(item)
+        else:
+            buckets[1][1].append(item)
+    for title, items in buckets:
+        if not items:
+            continue
+        lines.append(f"### {title}\n")
+        for item in items:
+            owner = f" — **{item['owner']}**" if item.get("owner") else ""
+            due = f" — due `{str(item['dueAt'])[:10]}`" if item.get("dueAt") else ""
+            scope = ""
+            if item.get("clientName"):
+                scope = f" — {item['clientName']}"
+                if item.get("contextName"):
+                    scope += f" / {item['contextName']}"
+            lines.append(f"- `{item['status']}` {item['text']}{owner}{due}{scope} "
+                         f"_(id: {item['id']})_")
+        lines.append("")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+@monitor_mcp_tool("list_action_items", context_provider=_current_user)
+async def list_action_items(client: Optional[str] = None,
+                            context: Optional[str] = None,
+                            status: Optional[str] = None,
+                            dueBefore: Optional[str] = None):
+    """
+    List commitments — what is owed, by whom, and by when.
+
+    This is the register the diary save path fills from `## Actions` and
+    `## Open Questions` bullets. Use it to answer "what is outstanding for this
+    client", "what is overdue", or "what did I promise in that meeting".
+
+    Unlike search scope, `client` and `context` here **filter**: the panel is
+    asking a closed question, so an item filed under another engagement is not
+    a lower-ranked answer, it is a wrong one.
+
+    Parameters:
+      client: client name to narrow to (abbreviations resolve against the
+        stored names). An unknown name widens to the whole vault rather than
+        returning nothing, so a typo cannot look like "no commitments".
+      context: project name within that client.
+      status: one of 'open', 'done', 'dropped'. Defaults to open items only
+        when no client or context is given, and to every status when one is.
+      dueBefore: ISO date; keeps items due on or before it.
+
+    Returns Markdown grouped into Overdue / This week and later / No due date.
+    Each row carries its `id` for `update_action_item`.
+    """
+    user = _current_user()
+    client_id, context_id = _action_scope_ids(client, context, user)
+    rows = mem.db_list_action_items(user, client_id=client_id, context_id=context_id,
+                                    status=status, due_before=dueBefore)
+    heading = "Action Items"
+    if client:
+        heading = f"Action Items — {client}"
+    return _format_action_items(rows, heading)
+
+
+@mcp.tool()
+@monitor_mcp_tool("save_action_item", context_provider=_current_user)
+async def save_action_item(text: str, owner: Optional[str] = None,
+                           dueAt: Optional[str] = None,
+                           client: Optional[str] = None,
+                           context: Optional[str] = None):
+    """
+    Record a commitment that did not come out of a diary entry.
+
+    Most items are extracted from a meeting's `## Actions` bullet list, so this
+    is for the ones that are not: something agreed in a corridor, a promise made
+    in a call nobody transcribed. Writing it here gives it the same lifecycle as
+    an extracted item — owner, deadline, status, scope, and a place in the
+    panel.
+
+    Parameters:
+      text: what is owed. Write it as an action ("send the architecture doc"),
+        not as a note.
+      owner: who owes it. A person's name, or "me".
+      dueAt: ISO date (YYYY-MM-DD). Omit it when no date was named — a guessed
+        deadline is worse than a missing one, because a missing one reads as
+        "no date" and a guess reads as a fact.
+      client / context: the engagement this belongs to. Resolved to stored
+        names; an unknown name records the item unscoped rather than creating a
+        duplicate client.
+
+    Returns the created item, including its `id`.
+    """
+    user = _current_user()
+    client_id, context_id = _action_scope_ids(client, context, user)
+    result = mem.db_create_action_item(user, text, owner=owner, due_at=dueAt,
+                                       client_id=client_id, context_id=context_id)
+    if not result.get("ok"):
+        return f"Could not record the action item: {result.get('reason')}"
+    item = result["item"]
+    return (f"Recorded action item `{item['id']}`: {item['text']}"
+            + (f" — **{item['owner']}**" if item.get("owner") else "")
+            + (f" — due `{str(item['dueAt'])[:10]}`" if item.get("dueAt") else "")
+            + ".")
+
+
+@mcp.tool()
+@monitor_mcp_tool("update_action_item", context_provider=_current_user)
+async def update_action_item(id: str, status: Optional[str] = None,
+                             dueAt: Optional[str] = None,
+                             owner: Optional[str] = None,
+                             text: Optional[str] = None):
+    """
+    Mark a commitment done, dropped, or move its owner or deadline.
+
+    `status` is the field this exists for: a register nobody can close is a list
+    of guilt rather than a list of work. Allowed values are 'open', 'done' and
+    'dropped'; a re-extraction from the source meeting will not reopen a
+    completed item, so marking it done is safe.
+
+    Parameters:
+      id: the item id from `list_action_items`.
+      status: 'open', 'done' or 'dropped'.
+      dueAt: ISO date (YYYY-MM-DD), or an empty string to clear it.
+      owner: replaces the owner.
+      text: replaces the wording, and its matching key, so a later
+        re-extraction recognises the edited bullet instead of adding a second
+        item for it.
+
+    Returns the updated item, or a refusal naming the reason.
+    """
+    if dueAt == "":
+        dueAt = None
+    result = mem.db_update_action_item(id, _current_user(), status=status,
+                                       due_at=dueAt, owner=owner, text=text)
+    if not result.get("ok"):
+        return f"Could not update action item `{id}`: {result.get('reason')}"
+    item = result["item"]
+    return (f"Updated `{item['id']}` — `{item['status']}`: {item['text']}"
+            + (f" — **{item['owner']}**" if item.get("owner") else "")
+            + (f" — due `{str(item['dueAt'])[:10]}`" if item.get("dueAt") else "")
+            + ".")
+
+
+# ---------------------------------------------------------------------------
 # Skills & Resources
 # ---------------------------------------------------------------------------
 from mcp_skills import register_skills

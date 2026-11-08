@@ -1240,3 +1240,317 @@ def timestamp_in_window(stamp: object, after: object = None, before: object = No
         if text[:len(bound)] > bound:
             return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# Action items
+#
+# Every meeting produces commitments, and the diary format already carries them
+# in `## Actions` / `## Open Questions` bullets. Nothing parsed them, so they
+# stayed prose and the only way to find out what was outstanding was to reread
+# the meeting.
+#
+# Parsing is deterministic and runs before any model call, because a bullet
+# reading `- [ ] Tim: send the architecture doc by 2026-05-31` needs no model --
+# and the one field that must be exact is the date, which is the field a model
+# is most willing to invent. The LLM fallback exists for free prose only.
+# ---------------------------------------------------------------------------
+
+# Headings whose bullets are commitments. Matched on the normalised heading
+# text, so `## Actions`, `### Action Items` and `## ACTION ITEMS` all count.
+_ACTION_SECTIONS = {
+    "action", "actions", "action item", "action items", "action point",
+    "action points", "next step", "next steps", "follow up", "follow ups",
+    "follow-up", "follow-ups", "commitment", "commitments", "todo", "todos",
+    "to do", "to dos", "open question", "open questions", "outstanding",
+    "outstanding items", "open items",
+}
+
+_HEADING_LINE = re.compile(r"^(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$", re.MULTILINE)
+_BULLET_LINE = re.compile(r"^[ \t]*(?:[-*+]|\d+[.)])[ \t]+(.*\S)[ \t]*$")
+_CHECKBOX = re.compile(r"^\[([ xX])\][ \t]+")
+_ADDRESSED_SEPARATOR = re.compile(r"[ \t]*[:\u2014\u2013-][ \t]+")
+
+# A leading `Name:` is the owner when the name is short and looks like one. The
+# guard matters: "Note: the migration is late" is not an assignment to Note, and
+# treating it as one invents a person.
+_OWNER_STOPWORDS = {
+    "note", "notes", "decision", "decisions", "risk", "risks", "issue",
+    "issues", "blocker", "blockers", "status", "update", "updates", "context",
+    "question", "questions", "answer", "answers", "outcome", "outcomes",
+    "next", "action", "actions", "summary", "open", "done", "todo", "tbc",
+    "tbd", "info", "detail", "details", "background", "reason", "impact",
+    "proposal", "recommendation", "observation", "concern", "assumption",
+}
+_OWNER_TOKEN = re.compile(r"^[A-Z][\w'\u2019.-]*$")
+
+_MONTHS = {
+    "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+    "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
+    "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9, "oct": 10,
+    "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
+}
+
+_ISO_DATE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
+_DMY_DATE = re.compile(r"\b(\d{1,2})[/.](\d{1,2})[/.](\d{2,4})\b")
+_MONTH_DAY_YEAR = re.compile(
+    r"\b(" + "|".join(_MONTHS) + r")[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})\b",
+    re.I)
+_DAY_MONTH_YEAR = re.compile(
+    r"\b(\d{1,2})(?:st|nd|rd|th)?\s+(" + "|".join(_MONTHS) + r")[a-z]*\.?,?\s+(\d{4})\b",
+    re.I)
+_MONTH_DAY = re.compile(
+    r"\b(" + "|".join(_MONTHS) + r")[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?\b", re.I)
+_WEEKDAY = {
+    "monday": 0, "mon": 0, "tuesday": 1, "tue": 1, "tues": 1, "wednesday": 2,
+    "wed": 2, "thursday": 3, "thu": 3, "thur": 3, "thurs": 3, "friday": 4,
+    "fri": 4, "saturday": 5, "sat": 5, "sunday": 6, "sun": 6,
+}
+_WEEKDAY_PHRASE = re.compile(
+    r"\b(?:by|before|on|due|until|till)?\s*(next|this|coming)?\s*"
+    r"(monday|mon|tuesday|tue|tues|wednesday|wed|thursday|thu|thur|thurs|"
+    r"friday|fri|saturday|sat|sunday|sun)\b", re.I)
+
+
+_MONTH_DAYS = (0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
+
+
+def _is_leap(year: int) -> bool:
+    return year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+
+
+def _valid_date(year: int, month: int, day: int):
+    """ISO date string, or None when the three numbers are not a real date.
+
+    Arithmetic rather than `datetime`, because this module's import set is
+    pinned to `os`/`re`/`json`/`difflib` -- it must import with no DB drivers
+    and no framework, and `ResolverInputTests` holds that line.
+    """
+    if not 1 <= month <= 12 or day < 1:
+        return None
+    limit = _MONTH_DAYS[month] + (1 if month == 2 and _is_leap(year) else 0)
+    if day > limit:
+        return None
+    return "%04d-%02d-%02d" % (year, month, day)
+
+
+def _days_from_civil(year: int, month: int, day: int) -> int:
+    """Days since 1970-01-01 (Howard Hinnant's algorithm)."""
+    year -= month <= 2
+    era = (year if year >= 0 else year - 399) // 400
+    yoe = year - era * 400
+    doy = (153 * (month + (-3 if month > 2 else 9)) + 2) // 5 + day - 1
+    doe = yoe * 365 + yoe // 4 - yoe // 100 + doy
+    return era * 146097 + doe - 719468
+
+
+def _civil_from_days(days: int):
+    days += 719468
+    era = (days if days >= 0 else days - 146096) // 146097
+    doe = days - era * 146097
+    yoe = (doe - doe // 1460 + doe // 36524 - doe // 146096) // 365
+    year = yoe + era * 400
+    doy = doe - (365 * yoe + yoe // 4 - yoe // 100)
+    mp = (5 * doy + 2) // 153
+    day = doy - (153 * mp + 2) // 5 + 1
+    month = mp + (3 if mp < 10 else -9)
+    return year + (month <= 2), month, day
+
+
+def _coerce_reference(today):
+    """Turn ``today`` into (year, month, day), or None."""
+    if today is None:
+        return None
+    if isinstance(today, str):
+        match = __import__("re").match(r"(\d{4})-(\d{2})-(\d{2})", today.strip())
+        if not match:
+            return None
+        year, month, day = (int(part) for part in match.groups())
+        return (year, month, day) if _valid_date(year, month, day) else None
+    for attribute in ("year", "month", "day"):
+        if not hasattr(today, attribute):
+            return None
+    return (int(today.year), int(today.month), int(today.day))
+
+
+def parse_due_date(text: object, today=None):
+    """Return an ISO date named in ``text``, or None. Never guesses.
+
+    Explicit forms resolve with no reference point: `2026-05-31`,
+    `31/05/2026`, `May 31 2026`, `31 May 2026`, and `May 31` (the year is the
+    one in ``today``, because a month and a day *were* named and only the year
+    was elided).
+
+    A weekday (`by Friday`) is the one form that needs a reference, so it
+    resolves only when ``today`` is supplied -- and the caller supplies the
+    **document's own date**, not the wall clock. Measuring "by Friday" from the
+    meeting is what the sentence meant; measuring it from today would silently
+    move a three-week-old commitment into next week.
+
+    Nothing else resolves. A phrase this function cannot read leaves the field
+    null, which is the honest answer and the one reconciliation relies on: an
+    invented due date is worse than a missing one, because a missing one reads
+    as "no date given" and an invented one reads as a fact.
+    """
+    if not text:
+        return None
+    raw = str(text)
+
+    match = _ISO_DATE.search(raw)
+    if match:
+        return _valid_date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+
+    match = _DMY_DATE.search(raw)
+    if match:
+        year = int(match.group(3))
+        if year < 100:
+            year += 2000
+        return _valid_date(year, int(match.group(2)), int(match.group(1)))
+
+    match = _MONTH_DAY_YEAR.search(raw)
+    if match:
+        return _valid_date(int(match.group(3)), _MONTHS[match.group(1).lower()],
+                           int(match.group(2)))
+
+    match = _DAY_MONTH_YEAR.search(raw)
+    if match:
+        return _valid_date(int(match.group(3)), _MONTHS[match.group(2).lower()],
+                           int(match.group(1)))
+
+    reference = _coerce_reference(today)
+
+    match = _MONTH_DAY.search(raw)
+    if match and reference is not None:
+        return _valid_date(reference[0], _MONTHS[match.group(1).lower()],
+                           int(match.group(2)))
+
+    if reference is not None:
+        match = _WEEKDAY_PHRASE.search(raw)
+        if match:
+            days = _days_from_civil(*reference)
+            target = _WEEKDAY[match.group(2).lower()]
+            weekday = (days + 3) % 7  # 1970-01-01 was a Thursday
+            ahead = (target - weekday) % 7
+            if ahead == 0:
+                ahead = 7
+            if (match.group(1) or "").lower() == "next":
+                ahead += 7
+            return _valid_date(*_civil_from_days(days + ahead))
+    return None
+
+
+def split_owner(text: str):
+    """Return ``(owner, rest)`` for a bullet, with owner None when unnamed.
+
+    Recognises the two shapes people actually write -- ``Tim: send the doc`` and
+    ``**Tim** - send the doc`` -- and refuses the look-alikes. ``Note: the
+    migration is late`` is not an assignment to somebody called Note, and a
+    first segment of five words is a sentence with a colon in it rather than a
+    name.
+    """
+    raw = (text or "").strip()
+    match = _ADDRESSED_SEPARATOR.search(raw)
+    if not match:
+        return None, raw
+    head = raw[:match.start()].strip().strip("*_`")
+    tail = raw[match.end():].strip()
+    if not head or not tail:
+        return None, raw
+    lowered = head.lower()
+    if lowered.startswith("owner:"):
+        head = head.split(":", 1)[1].strip().strip("*_`")
+    words = head.split()
+    if not words or len(words) > 3 or lowered in _OWNER_STOPWORDS:
+        return None, raw
+    if not all(_OWNER_TOKEN.match(word) or word.lower() in {"and", "&"}
+               for word in words):
+        return None, raw
+    return " ".join(words), tail
+
+
+def normalise_action_text(text: object) -> str:
+    """The matching key for reconciliation.
+
+    Case, runs of whitespace and trailing punctuation are not what makes two
+    bullets the same commitment, so all three are removed. Everything else is
+    kept: a reconciliation that matches too loosely closes a commitment that is
+    still open, which is the failure this feature exists to prevent.
+    """
+    raw = str(text or "").strip()
+    # A caller may hand over the whole line, so the bullet marker and the
+    # checkbox are normalisation, not content. Both are stripped for the same
+    # reason: `- [x] send the doc` and `send the doc` are one commitment, and a
+    # key that says otherwise makes a re-extraction close it and reopen a copy.
+    bullet = _BULLET_LINE.match(raw)
+    if bullet:
+        raw = bullet.group(1).strip()
+    checkbox = _CHECKBOX.match(raw)
+    if checkbox:
+        raw = raw[checkbox.end():].strip()
+    raw = " ".join(raw.split()).strip().strip("*_`")
+    return raw.rstrip(" .,;:").lower()
+
+
+def parse_action_items(text: object, today=None) -> list:
+    """Extract commitments from the Markdown bullets of an action section.
+
+    Returns ``[{text, owner, dueAt, status, section}]``, in document order and
+    de-duplicated on the normalised text. ``status`` is ``done`` for a checked
+    box (``- [x]``) and ``open`` otherwise; a checked bullet is the one case
+    where the source itself states the state, so reading it is not an
+    inference.
+
+    Only bullets under an action-shaped heading are considered. A `## Decisions`
+    section is full of things somebody will do, and parsing it would fill the
+    register with obligations nobody took on.
+    """
+    body = str(text or "")
+    if not body.strip():
+        return []
+
+    lines = body.splitlines()
+    items = []
+    seen = set()
+    in_section = False
+    section = ""
+
+    for line in lines:
+        heading = _HEADING_LINE.match(line.strip())
+        if heading:
+            title = " ".join(heading.group(2).split()).strip().rstrip(":").lower()
+            in_section = title in _ACTION_SECTIONS
+            if in_section:
+                section = title
+            continue
+        if not in_section:
+            continue
+        bullet = _BULLET_LINE.match(line)
+        if not bullet:
+            continue
+        raw = bullet.group(1).strip()
+        status = "open"
+        checkbox = _CHECKBOX.match(raw)
+        if checkbox:
+            status = "done" if checkbox.group(1).lower() == "x" else "open"
+            raw = raw[checkbox.end():].strip()
+        if not raw:
+            continue
+        owner, rest = split_owner(raw)
+        key = normalise_action_text(raw)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        items.append({
+            "text": rest if owner else raw,
+            "key": key,
+            "owner": owner,
+            "dueAt": parse_due_date(raw, today),
+            "status": status,
+            "section": section,
+        })
+    return items
+
+
+# Buttons the sheet offers; the server refuses anything else, so the two cannot
+# drift into a state the UI cannot render.
+ACTION_STATUSES = ("open", "done", "dropped")

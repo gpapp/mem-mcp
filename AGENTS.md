@@ -78,7 +78,7 @@ own body and a namespace entry cannot reach that.
 
 ```bash
 cd mem-mcp
-python3 -m unittest -v test_matching_regressions.py test_embedding_reliability.py test_chunking.py test_cypher_safety.py test_backup_compression.py test_people_extraction.py test_graph_scope.py test_mobile_layout.py test_llm_reliability.py test_env_wiring.py test_status_monitor.py test_sessions.py test_auth_guard.py test_google_auth.py test_registration.py test_vault_migration.py test_sharing.py test_share_endpoints.py test_sharing_readpaths.py test_live_notes.py test_skill_catalogue.py
+python3 -m unittest -v test_matching_regressions.py test_embedding_reliability.py test_chunking.py test_cypher_safety.py test_backup_compression.py test_people_extraction.py test_graph_scope.py test_mobile_layout.py test_llm_reliability.py test_env_wiring.py test_status_monitor.py test_sessions.py test_auth_guard.py test_google_auth.py test_registration.py test_vault_migration.py test_sharing.py test_share_endpoints.py test_sharing_readpaths.py test_live_notes.py test_skill_catalogue.py test_action_items.py
 ```
 
 This was a Windows path (`C:/tools/miniconda3/python.exe`) with PowerShell `Push-Location`/`Pop-Location`, and it does not exist on the Linux host these files are edited from — every suite "failed" on an interpreter that is not there. Any `python`/`python3` on `PATH` runs all of them; none of them import a DB driver.
@@ -1877,6 +1877,92 @@ Search diary entries from the calendar rail.
 - Clicking a result navigates to that date's entries
 - Clearing the input restores the full date history list
 - API endpoint: `GET /api/diary/search?q=<text>&limit=10&top_p=0.4`
+
+### Open Commitments
+
+Every meeting produces commitments and they used to die in a Markdown bullet. The
+diary format already carries `## Actions` and `## Open Questions`, and Live Notes
+already asks the model to keep "owners, numbers, dates, risks and open
+questions" — but nothing parsed them, so the only way to find out what was
+outstanding was to reread the meeting. `:ActionItem` is that register, and it is
+the feature that decides whether the product is useful to a consultant at all.
+
+**An action item is its own node, not a `:Fact`.** A fact is a statement about
+the world and stays true or stops being true; an obligation is *owed*, has an
+owner, may have a deadline, and moves through a state machine. Folding it into
+`:Fact` would put `status` on a node type with no concept of one, and every fact
+query would either have to filter it out or carry it.
+
+- **Extraction is deterministic and runs before any model call.**
+  `parse_action_items` / `parse_due_date` / `split_owner` in
+  `matching_utils.py` read the bullets, so the rules are pure and callable from a
+  suite with no database. `- [ ] Tim: send the architecture doc by 2026-05-31`
+  needs no model — and the one field that must be exact is the date, which is the
+  field a model is most willing to invent. The LLM fallback in `tasks.md` is
+  deliberately still unbuilt: nothing has yet needed it, and adding a model call
+  to a path that is currently deterministic buys latency and hallucination risk
+  on the field that matters most.
+- **Only action-shaped headings count.** `## Decisions` is full of things
+  somebody will do, and parsing it would fill the register with obligations
+  nobody took on. `_ACTION_SECTIONS` is an allow-list for exactly that reason.
+- **A checked box is read as `done`, because the source stated it.** That is the
+  one case where reading a status is not an inference.
+- **A label is not an owner.** `Note: the migration is late` is not an assignment
+  to somebody called Note, so `split_owner` refuses a head longer than three
+  words, one in `_OWNER_STOPWORDS`, or one that is not capitalised words. Getting
+  this wrong invents a person who then appears in every people-shaped view.
+- **A due date the text never named is `null`.** `parse_due_date` resolves the
+  explicit forms with no reference point (`2026-05-31`, `31/05/2026`,
+  `May 31 2026`, `31 May 2026`) and `May 31` against a reference. A weekday
+  (`by Friday`) resolves **only against the document's own date**, never the wall
+  clock: "by Friday" in a meeting means the Friday after the meeting, and
+  measuring it from today silently moves a three-week-old commitment into next
+  week. Nothing else resolves — a missing date reads as "no date given", an
+  invented one reads as a fact.
+- **Re-extraction reconciles, it does not append.** `db_sync_action_items`
+  matches on `normalise_action_text`, which strips the bullet marker, the
+  checkbox, case, whitespace and trailing punctuation. The id cannot be the key:
+  it is minted on create, and a bullet edited from "send the doc" to "send the
+  doc today" is the same commitment. An unchanged bullet is updated in place, and
+  an item a human marked `done` or `dropped` is **never reopened** — the work was
+  finished, the bullet is still in the minutes, and reopening it is how a
+  register becomes untrustworthy.
+- **Silence about actions is not a withdrawal.** `authoritative=False` is passed
+  when the parse found no action section at all, and then nothing is closed. The
+  items may have come from a live note, from a manual add, or from a human, and a
+  meeting minutes file re-saved with a different heading must not empty the
+  register. A section that now lists nothing *is* authoritative and does close
+  what it used to list.
+- **Scope is copied from the source and follows it.** An item inherits its
+  source's `FOR_CLIENT` / `IN_CONTEXT` edges, and `_apply_scope` is called only
+  when the caller actually knows the scope — deleting then re-adding nothing is a
+  silent unscope, so an unknown scope must leave the edges alone.
+- **The list filters; it does not rank.** `db_list_action_items` takes
+  `client_id` / `context_id` as a `MATCH`, unlike search scope. The panel asks a
+  closed question, so an item from another engagement is a wrong answer rather
+  than a lower-ranked one. `overdue` is computed by `describe_action_item` and
+  never stored: a stored flag is wrong the moment midnight passes and nothing
+  runs to change it.
+- **A graph that cannot be reached is skipped, not fatal.** Both the sync and the
+  list return a zeroed / empty result with a WARNING, because a diary save must
+  not fail because the register could not be updated.
+
+Surfaces: three MCP tools (`list_action_items`, `save_action_item`,
+`update_action_item`), three GUI routes (`GET /api/action-items`,
+`POST /api/action-items`, `POST /api/action-items/{id}`), the **My actions** card
+at the top of the Clients page, and an "Open items" block inside each client and
+project panel fetched by `toggleScopeItems`.
+
+`test_action_items.py` is the 22nd suite. It lifts `db_sync_action_items`,
+`_apply_scope` and `db_list_action_items` out of `action_manager.py` with
+`ast.get_source_segment` (that module imports `common`, so it cannot be imported
+here) and **calls** them against fake drivers — the properties worth guarding are
+what happens to an item that already exists, and none of them is visible in the
+shape of the code. The parser is covered separately in
+`test_matching_regressions.py::ActionItemParsingTests`, and `CallSiteTests` pins
+the wiring, because re-injecting the missing call into `db_save_diary` left every
+parser test green — the same "a test of a helper is not a test of its call site"
+lesson, and the reason that class is an AST walk rather than a substring search.
 
 ### Dashboard Deduplication
 Service → **🧹 Deduplicate memories** provides a review-first merge workflow. It is on the

@@ -25,7 +25,6 @@ surfaces them — which is why task 5 exists.
 
 | # | task | size |
 |---|---|---|
-| 5 | Open commitments register (`:ActionItem`) | L |
 | 6 | Meeting-prep brief + skill | M |
 | 7 | Stakeholder roster with staleness | M |
 | 8 | Decision log per client | M |
@@ -33,49 +32,12 @@ surfaces them — which is why task 5 exists.
 | 10 | Remaining skills (`hygiene`, `orientation`, `weekly-review`) | S |
 | 11 | Deliverables register | M |
 
-Tasks 1, 2, 3 and 4 are shipped (see `task_history.md`). They came first because the
+Tasks 1, 2, 3, 4 and 5 are shipped (see `task_history.md`). They came first because the
 skill surface is what a client meets before it meets the vault: a discovery call
 that answers with three opaque filenames, and no skill that says how to read the
 vault, makes every later session worse.
 
 ---
-
-## 5. Open commitments register (`:ActionItem`)
-
-Every meeting produces commitments; they die in a Markdown bullet. This is the
-feature that decides whether the product is useful to a consultant.
-
-- [ ] `:ActionItem {id, userId, text, owner, dueAt, status, sourceLabel,
-      sourceId, createdAt, updatedAt}` in Neo4j, scoped by the same
-      `FOR_CLIENT` / `IN_CONTEXT` edges facts use, plus `RAISED_IN` → the diary
-      entry or note.
-- [ ] Extraction runs on diary save/update and on live-note commit.
-      **Deterministic first**: parse `## Actions` / `## Open Questions` bullets
-      for an owner and a date.
-- [ ] LLM fallback only for free prose, through
-      `get_extraction_response(..., is_good=...)` on `MEM_EXTRACT_MODEL` — the
-      same route the keyword and people extractors already use.
-- [ ] Re-extraction reconciles rather than appends: match on normalised text
-      within the same client, close an item whose bullet has gone, and never
-      reopen a `done` item.
-- [ ] `status ∈ {open, done, dropped}`.
-- [ ] A due date the source text never named is stored `null`, never inferred
-      (the `context_named_in_text` rule).
-- [ ] UI: "Open items" in the existing client/project panel
-      (`client_manager._scope_items`, line 701).
-- [ ] UI: cross-client **My actions** list grouped overdue / this week / later.
-- [ ] MCP: `list_action_items`, `save_action_item`, `update_action_item`.
-- [ ] Tests: extraction is pure and unit-testable in `matching_utils.py` (no DB);
-      reconciliation is driven against fakes; the call sites are pinned — a
-      helper test is not a test of its call site.
-
-**Decisions already made:** an action item is its own node, not a `:Fact`. A fact
-is a statement about the world; an action is an obligation with a state machine,
-and folding it into `:Fact` would put `status` on a node type that has no concept
-of one. Deterministic parsing before the LLM because a bullet reading
-`- [ ] Tim: send the architecture doc by Fri` needs no model, and every model call
-spent on it is latency plus a hallucination risk on the one field that must be
-exact.
 
 ## 6. Meeting-prep brief, and its skill
 

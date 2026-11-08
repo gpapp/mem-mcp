@@ -2189,3 +2189,117 @@ class SearchNarrowingHelperTests(unittest.TestCase):
         self.assertFalse(m.timestamp_in_window("", None, "2026-12-31"))
         self.assertTrue(m.timestamp_in_window(None, None, None),
                         msg="no bounds is every record")
+
+
+class ActionItemParsingTests(unittest.TestCase):
+    """Commitments come out of Markdown bullets, deterministically.
+
+    Every one of these is a sentence a reader acts on, and the parser is the
+    only part of the commitments register that can be tested without a
+    database -- so the rules live here rather than behind a Cypher query. The
+    date rules matter most: a due date the text never named must stay null, and
+    the one field a model is most willing to invent is the one that has to be
+    exact.
+    """
+
+    BODY = """## Decisions
+- We will adopt the PPC framework.
+
+## Actions
+- [ ] Tim: send the architecture doc by 2026-05-31
+- [x] Alice: book the steering committee
+- **Bob** - draft the migration plan by 31 May 2026
+- Note: the migration is late
+- Chaser the vendor about the quote
+
+## Open Questions
+- Who owns the integration layer?
+"""
+
+    def test_only_action_sections_are_parsed(self):
+        items = m.parse_action_items(self.BODY)
+        texts = [i["text"] for i in items]
+        self.assertFalse(any("adopt the PPC framework" in t for t in texts),
+                         msg="a decision is not a commitment: parsing one fills "
+                             "the register with obligations nobody took on")
+        self.assertTrue(any("Who owns the integration layer?" in t for t in texts),
+                        msg="open questions are unresolved work and belong here")
+
+    def test_a_checked_box_is_read_as_done(self):
+        items = {i["text"]: i for i in m.parse_action_items(self.BODY)}
+        self.assertEqual(items["book the steering committee"]["status"], "done")
+        self.assertEqual(items["send the architecture doc by 2026-05-31"]["status"],
+                         "open")
+
+    def test_owner_is_the_leading_name(self):
+        items = {i["text"]: i for i in m.parse_action_items(self.BODY)}
+        self.assertEqual(items["send the architecture doc by 2026-05-31"]["owner"], "Tim")
+        self.assertEqual(items["draft the migration plan by 31 May 2026"]["owner"], "Bob")
+        self.assertIsNone(items["Chaser the vendor about the quote"]["owner"])
+
+    def test_a_label_is_not_an_owner(self):
+        items = {i["text"]: i for i in m.parse_action_items(self.BODY)}
+        self.assertIn("Note: the migration is late", items,
+                      msg="'Note:' is a label, not somebody called Note")
+        self.assertIsNone(items["Note: the migration is late"]["owner"])
+
+    def test_due_dates_come_from_the_text(self):
+        items = {i["text"]: i for i in m.parse_action_items(self.BODY)}
+        self.assertEqual(items["send the architecture doc by 2026-05-31"]["dueAt"],
+                         "2026-05-31")
+        self.assertEqual(items["draft the migration plan by 31 May 2026"]["dueAt"],
+                         "2026-05-31")
+        self.assertIsNone(items["book the steering committee"]["dueAt"],
+                          msg="a due date the text never named must stay null")
+
+    def test_explicit_date_forms(self):
+        cases = {
+            "2026-05-31": "2026-05-31",
+            "31/05/2026": "2026-05-31",
+            "31.05.2026": "2026-05-31",
+            "May 31 2026": "2026-05-31",
+            "31 May 2026": "2026-05-31",
+            "due 2026-05-31 please": "2026-05-31",
+        }
+        for phrase, expected in cases.items():
+            with self.subTest(phrase=phrase):
+                self.assertEqual(m.parse_due_date(phrase), expected)
+
+    def test_an_impossible_date_is_not_a_date(self):
+        self.assertIsNone(m.parse_due_date("2026-02-30"),
+                          msg="a date that does not exist must not be stored")
+        self.assertIsNone(m.parse_due_date("sometime soon"))
+        self.assertIsNone(m.parse_due_date(""))
+
+    def test_a_month_and_day_takes_its_year_from_the_reference(self):
+        self.assertEqual(m.parse_due_date("by March 3", today="2026-05-04"), "2026-03-03")
+        self.assertIsNone(m.parse_due_date("by March 3"),
+                          msg="with no reference the year is unknown, and an "
+                              "invented year is worse than a missing date")
+
+    def test_a_weekday_is_measured_from_the_document_not_the_clock(self):
+        # 2026-05-04 is a Monday.
+        self.assertEqual(m.parse_due_date("by Friday", today="2026-05-04"), "2026-05-08")
+        self.assertEqual(m.parse_due_date("by next Friday", today="2026-05-04"),
+                         "2026-05-15")
+        self.assertEqual(m.parse_due_date("by Monday", today="2026-05-04"),
+                         "2026-05-11",
+                         msg="'by Monday' said on a Monday means the next one")
+        self.assertIsNone(m.parse_due_date("by Friday"),
+                          msg="the wall clock is not a reference point: measuring "
+                              "an old meeting's deadline from today moves it")
+
+    def test_identical_bullets_appear_once(self):
+        body = "## Actions\n- send the doc\n- Send the doc.\n"
+        self.assertEqual(len(m.parse_action_items(body)), 1)
+
+    def test_normalisation_is_the_matching_key(self):
+        self.assertEqual(m.normalise_action_text("- [x] Send the doc."),
+                         m.normalise_action_text("send the doc"))
+        self.assertNotEqual(m.normalise_action_text("send the doc"),
+                            m.normalise_action_text("send the doc today"),
+                            msg="a materially different commitment is a different one")
+
+    def test_a_body_with_no_action_section_yields_nothing(self):
+        self.assertEqual(m.parse_action_items("## Decisions\n- yes\n"), [])
+        self.assertEqual(m.parse_action_items(""), [])

@@ -44,6 +44,7 @@ from client_manager import (
     INFERRED_SCOPE_BOOST, INACTIVE_PENALTY
 )
 
+from action_manager import sync_actions_from_text
 import sharing  # Phase 3: shared-vault read access policy layer
 # The visibility rule and the RELEVANT_TO id pass live in fact_manager, which
 # imports this module only lazily (function-local, to avoid a cycle) — so a
@@ -625,6 +626,14 @@ async def db_save_diary(content: str, user_id: str, timestamp: str, name: str, m
     })
     # Auto-link People facts mentioned by name (add-only, fire-and-forget)
     await _auto_link_people(doc_id, content, user_id)
+    # Commitments come out of the same body the keywords and participants come
+    # from, and are reconciled against what this entry already had rather than
+    # appended. `today` is the entry's own date: "by Friday" means the Friday
+    # after the meeting, and measuring it from the wall clock would move a
+    # three-week-old commitment into next week.
+    await sync_actions_from_text(doc_id, "DiaryEntry", user_id, content,
+                                 today=(entry_date or "")[:10] or None,
+                                 client_id=client_id, context_id=context_id)
     return timestamp
 
 
@@ -1134,6 +1143,11 @@ async def db_update_diary(entry_id: str, user_id: str, content: Optional[str] = 
     await publish_db_event(user_id, "diary_changed", {"action": "update", "id": entry_id, "date": entry_date})
     # Auto-link People facts mentioned by name (add-only, fire-and-forget)
     await _auto_link_people(entry_id, new_content, user_id)
+    # Same reconciliation the save path runs, against the same entry id, so an
+    # edit updates the register instead of duplicating it.
+    await sync_actions_from_text(entry_id, "DiaryEntry", user_id, new_content,
+                                 today=(entry_date or "")[:10] or None,
+                                 client_id=client_id, context_id=context_id)
     return True
 
 
