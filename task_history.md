@@ -5,6 +5,51 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# Skills: discovery returns descriptions, and every skill is addressable
+
+- **Why**: `find_skills` was `[f[:-3] for f in os.listdir(skills_dir) if
+  f.endswith(".md")]`. Discovery answered with three opaque filenames, so a
+  client had to `get_skill_workflow` every skill to learn that none of them
+  answered its question — the one tool whose purpose is *not* loading things
+  forced loading everything. Separately, `register_skills` hand-registered
+  `skill://process-transcription` and `skill://memory-deduplication`, while the
+  `process-transcription` prompt tells the reader to "load skill
+  'process-directory' instead" — so the one recommended path was the one path a
+  client could not address by URI.
+- **What shipped**:
+  - New `mem-mcp/skill_catalogue.py`, stdlib-only (`os`, `re`) so the parsing
+    rules are importable and *callable* on a box with no fastmcp. It reads flat
+    `key: value` front matter from the first `---` block only, skips folded
+    (`>`) and literal (`|`) scalars rather than half-parsing them, keeps the
+    **first** value of a repeated key, and refuses a block that does not open
+    the document. Description fallback chain: front matter → first Markdown
+    heading → filename stem, so a skill is discoverable the moment its `.md`
+    exists. `list_skills()` is sorted, because `listdir` order reshuffles
+    between deploys and that is noise in a client's first request.
+  - `find_skills` returns `[{name, description, path}]` from that module.
+  - `get_skill_workflow` resolves the name **through the catalogue** instead of
+    joining the argument into a path. The name comes from a model, so
+    `../../etc/passwd` was previously read and returned; a miss now names the
+    skills that do exist.
+  - `register_skills` derives every `skill://<name>` resource from the
+    directory, and `process-directory` gained the prompt it never had. The
+    reader is built by `_skill_reader(path, name, description)` — a **factory,
+    not a closure in the loop**, because a loop body closes over the variable
+    and every URI would serve the last skill's text.
+  - `skills/memory-deduplication.md` gained the front matter the other two
+    already carried.
+- **Tests**: new `mem-mcp/test_skill_catalogue.py` (19 tests) — the 21st suite,
+  and one of the few that **imports its subject directly**. It calls the parser
+  for each rule and each fallback, checks the real `skills/` directory (one
+  entry per file, non-empty descriptions, sorted, missing directory → `[]`),
+  and reads `register_skills` through the AST for the two things a callable test
+  cannot reach because `mcp_skills` needs fastmcp.
+- **The one thing to remember**: the resource loop's binding is the trap, not
+  the loop. A closure written inside it looks correct, registers every URI, and
+  serves the same skill from all of them.
+
+---
+
 # Live notes: stale Recording statuses repaired on read and at boot (2026-11-04)
 
 - **Reported as**: "The transcription status in live notes says 'Recording'.

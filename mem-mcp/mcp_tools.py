@@ -6,6 +6,7 @@ from typing import Optional, List
 import memory as mem
 import sharing
 import audit
+import skill_catalogue
 from mcp_logging import monitor_mcp_tool
 from matching_utils import execute_merge
 
@@ -867,13 +868,16 @@ async def set_client_status(clientId: str, active: bool):
 async def find_skills():
     """
     Scan the skills/ directory and list all available skill workflows.
-    Use this to discover new capabilities without a server restart.
+
+    Returns one entry per skill with its name and description, so a caller can
+    decide which workflow it needs without loading all of them — discovery
+    that answers with three opaque filenames costs one `get_skill_workflow`
+    call per skill and still tells the reader nothing. Descriptions come from
+    each file's YAML front matter, falling back to its opening heading: a
+    skill is discoverable the moment its `.md` exists, whether or not the
+    author remembered the metadata.
     """
-    import os
-    skills_dir = os.path.join(os.path.dirname(__file__), "skills")
-    if not os.path.exists(skills_dir):
-        return []
-    return [f[:-3] for f in os.listdir(skills_dir) if f.endswith(".md")]
+    return skill_catalogue.list_skills()
 
 @mcp.tool()
 @monitor_mcp_tool("get_skill_workflow", context_provider=_current_user)
@@ -883,9 +887,14 @@ async def get_skill_workflow(skillName: str):
     Allows the LLM to understand and execute complex workflows stored as documentation.
     """
     import os
-    path = os.path.join(os.path.dirname(__file__), "skills", f"{skillName}.md")
-    if not os.path.exists(path):
-        return f"Skill '{skillName}' not found."
+    # Resolve through the catalogue rather than joining the argument into a
+    # path: `skillName` comes from a model, and a name like `../../etc/passwd`
+    # would otherwise be read and returned. Only a real skill resolves.
+    known = {entry["name"] for entry in skill_catalogue.list_skills()}
+    if skillName not in known:
+        hint = ", ".join(sorted(known)) or "none found"
+        return f"Skill '{skillName}' not found. Available: {hint}."
+    path = os.path.join(skill_catalogue.default_skills_dir(), f"{skillName}.md")
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
 

@@ -78,7 +78,7 @@ own body and a namespace entry cannot reach that.
 
 ```bash
 cd mem-mcp
-python3 -m unittest -v test_matching_regressions.py test_embedding_reliability.py test_chunking.py test_cypher_safety.py test_backup_compression.py test_people_extraction.py test_graph_scope.py test_mobile_layout.py test_llm_reliability.py test_env_wiring.py test_status_monitor.py test_sessions.py test_auth_guard.py test_google_auth.py test_registration.py test_vault_migration.py test_sharing.py test_share_endpoints.py test_sharing_readpaths.py test_live_notes.py
+python3 -m unittest -v test_matching_regressions.py test_embedding_reliability.py test_chunking.py test_cypher_safety.py test_backup_compression.py test_people_extraction.py test_graph_scope.py test_mobile_layout.py test_llm_reliability.py test_env_wiring.py test_status_monitor.py test_sessions.py test_auth_guard.py test_google_auth.py test_registration.py test_vault_migration.py test_sharing.py test_share_endpoints.py test_sharing_readpaths.py test_live_notes.py test_skill_catalogue.py
 ```
 
 This was a Windows path (`C:/tools/miniconda3/python.exe`) with PowerShell `Push-Location`/`Pop-Location`, and it does not exist on the Linux host these files are edited from — every suite "failed" on an interpreter that is not there. Any `python`/`python3` on `PATH` runs all of them; none of them import a DB driver.
@@ -1924,10 +1924,61 @@ Service → **Backup & Restore** manages the savepoints.
 ### Skills System
 Pluggable skill workflows loaded from Markdown files in `mem-mcp/skills/`.
 
-- `find_skills` — lists all available skill `.md` files
-- `get_skill_workflow(name)` — returns the full Markdown content of a skill
-- MCP prompts (`process-transcription`, `memory-deduplication`) inject skill instructions into the conversation
-- Add new skills by creating a `.md` file in `mem-mcp/skills/` — no server restart required
+- **`skill_catalogue.py` is the only reader of that directory**, and it is
+  stdlib-only (`os`, `re`) for the same reason `sessions.py` and
+  `matching_utils.py` are: `mcp_skills.py` imports fastmcp and `memory`, so
+  nothing inside it can be called by a suite on a box with no fastmcp. The
+  parsing rules are the part worth testing, so they live where they can be
+  tested.
+- `find_skills` — returns `[{name, description, path}]` per skill, **not bare
+  filenames**. It used to be `[f[:-3] for f in os.listdir(...)]`, which meant a
+  client had to `get_skill_workflow` every skill to learn that none of them
+  answered its question. Descriptions come from each file's YAML front matter
+  with a fallback chain — front matter → first Markdown heading → filename
+  stem — so **a skill is discoverable the moment its `.md` exists**, whether or
+  not the author remembered the metadata. `memory-deduplication.md` was the one
+  file missing front matter and now has it.
+- **The front-matter parser is deliberately not a YAML implementation.** It
+  reads flat `key: value` pairs from the first `---` block and nothing else. A
+  folded (`>`) or literal (`|`) scalar is *skipped* rather than half-parsed, so
+  the heading fallback fires instead of a description that reads as `>`. A
+  repeated key keeps its **first** value: a duplicate is a mistake, and taking
+  the last makes the answer depend on where the mistake was typed. A block that
+  does not open the document is body text — otherwise every horizontal rule
+  becomes metadata.
+- `get_skill_workflow(name)` resolves the name **through the catalogue** rather
+  than joining the argument into a path. `name` comes from a model, and
+  `../../etc/passwd` would otherwise be read and returned; a miss now names the
+  skills that do exist instead of only what it could not find.
+- **Every skill is resource-addressable, and `register_skills` derives them from
+  the directory.** Two were hand-registered and `process-directory` was not, so
+  the one skill the `process-transcription` prompt tells you to load was the one
+  a client could not address by URI. Adding a `.md` file is now genuinely all a
+  new skill needs — which is what the tool documentation claimed for as long as
+  it was false.
+  - **The reader is built by `_skill_reader(path, name, description)`, a
+    factory, not a closure inside the loop.** A loop body closes over the
+    variable, so every `skill://` URI would serve the *last* skill's text. The
+    default-argument trick also works, but it hides the trap; the factory names
+    it. It also sets `__name__` and `__doc__` per skill, because a resource
+    without them is a duplicate registration or an unnamed one.
+  - Do not reintroduce a hand-written `@mcp.resource("skill://...")`: the loop
+    registers the same URI again, and which one wins is not a property anyone
+    chose.
+- MCP prompts (`process-transcription`, `process-directory`,
+  `memory-deduplication`) inject skill instructions into the conversation.
+  `process-directory`'s prompt defers to `process-transcription` for per-file
+  content and claims only the batch sequencing — the directory skill drives the
+  transcription skill, it does not restate it.
+- `test_skill_catalogue.py` **imports and calls** `skill_catalogue` (it can,
+  being stdlib-only) for the parsing rules, the fallback chain, and the real
+  `skills/` directory — one entry per file, non-empty descriptions, sorted
+  output, a missing directory yielding `[]`. `RegistrationSourceTests` reads
+  `register_skills` through the AST because `mcp_skills` cannot be imported
+  here, and asserts the loop exists and no hand-registered URI survives. Two of
+  those assertions are the `assertIn`-checks-a-token lesson: "the loop is
+  present" is not "every skill has a URI", so the shipped files are enumerated
+  against the directory rather than the source.
 
 ### Diary Keyword Extraction
 Every diary save/update triggers automatic keyword extraction via the query LLM (`qwen3.5:0.8b`).

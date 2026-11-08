@@ -1,3 +1,8 @@
+---
+name: memory-deduplication
+description: Find and merge duplicate records in one category — cluster candidates by vector similarity and shared scope, adjudicate each cluster with the model, and merge into a chosen master without losing links or orphaning vectors.
+---
+
 # Skill: Memory Deduplication
 
 This skill provides a systematic workflow for identifying and merging duplicate entries in the Memory Vault. Duplicate entries often occur when information is captured from different sources (e.g., meeting transcriptions, manual notes, diary entries) with slightly different phrasing or levels of detail.

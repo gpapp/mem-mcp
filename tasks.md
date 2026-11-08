@@ -25,10 +25,8 @@ surfaces them — which is why task 5 exists.
 
 | # | task | size |
 |---|---|---|
-| 1 | `find_skills` returns descriptions | S |
 | 2 | `search-and-recall` skill | S |
 | 3 | Time- and person-bounded search | S |
-| 4 | Every skill resource-addressable | S |
 | 5 | Open commitments register (`:ActionItem`) | L |
 | 6 | Meeting-prep brief + skill | M |
 | 7 | Stakeholder roster with staleness | M |
@@ -37,25 +35,11 @@ surfaces them — which is why task 5 exists.
 | 10 | Remaining skills (`hygiene`, `orientation`, `weekly-review`) | S |
 | 11 | Deliverables register | M |
 
-Tasks 1-4 together are roughly a day, and they improve every session after them
-— including the sessions spent building task 5 — which is why they come first.
+Tasks 1 and 4 are shipped (see `task_history.md`). They came first because the
+skill surface is what a client meets before it meets the vault, and a discovery
+call that answers with three opaque filenames makes every later session worse.
 
 ---
-
-## 1. `find_skills` returns descriptions, not bare filenames
-
-`find_skills` (`mcp_tools.py:866`) is
-`[f[:-3] for f in os.listdir(skills_dir) if f.endswith(".md")]`. Discovery
-returns three opaque strings, so an agent must load all three to learn that none
-answers its question — the one tool whose purpose is *not* loading things forces
-loading everything.
-
-- [ ] Parse the YAML front matter (`name`, `description`) two of the three skills
-      already carry, and return `[{name, description}]`.
-- [ ] Fall back to the filename when a file has no front matter.
-- [ ] Deterministic only — no model call on a discovery path.
-- [ ] `memory-deduplication.md` gains the front matter the other two have.
-- [ ] Test: every `.md` in `skills/` yields a non-empty description.
 
 ## 2. `search-and-recall` skill
 
@@ -79,7 +63,8 @@ The skill must state, in the order a reader needs them:
 - [ ] `find_patterns` is for "what recurs", not for "what is true of X".
 - [ ] When the vault disagrees with the user, say so rather than smoothing it
       over.
-- [ ] Registered as a `skill://` resource (see task 4).
+- [ ] Registered as a `skill://` resource — free now that registration is
+      derived from the directory (see `AGENTS.md` → Skills System).
 
 ## 3. Time- and person-bounded search
 
@@ -98,22 +83,6 @@ cannot express today.
       rewriter must not invent a date range.
 - [ ] Tests: the window widening is driven against fakes; the rewriter's
       no-invented-range rule is pinned at its call site.
-
-## 4. Every skill must be resource-addressable, including `process-directory`
-
-`register_skills` hand-registers `skill://process-transcription` and
-`skill://memory-deduplication`. **`process-directory` has neither a resource nor
-a prompt**, yet the `process-transcription` prompt tells the reader to "load
-skill 'process-directory' instead" — so the recommended path is the one path a
-client cannot address by URI. The documented promise that adding a `.md` file
-needs "no server restart" is also true only for `get_skill_workflow`.
-
-- [ ] Resources registered by iterating `skills/*.md`, not one decorator per
-      skill (bind the name with a default argument so the closure is not
-      late-bound).
-- [ ] A prompt for `process-directory` alongside the existing two.
-- [ ] Test asserting every `.md` in `skills/` has a matching `skill://` URI — the
-      asymmetry is invisible until someone adds the fourth skill.
 
 ## 5. Open commitments register (`:ActionItem`)
 
