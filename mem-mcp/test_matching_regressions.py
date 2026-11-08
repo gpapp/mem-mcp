@@ -2099,3 +2099,93 @@ class ScopeStaysOutOfConfidenceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+import matching_utils as m
+
+
+class SearchNarrowingHelperTests(unittest.TestCase):
+    """The pure half of time- and person-bounded search.
+
+    `after`/`before`/`person` are narrowing filters, which is the opposite of
+    scope: scope ranks and removes nothing, these remove. The failure mode they
+    must not reproduce is the one scope filtering already produced -- a filter
+    that quietly matches nothing and reads as "the vault has no such record".
+    So a window that cannot be parsed is no window, and a person who resolves to
+    nobody filters on the literal string instead of the nearest stranger.
+    """
+
+    def test_a_name_is_a_word_not_a_substring(self):
+        self.assertFalse(m.mention_in_text("we discussed the timeout", "Tim"),
+                         msg="a substring test keeps every record mentioning "
+                             "'timeout' when the caller asked about 'Tim', which "
+                             "reads as a person filter working while it does nothing")
+        self.assertTrue(m.mention_in_text("Tim said so", "Tim"))
+        self.assertTrue(m.mention_in_text("asked tim about it", "Tim"))
+        self.assertFalse(m.mention_in_text("Timothy said so", "Tim"))
+
+    def test_a_multi_word_name_matches_as_a_phrase(self):
+        self.assertTrue(m.mention_in_text("the Deutsche Bank review", "Deutsche Bank"))
+        self.assertFalse(m.mention_in_text("the bank review", "Deutsche Bank"))
+
+    def test_a_name_with_surrounding_punctuation_matches(self):
+        self.assertTrue(m.mention_in_text("(Alice)", "Alice"))
+        self.assertTrue(m.mention_in_text("Alice's notes", "Alice"))
+
+    def test_an_empty_name_or_text_matches_nothing(self):
+        self.assertFalse(m.mention_in_text("", "Alice"))
+        self.assertFalse(m.mention_in_text("Alice spoke", ""))
+        self.assertFalse(m.mention_in_text(None, "Alice"))
+
+    def test_a_person_resolves_to_the_stored_spelling(self):
+        candidates = ["Tim Smith", "Timothy Smith", "Alice Jones"]
+        self.assertEqual(m.resolve_person_name("Tim Smith", candidates), "Tim Smith")
+
+    def test_an_unknown_person_resolves_to_nothing(self):
+        self.assertIsNone(
+            m.resolve_person_name("Radoslav", ["Tim Smith", "Alice Jones"]),
+            msg="matching the nearest stranger is the defect people_match_allowed exists to prevent")
+
+    def test_resolution_is_deterministic_across_candidate_order(self):
+        forward = m.resolve_person_name("Tim Smith", ["Tim Smith", "Timothy Smith"])
+        backward = m.resolve_person_name("Tim Smith", ["Timothy Smith", "Tim Smith"])
+        self.assertEqual(forward, backward)
+
+    def test_a_date_phrase_is_recognised_and_a_topic_is_not(self):
+        for phrase in ("May 2026", "2026-07", "2026-07-15", "last quarter", "Q3 2026", "2026"):
+            self.assertTrue(m.is_date_expression(phrase), msg=phrase)
+        for phrase in ("SAP 2026 roadmap", "DB AI Adoption", "migration", "Tim"):
+            self.assertFalse(m.is_date_expression(phrase), msg=phrase)
+
+    def test_an_explicit_window_strips_the_dates_from_the_variants(self):
+        variants = [("SAP 2026 roadmap", 1.0), ("May 2026", 0.6), ("2026", 0.85)]
+        self.assertEqual(m.strip_date_variants(variants), [("SAP 2026 roadmap", 1.0)],
+                         msg="a date variant embeds words the window already "
+                             "answered, at the cost of an embedding and a weight")
+
+    def test_stripping_never_empties_the_variant_list(self):
+        variants = [("May 2026", 1.0)]
+        self.assertEqual(m.strip_date_variants(variants), variants,
+                         msg="a filter that returns nothing is worse than one "
+                             "that returns something to filter")
+        self.assertEqual(m.strip_date_variants([]), [])
+
+    def test_a_date_only_bound_covers_its_whole_day(self):
+        stamp = "2026-05-31T14:20:00Z"
+        self.assertTrue(m.timestamp_in_window(stamp, "2026-05-01", "2026-05-31"),
+                        msg="a plain <= would drop the 31st of May entirely")
+        self.assertTrue(m.timestamp_in_window(stamp, None, "2026-05-31"))
+        self.assertFalse(m.timestamp_in_window(stamp, "2026-06-01", None))
+        self.assertFalse(m.timestamp_in_window("2026-06-01T00:00:00Z", None, "2026-05-31"))
+
+    def test_a_datetime_bound_is_honoured_to_the_minute(self):
+        self.assertFalse(m.timestamp_in_window("2026-05-31T15:00:00Z", None, "2026-05-31T14:00"))
+        self.assertTrue(m.timestamp_in_window("2026-05-31T13:00:00Z", None, "2026-05-31T14:00"))
+
+    def test_a_record_with_no_timestamp_is_outside_a_window(self):
+        self.assertFalse(m.timestamp_in_window(None, "2026-01-01", None),
+                         msg="a window is a claim about when something happened; "
+                             "a record that cannot answer it does not satisfy it")
+        self.assertFalse(m.timestamp_in_window("", None, "2026-12-31"))
+        self.assertTrue(m.timestamp_in_window(None, None, None),
+                        msg="no bounds is every record")

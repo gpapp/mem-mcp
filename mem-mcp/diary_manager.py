@@ -18,12 +18,15 @@ from common import (
     get_extraction_response, LLM_QUERY_MODEL,
 )
 from matching_utils import (
+    mention_in_text,
     parse_people_name_array,
     resolve_people_candidates,
+    resolve_person_name,
     scope_axis_tier,
     scope_context_tier,
     scope_strength,
     text_windows,
+    timestamp_in_window,
 )
 from chunking import (
     CHUNK_FETCH_MULTIPLIER,
@@ -625,7 +628,7 @@ async def db_save_diary(content: str, user_id: str, timestamp: str, name: str, m
     return timestamp
 
 
-async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float = 0.4, client: Optional[str] = None, context: Optional[str] = None) -> list:
+async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float = 0.4, client: Optional[str] = None, context: Optional[str] = None, after: Optional[str] = None, before: Optional[str] = None, person: Optional[str] = None) -> list:
     """Vector-similarity search across the diary collection with mention enrichment.
 
     Uses LLM query rewriting for multi-variant search and boosts results whose
@@ -639,7 +642,8 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
     nothing at all and the search came back empty), and it deleted the very
     entries ``scopeStrength`` needs in order to rank the rest.
     """
-    from fact_manager import rewrite_search_query, _db_relevant_scope, _record_scope_ids
+    from fact_manager import (DATE_WINDOW_FETCH_MULTIPLIER, rewrite_search_query,
+                             _db_relevant_scope, _record_scope_ids)
 
     qdrant = await get_qdrant()
     neo4j_driver = get_neo4j()
@@ -660,6 +664,11 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
     # several times in a single result set. Over-fetch or a long entry crowds
     # every other entry out of the window before the merge below can collapse it.
     fetch_limit = max(limit * 4 * CHUNK_FETCH_MULTIPLIER, 20)
+    # A window or a person is applied after the fetch, so the fetch has to reach
+    # further: post-filtering one page sized for an unfiltered query is how a
+    # one-month window over a three-year diary returns nothing.
+    if after or before or person:
+        fetch_limit *= DATE_WINDOW_FETCH_MULTIPLIER
 
     # Phase 3: when the caller has access to shared vaults the owner filter widens.
     # The ids only widen the raw match — an owner's record below must then clear
@@ -754,6 +763,41 @@ async def db_search_diary(query: str, user_id: str, limit: int = 3, top_p: float
                 continue
             v["relatedIds"] = rel_ids.get(rid, set())
             all_results[rid] = v
+
+    # 2b. Narrowing filters. Unlike scope, these remove -- the caller who names a
+    #     date or a person has said which entries are in question, not which are
+    #     merely preferred. The diary payload carries `timestamp`, so no second
+    #     read is needed here the way fact search needs one.
+    if after or before:
+        all_results = {
+            rid: v for rid, v in all_results.items()
+            if timestamp_in_window(
+                (v["point"].payload or {}).get("timestamp")
+                or (v["point"].payload or {}).get("date"),
+                after, before)
+        }
+
+    if person:
+        # Resolve against the names this page already carries, then fall back to
+        # the literal string. Nothing resolved means there is no stored record to
+        # compare against -- and matching the nearest stranger is the exact defect
+        # `people_match_allowed` exists to prevent.
+        seen = set()
+        for v in all_results.values():
+            for name in ((v["point"].payload or {}).get("mentions") or ()):
+                if isinstance(name, str) and name:
+                    seen.add(name)
+        canonical = resolve_person_name(person, sorted(seen)) or person
+
+        def _mentions_person(v):
+            payload = v["point"].payload or {}
+            for name in (payload.get("mentions") or ()):
+                if isinstance(name, str) and mention_in_text(name, canonical):
+                    return True
+            return (mention_in_text(payload.get("content"), canonical)
+                    or mention_in_text(payload.get("name"), canonical))
+
+        all_results = {rid: v for rid, v in all_results.items() if _mentions_person(v)}
 
     # 3. Scope ranking, before the top_p cut. Ordering has to happen first so the
     #    limit is spent on the entries the caller asked for; the threshold still

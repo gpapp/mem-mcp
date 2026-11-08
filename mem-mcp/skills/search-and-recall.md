@@ -135,6 +135,28 @@ inferences drawn from the query.
 - A null client or project on a diary entry means unclassified *or* classified
   as generic — both are real outcomes. It does not mean the entry is unfinished.
 
+## Narrowing: Dates and People
+
+`client` / `context` rank. `after` / `before` / `person` **remove** — use them
+when you already know which records are in question, not to steer the ordering.
+
+- `after` / `before` take an inclusive ISO date or datetime (`2026-05-01`,
+  `2026-05-31T14:00`). A date-only bound covers that whole day, so
+  `before="2026-05-31"` includes the 31st.
+- `person` keeps only records that mention that person by name. The name is
+  matched to a stored People record first, so a near-miss spelling lands on the
+  record you meant; if nothing resolves, the literal spelling is used and a
+  result of nothing means nobody by that name is recorded — say so.
+- A record with no date is **outside** every window. That is deliberate: a
+  window is a claim about when something happened, and a record that cannot
+  answer it does not satisfy it.
+- An explicit range **wins** over time phrasing in the query. You do not need
+  to also write the date into `query`, and writing it there does not narrow
+  anything that the range has not already narrowed.
+
+If a windowed search returns nothing, widen the range before concluding the
+vault is empty — the window is the most common reason a real record is absent.
+
 ## Checklist
 
 - [ ] Searched the tool that matches the *kind* of thing wanted

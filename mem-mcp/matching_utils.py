@@ -1106,3 +1106,137 @@ def cache_key(*parts) -> tuple:
         else:
             key.append(str(part))
     return tuple(key)
+
+
+# ---------------------------------------------------------------------------
+# Time- and person-bounded search
+#
+# Both are *narrowing* filters, unlike scope, which only ranks. The difference
+# is deliberate: a caller who names a date window or a person has said which
+# records are in question, not which should merely be preferred. What the code
+# must not do is narrow by guessing -- a window that cannot be parsed is no
+# window, and a person name that resolves to nothing filters by the literal
+# string rather than matching the nearest stranger.
+# ---------------------------------------------------------------------------
+
+# A name is a word, not a substring: "Tim" must not keep every record that
+# mentions "timeout", and "Deutsche Bank" must match that phrase rather than
+# either word on its own. Lookarounds rather than ``\b`` because a name may
+# begin or end with a non-word character ("O'Brien", "AT&T").
+_MENTION_CACHE: dict = {}
+
+
+def _mention_pattern(name: str) -> "re.Pattern":
+    pattern = _MENTION_CACHE.get(name)
+    if pattern is None:
+        pattern = re.compile(r"(?<!\w)" + re.escape(name) + r"(?!\w)", re.IGNORECASE)
+        if len(_MENTION_CACHE) < 256:
+            _MENTION_CACHE[name] = pattern
+    return pattern
+
+
+def mention_in_text(text: object, name: object) -> bool:
+    """True when ``name`` appears in ``text`` as a whole word or phrase.
+
+    Deliberately not a substring test. A substring keeps every record that
+    mentions "timeout" when the caller asked about "Tim", which reads as a
+    person filter working while it is doing nothing of the kind.
+    """
+    if not text or not name:
+        return False
+    return bool(_mention_pattern(str(name)).search(str(text)))
+
+
+def resolve_person_name(person: str, candidates, min_confidence: float = None) -> Optional[str]:
+    """Resolve a caller-supplied person name to the stored spelling, or None.
+
+    ``people_match_allowed`` is the same gate that decides whether an extracted
+    name may become a ``MENTIONS`` edge, and it is reused here rather than
+    re-derived: the defect it exists to prevent -- a misspelling of somebody
+    absent coming back as a confident stranger -- is exactly the defect a
+    person filter would reintroduce. Nothing above ``MIN_MATCH_CONFIDENCE``
+    resolves, and the caller then filters on the literal string, which is
+    honest about having no record to compare against.
+
+    Ties are broken by confidence and then by name, so the answer does not
+    depend on dictionary order.
+    """
+    if not person:
+        return None
+    threshold = MIN_MATCH_CONFIDENCE if min_confidence is None else min_confidence
+    best = None
+    for candidate in candidates or ():
+        if not candidate:
+            continue
+        confidence, evidence = identity_confidence(person, name=candidate, name_like=True)
+        if not people_match_allowed(person, {"name": candidate, "confidence": confidence,
+                                             "evidence": evidence}, min_score=threshold):
+            continue
+        if best is None or confidence > best[0] or (confidence == best[0] and candidate < best[1]):
+            best = (confidence, candidate)
+    return best[1] if best else None
+
+
+# A date expression the query rewriter likes to invent, or to keep when the
+# caller already gave an explicit window. Only pure date phrases are matched, so
+# "SAP 2026 roadmap" survives -- dropping that would delete the topic as well as
+# the range.
+_DATE_VARIANTS = (
+    re.compile(r"^(last|this|next)\s+(week|month|quarter|year|monday|tuesday|wednesday|thursday|friday|saturday|sunday)$", re.I),
+    re.compile(r"^(yesterday|today|tomorrow|recently)$", re.I),
+    re.compile(r"^q[1-4]\s*\d{4}$", re.I),
+    re.compile(r"^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{4}$", re.I),
+    re.compile(r"^\d{4}$"),
+    re.compile(r"^\d{4}-\d{2}(-\d{2})?$"),
+    re.compile(r"^\d{1,2}/\d{1,2}/\d{2,4}$"),
+)
+
+
+def is_date_expression(text: object) -> bool:
+    """True when the whole phrase is a date and carries no topic at all."""
+    phrase = " ".join(str(text or "").split())
+    return any(pattern.match(phrase) for pattern in _DATE_VARIANTS)
+
+
+def strip_date_variants(variants: list) -> list:
+    """Drop date-only query variants when the caller gave an explicit window.
+
+    An explicit ``after``/``before`` wins. Leaving "last quarter" in the
+    variants turns one filtered search into several: the date variant embeds
+    the words the caller already expressed as a range, and it matches nothing
+    once the range is applied -- but it still costs an embedding and still
+    contributes weight to whatever it happens to score.
+
+    Never returns an empty list: if every variant was a date, the original text
+    is the only thing left to search with, and a filter that returns nothing is
+    worse than one that returns something to filter.
+    """
+    kept = [(text, weight) for text, weight in variants or () if not is_date_expression(text)]
+    return kept or list(variants or ())
+
+
+def timestamp_in_window(stamp: object, after: object = None, before: object = None) -> bool:
+    """True when an ISO-ish timestamp falls inside ``[after, before]``.
+
+    Compared as text on the **prefix the bound itself specifies**, which is what
+    makes ``before="2026-05-31"`` include a record stamped
+    ``2026-05-31T14:20:00Z``. A plain ``<=`` would exclude the whole day, and the
+    user asking for "before June" would silently lose the 31st of May.
+
+    A record with no timestamp is outside every window rather than inside it: a
+    window is a claim about when something happened, and a record that cannot
+    answer that question does not satisfy it. No bounds at all is everything,
+    which is why this returns True rather than False for the unbounded call.
+    """
+    text = str(stamp or "")
+    if not text:
+        return after is None and before is None
+    if after:
+        bound = str(after)
+        if text[:len(bound)] < bound:
+            return False
+    if before:
+        bound = str(before)
+        if text[:len(bound)] > bound:
+            return False
+    return True

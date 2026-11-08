@@ -192,7 +192,7 @@ async def add_fact(name: str, text: str, category: str, client: Optional[str] = 
 
 @mcp.tool()
 @monitor_mcp_tool("search_facts", context_provider=_current_user)
-async def search_facts(query: str, category: Optional[str] = None, limit: int = 5, top_p: float = 0.5, names_only: bool = False, client: Optional[str] = None, context: Optional[str] = None):
+async def search_facts(query: str, category: Optional[str] = None, limit: int = 5, top_p: float = 0.5, names_only: bool = False, client: Optional[str] = None, context: Optional[str] = None, after: Optional[str] = None, before: Optional[str] = None, person: Optional[str] = None):
     """
     Search for facts in the knowledge graph. Returns Markdown-formatted results.
 
@@ -221,6 +221,20 @@ async def search_facts(query: str, category: Optional[str] = None, limit: int = 
     section. Unconfirmed results are NOT the same record; never link, merge, or
     update them, and do not report them as found.
 
+    NARROWING (different from SCOPE) — `after`, `before` and `person` REMOVE
+    records, where `client`/`context` only rank them. Use them when you already
+    know which records are in question:
+      after/before: inclusive ISO date or datetime bounds, e.g. "2026-01-01".
+            A date-only bound covers that whole day. A record with no date is
+            outside every window rather than inside it.
+      person: only records that mention this person by name. The name resolves
+            to a stored People record first, so a near-miss spelling lands on
+            the record you meant; if it resolves to nothing the literal string
+            is used, and the answer says it found nobody rather than guessing.
+    An explicit `after`/`before` WINS over time phrasing in the query: the
+    rewrite is told not to add a date expression, and one it adds anyway is
+    stripped, so "last quarter" plus an explicit range means the range.
+
     Parameters:
       query: keyword or short phrase matching fact names/content
       category: optional filter ('People', 'Technology', 'Client', 'Project', 'Tool')
@@ -246,7 +260,7 @@ async def search_facts(query: str, category: Optional[str] = None, limit: int = 
     If a name search returns nothing confirmed, the person is not recorded yet —
     add the fact rather than editing an unconfirmed match.
     """
-    facts = await mem.db_search_memories(query, _current_user(), limit, category, top_p, client, context)
+    facts = await mem.db_search_memories(query, _current_user(), limit, category, top_p, client, context, after=after, before=before, person=person)
     if names_only:
         return "\n".join(f.get("name", "") or f.get("text", "")[:50] for f in facts if f.get("name") and not f.get("weak"))
     if not facts and (client or context):
@@ -530,7 +544,7 @@ async def diary_save_entry(content: str, name: Optional[str] = None, timestamp: 
 
 @mcp.tool()
 @monitor_mcp_tool("diary_search_entries", context_provider=_current_user)
-async def diary_search_entries(query: str, limit: int = 3, top_p: float = 0.4, client: Optional[str] = None, context: Optional[str] = None):
+async def diary_search_entries(query: str, limit: int = 3, top_p: float = 0.4, client: Optional[str] = None, context: Optional[str] = None, after: Optional[str] = None, before: Optional[str] = None, person: Optional[str] = None):
     """
     Search diary entries by vector similarity. Best for finding entries about specific topics.
 
@@ -547,6 +561,12 @@ async def diary_search_entries(query: str, limit: int = 3, top_p: float = 0.4, c
 
     Date-aware queries work well: "May 2026", "2026-07", "last Tuesday"
 
+    NARROWING (different from SCOPE) — `after`, `before` and `person` REMOVE
+    entries, where `client`/`context` only rank them. `after`/`before` take an
+    inclusive ISO date or datetime (a date-only bound covers the whole day);
+    `person` keeps only entries that mention that person by name. An explicit
+    range wins over date phrasing in the query.
+
     Parameters:
       query: topic keywords or date string
       limit: max results (default 3)
@@ -559,7 +579,7 @@ async def diary_search_entries(query: str, limit: int = 3, top_p: float = 0.4, c
     keywords, clientName, clientId, contextName, contextId, metadata, scopeStrength,
     scope. Use 'id' with diary_delete_entry or diary_save_entry to modify entries.
     """
-    return await mem.db_search_diary(query, _current_user(), limit, top_p, client, context)
+    return await mem.db_search_diary(query, _current_user(), limit, top_p, client, context, after=after, before=before, person=person)
 
 @mcp.tool()
 @monitor_mcp_tool("list_diary_entries", context_provider=_current_user)

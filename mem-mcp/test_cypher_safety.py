@@ -1934,3 +1934,58 @@ class QueryParameterBindingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class SearchWindowCallSiteTests(unittest.TestCase):
+    """The narrowing filters must widen the fetch, and must not invent a range.
+
+    `SearchNarrowingHelperTests` proves the helpers behave; this proves the
+    search paths *call* them. Both defects worth guarding here are wrong calls
+    rather than wrong functions, so neither is visible in the helper: a window
+    that post-filters one page sized for an unfiltered query returns nothing and
+    reads as "no such record", and a query rewriter told nothing about the
+    window invents a date variant that the window has already answered.
+    """
+
+    def _function_body(self, module, name):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), module)
+        with open(path, "r", encoding="utf-8") as handle:
+            source = handle.read()
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+                return ast.get_source_segment(source, node) or ""
+        raise AssertionError(f"{name} not found in {module}")
+
+    def test_the_fact_fetch_widens_before_a_window_is_applied(self):
+        body = self._function_body("fact_manager.py", "db_search_memories")
+        self.assertIn("windowed", body)
+        self.assertIn("fetch_limit *= DATE_WINDOW_FETCH_MULTIPLIER", body,
+                      msg="post-filtering a page sized for an unfiltered query "
+                          "is how a one-month window over a three-year vault "
+                          "comes back empty")
+
+    def test_the_rewriter_is_told_there_is_an_explicit_window(self):
+        body = self._function_body("fact_manager.py", "db_search_memories")
+        self.assertIn("no_dates=bool(after or before)", body,
+                      msg="the rewrite adds date phrases unless it is told not "
+                          "to; an explicit range wins")
+
+    def test_the_window_and_the_person_are_actually_applied(self):
+        body = self._function_body("fact_manager.py", "db_search_memories")
+        self.assertIn("timestamp_in_window(", body)
+        self.assertIn("mention_in_text(", body)
+        self.assertIn("resolve_person_name(", body)
+
+    def test_the_diary_fetch_widens_before_a_window_is_applied(self):
+        body = self._function_body("diary_manager.py", "db_search_diary")
+        self.assertIn("fetch_limit *= DATE_WINDOW_FETCH_MULTIPLIER", body)
+        self.assertIn("timestamp_in_window(", body)
+        self.assertIn("mention_in_text(", body)
+
+    def test_stripping_is_wired_into_the_rewriter(self):
+        body = self._function_body("fact_manager.py", "rewrite_search_query")
+        self.assertIn("strip_date_variants(", body,
+                      msg="the prompt asks; this is the half that holds when "
+                          "the model answers with a date anyway")
+        self.assertIn("no_dates", body)

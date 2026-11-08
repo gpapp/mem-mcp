@@ -1271,6 +1271,65 @@ Rules that matter when changing this code:
 - **`confidence` must never carry scope.** `identity_confidence()` returns `max(identity_strength, vector_confidence)` and `IDENTITY_STRENGTH["none"]` is `0.0`, so a scope term in that `max` would *outrank identity evidence* — a record assigned to the requested client whose name does not match at all would clear `top_p` and be rendered `confidence: 1.00 (name_conflict)`, on a docstring that tells the model ✅ records are safe to merge. `ScopeStaysOutOfConfidenceTests` asserts `identity_confidence` has no scope parameter at all. Note `raw_vector=0.9` saturates `vector_confidence` to 1.0, so those assertions use a mid vector.
 - **`db_search_diary` keeps its own inconsistency** — `top_p` on the blended `score`, not on `confidence`. Scope ranking is applied to it identically; do not "fix" the threshold while you are in there.
 
+### Narrowing filters: dates and people are not scope
+
+`search_facts` and `diary_search_entries` take `after` / `before` / `person`, and
+they are the **opposite** of `client` / `context` in exactly one way that
+matters: scope ranks, these **remove**. A caller who names a date window or a
+person has said which records are in question, not which should merely be
+preferred, so a record outside the window is a wrong answer rather than a
+lower-ranked one. Keep the two vocabularies distinct in every docstring — an
+agent that reads "filter" for both will conclude the vault is empty about a
+client it has plenty on.
+
+Three rules came out of the ways this goes silently wrong, and each is a
+different mechanism:
+
+- **A window has to widen the fetch, not post-filter one page.**
+  `DATE_WINDOW_FETCH_MULTIPLIER` (8, fact_manager.py) multiplies `fetch_limit`
+  before the narrowing runs, for the same reason `CHUNK_FETCH_MULTIPLIER` does:
+  a page sized for an unfiltered query answers a filtered one with nothing, and
+  "no such meeting" is indistinguishable from "the window was too narrow to
+  reach it". `SearchWindowCallSiteTests` pins the multiplication, because a
+  helper that filters correctly is not a test of the fetch that feeds it.
+- **A fact's date lives on the Neo4j node, not in its Qdrant payload.** Fact
+  payloads carry `text`/`name`/`category`/`userId`/`metadata` and the scope keys,
+  and no timestamp — so the window is a second batched read
+  (`MATCH (f:Fact) WHERE f.id IN $ids RETURN … toString(f.timestamp)`) over the
+  surviving ids, plus a Cypher clause in the exact-match pass where the date is
+  free. Diary payloads *do* carry `timestamp`, so the diary path is a payload
+  read with no second query. Do not "unify" the two by dropping a timestamp into
+  the fact payload: existing points have none, and a filter that silently
+  excludes every record written before the change is worse than the query it
+  replaces.
+- **`timestamp_in_window` compares on the prefix the bound specifies.** A plain
+  `<=` against `before="2026-05-31"` excludes `2026-05-31T14:20:00Z`, i.e. the
+  whole day — the user asks for "before June" and loses the 31st of May. A
+  record with **no** timestamp is outside every window rather than inside it: a
+  window is a claim about when something happened, and a record that cannot
+  answer that question does not satisfy it.
+
+`person` resolves through `resolve_person_name`, which is `people_match_allowed`
+— the same gate that decides whether an extracted name may become a `MENTIONS`
+edge — rather than a fresh comparison. The defect it exists to prevent is
+exactly the defect a person filter would reintroduce: a misspelling of somebody
+absent coming back as a confident stranger. Nothing above the threshold resolves,
+and the caller then filters on the **literal** string, which is honest about
+having found no record to compare against. `mention_in_text` is a whole-phrase
+match with lookarounds, not a substring test: a substring keeps every record
+mentioning "timeout" when the caller asked about "Tim", which reads as a filter
+working while it does nothing.
+
+**An explicit range beats date phrasing in the query.** `rewrite_search_query`
+grew a `no_dates` flag, which goes into the cache key (the same query under a
+window is a different question), adds a "do not add or infer any date
+expression" rule to the system prompt, and then runs `strip_date_variants` over
+whatever comes back — because a prompt is not a guard. `is_date_expression`
+matches only **whole** phrases, so `SAP 2026 roadmap` survives; dropping it would
+delete the topic as well as the range. `strip_date_variants` never returns an
+empty list for the same reason the window widens the fetch: a filter that returns
+nothing is worse than one that returns something to filter.
+
 ## Features
 
 ### Access Keys & Sessions

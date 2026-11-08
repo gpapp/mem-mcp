@@ -25,7 +25,6 @@ surfaces them — which is why task 5 exists.
 
 | # | task | size |
 |---|---|---|
-| 3 | Time- and person-bounded search | S |
 | 5 | Open commitments register (`:ActionItem`) | L |
 | 6 | Meeting-prep brief + skill | M |
 | 7 | Stakeholder roster with staleness | M |
@@ -34,30 +33,12 @@ surfaces them — which is why task 5 exists.
 | 10 | Remaining skills (`hygiene`, `orientation`, `weekly-review`) | S |
 | 11 | Deliverables register | M |
 
-Tasks 1, 2 and 4 are shipped (see `task_history.md`). They came first because the
+Tasks 1, 2, 3 and 4 are shipped (see `task_history.md`). They came first because the
 skill surface is what a client meets before it meets the vault: a discovery call
 that answers with three opaque filenames, and no skill that says how to read the
 vault, makes every later session worse.
 
 ---
-
-## 3. Time- and person-bounded search
-
-"What did Thomas say about the PPC migration last quarter" is a request the index
-cannot express today.
-
-- [ ] `search_facts` and `diary_search_entries` accept `after` / `before` and
-      `person`.
-- [ ] Date filtering uses the record's own timestamp, applied after the vector
-      query and before the result cap, so a narrow window widens `fetch_limit`
-      rather than returning nothing.
-- [ ] `person` resolves through the existing `people_match_allowed` gate — a name
-      filter must not reintroduce the confident-stranger bug that gate exists to
-      prevent.
-- [ ] An explicit `after`/`before` wins over time phrasing in the query, and the
-      rewriter must not invent a date range.
-- [ ] Tests: the window widening is driven against fakes; the rewriter's
-      no-invented-range rule is pinned at its call site.
 
 ## 5. Open commitments register (`:ActionItem`)
 

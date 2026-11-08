@@ -5,6 +5,35 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# Search: dates and people narrow, and a window widens the fetch
+
+- **Why**: `search_facts` and `diary_search_entries` could rank by scope but not
+  answer "what did Thomas say about the migration last quarter". Scope is a
+  *preference* — it never removes a record — so it cannot express "only
+  records from May", and an agent had no way to narrow at all. The gap mattered
+  because the two failure modes here are silent in the same direction scope
+  filtering was: a window that matches nothing reads as "the vault has no such
+  meeting", never as "your filter was wrong".
+- **What shipped**: `after` / `before` / `person` on both tools and both
+  managers, plus four pure helpers in `matching_utils.py` —
+  `mention_in_text`, `resolve_person_name`, `is_date_expression` /
+  `strip_date_variants`, and `timestamp_in_window`. `rewrite_search_query` grew
+  a `no_dates` flag (in the cache key, in the system prompt, and *then* a
+  `strip_date_variants` pass over the answer, because a prompt is not a guard).
+  `DATE_WINDOW_FETCH_MULTIPLIER` (8) widens the fetch before the narrowing runs,
+  and the fact path reads its window from the Neo4j node in one batched query
+  because fact payloads carry no timestamp.
+- **Tests**: `SearchNarrowingHelperTests` (13, in `test_matching_regressions.py`)
+  calls every helper, including that a date-only bound covers its whole day and
+  that a record with no timestamp is *outside* a window;
+  `SearchWindowCallSiteTests` (5, in `test_cypher_safety.py`) pins the call
+  sites — the fetch multiplication, the `no_dates` argument, and that stripping
+  is wired into the rewriter. Full suite **1486 OK**.
+- **The one thing to remember**: the narrowing filters widen the fetch instead
+  of post-filtering one page. A helper that filters correctly says nothing about
+  the page it was handed, and a page sized for an unfiltered query answers a
+  filtered one with nothing — which is indistinguishable from a true negative.
+
 # Skills: the first read-side skill — how to use the vault, not just fill it
 
 - **Why**: all three shipped skills were *write* workflows —

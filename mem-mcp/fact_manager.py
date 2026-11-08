@@ -38,11 +38,15 @@ from matching_utils import (
     combine_duplicate_signals,
     identity_confidence,
     looks_like_person_name,
+    mention_in_text,
     people_match_allowed,
+    resolve_person_name,
     scope_axis_tier,
     scope_context_tier,
     scope_strength,
     scopes_compatible,
+    strip_date_variants,
+    timestamp_in_window,
     validate_merge_ids,
 )
 from chunking import (
@@ -60,6 +64,12 @@ from chunking import (
 
 # Max unconfirmed (below top_p) results appended after the confident set.
 WEAK_RESULT_LIMIT = 2
+
+# A date window or a person filter narrows *after* the vector fetch, so the
+# fetch has to reach further than an unfiltered query would need. Post-filtering
+# a page sized for the unfiltered case is how a one-month window over a
+# three-year vault returns nothing and reads as "no such meeting".
+DATE_WINDOW_FETCH_MULTIPLIER = 8
 
 # Search-query rewrite cache. TTL 0 disables it entirely, which is the knob to
 # reach for if a stale client/project filter ever shows up in a cached rewrite
@@ -1129,7 +1139,8 @@ def _is_filter_echo(keyword: str) -> bool:
 async def rewrite_search_query(query: str, category: Optional[str] = None,
                                client: Optional[str] = None,
                                context: Optional[str] = None,
-                               expand: bool = False) -> list:
+                               expand: bool = False,
+                               no_dates: bool = False) -> list:
     """Use a tiny LLM to rewrite natural language into keyword search phrases.
 
     Returns a list of (keyword_string, weight) tuples.
@@ -1150,7 +1161,7 @@ async def rewrite_search_query(query: str, category: Optional[str] = None,
     if len(q.split()) <= 2 and not expand:
         return [(q, 1.0)]
 
-    key = cache_key(q, category, client, context, bool(expand))
+    key = cache_key(q, category, client, context, bool(expand), bool(no_dates))
     cached = QUERY_REWRITE_CACHE.get(key)
     if cached is not None:
         # A copy, not the stored list: callers weight and slice this, and a
@@ -1171,6 +1182,14 @@ async def rewrite_search_query(query: str, category: Optional[str] = None,
         "Rules: max 3 words each, nouns and proper nouns only, no stop words, "
         "most specific first, preserve exact names and identifiers."
     )
+    if no_dates:
+        # The caller already expressed the time range as a real filter. A date
+        # phrase in the variants embeds words that the window has already
+        # answered, costs an embedding, and contributes weight to whatever it
+        # happens to score -- so it is asked for here, and stripped below in
+        # case the model answers with one anyway.
+        system += (" Do not add, keep or infer any date expression -- the time "
+                   "range is applied as a filter, not as search text.")
     prompt = f"QUERY: {q}\nFILTERS: {filters}"
     try:
         import json as _json
@@ -1196,6 +1215,8 @@ async def rewrite_search_query(query: str, category: Optional[str] = None,
             if keywords:
                 logger.debug(f"[rewrite_search_query] '{q}' → {keywords}")
                 variants = [(q, 1.0)] + [(kw, 0.85) for kw in keywords[:4]]
+                if no_dates:
+                    variants = strip_date_variants(variants)
                 QUERY_REWRITE_CACHE.put(key, variants)
                 # A copy on the way out here too, not just on the read path. The
                 # list handed to `put` IS the cached object, so returning it
@@ -1205,7 +1226,7 @@ async def rewrite_search_query(query: str, category: Optional[str] = None,
     except Exception as exc:
         logger.warning(f"[rewrite_search_query] LLM rewrite failed, using heuristic: {type(exc).__name__}: {exc}")
 
-    return _expand_query(q)
+    return strip_date_variants(_expand_query(q)) if no_dates else _expand_query(q)
 
 
 def _expand_query(query: str) -> list:
@@ -1477,7 +1498,7 @@ def _db_relevant_scope(neo4j_driver, user_id: str, record_ids: list, owner_ids: 
     return out
 
 
-async def db_search_memories(query: str, user_id: str, limit: int = 5, category: Optional[str] = None, top_p: float = 0.4, client: Optional[str] = None, context: Optional[str] = None) -> list:
+async def db_search_memories(query: str, user_id: str, limit: int = 5, category: Optional[str] = None, top_p: float = 0.4, client: Optional[str] = None, context: Optional[str] = None, after: Optional[str] = None, before: Optional[str] = None, person: Optional[str] = None) -> list:
     """Search facts, ranking by scope then score, filtered by normalized confidence.
 
     Three independent rankings are combined. ``scopeStrength`` is the scope the
@@ -1499,6 +1520,22 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
     Results at or above ``top_p`` come first. Results below it are returned after
     the confident set, flagged ``weak: True`` and capped, so recall is preserved
     without letting an unconfirmed match look like a match.
+
+    ``after`` / ``before`` / ``person`` are a different kind of parameter from
+    ``client`` / ``context``, and the difference is the point: scope **ranks**,
+    these three **narrow**. A caller who names a date window or a person has said
+    which records are in question, not which should merely be preferred, so a
+    record outside the window is a wrong answer rather than a lower-ranked one.
+
+    What they must never do is narrow by guessing, because the failure is silent
+    in the same direction as a scope filter's was. A window that cannot be parsed
+    is no window; a person name that resolves to no stored record filters on the
+    literal string instead of matching the nearest stranger, which is the
+    ``people_match_allowed`` rule applied one layer up. And because a fact's
+    date lives on the Neo4j node rather than in its Qdrant payload, a windowed
+    search **widens ``fetch_limit``** before filtering rather than post-filtering
+    one page -- otherwise a one-month window over a three-year vault returns
+    nothing and reads as "no such meeting".
     """
     started = time.perf_counter()
     qdrant = await get_qdrant()
@@ -1548,6 +1585,14 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
             """
         if category:
             cypher += " AND toLower(f.category) = toLower($category)"
+        # The window narrows this pass too, in the graph where the date actually
+        # lives: a fact's Qdrant payload has no timestamp, only the Neo4j node
+        # does. Applied here it also keeps LIMIT 25 from being spent on records
+        # the caller has already excluded.
+        if after:
+            cypher += " AND f.timestamp >= datetime($after)"
+        if before:
+            cypher += " AND f.timestamp <= datetime($before)"
         # No FOR_CLIENT/IN_CONTEXT EXISTS clause here. This exact-match pass used
         # to be filtered by scope, which meant an unresolvable client name (or
         # the abbreviation "DB" against the node "Deutsche Bank (DB)") silently
@@ -1562,6 +1607,10 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
         params = {"ownerIds": owner_ids or [user_id], "query_str": query}
         if category:
             params["category"] = category.strip()
+        if after:
+            params["after"] = after
+        if before:
+            params["before"] = before
 
         neo_result = s.run(cypher, **params)
         raw_rows = list(neo_result)
@@ -1661,10 +1710,19 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
         client=want_client,
         context=want_context,
         expand=not exact_matches,
+        no_dates=bool(after or before),
     )
     # A chunked record occupies one fetch slot per chunk, so the raw limit has to
     # leave room for the family collapsing back down to `limit` records.
+    # A window or a person narrows *after* this fetch, so it has to widen the
+    # fetch instead: post-filtering one page sized for an unfiltered query is how
+    # a one-month window over a three-year vault comes back empty and reads as
+    # "no such meeting". The multiplier is deliberately generous -- a wasted
+    # fetch slot costs a comparison, a missing record costs the answer.
+    windowed = bool(after or before or person)
     fetch_limit = max(limit * 5 * CHUNK_FETCH_MULTIPLIER, 50)
+    if windowed:
+        fetch_limit *= DATE_WINDOW_FETCH_MULTIPLIER
 
     # Collect all results from all query variants
     all_vector_results = {}  # record id -> best result across all variants
@@ -1780,6 +1838,45 @@ async def db_search_memories(query: str, user_id: str, limit: int = 5, category:
     final_list = list(merged_results.values())
     if category:
         final_list = [r for r in final_list if r.get("category", "").lower() == category.lower()]
+
+    # 3b. Narrowing filters. These are the opposite of scope in the paragraph
+    # below: scope ranks and removes nothing, a window or a person removes. The
+    # distinction is what the caller said -- naming a date or a person says which
+    # records are in question, not which are merely preferred.
+    #
+    # The date lives on the Neo4j node and not in the Qdrant payload, which is
+    # why this is a second batched read rather than a filter expression: one
+    # query for the surviving ids, not one per record. `fetch_limit` was widened
+    # above, so the page this filters was sized to survive the narrowing.
+    if after or before:
+        wanted = [r["id"] for r in final_list]
+        stamps = {}
+        if wanted:
+            with neo4j_driver.session() as s:
+                rows = s.run(
+                    "MATCH (f:Fact) WHERE f.id IN $ids "
+                    "RETURN f.id AS id, toString(f.timestamp) AS ts",
+                    ids=wanted)
+                stamps = {row["id"]: row["ts"] for row in rows}
+        final_list = [r for r in final_list
+                      if timestamp_in_window(stamps.get(r["id"]), after, before)]
+
+    if person:
+        # Resolve the name through the same gate that decides whether an
+        # extracted name may become a MENTIONS edge. Nothing above the threshold
+        # means there is no stored record to compare against, so the literal
+        # string is used -- honest about having found nobody, and never
+        # approximated onto the nearest stranger.
+        with neo4j_driver.session() as s:
+            rows = s.run(
+                "MATCH (p:Fact) WHERE p.userId IN $ownerIds "
+                "AND toLower(p.category) = 'people' RETURN p.name AS name",
+                ownerIds=owner_ids or [user_id])
+            candidates = [row["name"] for row in rows if row["name"]]
+        canonical = resolve_person_name(person, candidates) or person
+        final_list = [r for r in final_list
+                      if mention_in_text(r.get("name"), canonical)
+                      or mention_in_text(r.get("text"), canonical)]
 
     # Scope ranking. This is a separate number from `score` and a separate
     # concern from `confidence`: it says how well the record matches the scope
