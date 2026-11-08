@@ -5,6 +5,45 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# Skills: the first read-side skill — how to use the vault, not just fill it
+
+- **Why**: all three shipped skills were *write* workflows —
+  `process-transcription`, `process-directory`, `memory-deduplication` all
+  describe how to get material into the vault. Nothing described how to answer a
+  question out of it, which is what a consultant does all day. Three behaviours
+  a reader needs are correct and counter-intuitive, and none is visible from a
+  tool signature: a `client` filter **prioritises and never filters** (so an
+  agent assuming a WHERE clause concludes a client has no data when it has
+  plenty); `score` is a blended ranking number that must never be thresholded
+  while `confidence` is the gate and `evidence` says whether a hit is the same
+  record or a near miss; and a hit is **always the whole record**, because long
+  records are chunked into several vectors and may surface as a fragment.
+- **What shipped**:
+  - New `mem-mcp/skills/search-and-recall.md` with front matter, organised as a
+    read workflow: the three tools and what each answers (including that
+    `find_patterns` answers "what recurs", not "what is true of X"), query the
+    index not the conversation, always pass the scope you already know,
+    confidence gates / score ranks, what to do when a name search comes back
+    weak (`get_fact_neighborhood` on the confirmed id), what a chunked hit
+    actually is, how to report a finding (cite date and name; say so when the
+    vault disagrees with the user; say when nothing was found), and a checklist.
+  - `SearchAndRecallSkillTests` in `test_skill_catalogue.py` — six tests pinning
+    the sentences that carry each rule, because a skill is prompt text and
+    nothing else in the suite notices when one is softened. Each uses
+    `assertTrue(needle in text, msg=...)` so a failure names the rule instead of
+    echoing the file.
+  - No registration work: `register_skills` derives `skill://` resources from
+    the directory, so adding the `.md` was the whole integration.
+- **Tests**: full documented suite list — **1468 tests, OK** (up from 1462).
+- **The one thing to remember**: this skill has no code behind it, which is
+  exactly why it can rot silently. If `search_facts` / `diary_search_entries`
+  semantics change — a scope filter that starts excluding, a `score` that
+  becomes a gate, chunking that stops hydrating — the tool docstring changes and
+  the skill does not. `SearchAndRecallSkillTests` pins the skill's claims, not
+  the tools', so a change to either side has to be made in both places.
+
+---
+
 # Skills: discovery returns descriptions, and every skill is addressable
 
 - **Why**: `find_skills` was `[f[:-3] for f in os.listdir(skills_dir) if

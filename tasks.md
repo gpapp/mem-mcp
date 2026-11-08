@@ -25,7 +25,6 @@ surfaces them — which is why task 5 exists.
 
 | # | task | size |
 |---|---|---|
-| 2 | `search-and-recall` skill | S |
 | 3 | Time- and person-bounded search | S |
 | 5 | Open commitments register (`:ActionItem`) | L |
 | 6 | Meeting-prep brief + skill | M |
@@ -35,36 +34,12 @@ surfaces them — which is why task 5 exists.
 | 10 | Remaining skills (`hygiene`, `orientation`, `weekly-review`) | S |
 | 11 | Deliverables register | M |
 
-Tasks 1 and 4 are shipped (see `task_history.md`). They came first because the
-skill surface is what a client meets before it meets the vault, and a discovery
-call that answers with three opaque filenames makes every later session worse.
+Tasks 1, 2 and 4 are shipped (see `task_history.md`). They came first because the
+skill surface is what a client meets before it meets the vault: a discovery call
+that answers with three opaque filenames, and no skill that says how to read the
+vault, makes every later session worse.
 
 ---
-
-## 2. `search-and-recall` skill
-
-The highest-value skill in this list and the cheapest: pure Markdown over
-behaviour that already exists but is nowhere documented for a client.
-`search_facts`'s docstring does not mention that `score` is a ranking number that
-must never be thresholded, that `confidence` is the gate, that `scopeStrength` is
-a third axis, or that ordering is `(scopeStrength, score, confidence)`.
-
-The skill must state, in the order a reader needs them:
-
-- [ ] Ask for `client` and `context` whenever they are known — scope
-      **prioritises and never excludes**, so a filter cannot cause an empty
-      result.
-- [ ] `score` ranks, `confidence` gates, `evidence` explains. Never threshold
-      `score`.
-- [ ] A weak-identity name query is deliberate: follow it with
-      `get_fact_neighborhood` rather than assuming a miss.
-- [ ] Long records are chunked, and a hit returns the whole record, so a
-      fragment is never the answer.
-- [ ] `find_patterns` is for "what recurs", not for "what is true of X".
-- [ ] When the vault disagrees with the user, say so rather than smoothing it
-      over.
-- [ ] Registered as a `skill://` resource — free now that registration is
-      derived from the directory (see `AGENTS.md` → Skills System).
 
 ## 3. Time- and person-bounded search
 

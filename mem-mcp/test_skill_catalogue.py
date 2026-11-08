@@ -190,5 +190,56 @@ class RegistrationSourceTests(unittest.TestCase):
                           "second registration is a duplicate")
 
 
+class SearchAndRecallSkillTests(unittest.TestCase):
+    """A skill is prompt text, so pin the claims that must not drift.
+
+    Every sentence here is one a reader acts on, and none of them is visible in
+    any other test: deleting "scope prioritises instead of filtering" leaves a
+    perfectly valid Markdown file that teaches the wrong thing, and no code
+    path notices. Same reasoning as `ScopePromptTests` — the file is the
+    product, so the file is what gets asserted.
+    """
+
+    def setUp(self):
+        with open(os.path.join(skill_catalogue.default_skills_dir(),
+                               "search-and-recall.md"), encoding="utf-8") as fh:
+            self.text = fh.read()
+
+    def _has(self, needle, why):
+        self.assertTrue(needle in self.text, msg=why)
+
+    def test_scope_prioritises_and_never_filters(self):
+        self._has("Scope prioritises; it never filters",
+                  "a reader who believes scope filters will conclude an empty "
+                  "result means the record is not filed under that client")
+
+    def test_score_is_never_a_threshold(self):
+        self._has("never be thresholded",
+                  "`score` is a ranking value, not a similarity; treating it "
+                  "as a gate drops the records the escape hatch exists for")
+        self._has("`confidence`", "confidence is the gate and must be named")
+        self._has("`evidence`", "evidence is what says whether it is the same record")
+
+    def test_unconfirmed_matches_must_not_be_acted_on(self):
+        self._has("not the same record",
+                  "an unconfirmed near miss is how a second record for one "
+                  "person gets created and never reconciled")
+
+    def test_find_patterns_is_scoped_to_what_it_answers(self):
+        self._has("what recurs",
+                  "`find_patterns` is the tool most likely to be asked a "
+                  "question it does not answer")
+
+    def test_a_hit_is_the_whole_record(self):
+        self._has("always the whole record",
+                  "chunked records return complete text; a reader who assumes "
+                  "a fragment will join two hits that share an id")
+
+    def test_disagreement_is_reported(self):
+        self._has("vault disagrees with what the user just said",
+                  "a dated record contradicting a recollection is the most "
+                  "valuable thing this vault produces, and only if it is said")
+
+
 if __name__ == "__main__":
     unittest.main()

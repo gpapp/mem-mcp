@@ -1980,6 +1980,34 @@ Pluggable skill workflows loaded from Markdown files in `mem-mcp/skills/`.
   present" is not "every skill has a URI", so the shipped files are enumerated
   against the directory rather than the source.
 
+**The shipped skills split into two kinds, and only one kind existed for a long
+time.** `process-transcription`, `process-directory` and `memory-deduplication`
+are all *write* workflows — they describe how to get material into the vault.
+`search-and-recall` is the first **read** skill: how to answer a question out of
+the vault once it is in there. That asymmetry is why an agent with three
+skills still could not use the product the way a consultant does.
+
+`search-and-recall` exists because three behaviours are correct and
+counter-intuitive, and every one of them is invisible from a tool signature:
+
+- **Scope prioritises and never filters.** A client filter is not a WHERE
+  clause; other clients' records come back ranked lower. An agent that assumes
+  filtering will conclude the vault has no data about a client it has plenty on.
+- **`score` ranks, `confidence` gates, `evidence` explains.** `score` is a
+  blended ranking number, not a similarity, and thresholding it discards good
+  hits. `top_p` filters on `confidence`. `evidence` is the label that says
+  whether a hit is the same record or a near miss — and the "Unconfirmed
+  matches" section is a warning, not a result set.
+- **A hit is the whole record.** Long records are chunked into several vectors,
+  so a search may surface a fragment as its entry point; the record returned is
+  complete. Two hits sharing an id are one record, not two.
+
+`SearchAndRecallSkillTests` pins each of those sentences, for the same reason
+`ScopePromptTests` pins the classifier's: a skill is prompt text, and nothing
+else in the suite notices when a sentence that carries a rule is softened or
+deleted. The tests `assertTrue(needle in text, msg=...)` rather than
+`assertIn(text)` so a failure names the rule instead of echoing the file.
+
 ### Diary Keyword Extraction
 Every diary save/update triggers automatic keyword extraction via the query LLM (`qwen3.5:0.8b`).
 
