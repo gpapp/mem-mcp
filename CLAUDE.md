@@ -44,9 +44,10 @@ mem-mcp/
 ├── live_notes.py         # Live-notes prompts, gate, budgets (stdlib-only)
 ├── sharing.py, audit.py  # Project/context sharing and its audit trail
 ├── chunking.py, scoped_ids.py, google_auth.py
+├── model_bench.py        # CLI: every chat model against every role's real prompt (stdlib-only)
 ├── skills/               # Markdown workflows, discovered from the directory
 ├── templates/            # dashboard.html and the live-notes worklet
-└── test_*.py             # 24 dependency-light regression suites
+└── test_*.py             # 25 dependency-light regression suites
 ```
 
 Only the stdlib-only modules are importable on a machine with no fastapi, no
@@ -84,7 +85,7 @@ python3 -m unittest test_matching_regressions.py test_embedding_reliability.py \
   test_sessions.py test_auth_guard.py test_google_auth.py test_registration.py \
   test_vault_migration.py test_sharing.py test_share_endpoints.py \
   test_sharing_readpaths.py test_live_notes.py test_skill_catalogue.py \
-  test_action_items.py test_briefing.py test_roster.py
+  test_action_items.py test_briefing.py test_roster.py test_model_bench.py
 ```
 
 Before committing: `python3 -m py_compile <file>.py` for Python, `node --check`

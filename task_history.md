@@ -5,6 +5,35 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# The model-selection harness was documented nowhere
+
+**Why.** `model_bench.py` and its suite have existed since October and not one
+of `README.md`, `CLAUDE.md`, `AGENTS.md`, `.env.example` or the compose file
+mentioned them — `grep` found zero matches in all five. It is the tool that
+decides which chat model this deployment runs, and the four-roles-across-two-
+models split in "Critical Config" rests on comparisons it is supposed to make
+repeatable. Undocumented, the only way to find it was to list the directory.
+
+**What shipped.** `README.md`: `model_bench.py` joins the CLI tools in the tree,
+the suite count goes 24 -> 25, `## Testing` runs the real command and names the
+new suite, and `## Features` gains *Model Benchmark*. `CLAUDE.md`: the tree and
+the test command. `AGENTS.md`: the new suite joins the documented command, and a
+section before `### Dashboard Deduplication` records why it exists — it guards
+the scorers in **both** directions, because a scorer that never fires calls every
+model perfect and one that fires too easily calls a good model broken, and both
+are green-looking results that send an operator to the wrong model.
+
+**Tests.** **1649 passing** across 25 files (the previous 1587 plus this
+suite's 62), 55.4 s. `git -c core.whitespace=cr-at-eol diff --check` clean.
+
+**The one thing to remember.** This suite is the only one that tests a CLI tool
+rather than a server module, and it can import its subject directly because
+`model_bench.py` is stdlib-only — the same reason `sessions.py` and
+`matching_utils.py` are. Its prompt lift fails with `PromptDrift` and exit code
+2 rather than falling back to a copy, so a pass always measures what ships.
+
+---
+
 # Docs: the README and CLAUDE.md catch up with the vault
 
 **Why.** Six modules and eight test suites landed this session, and neither

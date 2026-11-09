@@ -33,7 +33,8 @@ mem-mcp/
 ├── migrate_vault_user.py  # CLI: hand one user's whole vault to another
 ├── reindex_chunks.py      # CLI: backfill chunking for existing long records
 ├── reindex_diary_keywords.py  # CLI: backfill keyword extraction for existing diary entries
-├── test_*.py              # 24 dependency-light regression suites (see Testing)
+├── model_bench.py         # CLI: run every chat model against every app role's real prompt
+├── test_*.py              # 25 dependency-light regression suites (see Testing)
 ├── skills/                # Markdown skill workflows, loaded at request time
 ├── templates/             # Landing page and dashboard
 ├── requirements.txt
@@ -50,6 +51,7 @@ mem-mcp/
 - **Diary** — Narrative entries with Markdown support, LLM-powered keyword extraction, and vector similarity search.
 - **Smart Search** — LLM query rewriting (see `MEM_EXTRACT_MODEL`) decomposes natural language into keyword phrases; multi-query expansion merges results from multiple vector searches.
 - **Memory Deduplication** — Scope-aware multi-signal similarity clustering (vector, name, alias, email) with weighted fuzzy evidence, core-member filtering, and a guided merge workflow.
+- **Model Benchmark** — `model_bench.py` runs every installed chat model against every app role's *real* prompt shape — lifted out of the source with `ast`, so a moved prompt fails loudly instead of silently measuring a stale copy — and reports what a human needs to compare them. It scores only what is objective (JSON validity, name recall, retention, filter echo, degenerate decode) and prints the raw answers for the judgement a regex cannot make. Each model is sent the sampling its own model card specifies, because a harness that pins temperature 0 measures itself rather than a model tuned for 0.7. This is the repeatable version of the hand-measured comparisons behind the four-roles-across-two-models split.
 - **LLM-Assisted Resolution** — LLMs review bounded People and duplicate candidates with diary, scope, metadata, and record context; returned IDs are validated before use.
 - **Recoverable Merges** — Neo4j/Qdrant merge cleanup records pending Qdrant deletions and retries them through startup orphan reconciliation when a store is temporarily unavailable.
 - **Dashboard Deduplication** — The Service → Data sub-tab scans scope-compatible clusters, lets you select the records to merge, generates an editable consolidated draft with the LLM, and requires confirmation before merging.
@@ -311,7 +313,7 @@ permanent.
 ## Testing
 
 Run the focused dependency-light regression suite. Any `python` or `python3` on
-`PATH` runs all twenty-four of them, and none of them needs Neo4j, Qdrant or
+`PATH` runs all twenty-five of them, and none of them needs Neo4j, Qdrant or
 Ollama:
 
 ```bash
@@ -323,7 +325,7 @@ MEM_SESSION_DIR=/tmp/mem-vault-test-sessions python3 -m unittest -v \
   test_status_monitor test_sessions test_auth_guard test_google_auth \
   test_registration test_vault_migration test_sharing test_share_endpoints \
   test_sharing_readpaths test_live_notes test_skill_catalogue \
-  test_action_items test_briefing test_roster
+  test_action_items test_briefing test_roster test_model_bench
 ```
 
 `MEM_SESSION_DIR` matters: without it the session and PSK tests write a

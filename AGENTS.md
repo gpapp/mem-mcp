@@ -78,7 +78,7 @@ own body and a namespace entry cannot reach that.
 
 ```bash
 cd mem-mcp
-python3 -m unittest -v test_matching_regressions.py test_embedding_reliability.py test_chunking.py test_cypher_safety.py test_backup_compression.py test_people_extraction.py test_graph_scope.py test_mobile_layout.py test_llm_reliability.py test_env_wiring.py test_status_monitor.py test_sessions.py test_auth_guard.py test_google_auth.py test_registration.py test_vault_migration.py test_sharing.py test_share_endpoints.py test_sharing_readpaths.py test_live_notes.py test_skill_catalogue.py test_action_items.py test_briefing.py test_roster.py
+python3 -m unittest -v test_matching_regressions.py test_embedding_reliability.py test_chunking.py test_cypher_safety.py test_backup_compression.py test_people_extraction.py test_graph_scope.py test_mobile_layout.py test_llm_reliability.py test_env_wiring.py test_status_monitor.py test_sessions.py test_auth_guard.py test_google_auth.py test_registration.py test_vault_migration.py test_sharing.py test_share_endpoints.py test_sharing_readpaths.py test_live_notes.py test_skill_catalogue.py test_action_items.py test_briefing.py test_roster.py test_model_bench.py
 ```
 
 This was a Windows path (`C:/tools/miniconda3/python.exe`) with PowerShell `Push-Location`/`Pop-Location`, and it does not exist on the Linux host these files are edited from — every suite "failed" on an interpreter that is not there. Any `python`/`python3` on `PATH` runs all of them; none of them import a DB driver.
@@ -2088,6 +2088,63 @@ copy would not prove the shipped string was the one executed. Two tests came out
 of writing it: the sort order had been described in one direction and
 implemented in the other, and `works as a data engineer` was storing
 `a data engineer`.
+
+`test_model_bench.py` is the 25th suite, and it is the only one that tests a
+**CLI tool** rather than a server module — `model_bench.py` decides which chat
+model this deployment should run, so the code that decides a verdict needs the
+same protection as the code that serves a request. It **imports and calls**
+`model_bench` directly: that module is stdlib-only (`urllib`, `json`, `ast`,
+`argparse`, `time`, `statistics`, `re`, `shutil`), so there is no
+`ast.get_source_segment` lifting here and no fake driver to write — the harness
+under test is already the thing that runs on a bare host. 62 tests across 15
+classes.
+
+**It guards the scorers in both directions, and that is the point of the file.**
+A scorer that never fires reports every model as perfect; one that fires too
+easily reports a good model as broken. Both are green-looking results that send
+an operator to the wrong model, and neither raises. So the tests pair each
+scorer with a positive and a negative case — degenerate-but-valid JSON must
+score as degenerate, a genuine `[]` must not; a name that appears in the answer
+must be counted, one that does not must not; retention must notice a dropped
+tail and must not notice a reordered one.
+
+**The prompt lift is the other half.** `_lift_*` reads the module-level system
+prompt the app *actually sends* out of the source with `ast`, so a pass measures
+what ships rather than a copy in the harness. A prompt that moves or is renamed
+makes the lift fail with `PromptDrift`, which `main` turns into **exit code 2**
+rather than falling back to a stale string — a benchmark that silently measures
+last month's prompt is worse than one that refuses to run. `PromptLiftTests`
+covers the lift itself, `PromptDrift` included. Two roles (`merge`, `live`) are
+deliberately exempt: their prompts are assembled from graph candidates the
+script cannot see, so they are reproduced at contract level and the report says
+so.
+
+**Sampling is per model, and that is a measured decision, not a preference.**
+The app pins `temperature: 0.0` in `get_llm_response`, which is right for short
+JSON answers and wrong as a benchmark setting: a model whose card specifies
+0.7–1.0 would be measured as the harness rather than as itself.
+`sampling_for()` reads the family out of the tag and sends the values that
+family's own model card states — three of five families disagreed with what the
+harness originally sent. `RoleSamplingTests` pins each family, and
+`ThinkBudgetTests` pins the reasoning allowance: a thinking model given the
+non-thinking output budget truncates mid-JSON and reads as a bad model.
+
+**`--num-ctx` exists because the first run was an unequal comparison.** Without
+it each tag loaded with its own default context, so two models were answering
+different questions. It defaults to `$OLLAMA_CONTEXT_LENGTH` and then 16332, the
+same ceiling the merge path is sized against, so the bench and the app measure
+against one window. `ContextWindowTests` covers the estimate and the budget.
+
+Cost control is `--dry-run` (print the plan, no network), `--stub` (self-test
+against canned answers) and `--out`: `persist()` rewrites `bench.json` **after
+every call**, so a pass killed at the GPU's limit loses only the call in flight.
+A full pass is hours of prompt evaluation on a card shared with ASR — run it
+with the microphone closed.
+
+The file is not in the dependency-light suites because it is trivial; it is in
+them because a wrong scorer here costs a model swap, and a model swap is not
+free of re-verification — see "Critical Config" for the four-roles-across-two-
+models split this harness exists to make repeatable.
 
 ### Dashboard Deduplication
 Service → **🧹 Deduplicate memories** provides a review-first merge workflow. It is on the
