@@ -25,35 +25,17 @@ surfaces them — which is why task 5 exists.
 
 | # | task | size |
 |---|---|---|
-| 7 | Stakeholder roster with staleness | M |
 | 8 | Decision log per client | M |
 | 9 | Engagement timeline | M |
 | 10 | Remaining skills (`hygiene`, `orientation`, `weekly-review`) | S |
 | 11 | Deliverables register | M |
 
-Tasks 1, 2, 3, 4, 5 and 6 are shipped (see `task_history.md`). They came first because the
+Tasks 1, 2, 3, 4, 5, 6 and 7 are shipped (see `task_history.md`). They came first because the
 skill surface is what a client meets before it meets the vault: a discovery call
 that answers with three opaque filenames, and no skill that says how to read the
 vault, makes every later session worse.
 
 ---
-
-## 7. Stakeholder roster with staleness
-
-People are `:Fact` rows in category `People` with free-text bodies, and the
-people extractor already writes `MENTIONS` edges from diary entries to them. The
-relationship graph is therefore already built and entirely unread.
-
-- [ ] Per-client roster: name, role (parsed from the fact body), last mentioned,
-      mention count, open actions they own.
-- [ ] "Last seen" derived from the newest `MENTIONS` edge — read-only, no new
-      writes, no migration.
-- [ ] Flag a named stakeholder with no mention in `MEM_ROSTER_STALE_DAYS` (60).
-- [ ] Rendered as a section of the client panel, next to open items.
-
-**Decisions already made:** no new `:Person` node. The People facts and their
-edges already carry the data; a parallel node type would need a migration and
-would immediately disagree with the facts it mirrors.
 
 ## 8. Decision log per client
 

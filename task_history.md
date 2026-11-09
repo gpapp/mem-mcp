@@ -5,6 +5,42 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# Stakeholder roster: who is in the room, and who has gone quiet
+
+**Why.** After "what is open", the next question before a meeting is "who am I
+about to sit with, and who have I lost touch with". The vault could not answer
+either. People are `:Fact` rows and the people extractor has been writing
+`MENTIONS` edges from every diary save for a long time, so the relationship graph
+already existed and was entirely unread — the information was there and nothing
+surfaced it.
+
+**What shipped.**
+
+- `roster.py` — stdlib-only, zero app imports: `parse_role` (three shapes, and
+  `None` for everything else), `days_since`, `build_roster`, `stale_rows`,
+  `render_roster`.
+- `roster_manager.py` — `db_stakeholder_roster` (one query reading **both**
+  scope halves, `MENTIONS` constrained to the People category) and
+  `attach_open_actions`, which folds commitment counts in afterwards so the two
+  reads fail independently.
+- `GET /api/clients/{id}/roster` and `GET /api/contexts/{id}/roster` via
+  `_roster_with_actions`; a `stakeholder_roster` MCP tool; a collapsed
+  `Stakeholders (N, M quiet)` block in the client and project panels.
+- `MEM_ROSTER_STALE_DAYS` (60) and `MEM_ROSTER_LIMIT` (200), in `.env.example`
+  and the compose `environment:` block.
+- `test_roster.py`, the 24th suite — 36 tests.
+
+**Tests.** 1587 OK (up from 1551).
+
+**The one thing to remember.** Writing the tests found two real defects in the
+code that was about to ship: `build_roster`'s docstring said unmeasured people
+sort first and its test asserted last, and `works as a data engineer` was parsed
+as the role `a data engineer`. Neither is visible by reading the implementation;
+both are the kind of wrongness that looks right. And the query reads **both**
+scope halves on purpose — a person scoped directly, or reachable only through a
+scoped diary entry that mentions them. Reading one half produces a roster that is
+short and looks complete, which is the failure mode that gets trusted.
+
 # Meeting prep: a brief assembled from what is already recorded
 
 **Why.** Every other surface in this product answers a question you ask it. A

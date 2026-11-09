@@ -1217,6 +1217,74 @@ async def client_brief(client: str, context: Optional[str] = None):
     return result["markdown"]
 
 
+@mcp.tool()
+@monitor_mcp_tool("stakeholder_roster", context_provider=_current_user)
+async def stakeholder_roster(client: str, context: Optional[str] = None):
+    """
+    Who is on this engagement, what their role is, and when each of them was
+    last mentioned in a meeting note.
+
+    Use it to prep for a meeting ("who am I about to sit with?") and to notice
+    a relationship going quiet ("who have I not spoken to in two months?"). It
+    reads edges the diary already wrote -- every saved entry links the people it
+    names -- so a person nobody has written about has no last-seen date rather
+    than a guessed one.
+
+    `client` is a client name and `context` narrows it to one project; both
+    accept the spellings `list_clients` returns. An unknown name is an error
+    rather than a nearest-match, because a roster is read out loud.
+
+    Returns Markdown. The `Last spoken` column is the newest diary entry that
+    mentions the person, with the number of days since; a stakeholder with no
+    date is unmeasured, not stale. Rows are ordered quietest-first, and anyone
+    past `MEM_ROSTER_STALE_DAYS` is flagged.
+    """
+    clients = mem.db_list_clients(_current_user()) or []
+    wanted = (client or "").strip().lower()
+    found = None
+    for row in clients:
+        if (row.get("name") or "").strip().lower() == wanted:
+            found = row
+            break
+    if found is None:
+        for row in clients:
+            name = (row.get("name") or "").strip().lower()
+            if wanted and (wanted in name or name in wanted):
+                found = row
+                break
+    if found is None:
+        known = ", ".join(sorted(row.get("name") or "?" for row in clients)) or "none"
+        return f"No client matches '{client}'. Known clients: {known}."
+
+    context_id = None
+    if context:
+        wanted_context = context.strip().lower()
+        for row in found.get("contexts") or ():
+            if (row.get("name") or "").strip().lower() == wanted_context:
+                context_id = row.get("id")
+                break
+        if context_id is None:
+            known = ", ".join(row.get("name") or "?" for row in found.get("contexts") or ()) or "none"
+            return (f"No project matches '{context}' under {found.get('name')}. "
+                    f"Known projects: {known}.")
+
+    try:
+        roster = mem.db_stakeholder_roster(_current_user(), client_id=found["id"],
+                                           context_id=context_id)
+    except ValueError as e:
+        return f"Could not read the roster: {e}"
+    if not roster.get("ok", True) and not roster.get("rows"):
+        return roster.get("markdown") or "_The roster could not be read._"
+
+    try:
+        actions = mem.db_list_action_items(_current_user(), client_id=found["id"],
+                                           context_id=context_id, status="open")
+    except Exception as exc:                              # noqa: BLE001
+        logger.warning("roster: open commitments unavailable: %s", exc)
+        actions = []
+    return mem.attach_open_actions(roster, actions).get("markdown") or ""
+
+
 # ---------------------------------------------------------------------------
 # Skills & Resources
 # ---------------------------------------------------------------------------

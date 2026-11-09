@@ -78,7 +78,7 @@ own body and a namespace entry cannot reach that.
 
 ```bash
 cd mem-mcp
-python3 -m unittest -v test_matching_regressions.py test_embedding_reliability.py test_chunking.py test_cypher_safety.py test_backup_compression.py test_people_extraction.py test_graph_scope.py test_mobile_layout.py test_llm_reliability.py test_env_wiring.py test_status_monitor.py test_sessions.py test_auth_guard.py test_google_auth.py test_registration.py test_vault_migration.py test_sharing.py test_share_endpoints.py test_sharing_readpaths.py test_live_notes.py test_skill_catalogue.py test_action_items.py test_briefing.py
+python3 -m unittest -v test_matching_regressions.py test_embedding_reliability.py test_chunking.py test_cypher_safety.py test_backup_compression.py test_people_extraction.py test_graph_scope.py test_mobile_layout.py test_llm_reliability.py test_env_wiring.py test_status_monitor.py test_sessions.py test_auth_guard.py test_google_auth.py test_registration.py test_vault_migration.py test_sharing.py test_share_endpoints.py test_sharing_readpaths.py test_live_notes.py test_skill_catalogue.py test_action_items.py test_briefing.py test_roster.py
 ```
 
 This was a Windows path (`C:/tools/miniconda3/python.exe`) with PowerShell `Push-Location`/`Pop-Location`, and it does not exist on the Linux host these files are edited from — every suite "failed" on an interpreter that is not there. Any `python`/`python3` on `PATH` runs all of them; none of them import a DB driver.
@@ -2018,6 +2018,76 @@ knob that does not reach the container is not a knob.
 `skills/meeting-prep.md` walks the same five steps by hand with existing tools,
 so the workflow is useful without the endpoint and the endpoint has a written
 spec. `test_briefing.py` is the 23rd suite.
+
+### Stakeholder Roster
+
+Who is in the room, what they do, and who has gone quiet. The roster answers the
+second question a consultant asks before a meeting, after "what is open".
+
+**There is no `:Person` node, and there is no roster table.** People are `:Fact`
+rows in category `People`, and the people extractor already writes
+`(:DiaryEntry)-[:MENTIONS {source: 'auto'|'manual'}]->(:Fact)` on every diary
+save. Last-seen is `max(d.timestamp)` over that edge. A parallel node type would
+need a migration and would immediately disagree with the facts it mirrors — the
+same reasoning as "SQLite is the only source of truth" for sharing.
+
+- **A `MENTIONS` edge is not proof of a person.** Link management lets a user
+  attach *any* fact to a diary entry, so the query constrains the target with
+  `toLower(coalesce(p.category, '')) = 'people'`. Without it the roster fills
+  with projects and tools that happen to be mentioned.
+- **Both scope halves are read.** A person can be scoped directly
+  (`FOR_CLIENT` / `IN_CONTEXT` on the People fact) or only reachable through a
+  scoped diary entry that mentions them. A roster that reads one half lists
+  **half the room**, which is worse than a short one because it looks complete.
+  The suffix filter is `WHERE directScope > 0 OR viaScope > 0`.
+- **Mentions are counted across the whole vault, not per engagement.** "When did
+  I last speak to this person" is a question about the person; scoping it to the
+  client would answer a different one.
+- **A role is read, never inferred.** `parse_role` accepts three shapes — a
+  labelled line (`Role: CTO`), a predicate on the name (`Tim is the CTO at …`),
+  a dash form (`Tim Smith — CTO`) — and returns `None` for everything else. A
+  body that merely mentions a job word is not a statement about this person's
+  role, and reading it as one is how a roster starts inventing org charts the
+  consultant then repeats in the room. A leading article is dropped, because
+  "a data engineer" beside every name reads like a machine wrote it.
+- **No date is unmeasured, not stale.** `stale` requires `measured`; a person
+  nobody wrote about has no date at all, and reporting them as "quiet for 400
+  days" would be inventing a measurement. They still sort **first** — nothing
+  recorded is a bigger unknown than mentioned-a-while-ago.
+- **`MEM_ROSTER_STALE_DAYS=0` disables the flag, and that is not
+  arithmetic.** `gap >= 0` is true of everyone who has ever been mentioned, so
+  the naive test turns "stop warning me" into "flag the whole roster". The guard
+  is `bool(stale_days) and …`.
+- **Columns appear only when something can fill them.** An all-empty `Role`
+  column makes the table look broken; the quiet count is stated in a sentence
+  underneath rather than left to be counted, because "four people have gone
+  quiet" is the line that prompts an email.
+- **The two reads fail independently.** `_roster_with_actions` reads the graph
+  first and folds the open-commitment counts in after, because the action
+  register being unavailable must not cost the reader the roster. An unreachable
+  graph answers `ok: False` with a sentence, never a raise — the panel has to be
+  able to tell "graph down" from "nobody recorded".
+- **A roster without a scope is refused.** Only one person's People facts is the
+  People category with a new heading.
+
+Surfaces: `GET /api/clients/{id}/roster`, `GET /api/contexts/{id}/roster` (which
+resolves the parent client when the caller does not send `clientId`), the
+`stakeholder_roster` MCP tool, and a collapsed `Stakeholders (N, M quiet)` block
+in each client and project panel beside the brief and the open items.
+
+`MEM_ROSTER_STALE_DAYS` (60) and `MEM_ROSTER_LIMIT` (200) are in `.env.example`
+*and* the compose `environment:` block; both use the
+`os.getenv(NAME) or default` form, so an empty interpolation from compose cannot
+crash the import.
+
+`test_roster.py` is the 24th suite. `roster.py` is stdlib-only, so it is
+**imported and called**; `roster_manager.py` imports `common`, so a stub
+`common` is installed in `sys.modules` and the real module is then imported —
+the query is the part that decides which half of the room appears, and a lifted
+copy would not prove the shipped string was the one executed. Two tests came out
+of writing it: the sort order had been described in one direction and
+implemented in the other, and `works as a data engineer` was storing
+`a data engineer`.
 
 ### Dashboard Deduplication
 Service → **🧹 Deduplicate memories** provides a review-first merge workflow. It is on the

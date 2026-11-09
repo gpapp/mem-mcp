@@ -79,6 +79,14 @@ from brief_manager import (
     BRIEF_MODEL, BRIEF_TIMEOUT, BRIEF_MEETING_LIMIT,
 )
 
+# The roster reads edges the rest of the app already writes, so it has no
+# migration of its own; `roster.py` is stdlib-only for the same reason the
+# briefing layout is.
+from roster_manager import (
+    db_stakeholder_roster, attach_open_actions,
+    ROSTER_STALE_DAYS, ROSTER_LIMIT,
+)
+
 # The WebSocket origin check is a pure helper; keeping it in `live_notes.py`
 # means the rule can be tested without a running server.
 from live_notes import (

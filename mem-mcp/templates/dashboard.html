@@ -3067,21 +3067,41 @@
         const ai = await api.get('action-items?' + params + '&status=open');
         actions = (ai && ai.items) || [];
       } catch(e) { actions = []; }
+      let roster = null;
+      try {
+        roster = type === 'client'
+          ? await api.get('clients/' + id + '/roster')
+          : await api.get('contexts/' + id + '/roster');
+      } catch(e) { roster = null; }
       // The brief is offered on every panel, including one with no items --
       // an engagement with nothing recorded is exactly when a person wants to
       // read the gap list before walking in.
       const briefHtml = `<div style="padding:.35rem .4rem;border-bottom:1px solid var(--border);">`
         + `<button class="btn btn-sm btn-ghost" style="padding:.15rem .5rem;font-size:.72rem;"`
         + ` onclick="event.stopPropagation(); showScopeBrief('${type}', '${id}')">📋 Brief</button></div>`;
-      const actionsHtml = briefHtml + (actions.length
+      // Who is in the room, and who has gone quiet. Collapsed by default
+      // because this is the longest of the three blocks and the panel is
+      // narrow, but the summary states the count and the quiet count so the
+      // number that matters is readable without opening it.
+      const rosterRows = (roster && roster.rows) || [];
+      const quietCount = (roster && roster.stale ? roster.stale.length : 0);
+      const rosterHtml = rosterRows.length
+        ? `<details style="padding:.35rem .4rem;border-bottom:1px solid var(--border);">`
+          + `<summary style="cursor:pointer;font-size:.72rem;color:var(--muted);">`
+          + `Stakeholders (${rosterRows.length}${quietCount ? ', ' + quietCount + ' quiet' : ''})`
+          + `</summary>`
+          + `<div class="markdown-body" style="font-size:.76rem;margin-top:.35rem;">`
+          + `${marked.parse(roster.markdown || '')}</div></details>`
+        : '';
+      const headerHtml = briefHtml + rosterHtml + (actions.length
         ? `<div style="padding:.35rem .4rem;font-size:.72rem;color:var(--muted);border-bottom:1px solid var(--border);">Open items</div>`
           + renderActionRows(actions, {})
         : '');
       const rows = [];
       (data.facts || []).forEach(f => rows.push({kind:'fact', id: f.id, name: f.name, cat: f.category}));
       (data.diary || []).forEach(d => rows.push({kind:'diary', id: d.id, name: d.name, ts: d.timestamp}));
-      if (!rows.length) { panel.innerHTML = actionsHtml + '<p style="padding:.4rem;font-size:.8rem;color:var(--muted);">No items linked yet.</p>'; return; }
-      panel.innerHTML = actionsHtml + rows.map(r => {
+      if (!rows.length) { panel.innerHTML = headerHtml + '<p style="padding:.4rem;font-size:.8rem;color:var(--muted);">No items linked yet.</p>'; return; }
+      panel.innerHTML = headerHtml + rows.map(r => {
         if (r.kind === 'fact') {
           // The ✏️ is withheld on a record the caller may read but not write.
           // The row carries `readOnly` only on a shared panel, so an own panel

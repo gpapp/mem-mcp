@@ -1667,6 +1667,72 @@ async def api_context_brief(request: Request, context_id: str,
         raise _service_unavailable(e)
 
 
+def _roster_with_actions(user, client_id, context_id=""):
+    """Read the roster, then fold the open-commitment counts into it.
+
+    Two reads with two independent failure modes, done in that order on
+    purpose: the graph gives names and last-seen dates, the action register
+    gives who owes what, and a roster that renders without the counts is still
+    worth reading. Folding them the other way round would lose the roster when
+    only the register is unavailable.
+    """
+    roster = mem.db_stakeholder_roster(user, client_id=client_id,
+                                       context_id=context_id or None)
+    try:
+        actions = mem.db_list_action_items(user, client_id=client_id,
+                                           context_id=context_id or None,
+                                           status="open")
+    except Exception as exc:                              # noqa: BLE001
+        logger.warning("roster: open commitments unavailable: %s", exc)
+        actions = []
+    return mem.attach_open_actions(roster, actions)
+
+
+@web_app.get("/api/clients/{client_id}/roster", response_class=JSONResponse)
+async def api_client_roster(request: Request, client_id: str, contextId: str = ""):
+    """Who is on this engagement, and when each of them was last in the room.
+
+    "Last seen" is read off the newest `MENTIONS` edge from a diary entry, which
+    the people extractor already writes on every save — there is no roster table
+    and no migration, and a person nobody has written about simply has no date.
+    """
+    try:
+        return _roster_with_actions(_require_user(request), client_id, contextId)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except RuntimeError as e:
+        raise _service_unavailable(e)
+
+
+@web_app.get("/api/contexts/{context_id}/roster", response_class=JSONResponse)
+async def api_context_roster(request: Request, context_id: str, clientId: str = ""):
+    """The same roster for one project.
+
+    The parent client is resolved when the caller does not send it, for the same
+    reason the brief route does: a project can be reached from the graph where
+    only its own id is known, and the action register is keyed by engagement.
+    """
+    try:
+        user = _require_user(request)
+        client_id = clientId
+        if not client_id:
+            for client in mem.db_list_clients(user) or ():
+                if any(c.get("id") == context_id for c in client.get("contexts") or ()):
+                    client_id = client.get("id")
+                    break
+        if not client_id:
+            raise HTTPException(status_code=404, detail="Project not found.")
+        return _roster_with_actions(user, client_id, context_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except RuntimeError as e:
+        raise _service_unavailable(e)
+
+
 @web_app.get("/api/action-items", response_class=JSONResponse)
 async def api_list_action_items(request: Request, clientId: str = "", contextId: str = "",
                                 status: str = "", dueBefore: str = ""):
