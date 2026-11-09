@@ -27,13 +27,20 @@ mem-mcp/
 ├── chunking.py            # Splitting a long record into several vectors, and searching them
 ├── scoped_ids.py          # The one place client/context ids are derived (uuid5)
 ├── sessions.py            # Stdlib-only: sessions, access keys, credential store, registration
+├── sharing.py             # Stdlib-only: the visibility/permission policy for a grant
+├── audit.py               # Share links, grants and the access trail, in their own audit.db
 ├── backup.py              # Savepoints: Qdrant snapshot + graph export, and restore
 ├── status_monitor.py      # Ollama status snapshot, change fingerprint, SSE subscribers
+├── live_notes.py          # Stdlib-only: live-note prompts, budgets, pause tail, audio gate
+├── live_manager.py        # Transcript/segment CRUD, consumption markers, the note job runner
 ├── google_auth.py         # OAuth 2.0 authorization-code client over stdlib urllib
 ├── migrate_vault_user.py  # CLI: hand one user's whole vault to another
 ├── reindex_chunks.py      # CLI: backfill chunking for existing long records
 ├── reindex_diary_keywords.py  # CLI: backfill keyword extraction for existing diary entries
 ├── model_bench.py         # CLI: run every chat model against every app role's real prompt
+├── search_diagnostics.py  # CLI: trace one query through Neo4j, Qdrant and the merge, to a jsonl log
+├── search_batch_test.py   # CLI: run a fixed query suite and print a pass/fail summary table
+├── search_report.py       # CLI: render that jsonl log as a markdown report
 ├── test_*.py              # 25 dependency-light regression suites (see Testing)
 ├── skills/                # Markdown skill workflows, loaded at request time
 ├── templates/             # Landing page and dashboard

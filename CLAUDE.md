@@ -42,9 +42,12 @@ mem-mcp/
 ├── backup.py             # Savepoints, restore, vault fingerprint
 ├── status_monitor.py     # Ollama status poller + SSE fan-out (stdlib-only)
 ├── live_notes.py         # Live-notes prompts, gate, budgets (stdlib-only)
+├── live_manager.py       # Transcript/segment CRUD, consumption markers, the note job runner
 ├── sharing.py, audit.py  # Project/context sharing and its audit trail
 ├── chunking.py, scoped_ids.py, google_auth.py
 ├── model_bench.py        # CLI: every chat model against every role's real prompt (stdlib-only)
+├── search_diagnostics.py, search_batch_test.py, search_report.py
+                        # CLI: trace one query, run a fixed query suite, render the log
 ├── skills/               # Markdown workflows, discovered from the directory
 ├── templates/            # dashboard.html and the live-notes worklet
 └── test_*.py             # 25 dependency-light regression suites

@@ -5,6 +5,39 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# Seven modules were missing from the architecture trees
+
+**Why.** The two trees are the only map of the package, and a module that is not
+on the map is a module a reader does not know exists. Seven non-test modules were
+absent from both: `live_manager.py` (the whole live-notes job runner, referenced
+throughout `AGENTS.md` but listed in neither tree), `live_notes.py`, `sharing.py`,
+`audit.py`, and the three search diagnostics (`search_diagnostics.py`,
+`search_batch_test.py`, `search_report.py`) — the last three documented nowhere
+in the repository at all.
+
+The three search scripts are the ones that had no home. They are `python -m` dev
+tools run by hand, so they do not belong in the suites and nothing imports them —
+which is exactly how they stayed invisible. But the question they answer is the
+one that otherwise costs an afternoon: *did this record miss on retrieval, or
+only on ranking?*
+
+**What shipped.** `README.md` and `CLAUDE.md` trees now list all 35 non-test
+modules with one-line descriptions. `AGENTS.md` gained a paragraph at the end of
+"Search Scoring & Confidence" explaining the trace → batch → report workflow and
+why these three are deliberately outside the suites: a diagnostic that breaks is
+noticed when it is run, unlike a scorer.
+
+**Tests.** Docs only; no `.py` touched. Suite unchanged at 1649 passing across 25
+files. `git -c core.whitespace=cr-at-eol diff --check` clean.
+
+**The one thing to remember.** Both trees are hand-maintained lists, and nothing
+fails when they drift. `ls mem-mcp/*.py | grep -v '^test_'` and the tree should
+name the same set; that comparison is the whole check, and it found seven. When
+adding a module, add the line in the same commit — the alternative is a doc that
+is right about everything it mentions and silent about a quarter of the codebase.
+
+---
+
 # The model-selection harness was documented nowhere
 
 **Why.** `model_bench.py` and its suite have existed since October and not one
