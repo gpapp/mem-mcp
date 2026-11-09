@@ -1,62 +1,104 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file is a short orientation for AI assistants. **`AGENTS.md` is the source
+of truth** — it is long, it is specific, and it documents the reason behind each
+rule. Read it before changing behaviour in any area it covers.
 
-## High-Level Architecture & Structure
+## What this is
 
-This repository is `mem-mcp`, a self-hosted Model Context Protocol (MCP) server that provides a persistent semantic memory layer for AI agents using vector embeddings (Qdrant) and a Knowledge Graph (Neo4j). 
+A self-hosted MCP server that gives agents and people a persistent memory layer
+over vector embeddings (Qdrant) and a knowledge graph (Neo4j), with an editable
+web dashboard on the same process.
 
-- **Unified Server**: The application is a unified FastAPI server exposing a web GUI, REST API, and an MCP endpoint, all running on the same port (8080 by default).
-- **Core Components** (`mem-mcp/` directory):
-  - `server.py`: The entry point that mounts the web app, MCP server, and handles routing and CORS middleware.
-  - `memory.py`: The core shared library containing database clients (Qdrant, Neo4j, Ollama), configuration loading from environment variables, and the logic for graph traversal and vector searches.
-  - `mcp_tools.py`: Contains the tool definitions utilizing `FastMCP` (e.g., `create_fact`, `search_facts`, `link_facts`).
-  - `gui.py`: The FastAPI web app handling the Landing Page (`/`), Web Dashboard (`/gui`), and REST API endpoints (`/api/*`).
-- **Multi-user Isolation**: Operations automatically resolve the user vault dynamically from headers (`Authorization: Basic` or proxy headers like `X-Remote-User`). 
-- **Infrastructure**: Dependencies (Neo4j, Qdrant, Ollama) are orchestrated via Docker Compose (`docker-compose.yml`).
+| Component | Port | Notes |
+|---|---|---|
+| App | 8086 (Docker), 8080 (internal) | GUI `/gui`, MCP `/mcp`, REST `/api/*` |
+| Qdrant | 6333 | Internal only |
+| Neo4j | 7687 | Internal only |
+| Ollama | 11434 | Internal only |
+| nginx | `/mem-mcp` | Proxy mount point — include in every URL |
 
-## Common Development Commands
+## Architecture
 
-### Environment Setup
-We use `uv` and Python virtual environments as specified in global instructions.
-
-```powershell
-cd mem-mcp
-uv venv
-.\.venv\Scripts\Activate.ps1
-uv pip install -r requirements.txt
+```
+mem-mcp/
+├── server.py             # Lifespan, middleware order, uvicorn entry
+├── memory.py             # The fan-out module: re-exports every manager
+├── common.py             # Config, Ollama chat/embed, Neo4j driver, graph lock
+├── fact_manager.py       # :Fact CRUD, search, merge, consistency, chunks
+├── diary_manager.py      # :DiaryEntry CRUD, keyword + people extraction
+├── client_manager.py     # :Client / :Context, scope, resolution
+├── action_manager.py     # The :ActionItem register
+├── roster_manager.py     # Stakeholder roster (People facts, mentions, last-seen)
+├── brief_manager.py      # Assembles a brief's material, then has the model polish it
+├── matching_utils.py     # Pure matching, merge, scope, date/action parsing
+├── roster.py             # Stdlib-only: role parsing, staleness, roster Markdown
+├── briefing.py           # Stdlib-only: the meeting-prep brief's layout rules
+├── skill_catalogue.py    # Stdlib-only: reads skills/, front matter, descriptions
+├── gui.py                # Every HTTP route, the live-notes WS proxy
+├── mcp_tools.py          # The MCP tools
+├── mcp_skills.py         # MCP skills, resources and prompts
+├── sessions.py           # Sessions, credentials, access keys (stdlib-only)
+├── backup.py             # Savepoints, restore, vault fingerprint
+├── status_monitor.py     # Ollama status poller + SSE fan-out (stdlib-only)
+├── live_notes.py         # Live-notes prompts, gate, budgets (stdlib-only)
+├── sharing.py, audit.py  # Project/context sharing and its audit trail
+├── chunking.py, scoped_ids.py, google_auth.py
+├── skills/               # Markdown workflows, discovered from the directory
+├── templates/            # dashboard.html and the live-notes worklet
+└── test_*.py             # 24 dependency-light regression suites
 ```
 
-### Running Infrastructure (Databases & Embedder)
-Before starting the application, the local infrastructure must be running:
+Only the stdlib-only modules are importable on a machine with no fastapi, no
+httpx and no database driver. That is why the pure rules live in them.
 
-```powershell
-# Copy environment template if you haven't
-Copy-Item .env.example .env
+## Authentication — two gates, different credentials
 
-# Start Qdrant, Neo4j, Ollama
-docker-compose up -d
+| gate | accepts | covers |
+|---|---|---|
+| `/mcp` | **only** `Authorization: Bearer mvk_…` | every route fastmcp registers |
+| `/gui`, `/api/*` | session cookie → verified `Basic` → `Bearer mvk_…` | ~60 handlers |
+| `/api/auth/*` | nothing, by design | login, logout, signup, OAuth |
 
-# Initialize the embedder in Ollama
+**Do not reintroduce header-based identity.** `_user` reads `session["user"]`
+and `request.state.user` only. Proxy headers (`X-Remote-User`) and a decoded
+`Basic` username authenticate nothing — that model was removed on purpose, and
+`AGENTS.md` → Authentication explains each hole it left.
+
+## Development
+
+```bash
+cp .env.example .env          # set MEM_NEO4J_PASSWORD
+docker compose up -d
 docker exec ollama ollama pull nomic-embed-text
+docker compose up -d --build mem-mcp
 ```
 
-### Starting the Server for Development
-To run the server locally outside of Docker for easier debugging (requires infrastructure from `docker-compose` to be running):
+Run the suites (no database needed, from `mem-mcp/`):
 
-```powershell
-cd mem-mcp
-.\.venv\Scripts\Activate.ps1
-python server.py
-```
-*(Ensure `.env` values like `MEM_NEO4J_PASSWORD` are loaded into your environment, or rely on `python-dotenv` if added.)*
-
-Alternatively, build and run everything in Docker:
-```powershell
-docker-compose up --build -d
+```bash
+python3 -m unittest test_matching_regressions.py test_embedding_reliability.py \
+  test_chunking.py test_cypher_safety.py test_backup_compression.py \
+  test_people_extraction.py test_graph_scope.py test_mobile_layout.py \
+  test_llm_reliability.py test_env_wiring.py test_status_monitor.py \
+  test_sessions.py test_auth_guard.py test_google_auth.py test_registration.py \
+  test_vault_migration.py test_sharing.py test_share_endpoints.py \
+  test_sharing_readpaths.py test_live_notes.py test_skill_catalogue.py \
+  test_action_items.py test_briefing.py test_roster.py
 ```
 
-### Viewing Logs
-```powershell
-docker-compose logs -f mem-mcp
-```
+Before committing: `python3 -m py_compile <file>.py` for Python, `node --check`
+on the extracted dashboard `<script>` for JavaScript, and
+`git -c core.whitespace=cr-at-eol diff --check`.
+
+The container is Python **3.11**; the editing host may be newer. Anything legal
+only on 3.12+ (PEP 695 `type X = …`, `itertools.batched`) imports fine here and
+breaks the container.
+
+## Task tracking
+
+- `tasks.md` — **open work only**, with acceptance criteria.
+- `task_history.md` — completed work, newest first, naming the commit.
+
+When a task finishes, move it: write the entry into `task_history.md`, delete
+the section from `tasks.md`.

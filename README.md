@@ -12,12 +12,18 @@ mem-mcp/
 ├── fact_manager.py        # Fact CRUD, search, dedup, graph operations
 ├── diary_manager.py       # Diary CRUD, search, keyword extraction, consistency
 ├── client_manager.py      # Client/Context nodes, scope inference, status management
+├── action_manager.py      # The :ActionItem register — commitments parsed out of diary entries
+├── roster_manager.py      # Stakeholder roster: People facts, their mentions, last-seen
+├── brief_manager.py       # Assembles a brief's material, then has the model polish it
 ├── migrate_client_context.py  # One-time migration: Client/Project facts → Client/Context nodes
 ├── mcp_tools.py           # FastMCP tool definitions
 ├── mcp_skills.py          # MCP prompts and resource definitions for skills
+├── skill_catalogue.py     # Stdlib-only: reads skills/, front matter, fallback descriptions
 ├── mcp_logging.py         # MCP tool call logging/monitoring
 ├── gui.py                 # FastAPI web app: REST API, Landing Page, and Dashboard
-├── matching_utils.py      # Dependency-light matching, merge, and LLM candidate helpers
+├── matching_utils.py      # Dependency-light matching, merge, prompt and date parsing helpers
+├── roster.py              # Stdlib-only: role parsing, staleness, roster Markdown
+├── briefing.py            # Stdlib-only: the meeting-prep brief's layout rules
 ├── chunking.py            # Splitting a long record into several vectors, and searching them
 ├── scoped_ids.py          # The one place client/context ids are derived (uuid5)
 ├── sessions.py            # Stdlib-only: sessions, access keys, credential store, registration
@@ -27,7 +33,7 @@ mem-mcp/
 ├── migrate_vault_user.py  # CLI: hand one user's whole vault to another
 ├── reindex_chunks.py      # CLI: backfill chunking for existing long records
 ├── reindex_diary_keywords.py  # CLI: backfill keyword extraction for existing diary entries
-├── test_*.py              # 16 dependency-light regression suites (see Testing)
+├── test_*.py              # 24 dependency-light regression suites (see Testing)
 ├── skills/                # Markdown skill workflows, loaded at request time
 ├── templates/             # Landing page and dashboard
 ├── requirements.txt
@@ -48,14 +54,20 @@ mem-mcp/
 - **Recoverable Merges** — Neo4j/Qdrant merge cleanup records pending Qdrant deletions and retries them through startup orphan reconciliation when a store is temporarily unavailable.
 - **Dashboard Deduplication** — The Service → Data sub-tab scans scope-compatible clusters, lets you select the records to merge, generates an editable consolidated draft with the LLM, and requires confirmation before merging.
 - **Split Chat Model Roles** — High-volume extraction — diary keywords, people names, search-query rewriting — runs on `MEM_EXTRACT_MODEL`; the judgement calls, scope classification and merge drafts, run on `MEM_SCOPE_MODEL` and `MEM_MERGE_MODEL`. See [Chat models](#chat-models) for why the split is not a preference.
-- **Skills System** — Pluggable skill workflows (e.g., `process-transcription`, `memory-deduplication`) loaded from Markdown files.
+- **Skills System** — Pluggable skill workflows loaded from Markdown files, no restart needed. `find_skills` returns each skill's **name, description and path** (from its front matter, falling back to the first heading), so an agent can tell what a skill does before loading it; every skill is also addressable as a `skill://` resource, derived from the directory rather than hand-registered. The shipped set splits into write workflows (`process-transcription`, `process-directory`, `memory-deduplication`, `meeting-prep`) and read workflows (`search-and-recall`).
 - **Unified Web UI** — A modern, proxy-aware dashboard to manage memories, view diary history, and explore insights.
 - **Multi-user Isolation** — Secure per-user vaults, resolved from a verified dashboard session, a password-checked `Basic` credential, or an access key. Nothing else names a user.
 - **Client & Context Scoping** — Facts and diary entries can be scoped to a Client (e.g. "Deutsche Bank") and a Context within it (e.g. "SAP Implementation") via `FOR_CLIENT` / `IN_CONTEXT` graph links.
 - **Scope-Priority Search** — An explicit `client`/`context` **prioritises** results (sort key `(scopeStrength, score, confidence)`) but **never excludes** them. A record filed under another client, or under none, still comes back — ranked lower. That is what makes it work with two people called John at the same bank: asked for one project, the right one comes first and the other is still findable.
 - **Scope Inference** — When no explicit client is passed, search infers the client from the query text.
+- **Time- and Person-Bounded Search** — `search_facts` and `diary_search_entries` also take `after` / `before` / `person`, and these **narrow** where scope only ranks: a record outside the window is a wrong answer, not a lower-ranked one. A window widens the fetch before filtering, so a narrow range cannot read as "nothing recorded"; `person` resolves through the same confidence gate that guards automatic `MENTIONS` links, and a name that resolves to nothing filters literally rather than matching the nearest stranger. An explicit range beats date phrasing in the query — the rewriter is told not to invent one.
 - **Inactive Client & Context Handling** — Clients untouched for 90 days are auto-deprioritized (−0.15 score, never hidden). Status can be manually pinned via `set_client_status`, `PUT /api/clients/{id}`, or the Clients-tab toggle; pinned clients are never auto-changed. Similarly, projects (contexts) can be toggled active/inactive, applying the same search ranking penalty unless explicitly requested.
-- **Clients & Projects Tab** — The client list with activate/deactivate, rename, delete, and the projects nested under each client.
+- **Clients & Projects Tab** — The client list with activate/deactivate, rename, delete, and the projects nested under each client. Each client and project panel also carries three blocks:
+  - **📋 Brief** — a one-page meeting-prep brief assembled from what is already recorded: where the engagement stands, what is open, recent meetings, and what is known. It renders the plain brief *before* calling the model, so a model failure costs polish rather than the document.
+  - **Stakeholders (N, M quiet)** — who is in the room, what they do, when you last spoke to them, and how many open commitments they own.
+  - **Open items** — the commitments filed against that engagement.
+- **Open Commitments** — Every meeting produces promises, and they used to die in a Markdown bullet. `## Actions` and `## Open Questions` are now parsed into `:ActionItem` nodes on every diary save and edit — deterministically, with no model call, because the one field that must be exact is the date. Each item carries an owner, an optional due date, and a status (`open` / `done` / `dropped`); a re-save reconciles rather than appends and never reopens something a human marked done. A record with no action section closes nothing, so re-saving minutes under a different heading cannot empty the register. The **My actions** card on the Clients page groups everything by overdue, due next, and undated.
+- **Stakeholder Roster** — People are `:Fact` rows in category `People`, and the people extractor already links them from diary entries, so "last seen" is a read of edges that already exist — no roster table, no migration. Both scope halves are read (a person scoped directly, or reachable only through a meeting that mentioned them), because a roster that reads one half is short *and* looks complete. A role is read from the fact body, never inferred; a person nobody has written about has no date at all rather than an invented one, and sorts first.
 - **Setup Tab** — MCP connection details and **Access Keys** (revocable `Bearer mvk_…` credentials for MCP clients), plus your live browser sessions.
 - **Admin-Only Service Tab** — Operations that act on the whole vault or the whole server rather than on one account live here, behind `MEM_ADMIN_USER`, in three sub-tabs:
   - **Users** — every account from all three credential stores (registered signups, Google-linked vaults, and the operator's `htpasswd` file) with enable/disable and an irreversible delete. Also shows whether signup is currently on, read-only.
@@ -299,7 +311,8 @@ permanent.
 ## Testing
 
 Run the focused dependency-light regression suite. Any `python` or `python3` on
-`PATH` runs all sixteen of them, and none of them needs Neo4j, Qdrant or Ollama:
+`PATH` runs all twenty-four of them, and none of them needs Neo4j, Qdrant or
+Ollama:
 
 ```bash
 cd mem-mcp
@@ -308,7 +321,9 @@ MEM_SESSION_DIR=/tmp/mem-vault-test-sessions python3 -m unittest -v \
   test_cypher_safety test_backup_compression test_people_extraction \
   test_graph_scope test_mobile_layout test_llm_reliability test_env_wiring \
   test_status_monitor test_sessions test_auth_guard test_google_auth \
-  test_registration test_vault_migration
+  test_registration test_vault_migration test_sharing test_share_endpoints \
+  test_sharing_readpaths test_live_notes test_skill_catalogue \
+  test_action_items test_briefing test_roster
 ```
 
 `MEM_SESSION_DIR` matters: without it the session and PSK tests write a
@@ -322,14 +337,20 @@ Cypher written in each module, snapshot compression, the diary people/keyword
 extraction windowing, graph scope and capping, the mobile stylesheet, LLM chat
 timeouts and log content, that every documented variable actually reaches the
 container, the session and PSK stores, which credential each gate accepts, the
-OAuth redirect flow, the registration routes, and the vault-move planner.
+OAuth redirect flow, the registration routes, the vault-move planner, the
+sharing policy and its read paths, the live-notes gate and pause tail, skill
+discovery and registration, the commitments register and its reconciliation,
+the brief's rendering and its degrade-don't-raise contract, and the stakeholder
+roster's query shape.
 
 Most suites cannot import their subject — `gui.py`, `common.py` and
 `backup.py` need FastAPI, httpx and the database drivers. Those suites lift the
 real functions out of the source with `ast.get_source_segment` and run them
-against stubs, so they test the shipping code rather than a copy. A few modules
-(`sessions.py`, `matching_utils.py`, `google_auth.py`, `status_monitor.py`) are
-stdlib-only by design precisely so they *can* be imported and called directly.
+against stubs, so they test the shipping code rather than a copy. A growing set
+(`sessions.py`, `matching_utils.py`, `google_auth.py`, `status_monitor.py`,
+`skill_catalogue.py`, `briefing.py`, `roster.py`) is stdlib-only by design
+precisely so it *can* be imported and called directly — the rules worth testing
+are the ones with no database in them.
 
 ## Backups
 

@@ -5,6 +5,41 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# Docs: the README and CLAUDE.md catch up with the vault
+
+**Why.** Six modules and eight test suites landed this session, and neither
+orientation document knew about any of them. `CLAUDE.md` was the worse of the
+two: it listed four components, cited a `create_fact` tool that has never
+existed (it is `add_fact`), and described identity as resolved from
+`Authorization: Basic` or a `X-Remote-User` proxy header — the model this repo
+deliberately removed, because a decoded username authenticates nothing and proxy
+headers are client-supplied. A new contributor reading it would have rebuilt a
+security hole that took a long time to close.
+
+**What shipped.** `README.md`: the architecture tree gains `action_manager.py`,
+`roster_manager.py`, `brief_manager.py`, `skill_catalogue.py`, `roster.py` and
+`briefing.py` with one-line descriptions, the suite count goes 16 -> 24, and
+`## Features` gains *Time- and Person-Bounded Search*, *Open Commitments* and
+*Stakeholder Roster* while *Skills System* and *Clients & Projects Tab* are
+rewritten. `## Testing` runs the real 24-file command, and the stdlib-only list
+grew from four modules to seven.
+
+`CLAUDE.md`: rewritten in full to name `AGENTS.md` as the source of truth and
+carry only what it does not say compactly — what the service is, the module
+tree, the two-gate auth table with an explicit "do not reintroduce header-based
+identity", and the Linux development, testing and task-tracking commands.
+
+**Tests.** No code changed, so the suite is unchanged at 1587 passing across 24
+files. `git -c core.whitespace=cr-at-eol diff --check` is clean.
+
+**The one thing to remember.** `CLAUDE.md` and `README.md` are the two files
+that go stale in silence, because nothing imports them and no test reads them.
+When a module or a suite is added, both need the edit in the same commit — the
+count in the tree line and the name in the test command are the two halves that
+were wrong here.
+
+---
+
 # Stakeholder roster: who is in the room, and who has gone quiet
 
 **Why.** After "what is open", the next question before a meeting is "who am I
