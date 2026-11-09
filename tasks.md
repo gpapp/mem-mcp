@@ -25,41 +25,18 @@ surfaces them — which is why task 5 exists.
 
 | # | task | size |
 |---|---|---|
-| 6 | Meeting-prep brief + skill | M |
 | 7 | Stakeholder roster with staleness | M |
 | 8 | Decision log per client | M |
 | 9 | Engagement timeline | M |
 | 10 | Remaining skills (`hygiene`, `orientation`, `weekly-review`) | S |
 | 11 | Deliverables register | M |
 
-Tasks 1, 2, 3, 4 and 5 are shipped (see `task_history.md`). They came first because the
+Tasks 1, 2, 3, 4, 5 and 6 are shipped (see `task_history.md`). They came first because the
 skill surface is what a client meets before it meets the vault: a discovery call
 that answers with three opaque filenames, and no skill that says how to read the
 vault, makes every later session worse.
 
 ---
-
-## 6. Meeting-prep brief, and its skill
-
-One click (and one MCP tool) that assembles a one-page brief for a client or
-project: roster with roles, open actions, decisions since a date, recent diary
-headlines, and the highest-signal linked facts — then a single LLM pass to write
-it up.
-
-- [ ] `GET /api/clients/{id}/brief` and a `client_brief` MCP tool.
-- [ ] Composed from existing reads (`db_list_diary`, `_scope_items`, action
-      items, `db_list_clients`) — no new storage.
-- [ ] Markdown output, cacheable per client until the vault changes
-      (`vault_fingerprint` already answers exactly that).
-- [ ] Degrades to the raw sections rather than a failed request when the model is
-      down, the way every other LLM surface here does.
-- [ ] `meeting-prep` skill walks the same steps as a manual workflow over
-      existing tools, so it is useful before the endpoint lands and becomes that
-      endpoint's spec.
-
-**Decisions already made:** this is composition, not a new pipeline, and it is
-the cheapest way to make tasks 5, 7 and 8 pay off — the brief is where a
-consultant reads them.
 
 ## 7. Stakeholder roster with staleness
 

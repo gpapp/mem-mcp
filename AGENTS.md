@@ -78,7 +78,7 @@ own body and a namespace entry cannot reach that.
 
 ```bash
 cd mem-mcp
-python3 -m unittest -v test_matching_regressions.py test_embedding_reliability.py test_chunking.py test_cypher_safety.py test_backup_compression.py test_people_extraction.py test_graph_scope.py test_mobile_layout.py test_llm_reliability.py test_env_wiring.py test_status_monitor.py test_sessions.py test_auth_guard.py test_google_auth.py test_registration.py test_vault_migration.py test_sharing.py test_share_endpoints.py test_sharing_readpaths.py test_live_notes.py test_skill_catalogue.py test_action_items.py
+python3 -m unittest -v test_matching_regressions.py test_embedding_reliability.py test_chunking.py test_cypher_safety.py test_backup_compression.py test_people_extraction.py test_graph_scope.py test_mobile_layout.py test_llm_reliability.py test_env_wiring.py test_status_monitor.py test_sessions.py test_auth_guard.py test_google_auth.py test_registration.py test_vault_migration.py test_sharing.py test_share_endpoints.py test_sharing_readpaths.py test_live_notes.py test_skill_catalogue.py test_action_items.py test_briefing.py
 ```
 
 This was a Windows path (`C:/tools/miniconda3/python.exe`) with PowerShell `Push-Location`/`Pop-Location`, and it does not exist on the Linux host these files are edited from — every suite "failed" on an interpreter that is not there. Any `python`/`python3` on `PATH` runs all of them; none of them import a DB driver.
@@ -1963,6 +1963,61 @@ shape of the code. The parser is covered separately in
 the wiring, because re-injecting the missing call into `db_save_diary` left every
 parser test green — the same "a test of a helper is not a test of its call site"
 lesson, and the reason that class is an AST walk rather than a substring search.
+
+### Meeting-Prep Brief
+
+`client_brief` and `GET /api/clients/{id}/brief` answer the question a consultant
+asks most: *what do I need to know before I walk into this room?* It is a **read**
+that composes reads — no new storage, no extraction, no write path.
+
+**`briefing.py` is stdlib-only with zero imports.** That is not tidiness: the
+layout rules are the part worth testing, and `brief_manager.py` reaches four
+managers and a model, so anything inside it is untestable here. `test_briefing.py`
+imports and *calls* `group_facts_by_category`, `summarise`, `gaps`, `render`,
+`build_prompt` and `polish`.
+
+- **The model is handed the rendered brief, not the raw rows.** The fallback and
+  the polished version then describe the same engagement, which is what stops a
+  model failure from changing *what the reader is told* as well as how it reads.
+- **A model failure degrades, it never raises.** `db_build_brief` renders first
+  and asks second; the answer is caught and the plain brief is served with
+  `degraded: True`, which the modal states in a line above the document. A 503 on
+  the way into a meeting is worse than an unpolished list.
+- **`polish` has a length floor, not a quality bar.** Under 80 characters it
+  returns the fallback, which catches `""` and `"Here is the brief:"` and nothing
+  else. A terse brief is still a brief.
+- **Every section renders something.** An empty one says `_Nothing recorded._`
+  and `gaps` writes the sentence out ("No commitments are overdue.") rather than
+  leaving the reader to infer it from silence. Distinguishing "on track" from
+  "nobody wrote anything down" is most of what a brief is for.
+- **Ordering is fixed, not alphabetical-by-luck.** `CATEGORY_ORDER` puts Project,
+  Client, People, Technology, Tool first and appends any other category
+  alphabetically *after* them, so a vault that grows a category does not
+  reshuffle every existing section.
+- **The cache is the vault fingerprint, not a timer.** `vault_fingerprint()`
+  already answers "has anything changed" for the scheduled backup, so the brief
+  reuses it rather than inventing a second answer; an unreadable fingerprint is
+  the empty string and never matches, so a store that cannot be reached rebuilds
+  instead of serving a stale document. `refresh=1` drops it explicitly.
+- **A project brief names the client.** A project id is not enough — "Where this
+  stands" leads with the client — so `GET /api/contexts/{id}/brief` resolves the
+  parent through `db_list_clients` when the caller does not send `clientId`.
+- **An unknown client is refused, not fuzzy-matched into the nearest one.** The
+  brief names the client at the top and gets read out loud. The MCP tool answers
+  with the known clients so the caller can retry.
+- **The panel offers it even when the panel is empty.** An engagement with
+  nothing recorded is exactly when the gap list is worth reading, so the `📋 Brief`
+  button is rendered before the "Open items" block rather than inside it.
+
+`MEM_BRIEF_MODEL` (empty = `LLM_QUERY_MODEL`), `MEM_BRIEF_TIMEOUT` (120 s — the
+first LLM surface in this app sized for someone standing in a corridor rather
+than for a background pass) and `MEM_BRIEF_MEETINGS` (8) tune it. All three are
+in `.env.example` *and* the compose `environment:` block, because a documented
+knob that does not reach the container is not a knob.
+
+`skills/meeting-prep.md` walks the same five steps by hand with existing tools,
+so the workflow is useful without the endpoint and the endpoint has a written
+spec. `test_briefing.py` is the 23rd suite.
 
 ### Dashboard Deduplication
 Service → **🧹 Deduplicate memories** provides a review-first merge workflow. It is on the

@@ -72,6 +72,13 @@ from action_manager import (
     db_create_action_item, sync_actions_from_text, describe_action_item,
 )
 
+# The brief is a read that composes the other managers; the module itself is
+# stdlib-only so the pure half is callable from a suite with no DB drivers.
+from brief_manager import (
+    db_build_brief, clear_cache as clear_brief_cache,
+    BRIEF_MODEL, BRIEF_TIMEOUT, BRIEF_MEETING_LIMIT,
+)
+
 # The WebSocket origin check is a pure helper; keeping it in `live_notes.py`
 # means the rule can be tested without a running server.
 from live_notes import (

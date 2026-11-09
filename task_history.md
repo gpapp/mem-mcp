@@ -5,6 +5,40 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# Meeting prep: a brief assembled from what is already recorded
+
+**Why.** Every other surface in this product answers a question you ask it. A
+consultant walking into a room does not have a question, they have ten minutes.
+The pieces were all present -- the client, its projects, the open commitments,
+the recent meetings, the facts -- and assembling them by hand took five searches
+and a mental merge. `client_brief` is that merge.
+
+**What shipped.**
+- `briefing.py` -- the pure layout: `group_facts_by_category`, `summarise`,
+  `gaps`, `render`, `build_prompt`, `polish`, plus `SYSTEM_PROMPT`. Stdlib-only
+  and import-free so the rules can be called from a suite.
+- `brief_manager.py` -- `db_build_brief(client_id, user_id, context_id=None)`
+  gathers through the existing managers, renders the fallback **first**, then
+  asks the model, and caches on `vault_fingerprint()`.
+- `GET /api/clients/{id}/brief`, `GET /api/contexts/{id}/brief`, and the
+  `client_brief` MCP tool.
+- A `Brief` button on every client and project panel, rendering into a modal and
+  stating plainly when the model was unavailable.
+- `skills/meeting-prep.md` -- the same five steps by hand, which is what makes
+  the workflow usable without the endpoint.
+- `MEM_BRIEF_MODEL` / `MEM_BRIEF_TIMEOUT` / `MEM_BRIEF_MEETINGS`, wired in both
+  `.env.example` and the compose `environment:` block.
+
+**Tests.** 1551 OK (`test_briefing.py` adds 32 and is the 23rd suite).
+
+**The one thing to remember.** The model is handed the *rendered* brief rather
+than the raw rows, and the render happens before the call. That ordering is what
+makes a model outage cost polish instead of information -- reverse it and the
+fallback path stops existing, and the failure mode is a 503 in front of somebody
+who is already late.
+
+---
+
 # Commitments: an `:ActionItem` register fed by the diary
 
 Every meeting produces commitments, and until now they existed only as bullets

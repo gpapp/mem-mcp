@@ -1157,6 +1157,66 @@ async def update_action_item(id: str, status: Optional[str] = None,
             + ".")
 
 
+@mcp.tool()
+@monitor_mcp_tool("client_brief", context_provider=_current_user)
+async def client_brief(client: str, context: Optional[str] = None):
+    """
+    Assemble a one-page briefing for one engagement, out of what is already
+    recorded. Use it before a meeting, a steering committee or a status call.
+
+    It gathers the client's projects, its open commitments (overdue first), the
+    most recent meetings and the facts on file, and writes them up. Everything
+    in it is attributed to a record that exists -- it does not research, infer
+    or fill gaps with plausible detail.
+
+    `client` is a client name; `context` narrows it to one project. Both accept
+    the spellings `list_clients` returns, and an abbreviation declared in a
+    stored name (e.g. "DB" for "Deutsche Bank (DB)"). An unknown name is an
+    error rather than a guess, because the brief names the client at the top
+    and a wrong one is read out loud.
+
+    Returns Markdown. When the model is unavailable the same brief comes back
+    unpolished rather than as an error -- a plain list is still worth reading
+    on the way into a meeting.
+    """
+    clients = mem.db_list_clients(_current_user()) or []
+    wanted = (client or "").strip().lower()
+    found = None
+    for row in clients:
+        name = (row.get("name") or "").strip()
+        if name.lower() == wanted:
+            found = row
+            break
+    if found is None:
+        for row in clients:
+            name = (row.get("name") or "").strip().lower()
+            if wanted and (wanted in name or name in wanted):
+                found = row
+                break
+    if found is None:
+        known = ", ".join(sorted(row.get("name") or "?" for row in clients)) or "none"
+        return f"No client matches '{client}'. Known clients: {known}."
+
+    context_id = None
+    if context:
+        wanted_context = context.strip().lower()
+        for row in found.get("contexts") or ():
+            if (row.get("name") or "").strip().lower() == wanted_context:
+                context_id = row.get("id")
+                break
+        if context_id is None:
+            known = ", ".join(row.get("name") or "?" for row in found.get("contexts") or ()) or "none"
+            return (f"No project matches '{context}' under {found.get('name')}. "
+                    f"Known projects: {known}.")
+
+    try:
+        result = await mem.db_build_brief(found["id"], _current_user(),
+                                          context_id=context_id)
+    except ValueError as e:
+        return f"Could not build the brief: {e}"
+    return result["markdown"]
+
+
 # ---------------------------------------------------------------------------
 # Skills & Resources
 # ---------------------------------------------------------------------------

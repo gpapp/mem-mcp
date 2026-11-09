@@ -1613,6 +1613,60 @@ async def api_client_items(client_id: str, request: Request):
         raise _service_unavailable(e)
 
 
+@web_app.get("/api/clients/{client_id}/brief", response_class=JSONResponse)
+async def api_client_brief(request: Request, client_id: str,
+                           contextId: str = "", refresh: int = 0):
+    """A briefing for one engagement, assembled from what is already recorded.
+
+    Deliberately its own route rather than a flag on the items panel: the panel
+    is a list of rows and this is a document someone reads before a meeting.
+    `contextId` narrows to one project, and `refresh=1` drops the cached copy
+    (the cache expires on the vault fingerprint anyway; this is for the reader
+    who has just added something and does not want to wait for a stamp).
+    """
+    try:
+        if refresh:
+            mem.clear_brief_cache()
+        return await mem.db_build_brief(client_id, _require_user(request),
+                                        context_id=contextId or None)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except RuntimeError as e:
+        raise _service_unavailable(e)
+
+
+@web_app.get("/api/contexts/{context_id}/brief", response_class=JSONResponse)
+async def api_context_brief(request: Request, context_id: str,
+                            clientId: str = "", refresh: int = 0):
+    """The same document for one project.
+
+    A project id is not enough to build a brief -- "Where this stands" names the
+    client, and a project can be reached from the graph where only its own id is
+    known -- so the client id travels with the request when the caller has it.
+    """
+    try:
+        if refresh:
+            mem.clear_brief_cache()
+        client_id = clientId
+        if not client_id:
+            for client in mem.db_list_clients(_require_user(request)) or ():
+                if any(c.get("id") == context_id for c in client.get("contexts") or ()):
+                    client_id = client.get("id")
+                    break
+        if not client_id:
+            raise HTTPException(status_code=404, detail="Project not found.")
+        return await mem.db_build_brief(client_id, _require_user(request),
+                                        context_id=context_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except RuntimeError as e:
+        raise _service_unavailable(e)
+
+
 @web_app.get("/api/action-items", response_class=JSONResponse)
 async def api_list_action_items(request: Request, clientId: str = "", contextId: str = "",
                                 status: str = "", dueBefore: str = ""):
