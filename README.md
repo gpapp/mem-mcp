@@ -56,6 +56,7 @@ mem-mcp/
 - **Advanced Metadata** — Facts support rich JSON metadata (tags, source, confidence, etc.).
 - **Knowledge Patterns** — Automatically identifies recurring themes and associations via graph analysis.
 - **Diary** — Narrative entries with Markdown support, LLM-powered keyword extraction, and vector similarity search.
+- **Live Notes** — Point a microphone at a meeting and get one growing, enriched note out of it. Audio is transcribed through `asr-mcp`; every **Pause & summarise** folds the new speech into the same `Fact` in category `Notes`, so the note is an ordinary fact — searchable, visible in Memories and Graph, and in every savepoint. The raw transcript is kept in Neo4j as evidence and is deliberately *never* embedded, because a search for a phrase should return the note rather than the transcript. Notes are about the meeting's topic: small talk and side conversations are dropped, and the facts a note cites are replaced on each pass so early over-linking can be corrected. A hard audio gate keeps every LLM and embedding call off the GPU while a recording socket is open, and a pause sends real silence then a flush frame — in that order, because a bare close loses the last utterance.
 - **Smart Search** — LLM query rewriting (see `MEM_EXTRACT_MODEL`) decomposes natural language into keyword phrases; multi-query expansion merges results from multiple vector searches.
 - **Memory Deduplication** — Scope-aware multi-signal similarity clustering (vector, name, alias, email) with weighted fuzzy evidence, core-member filtering, and a guided merge workflow.
 - **Model Benchmark** — `model_bench.py` runs every installed chat model against every app role's *real* prompt shape — lifted out of the source with `ast`, so a moved prompt fails loudly instead of silently measuring a stale copy — and reports what a human needs to compare them. It scores only what is objective (JSON validity, name recall, retention, filter echo, degenerate decode) and prints the raw answers for the judgement a regex cannot make. Each model is sent the sampling its own model card specifies, because a harness that pins temperature 0 measures itself rather than a model tuned for 0.7. This is the repeatable version of the hand-measured comparisons behind the four-roles-across-two-models split.
@@ -66,6 +67,7 @@ mem-mcp/
 - **Skills System** — Pluggable skill workflows loaded from Markdown files, no restart needed. `find_skills` returns each skill's **name, description and path** (from its front matter, falling back to the first heading), so an agent can tell what a skill does before loading it; every skill is also addressable as a `skill://` resource, derived from the directory rather than hand-registered. The shipped set splits into write workflows (`process-transcription`, `process-directory`, `memory-deduplication`, `meeting-prep`) and read workflows (`search-and-recall`).
 - **Unified Web UI** — A modern, proxy-aware dashboard to manage memories, view diary history, and explore insights.
 - **Multi-user Isolation** — Secure per-user vaults, resolved from a verified dashboard session, a password-checked `Basic` credential, or an access key. Nothing else names a user.
+- **Project/Context Sharing** — Hand one client or one project to another signed-in user, read-only or read-write, with a revocable link token (`MEM_SHARING_ENABLED`, off by default). A grantee sees their own vault plus the records under what was shared with them — including records that only *mention* it — and never the owner's other clients, sibling projects, or the owner's scope names. A write through a grant keeps the record in the owner's vault and stamps who actually changed it, and every grant decision lands in an audit trail an owner can read. Off by default, and with the flag off every share route answers 404 and every read path is byte-identical to its pre-sharing shape.
 - **Client & Context Scoping** — Facts and diary entries can be scoped to a Client (e.g. "Deutsche Bank") and a Context within it (e.g. "SAP Implementation") via `FOR_CLIENT` / `IN_CONTEXT` graph links.
 - **Scope-Priority Search** — An explicit `client`/`context` **prioritises** results (sort key `(scopeStrength, score, confidence)`) but **never excludes** them. A record filed under another client, or under none, still comes back — ranked lower. That is what makes it work with two people called John at the same bank: asked for one project, the right one comes first and the other is still findable.
 - **Scope Inference** — When no explicit client is passed, search infers the client from the query text.
@@ -230,7 +232,7 @@ identity itself as `X-Vault-User` after stripping any inbound copy.
 | Tool | Description |
 |---|---|
 | `add_fact` | Store a new fact with optional category, rich metadata, and client/context scope (auto-created). |
-| `search_facts` | Semantic search for facts with optional category and client/context scoping plus LLM query rewriting. |
+| `search_facts` | Semantic search for facts with optional category and client/context **ranking**, plus `after` / `before` / `person` **narrowing**, and LLM query rewriting. |
 | `list_clients` | List all clients with their contexts for the current user. |
 | `create_client` | Explicitly create a new client (idempotent). |
 | `set_client_status` | Pin a client active/inactive (pinned status is never auto-changed). |
@@ -248,8 +250,16 @@ identity itself as `X-Vault-User` after stripping any inbound copy.
 | `diary_search_entries` | Semantic search across diary entries with keyword boosting and optional client/context scoping. |
 | `list_diary_entries` | List diary entries within an optional time range. |
 | `diary_delete_entry` | Delete a diary entry by ID. |
-| `find_skills` | Scan the skills directory and list available skill workflows. |
+| `find_skills` | Scan the skills directory and list each skill's name, description and path. |
 | `get_skill_workflow` | Retrieve the detailed Markdown workflow for a specific skill. |
+| `list_action_items` | List commitments — what is owed, by whom, and by when. `client`/`context` here **filter** rather than rank. |
+| `save_action_item` | Record a commitment that did not come out of a diary entry. |
+| `update_action_item` | Mark a commitment done, dropped, or move its owner or deadline. |
+| `client_brief` | Assemble a one-page briefing for one engagement out of what is already recorded. |
+| `stakeholder_roster` | Who is on this engagement, what their role is, and when each was last mentioned. |
+| `list_shared_with_me` | List clients and projects shared with the caller by other owners. |
+| `accept_share_link` | Accept a share link token and create a grant for the caller. |
+| `list_share_grants` | List the recipients of a shared client or project (owner only). |
 
 ## Quick Start (Docker)
 

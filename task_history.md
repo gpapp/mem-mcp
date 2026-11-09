@@ -5,6 +5,45 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# The MCP tools table named 22 of the 29 tools that exist
+
+**Why.** `## MCP Tools (Advanced Suite)` is the only place a user learns what
+the server exposes, and eight decorated tools were absent from it: the whole
+sharing trio (`list_shared_with_me`, `accept_share_link`, `list_share_grants`),
+the whole commitments trio (`list_action_items`, `save_action_item`,
+`update_action_item`), `client_brief` and `stakeholder_roster`. Four of those
+shipped this session, so the table was drifting exactly as fast as the code.
+
+The gap is invisible from the table itself, which is what makes a hand-written
+list dangerous: 22 rows look complete. It was found by walking `mcp_tools.py`
+with `ast`, collecting every function carrying a `@tool` decorator, and
+diffing that set against the row names — 29 and 29, with both differences
+empty. A `grep -B1 '^@mcp.tool'` version of the same check failed to find the
+`def` lines and reported the real set as empty, so the AST walk is the check
+worth keeping.
+
+**What shipped.** `README.md`: the eight missing rows, with `search_facts`
+corrected to say it *ranks* on client/context and *narrows* on
+`after`/`before`/`person`, and `find_skills` corrected to say it returns each
+skill's name, description and path. Three feature bullets that never existed:
+**Live Notes** (an entire AGENTS.md section with no entry in `## Features`, so
+the biggest feature of the last month was undocumented for a reader), **Project/
+Context Sharing** (same, and `MEM_SHARING_ENABLED` defaults to 0, so its absence
+read as the feature not existing), and `Model Benchmark` (shipped earlier).
+
+**Tests.** Docs only; no `.py` touched. Suite unchanged at 1649 passing across
+25 files. `git -c core.whitespace=cr-at-eol diff --check` clean.
+
+**The one thing to remember.** Three hand-maintained lists describe this repo and
+nothing fails when any of them drifts: the architecture tree (checked with
+`ls mem-mcp/*.py | grep -v '^test_'`), the suite command (checked with
+`ls mem-mcp/test_*.py | wc -l`), and the MCP tools table (checked with an AST
+walk, because the decorator is the only definition of that surface). Documenting
+a feature is not the same as advertising it — Live Notes had a two-page section
+and no bullet.
+
+---
+
 # Seven modules were missing from the architecture trees
 
 **Why.** The two trees are the only map of the package, and a module that is not
