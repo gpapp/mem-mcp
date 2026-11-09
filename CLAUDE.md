@@ -38,6 +38,7 @@ mem-mcp/
 ├── gui.py                # Every HTTP route, the live-notes WS proxy
 ├── mcp_tools.py          # The MCP tools
 ├── mcp_skills.py         # MCP skills, resources and prompts
+├── mcp_logging.py        # MCP tool call logging/monitoring
 ├── sessions.py           # Sessions, credentials, access keys (stdlib-only)
 ├── backup.py             # Savepoints, restore, vault fingerprint
 ├── status_monitor.py     # Ollama status poller + SSE fan-out (stdlib-only)
@@ -48,6 +49,9 @@ mem-mcp/
 ├── model_bench.py        # CLI: every chat model against every role's real prompt (stdlib-only)
 ├── search_diagnostics.py, search_batch_test.py, search_report.py
                         # CLI: trace one query, run a fixed query suite, render the log
+├── migrate_client_context.py  # One-time migration: Client/Project facts to nodes
+├── migrate_vault_user.py      # CLI: hand one user's whole vault to another
+├── reindex_chunks.py, reindex_diary_keywords.py  # CLI: backfill chunking / keywords
 ├── skills/               # Markdown workflows, discovered from the directory
 ├── templates/            # dashboard.html and the live-notes worklet
 └── test_*.py             # 25 dependency-light regression suites
