@@ -25,30 +25,15 @@ surfaces them — which is why task 5 exists.
 
 | # | task | size |
 |---|---|---|
-| 8 | Decision log per client | M |
 | 9 | Engagement timeline | M |
 | 10 | Remaining skills (`hygiene`, `orientation`, `weekly-review`) | S |
 | 11 | Deliverables register | M |
 
-Tasks 1, 2, 3, 4, 5, 6 and 7 are shipped (see `task_history.md`). They came first because the
-skill surface is what a client meets before it meets the vault: a discovery call
+Tasks 1, 2, 3, 4, 5, 6, 7 and 8 are shipped (see `task_history.md`). They came first because the skill surface is what a client meets before it meets the vault: a discovery call
 that answers with three opaque filenames, and no skill that says how to read the
 vault, makes every later session worse.
 
 ---
-
-## 8. Decision log per client
-
-`## Decisions` is prose today. "Why did we choose X, and who signed off?" is the
-question a consultant is asked most often after the fact, and a client that
-changes its mind is the hardest thing to reconstruct.
-
-- [ ] Reuse the task 5 extraction machinery with a `:Decision {decidedAt,
-      decider, status, supersededBy}` shape.
-- [ ] Per-client chronological list, newest first, with the source diary entry
-      linked.
-- [ ] `supersededBy` is explicit rather than inferred — a decision that quietly
-      stops being followed is worse than one that was never logged.
 
 ## 9. Engagement timeline
 

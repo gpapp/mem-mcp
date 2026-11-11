@@ -3073,6 +3073,18 @@
           ? await api.get('clients/' + id + '/roster')
           : await api.get('contexts/' + id + '/roster');
       } catch(e) { roster = null; }
+      // The decision log is the one block that answers "why is this the way it
+      // is" rather than "what is outstanding", so it is read alongside the
+      // commitments rather than instead of them. Superseded rows are included
+      // on purpose: the history is the point.
+      let decisions = [];
+      try {
+        const dparams = type === 'client'
+          ? 'clientId=' + encodeURIComponent(id)
+          : 'contextId=' + encodeURIComponent(id);
+        const dj = await api.get('decisions?' + dparams);
+        decisions = (dj && dj.items) || [];
+      } catch(e) { decisions = []; }
       // The brief is offered on every panel, including one with no items --
       // an engagement with nothing recorded is exactly when a person wants to
       // read the gap list before walking in.
@@ -3093,7 +3105,22 @@
           + `<div class="markdown-body" style="font-size:.76rem;margin-top:.35rem;">`
           + `${marked.parse(roster.markdown || '')}</div></details>`
         : '';
-      const headerHtml = briefHtml + rosterHtml + (actions.length
+      const decisionsHtml = decisions.length
+        ? `<details style="padding:.35rem .4rem;border-bottom:1px solid var(--border);">`
+          + `<summary style="cursor:pointer;font-size:.72rem;color:var(--muted);">`
+          + `Decisions (${decisions.length})</summary>`
+          + `<div style="font-size:.76rem;margin-top:.35rem;">`
+          + decisions.map(d => {
+              const who = d.decider ? ' &mdash; <strong>' + escHtml(d.decider) + '</strong>' : '';
+              const when = d.decidedAt ? ' &middot; ' + escHtml(String(d.decidedAt).slice(0,10)) : '';
+              const mark = d.superseded
+                ? ' <span style="color:var(--muted);text-decoration:line-through;">(superseded)</span>'
+                : (d.status && d.status !== 'active' ? ' <span style="color:var(--muted);">(' + escHtml(d.status) + ')</span>' : '');
+              return `<div style="padding:.15rem 0;">&bull; ${escHtml(d.text || '')}${who}${when}${mark}</div>`;
+            }).join('')
+          + `</div></details>`
+        : '';
+      const headerHtml = briefHtml + rosterHtml + decisionsHtml + (actions.length
         ? `<div style="padding:.35rem .4rem;font-size:.72rem;color:var(--muted);border-bottom:1px solid var(--border);">Open items</div>`
           + renderActionRows(actions, {})
         : '');

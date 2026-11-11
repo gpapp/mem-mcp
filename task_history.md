@@ -5,6 +5,65 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# The decision log: what was decided, and what replaced it
+
+**Why.** `## Decisions` in a diary entry is prose, and prose is where a decision
+goes to be forgotten. Six months later the only person who can say why an
+architecture was chosen is the one who has left. The commitments register (task
+5) already proved the extraction shape works, so this task reused it for the one
+question a bullet list cannot answer: *is this still what we are doing, and if
+not, what replaced it?*
+
+**What shipped.** `decision_manager.py` with `:Decision {decidedAt, decider,
+status, supersededBy, key, sourceId, sourceLabel}`; a parser block in
+`matching_utils.py` (`parse_decisions`, `normalise_decision_text`,
+`DECISION_STATUSES`) reading `## Decisions` / `## Key Decisions` / `## Agreed` /
+`## Resolutions` bullets; two hooks in `diary_manager.py` beside the action
+hooks; five GUI routes (`GET /api/decisions`, `GET /api/clients/{id}/decisions`,
+`POST /api/decisions`, `POST /api/decisions/{id}`, `POST
+/api/decisions/{id}/supersede`); three MCP tools (`list_decisions`,
+`save_decision`, `supersede_decision`); a collapsed **Decisions (N)** block in
+every client and project panel; and `test_decision_log.py`, the 26th suite, at
+42 tests.
+
+**Three design decisions worth keeping.**
+
+*Supersession is explicit, and there are exactly two ways to set it* — a
+sentence a human wrote (`(superseded by: we use Postgres)`) or an explicit
+click. The written form is resolved against real rows and binds **only when
+exactly one decision has that normalised text**; two candidates is an ambiguous
+reference, and a confidently wrong link is worse than none because the field's
+entire value is that it can be trusted. Nothing infers it from the calendar or
+from a newer decision on the same topic.
+
+*`decidedAt` defaults to the source record's date, never the wall clock.* A
+decision taken in a March meeting was taken in March. The date is the one field
+a reader trusts to be exact, and measuring from today would date a three-week-old
+decision with the day somebody re-saved the file.
+
+*`withdrawn` is revivable; `superseded` and `reversed` are not.* Withdrawn means
+"this record stopped listing it", which says nothing about whether it is still
+in force. The other two were said by somebody outside the source, so a later
+re-save that still contains the original bullet must not quietly undo them —
+which is precisely the defect a naive "bullet present, therefore active"
+reconciliation produces.
+
+**Tests.** 1691 passing across 26 files (1649 + 42), 59.1 s. The parser is
+imported and called directly; the manager is exec'd against a stub `common`,
+because it needs a Neo4j driver this box does not have. `git -c
+core.whitespace=cr-at-eol diff --check` clean, `node --check` clean on the
+extracted dashboard script.
+
+**The one thing to remember.** A register of *state* can be wrong item by item
+and still be useful. A register of *history* cannot: a log that reports a
+superseded decision as current does not merely leave something out, it says
+something false, and the reader has no way to tell. That is why the terminal
+statuses here are protected in two places — the reconciler refuses to reopen
+them, and the withdrawal pass skips them — rather than in the one place a
+happy-path test would exercise.
+
+---
+
 # The container would not start: `Optional` was never imported
 
 **Why.** `resolve_person_name` in `matching_utils.py` is annotated

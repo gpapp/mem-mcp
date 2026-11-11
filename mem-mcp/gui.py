@@ -1789,6 +1789,102 @@ async def api_update_action_item(item_id: str, body: _ActionItemBody, request: R
     return result["item"]
 
 
+@web_app.get("/api/decisions", response_class=JSONResponse)
+async def api_list_decisions(request: Request, clientId: str = "", contextId: str = "",
+                             status: str = "", includeInactive: bool = True):
+    """The decision log, filtered by engagement.
+
+    ``clientId`` / ``contextId`` **filter**, like commitments and unlike search
+    scope. Superseded decisions are returned by default: a log that hides them
+    shows the current answer with no history, which is the state this exists to
+    escape.
+    """
+    user_id = _require_user(request)
+    try:
+        rows = mem.db_list_decisions(user_id, client_id=clientId or None,
+                                     context_id=contextId or None,
+                                     status=status or None,
+                                     include_inactive=includeInactive)
+        return {"items": [mem.describe_decision(r) for r in rows]}
+    except RuntimeError as e:
+        raise _service_unavailable(e)
+
+
+@web_app.get("/api/clients/{client_id}/decisions", response_class=JSONResponse)
+async def api_client_decisions(client_id: str, request: Request,
+                               includeInactive: bool = True):
+    """One engagement's decision log, newest first."""
+    user_id = _require_user(request)
+    try:
+        rows = mem.db_list_decisions(user_id, client_id=client_id,
+                                     include_inactive=includeInactive)
+        return {"clientId": client_id,
+                "items": [mem.describe_decision(r) for r in rows]}
+    except RuntimeError as e:
+        raise _service_unavailable(e)
+
+
+class _DecisionBody(BaseModel):
+    text: str = ""
+    decider: Optional[str] = None
+    decidedAt: Optional[str] = None
+    clientId: Optional[str] = None
+    contextId: Optional[str] = None
+    status: Optional[str] = None
+
+
+@web_app.post("/api/decisions", response_class=JSONResponse)
+async def api_create_decision(body: _DecisionBody, request: Request):
+    user_id = _require_user(request)
+    if not (body.text or "").strip():
+        raise HTTPException(status_code=400, detail="A decision needs text.")
+    result = mem.db_create_decision(user_id, body.text, decider=body.decider,
+                                    decided_at=body.decidedAt,
+                                    client_id=body.clientId,
+                                    context_id=body.contextId,
+                                    status=body.status or "active")
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("reason") or "Could not save.")
+    await mem.publish_db_event(user_id, "decisions_changed", {"action": "add"})
+    return result["item"]
+
+
+@web_app.post("/api/decisions/{item_id}", response_class=JSONResponse)
+async def api_update_decision(item_id: str, body: _DecisionBody, request: Request):
+    user_id = _require_user(request)
+    result = mem.db_update_decision(item_id, user_id, status=body.status,
+                                    text=(body.text or None),
+                                    decider=body.decider)
+    if not result.get("ok"):
+        raise HTTPException(status_code=404,
+                            detail=result.get("reason") or "No such decision.")
+    await mem.publish_db_event(user_id, "decisions_changed",
+                               {"action": "update", "id": item_id})
+    return result["item"]
+
+
+class _SupersedeBody(BaseModel):
+    supersededBy: str = ""
+
+
+@web_app.post("/api/decisions/{item_id}/supersede", response_class=JSONResponse)
+async def api_supersede_decision(item_id: str, body: _SupersedeBody, request: Request):
+    """Say that one decision replaced another, explicitly.
+
+    This is the only path that creates the link without a human writing the
+    sentence, and it is still a human's click — nothing is inferred.
+    """
+    user_id = _require_user(request)
+    result = mem.db_supersede_decision(item_id, body.supersededBy, user_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400,
+                            detail=result.get("reason") or "Could not supersede.")
+    await mem.publish_db_event(user_id, "decisions_changed",
+                               {"action": "supersede", "id": item_id,
+                                "supersededBy": body.supersededBy})
+    return result
+
+
 @web_app.get("/api/contexts/{context_id}/items", response_class=JSONResponse)
 async def api_context_items(context_id: str, request: Request):
     """Facts + diary entries linked to a project."""

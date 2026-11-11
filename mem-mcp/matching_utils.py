@@ -1555,3 +1555,189 @@ def parse_action_items(text: object, today=None) -> list:
 # Buttons the sheet offers; the server refuses anything else, so the two cannot
 # drift into a state the UI cannot render.
 ACTION_STATUSES = ("open", "done", "dropped")
+
+
+# ---------------------------------------------------------------------------
+# Decisions
+# ---------------------------------------------------------------------------
+#
+# A decision is parsed from the same Markdown body an action item is, and the
+# two share every piece of machinery except the section list and the tail. The
+# difference worth stating is the date: an action's date is when it is *due*, so
+# reading it out of the sentence is right; a decision's date is when it was
+# *made*, so a date inside the sentence ("extend the contract to 2027-01-01")
+# belongs to the decision and the date it was taken comes from the record that
+# contains it.
+
+_DECISION_SECTIONS = {
+    "decision", "decisions", "decided", "decision log", "key decisions",
+    "agreed", "agreements", "agreement", "resolution", "resolutions",
+    "choices", "choice",
+}
+
+# ``superseded`` is a link to a later decision and is only ever set from a
+# sentence someone wrote or an explicit call -- see ``db_supersede_decision``.
+# ``reversed`` is the source saying this one was overturned. ``withdrawn`` is
+# narrower and more honest than either: the record no longer lists the decision,
+# which is not the same as the client having changed its mind.
+DECISION_STATUSES = ("active", "superseded", "reversed", "withdrawn")
+
+# A marker the author wrote into the bullet, because the bullet is the only
+# place the source can say "this one no longer stands".
+_DECISION_MARKER = re.compile(
+    r"^\[(superseded|reversed|withdrawn|active)\][ \t:.\u2014\u2013-]*",
+    re.IGNORECASE)
+
+# ``(superseded by: we standardise on Postgres)`` / ``[superseded by X]``.
+_SUPERSEDED_BY = re.compile(
+    r"[\[(][ \t]*superseded[ \t]+by[ \t]*:?[ \t]*(.+?)[ \t]*[\])][ \t]*$",
+    re.IGNORECASE)
+
+_DECIDER_PREFIX = re.compile(
+    r"^decider[ \t]*:[ \t]*(.+?)[ \t]*(?:[:\u2014\u2013-][ \t]+|$)",
+    re.IGNORECASE)
+
+# ``Migrate to Postgres — Alice`` and ``… — Alice, 2026-05-31``. The second
+# group is an attribution date, and it is the only date this parser will read as
+# ``decidedAt``.
+_DECIDER_TAIL = re.compile(
+    r"[ \t]+[\u2014\u2013-][ \t]+([^,\u2014\u2013-]{1,40}?)"
+    r"(?:[ \t]*,[ \t]*(.+?))?[ \t]*$")
+
+
+def _looks_like_name(value: object) -> bool:
+    """Whether a fragment is a person, not the tail of a sentence.
+
+    Same rules as ``split_owner``, applied to a fragment that has already been
+    separated: one to three capitalised words, and never a label word like
+    ``Note`` or ``Decision``.
+    """
+    words = str(value or "").split()
+    if not words or len(words) > 3:
+        return False
+    if " ".join(words).lower() in _OWNER_STOPWORDS:
+        return False
+    return all(_OWNER_TOKEN.match(word) or word.lower() in {"and", "&"}
+               for word in words)
+
+
+def _decision_parts(raw: str, today=None):
+    """Split one bullet into ``(text, decider, status, superseded, decided)``.
+
+    Everything is optional except the text: a decision with no name against it
+    is still a decision, and inventing an author from the first capitalised word
+    of the sentence is how a register starts lying about who signed off.
+    """
+    body = (raw or "").strip()
+    checkbox = _CHECKBOX.match(body)
+    if checkbox:
+        body = body[checkbox.end():].strip()
+
+    status = None
+    marker = _DECISION_MARKER.match(body)
+    if marker:
+        status = marker.group(1).lower()
+        body = body[marker.end():].strip()
+
+    superseded = None
+    tail = _SUPERSEDED_BY.search(body)
+    if tail:
+        superseded = tail.group(1).strip()
+        body = body[:tail.start()].strip()
+
+    decider = None
+    decided = None
+    prefix = _DECIDER_PREFIX.match(body)
+    if prefix and _looks_like_name(prefix.group(1)):
+        decider = " ".join(prefix.group(1).split())
+        body = body[prefix.end():].strip()
+    else:
+        suffix = _DECIDER_TAIL.search(body)
+        if suffix and _looks_like_name(suffix.group(1)):
+            decider = " ".join(suffix.group(1).split())
+            if suffix.group(2):
+                decided = parse_due_date(suffix.group(2), today)
+            body = body[:suffix.start()].strip()
+        else:
+            owner, rest = split_owner(body)
+            if owner and rest:
+                decider, body = owner, rest
+
+    return body.strip(), decider, status, superseded, decided
+
+
+def normalise_decision_text(text: object) -> str:
+    """The reconciliation key for a decision.
+
+    Built from the decision itself, after the attribution has been removed, so
+    changing who signed a decision off -- or the date against their name -- does
+    not fork it into a second decision. A date *inside* the sentence stays,
+    because "extend the contract to 2027-01-01" is a different decision from
+    "extend the contract" and collapsing the two would be the loose match this
+    key exists to avoid.
+    """
+    body, _decider, _status, _superseded, _decided = _decision_parts(
+        str(text or "").strip())
+    return normalise_action_text(body)
+
+
+def parse_decisions(text: object, today=None, decided_at=None) -> list:
+    """Extract decisions from the Markdown bullets of a decisions section.
+
+    Returns ``[{text, key, decider, decidedAt, status, supersededByText,
+    section}]`` in document order, de-duplicated on the normalised text.
+
+    ``decided_at`` is the **source record's own date**, and it is the default
+    for every bullet. That is deliberate: a decision taken in a meeting was
+    taken on the day of the meeting, and measuring it from the wall clock would
+    date a three-week-old decision today. An attribution date
+    (``- Migrate to Postgres — Alice, 2026-05-31``) overrides it, because there
+    the source has named a different day on purpose.
+
+    Only bullets under a decision-shaped heading are considered. An
+    ``## Actions`` section is full of things somebody decided to do, and reading
+    those as decisions would fill the log with obligations nobody chose.
+    """
+    body = str(text or "")
+    if not body.strip():
+        return []
+
+    items = []
+    seen = set()
+    in_section = False
+    section = ""
+
+    for line in body.splitlines():
+        heading = _HEADING_LINE.match(line.strip())
+        if heading:
+            title = " ".join(heading.group(2).split()).strip().rstrip(":").lower()
+            in_section = title in _DECISION_SECTIONS
+            if in_section:
+                section = title
+            continue
+        if not in_section:
+            continue
+        bullet = _BULLET_LINE.match(line)
+        if not bullet:
+            continue
+        raw = bullet.group(1).strip()
+        if not raw:
+            continue
+        decision_text, decider, status, superseded, decided = _decision_parts(
+            raw, today)
+        if not decision_text:
+            continue
+        key = normalise_action_text(decision_text)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        items.append({
+            "text": decision_text,
+            "key": key,
+            "decider": decider,
+            "decidedAt": decided or decided_at,
+            "status": status or "active",
+            "supersededByText": superseded,
+            "section": section,
+        })
+    return items

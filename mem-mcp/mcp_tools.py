@@ -1157,6 +1157,150 @@ async def update_action_item(id: str, status: Optional[str] = None,
             + ".")
 
 
+def _format_decisions(rows, heading="Decisions"):
+    """Render the log newest-first, with what replaced what.
+
+    Ordering is chronological, not grouped by status: a decision log is read as
+    a history, and "what did we decide in March, and what changed in June?" is
+    the question it answers. Grouping by status would put every superseded row
+    in one place, which is exactly the reading that loses the sequence.
+    """
+    if not rows:
+        return "_No decisions recorded._"
+    lines = [f"## {heading}\n"]
+    for row in rows:
+        item = mem.describe_decision(row)
+        decider = f" — **{item['decider']}**" if item.get("decider") else ""
+        when = f" — {item['decidedAt']}" if item.get("decidedAt") else ""
+        scope = ""
+        if item.get("clientName"):
+            scope = f" — {item['clientName']}"
+            if item.get("contextName"):
+                scope += f" / {item['contextName']}"
+        marker = ""
+        if item.get("superseded"):
+            marker = " ~~(superseded)~~"
+        elif item.get("status") and item["status"] != "active":
+            marker = f" _({item['status']})_"
+        line = (f"- {item['text']}{decider}{when}{scope}{marker} "
+                f"_(id: {item['id']})_")
+        lines.append(line)
+        if item.get("replaces"):
+            lines.append("  - replaced: " + "; ".join(
+                str(x) for x in item["replaces"] if x))
+    lines.append("")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+@monitor_mcp_tool("list_decisions", context_provider=_current_user)
+async def list_decisions(client: Optional[str] = None,
+                         context: Optional[str] = None,
+                         status: Optional[str] = None,
+                         includeSuperseded: bool = True):
+    """
+    List the decisions recorded for an engagement, newest first.
+
+    This is the register the diary save path fills from `## Decisions`. Use it
+    to answer "why did we choose this", "who signed off on it", and — the
+    question a bullet list cannot answer — "is this still what we are doing, or
+    did something replace it?".
+
+    Like the commitment register and unlike search scope, `client` and
+    `context` **filter**: a decision from another engagement is a wrong answer,
+    not a lower-ranked one.
+
+    Parameters:
+      client: client name to narrow to (abbreviations resolve against the
+        stored names). An unknown name widens to the whole vault rather than
+        returning nothing, so a typo cannot look like "no decisions".
+      context: project name within that client.
+      status: one of 'active', 'superseded', 'reversed', 'withdrawn'.
+      includeSuperseded: keep decisions that have been replaced (default true).
+        A log that hides them shows the current answer with no history, which
+        is the state this register exists to escape.
+
+    Returns Markdown, newest first. Each row carries its `id` for
+    `supersede_decision`, and a superseded row names what replaced it.
+    """
+    user = _current_user()
+    client_id, context_id = _action_scope_ids(client, context, user)
+    rows = mem.db_list_decisions(user, client_id=client_id, context_id=context_id,
+                                 status=status, include_inactive=includeSuperseded)
+    heading = "Decisions"
+    if client:
+        heading = f"Decisions — {client}"
+    return _format_decisions(rows, heading)
+
+
+@mcp.tool()
+@monitor_mcp_tool("save_decision", context_provider=_current_user)
+async def save_decision(text: str, decider: Optional[str] = None,
+                        decidedAt: Optional[str] = None,
+                        client: Optional[str] = None,
+                        context: Optional[str] = None):
+    """
+    Record a decision that did not come out of a diary entry.
+
+    Most decisions are extracted from a meeting's `## Decisions` bullet list, so
+    this is for the ones that are not: a call nobody transcribed, an email, a
+    conversation in a corridor. Writing it here gives it the same lifecycle —
+    decider, date, status, scope, and a place in the panel.
+
+    Parameters:
+      text: the decision itself, stated as a decision ("we will use Postgres
+        for the ledger"), not as a topic.
+      decider: who signed it off. A person's name, not a team.
+      decidedAt: ISO date (YYYY-MM-DD). Omit it when no date was named — a
+        guessed date is worse than a missing one, because a missing one reads
+        as "undated" and a guess reads as a fact.
+      client / context: the engagement this belongs to. Resolved to stored
+        names; an unknown name records the decision unscoped rather than
+        creating a duplicate client.
+
+    Returns the created decision, including its `id`.
+    """
+    user = _current_user()
+    client_id, context_id = _action_scope_ids(client, context, user)
+    result = mem.db_create_decision(user, text, decider=decider,
+                                    decided_at=decidedAt, client_id=client_id,
+                                    context_id=context_id)
+    if not result.get("ok"):
+        return f"Could not record the decision: {result.get('reason')}"
+    item = result["item"]
+    return (f"Recorded decision `{item['id']}`: {item['text']}"
+            + (f" — **{item['decider']}**" if item.get("decider") else "")
+            + (f" — {item['decidedAt']}" if item.get("decidedAt") else "")
+            + ".")
+
+
+@mcp.tool()
+@monitor_mcp_tool("supersede_decision", context_provider=_current_user)
+async def supersede_decision(id: str, supersededBy: str):
+    """
+    Say that one decision replaced another, explicitly.
+
+    **Supersession is never inferred.** A decision that quietly stops being
+    followed is worse than one that was never logged, because the register then
+    says something false. The only two ways a row becomes superseded are a
+    sentence a human wrote in the minutes (`(superseded by: ...)`) and this
+    call. Nothing guesses from the calendar, from a newer decision on the same
+    topic, or from the text drifting.
+
+    Parameters:
+      id: the decision that stopped applying, from `list_decisions`.
+      supersededBy: the decision that replaced it. Both must belong to the
+        caller's vault.
+
+    Returns the link, or a refusal naming the reason.
+    """
+    user = _current_user()
+    result = mem.db_supersede_decision(id, supersededBy, user)
+    if not result.get("ok"):
+        return f"Could not supersede `{id}`: {result.get('reason')}"
+    return f"`{id}` is superseded by `{supersededBy}`."
+
+
 @mcp.tool()
 @monitor_mcp_tool("client_brief", context_provider=_current_user)
 async def client_brief(client: str, context: Optional[str] = None):

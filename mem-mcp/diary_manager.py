@@ -45,6 +45,7 @@ from client_manager import (
 )
 
 from action_manager import sync_actions_from_text
+from decision_manager import sync_decisions_from_text
 import sharing  # Phase 3: shared-vault read access policy layer
 # The visibility rule and the RELEVANT_TO id pass live in fact_manager, which
 # imports this module only lazily (function-local, to avoid a cycle) — so a
@@ -634,6 +635,13 @@ async def db_save_diary(content: str, user_id: str, timestamp: str, name: str, m
     await sync_actions_from_text(doc_id, "DiaryEntry", user_id, content,
                                  today=(entry_date or "")[:10] or None,
                                  client_id=client_id, context_id=context_id)
+    # Decisions come from the same body, and carry the entry's own date as
+    # their default decidedAt: a decision recorded in March was made in March,
+    # not on the day somebody happened to re-save the file.
+    await sync_decisions_from_text(doc_id, "DiaryEntry", user_id, content,
+                                   today=(entry_date or "")[:10] or None,
+                                   decided_at=(entry_date or "")[:10] or None,
+                                   client_id=client_id, context_id=context_id)
     return timestamp
 
 
@@ -1148,6 +1156,10 @@ async def db_update_diary(entry_id: str, user_id: str, content: Optional[str] = 
     await sync_actions_from_text(entry_id, "DiaryEntry", user_id, new_content,
                                  today=(entry_date or "")[:10] or None,
                                  client_id=client_id, context_id=context_id)
+    await sync_decisions_from_text(entry_id, "DiaryEntry", user_id, new_content,
+                                   today=(entry_date or "")[:10] or None,
+                                   decided_at=(entry_date or "")[:10] or None,
+                                   client_id=client_id, context_id=context_id)
     return True
 
 

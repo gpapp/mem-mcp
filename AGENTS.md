@@ -78,7 +78,7 @@ own body and a namespace entry cannot reach that.
 
 ```bash
 cd mem-mcp
-python3 -m unittest -v test_matching_regressions.py test_embedding_reliability.py test_chunking.py test_cypher_safety.py test_backup_compression.py test_people_extraction.py test_graph_scope.py test_mobile_layout.py test_llm_reliability.py test_env_wiring.py test_status_monitor.py test_sessions.py test_auth_guard.py test_google_auth.py test_registration.py test_vault_migration.py test_sharing.py test_share_endpoints.py test_sharing_readpaths.py test_live_notes.py test_skill_catalogue.py test_action_items.py test_briefing.py test_roster.py test_model_bench.py
+python3 -m unittest -v test_matching_regressions.py test_embedding_reliability.py test_chunking.py test_cypher_safety.py test_backup_compression.py test_people_extraction.py test_graph_scope.py test_mobile_layout.py test_llm_reliability.py test_env_wiring.py test_status_monitor.py test_sessions.py test_auth_guard.py test_google_auth.py test_registration.py test_vault_migration.py test_sharing.py test_share_endpoints.py test_sharing_readpaths.py test_live_notes.py test_skill_catalogue.py test_action_items.py test_briefing.py test_roster.py test_model_bench.py test_decision_log.py
 ```
 
 This was a Windows path (`C:/tools/miniconda3/python.exe`) with PowerShell `Push-Location`/`Pop-Location`, and it does not exist on the Linux host these files are edited from — every suite "failed" on an interpreter that is not there. Any `python`/`python3` on `PATH` runs all of them; none of them import a DB driver.
@@ -2147,6 +2147,67 @@ The file is not in the dependency-light suites because it is trivial; it is in
 them because a wrong scorer here costs a model swap, and a model swap is not
 free of re-verification — see "Critical Config" for the four-roles-across-two-
 models split this harness exists to make repeatable.
+
+`test_decision_log.py` is the 26th suite, and it covers the one register whose
+correctness is a question of *history* rather than of state. `:ActionItem` can
+be wrong item by item and still be useful; a decision log that quietly reports a
+superseded decision as current is not merely incomplete, it says something
+false — and the reader has no way to tell. That asymmetry is why the rules here
+are stricter than the ones beside them.
+
+**Supersession is explicit, and there are exactly two ways to set it.** A
+sentence a human wrote in the minutes — `(superseded by: we use Postgres)` — or
+an explicit call from `supersede_decision` / `POST /api/decisions/{id}/supersede`.
+Nothing infers it from the calendar, from a newer decision on the same topic, or
+from the text drifting. `_resolve_supersede_links` resolves the written sentence
+against the real rows and binds it **only when exactly one decision has that
+normalised text**; two candidates is an ambiguous reference, and a confidently
+wrong link is worse than none because the whole point of the field is that it can
+be trusted. `SupersedeLinkTests` drives all three outcomes (one match, two
+matches with the WARNING, none) because the failure mode is silent in every
+direction.
+
+**The parser's key is built from the decision, not from the attribution.**
+`normalise_decision_text` strips the bullet, the checkbox, the status marker and
+the decider before normalising, so changing who signed a decision off — or the
+date against their name — updates the row instead of forking it. A date *inside*
+the sentence stays, because "extend the contract to 2027-01-01" is a different
+decision from "extend the contract". `test_a_date_inside_the_sentence_is_part_of_the_decision`
+pins that half; `test_the_key_ignores_attribution_so_changing_the_decider_does_not_fork_it`
+pins the other, and the pair matters because either rule applied to both cases
+would be wrong.
+
+**`decidedAt` defaults to the source record's date, never the wall clock.** A
+decision taken in a March meeting was taken in March; measuring it from today
+would date a three-week-old decision with the day somebody re-saved the file, and
+the date is the one field a reader trusts to be exact. An attribution date
+(`- Migrate to Postgres — Alice, 2026-05-31`) overrides it, because there the
+source named a different day on purpose.
+
+**`withdrawn` is revivable; `superseded` and `reversed` are not.** The three mean
+different things. `withdrawn` is "this record stopped listing it", which says
+nothing about whether it is still in force, so a record that names it again
+brings it back to `active`. `superseded` and `reversed` were said by somebody
+outside the source, and a later re-save of the minutes that still contains the
+original bullet must not quietly undo that — which is the exact defect a naive
+"the bullet is present, so it is active" reconciliation produces.
+`test_a_superseded_row_is_not_reopened_by_a_resave` and
+`test_a_withdrawn_row_is_revived_when_the_bullet_returns` are the pair.
+
+**Silence is not a withdrawal, but an empty section is.** `authoritative` is
+`bool(items)` at the call site, so a transcript with no `## Decisions` heading —
+or a note written before this existed — closes nothing, while a section that
+exists and now lists nothing does close what it used to list. The same
+distinction `sync_actions_from_text` makes, for the same reason: re-saving
+minutes under a different heading must not empty the register.
+
+The suite **execs `decision_manager.py` against a stub `common`** rather than
+importing it, because the module needs a Neo4j driver that is not on this box.
+The parser half is imported and **called** directly — `matching_utils.py` has no
+app imports — so the grammar is tested against the shipping function rather than
+a copy. The exec'd half is the reconciliation, and it is scripted per query
+(`_sync_script`) so each test can assert what happened to a row that already
+existed, which is the only place the interesting behaviour lives.
 
 ### Dashboard Deduplication
 Service → **🧹 Deduplicate memories** provides a review-first merge workflow. It is on the

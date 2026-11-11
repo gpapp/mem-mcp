@@ -72,6 +72,13 @@ from action_manager import (
     db_create_action_item, sync_actions_from_text, describe_action_item,
 )
 
+from decision_manager import (
+    DECISION_STATUSES,
+    db_sync_decisions, db_list_decisions, db_update_decision,
+    db_create_decision, db_supersede_decision, sync_decisions_from_text,
+    describe_decision,
+)
+
 # The brief is a read that composes the other managers; the module itself is
 # stdlib-only so the pure half is callable from a suite with no DB drivers.
 from brief_manager import (
