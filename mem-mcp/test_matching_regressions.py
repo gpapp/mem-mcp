@@ -867,7 +867,7 @@ class ResolverInputTests(unittest.TestCase):
             elif isinstance(node, ast.ImportFrom):
                 imported.add((node.module or "").split(".")[0])
         self.assertTrue(
-            imported <= {"os", "re", "json", "difflib", "time"},
+            imported <= {"os", "re", "json", "difflib", "time", "typing"},
             f"matching_utils gained a dependency: {sorted(imported)}",
         )
 

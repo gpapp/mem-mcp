@@ -56,7 +56,16 @@ class Python311AnnotationTests(unittest.TestCase):
     # Scanned as text, never imported: gui.py and common.py cannot be imported
     # on a box without fastapi/httpx, which is precisely why the defect needs a
     # static check rather than a test that imports its subject.
-    MODULES = ("sessions.py", "gui.py", "common.py", "server.py")
+    #
+    # Derived from the directory rather than hand-listed, because the hand-list
+    # was wrong: `matching_utils.py` annotated `-> Optional[str]` without
+    # importing `Optional`, was never in this tuple, and took the container down
+    # on startup with `NameError: name 'Optional' is not defined` — invisible
+    # here because 3.14 defers annotations by default. A guard that enumerates
+    # its subjects by hand only protects the modules somebody remembered.
+    MODULES = tuple(sorted(
+        f for f in os.listdir(HERE) if f.endswith(".py") and not f.startswith("test_")
+    ))
 
     @staticmethod
     def _module_bindings(tree):

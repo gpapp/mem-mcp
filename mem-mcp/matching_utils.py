@@ -3,6 +3,7 @@ import re
 import json
 import difflib
 import time
+from typing import Optional
 
 # ---------------------------------------------------------------------------
 # Identity confidence

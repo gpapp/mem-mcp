@@ -5,6 +5,46 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# The container would not start: `Optional` was never imported
+
+**Why.** `resolve_person_name` in `matching_utils.py` is annotated
+`-> Optional[str]` and the module imports only `os`, `re`, `json`, `difflib` and
+`time`. The name was never bound. The container runs `python:3.11-slim`, where an
+annotation is evaluated when the `def` executes, so importing the module raised
+`NameError: name 'Optional' is not defined` and `server.py` died on line 17
+before the app was listening — every request 502, nothing in the log but the
+traceback.
+
+**Why it was invisible for weeks.** The editing host is Python 3.14, where
+PEP 649 makes annotations lazy *by default*, so `python3 -c "import
+matching_utils"` printed nothing wrong. The defect shipped in `9b2f650` (search
+narrowing) and the suite stayed green at 1649 tests across 25 files, because no
+suite can observe a fault that only the other interpreter exhibits.
+
+**What shipped.** `from typing import Optional`, and `typing` joins the
+`ResolverInputTests` allowlist — it is stdlib, so the property that test exists
+to protect (this module imports without DB drivers) is untouched.
+
+**The guard was the real defect, and it was already written.**
+`test_sessions.Python311AnnotationTests` walks the AST for exactly this: an
+annotation naming a module-level binding that is not available yet, unless the
+module defers annotations. It scanned a hand-written tuple of four modules
+(`sessions.py`, `gui.py`, `common.py`, `server.py`) and `matching_utils.py`
+was never in it. `MODULES` is now derived from the directory — every non-test
+module, 35 of them — so a new file is covered the moment it exists. Re-injecting
+the missing import fails with `matching_utils.py:1150 annotates with 'Optional'`,
+naming the file, the line and the name.
+
+**Tests.** 1649 passing across 25 files, and the widened guard reports nothing
+across all 35 modules.
+
+**The one thing to remember.** A guard that enumerates its subjects by hand
+protects the modules somebody remembered, which is the opposite of what a guard
+is for. When you find a list of filenames inside a test, ask what happens to the
+file that is added tomorrow.
+
+---
+
 # The MCP tools table named 22 of the 29 tools that exist
 
 **Why.** `## MCP Tools (Advanced Suite)` is the only place a user learns what
