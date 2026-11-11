@@ -5,6 +5,48 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# Three read skills, and the misunderstandings each one prevents
+
+**Why.** The shipped skills were four write workflows and one read workflow.
+Everything the product does *after* the material is in the vault — auditing
+scope, orienting a new session, running a weekly review — had no written
+workflow, so an agent improvised it and got the counter-intuitive parts wrong
+with total confidence.
+
+**What shipped.** Three Markdown skills, so no code changed: discovery is
+already directory-derived and every one is addressable as a `skill://`
+resource the moment the file exists.
+
+- **`vault-orientation`** — the first-session skill. A live note is an ordinary
+  `:Fact` in category `Notes`; a client filter **ranks and never excludes**; a
+  date window or a person **does** narrow; categories are global and belong to
+  nobody; scope is an edge, never a `clientId` property (which is Qdrant-only
+  and answers `None` for every node).
+- **`client-context-hygiene`** — a review order, and mostly a list of things not
+  to do from an agent session: creating a client on a near miss mints a
+  duplicate the classifier will never link to, `update_fact` deliberately cannot
+  repoint a record, and a single-item reclassify overrides the `scopeManual`
+  marker a bulk run skips. Reclassification is a **dashboard action**, and the
+  skill says so rather than naming a tool that does not exist — an agent told to
+  call a missing tool invents a workaround.
+- **`weekly-review`** — four questions that compose into one page. Its rules are
+  the ones a summary gets wrong: a person with no last-mentioned date is
+  *unmeasured*, not stale; an empty week is a finding and the window is not
+  silently widened; a closed commitment is not reopened because the bullet is
+  still in the minutes; and `list_action_items` / `list_decisions` **filter** on
+  scope where `search_facts` ranks.
+
+**Tests.** `NewReadSkillsTests` in `test_skill_catalogue.py` pins the sentences
+that carry each rule — a skill is prompt text, so nothing else notices when one
+is softened. 9 new tests, 34 in that suite, **1741 passing across 27 files**.
+
+**The one thing to remember.** A skill that names a tool which does not exist is
+worse than no skill: the agent does not stop, it improvises. When a step is a
+human action in the dashboard, write "this is a dashboard action" rather than
+the nearest-sounding tool name.
+
+---
+
 # The engagement timeline, and the order that was the feature
 
 **Why.** Everything needed to answer "where did this get to?" already existed in

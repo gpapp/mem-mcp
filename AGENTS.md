@@ -2449,6 +2449,26 @@ counter-intuitive, and every one of them is invisible from a tool signature:
   so a search may surface a fragment as its entry point; the record returned is
   complete. Two hits sharing an id are one record, not two.
 
+Three further read skills complete the set, and each exists because a step in
+it is counter-intuitive enough that an agent will otherwise do the wrong thing
+confidently:
+
+- **`vault-orientation`** is the first-session skill, and its job is to stop the
+  three misunderstandings that cost the most: that a client filter is a filter
+  (it ranks), that scope is a field (`clientId` is a Qdrant key and a property
+  read answers `None` for every node), and that a live note is something other
+  than an ordinary fact in category `Notes`.
+- **`client-context-hygiene`** is a review order, and it is mostly a list of
+  things **not** to do: creating a client on a near miss mints a duplicate the
+  classifier will never link to, `update_fact` cannot repoint a record, and a
+  single-item reclassify overrides a `scopeManual` marker that a bulk run
+  deliberately skips. Reclassification itself is a dashboard action, not a tool,
+  and the skill says so rather than naming a tool that does not exist.
+- **`weekly-review`** composes the four questions into one page. Its rules are
+  the ones a summary gets wrong: a person with no last-mentioned date is
+  *unmeasured*, not stale; an empty week is a finding; and `list_action_items` /
+  `list_decisions` **filter** on scope where `search_facts` ranks.
+
 `SearchAndRecallSkillTests` pins each of those sentences, for the same reason
 `ScopePromptTests` pins the classifier's: a skill is prompt text, and nothing
 else in the suite notices when a sentence that carries a rule is softened or

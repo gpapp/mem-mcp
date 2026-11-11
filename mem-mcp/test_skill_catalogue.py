@@ -241,5 +241,73 @@ class SearchAndRecallSkillTests(unittest.TestCase):
                   "valuable thing this vault produces, and only if it is said")
 
 
+class NewReadSkillsTests(unittest.TestCase):
+    """The three orientation skills are prompt text, so pin what must not drift.
+
+    Each assertion names a rule a reader would otherwise get wrong with full
+    confidence: that scope is a field, that a client filter filters, that a
+    person nobody wrote about has been "quiet". None of those is visible in any
+    code path, and all three produce a plausible, wrong answer.
+    """
+
+    def _text(self, name):
+        with open(os.path.join(skill_catalogue.default_skills_dir(), name),
+                  encoding="utf-8") as fh:
+            return fh.read()
+
+    def _has(self, name, needle, why):
+        self.assertTrue(needle in self._text(name), msg=why)
+
+    def test_scope_is_an_edge_and_never_a_property(self):
+        self._has("client-context-hygiene.md", "Scope is a pair of **edges**, not a field",
+                  "a reader who looks for a scope field finds `None` on every node "
+                  "and concludes the vault is unclassified")
+        self._has("vault-orientation.md", "answers `None` for everything",
+                  "the `clientId` property trap is the one that already shipped once")
+
+    def test_a_client_filter_ranks_and_a_date_window_narrows(self):
+        self._has("vault-orientation.md", "ranks and never excludes",
+                  "an agent that believes scope filters reports 'nothing recorded' "
+                  "for a client the vault has plenty on")
+        self._has("vault-orientation.md", "*does* narrow",
+                  "the two vocabularies must stay distinct or one is applied as "
+                  "the other")
+
+    def test_a_guessed_scope_is_worse_than_a_null(self):
+        self._has("client-context-hygiene.md", "A guessed scope is worse than a null",
+                  "the verdict is stamped with `scopeCheckedSig`, so a guess is "
+                  "permanent and the null was recoverable")
+
+    def test_creating_a_client_on_a_near_miss_is_refused(self):
+        self._has("client-context-hygiene.md", "Do not create a client on a near miss",
+                  "a near-miss client is a duplicate the classifier never links to")
+
+    def test_reclassification_is_a_dashboard_action(self):
+        self._has("client-context-hygiene.md", "Reclassification is a **dashboard action**",
+                  "there is no reclassify MCP tool; naming one sends the agent to "
+                  "call something that does not exist")
+
+    def test_a_live_note_is_an_ordinary_fact(self):
+        self._has("vault-orientation.md", "A live note is an ordinary fact",
+                  "agents otherwise look for a separate note store and miss the "
+                  "fact that is already searchable")
+
+    def test_an_undated_person_is_unmeasured_not_stale(self):
+        self._has("weekly-review.md", "unmeasured, not stale",
+                  "'quiet for 400 days' is an invented measurement and reads as a "
+                  "finding")
+
+    def test_overdue_is_computed_and_an_empty_week_is_a_finding(self):
+        self._has("weekly-review.md", "Overdue is computed at read time",
+                  "a stored flag is wrong the moment midnight passes")
+        self._has("weekly-review.md", "empty week is a finding",
+                  "silently widening the window is how a stale engagement stays "
+                  "invisible")
+
+    def test_a_closed_commitment_is_not_reopened(self):
+        self._has("weekly-review.md", "A closed commitment stays closed",
+                  "the bullet is still in the minutes; the work was finished")
+
+
 if __name__ == "__main__":
     unittest.main()

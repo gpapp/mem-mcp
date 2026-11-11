@@ -25,31 +25,13 @@ surfaces them — which is why task 5 exists.
 
 | # | task | size |
 |---|---|---|
-| 10 | Remaining skills (`hygiene`, `orientation`, `weekly-review`) | S |
 | 11 | Deliverables register | M |
 
-Tasks 1, 2, 3, 4, 5, 6, 7, 8 and 9 are shipped (see `task_history.md`). They came first because the skill surface is what a client meets before it meets the vault: a discovery call
+Tasks 1, 2, 3, 4, 5, 6, 7, 8, 9 and 10 are shipped (see `task_history.md`). They came first because the skill surface is what a client meets before it meets the vault: a discovery call
 that answers with three opaque filenames, and no skill that says how to read the
 vault, makes every later session worse.
 
 ---
-
-## 10. Remaining skills
-
-Cheap, and better once the data they describe exists.
-
-- [ ] `client-context-hygiene` — review order: list clients → find unclassified
-      records → reclassify → verify. States that a null scope is **permanent**
-      (`scopeCheckedSig`), that `scopeManual` protects a hand-set scope from a
-      bulk reclassify but not from a single-item one, and that creating a client
-      on a near-miss is the wrong fix because it mints a duplicate the classifier
-      will never link to.
-- [ ] `vault-orientation` — the first-hour skill: facts vs diary vs live notes,
-      clients vs contexts, categories are global and carry no owner, how scope is
-      attached, and the three or four questions a new user should try.
-- [ ] `weekly-review` — "what happened across all clients this week, what is
-      still open, who have I not spoken to". Composes `list_diary_entries`,
-      action items and roster staleness; before those exist it is a diary digest.
 
 ## 11. Deliverables register
 
