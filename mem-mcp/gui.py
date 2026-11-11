@@ -1733,6 +1733,49 @@ async def api_context_roster(request: Request, context_id: str, clientId: str = 
         raise _service_unavailable(e)
 
 
+@web_app.get("/api/clients/{client_id}/timeline", response_class=JSONResponse)
+async def api_client_timeline(request: Request, client_id: str, limit: int = 200):
+    """Where this engagement got to: one date-ordered narrative.
+
+    Four streams merged rather than four lists side by side. A reader asking
+    "where did this get to?" wants one story — the meetings, the decisions taken
+    in them, what closed, and what was learned — and four panels make them
+    reconstruct the chronology themselves.
+
+    Scope is resolved through the `FOR_CLIENT` edges inside the manager, never
+    from a `clientId` property: that key is a Qdrant payload key and no record
+    node carries it, so a property read answers `None` for everything.
+    """
+    try:
+        return mem.db_engagement_timeline(_require_user(request), client_id=client_id,
+                                          limit=limit)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except RuntimeError as e:
+        raise _service_unavailable(e)
+
+
+@web_app.get("/api/contexts/{context_id}/timeline", response_class=JSONResponse)
+async def api_context_timeline(request: Request, context_id: str, limit: int = 200):
+    """The same narrative for one project.
+
+    A project is a narrower question than its client and answers a different
+    one — "where did the migration work get to" rather than "where does the
+    account stand" — so it is its own read rather than a filter on the parent.
+    """
+    try:
+        return mem.db_engagement_timeline(_require_user(request), context_id=context_id,
+                                          limit=limit)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except RuntimeError as e:
+        raise _service_unavailable(e)
+
+
 @web_app.get("/api/action-items", response_class=JSONResponse)
 async def api_list_action_items(request: Request, clientId: str = "", contextId: str = "",
                                 status: str = "", dueBefore: str = ""):

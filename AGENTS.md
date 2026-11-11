@@ -78,7 +78,7 @@ own body and a namespace entry cannot reach that.
 
 ```bash
 cd mem-mcp
-python3 -m unittest -v test_matching_regressions.py test_embedding_reliability.py test_chunking.py test_cypher_safety.py test_backup_compression.py test_people_extraction.py test_graph_scope.py test_mobile_layout.py test_llm_reliability.py test_env_wiring.py test_status_monitor.py test_sessions.py test_auth_guard.py test_google_auth.py test_registration.py test_vault_migration.py test_sharing.py test_share_endpoints.py test_sharing_readpaths.py test_live_notes.py test_skill_catalogue.py test_action_items.py test_briefing.py test_roster.py test_model_bench.py test_decision_log.py
+python3 -m unittest -v test_matching_regressions.py test_embedding_reliability.py test_chunking.py test_cypher_safety.py test_backup_compression.py test_people_extraction.py test_graph_scope.py test_mobile_layout.py test_llm_reliability.py test_env_wiring.py test_status_monitor.py test_sessions.py test_auth_guard.py test_google_auth.py test_registration.py test_vault_migration.py test_sharing.py test_share_endpoints.py test_sharing_readpaths.py test_live_notes.py test_skill_catalogue.py test_action_items.py test_briefing.py test_roster.py test_model_bench.py test_decision_log.py test_timeline.py
 ```
 
 This was a Windows path (`C:/tools/miniconda3/python.exe`) with PowerShell `Push-Location`/`Pop-Location`, and it does not exist on the Linux host these files are edited from — every suite "failed" on an interpreter that is not there. Any `python`/`python3` on `PATH` runs all of them; none of them import a DB driver.
@@ -2208,6 +2208,63 @@ app imports — so the grammar is tested against the shipping function rather th
 a copy. The exec'd half is the reconciliation, and it is scripted per query
 (`_sync_script`) so each test can assert what happened to a row that already
 existed, which is the only place the interesting behaviour lives.
+
+`test_timeline.py` is the 27th suite, and it covers the first feature in this
+repo whose output is a **narrative** rather than a row. A timeline is not wrong
+because one record is missing; it is wrong because the order lies — a decision
+appears before the meeting that took it, a busy month is truncated while a quiet
+one is shown in full, or a closed commitment is filed under the date it was due
+instead of the day it closed. None of those raise, and all of them read as a
+correct history.
+
+`timeline.py` is stdlib-only, so the whole merging half is **imported and
+called**: `day_of` / `month_of` / `month_label`, the sort key, `build_events`,
+`group_by_month` and `summarise`. Four rules are pinned there and each is a
+decision rather than an accident:
+
+- **A decision is not duplicated when its meeting is in the same view.** It is
+  nested into that meeting's own `decisions` list, and promoted to a top-level
+  row only when the source entry is absent — a live note, an entry outside the
+  window, a deleted source. A decision with no readable origin still has to be
+  readable, which is the whole reason the promotion branch exists.
+- **The cap is applied before grouping, never per month.** A per-month cap would
+  truncate the busiest month and show a quiet one in full, which is the
+  opposite of what a reader wants.
+- **Undated rows sort last and share one `Undated` group**, because `UNDATED` is
+  a sentinel that keeps the sort tuple total rather than a special case in the
+  comparator.
+- **`summarise` counts a nested decision as a decision.** The panel states
+  "N meetings, N decisions" and that number gets quoted; counting only the
+  top-level rows under-reports by exactly the decisions that were taken in a
+  meeting, which is most of them.
+
+`timeline_manager.py` needs a Neo4j driver, so it is exec'd against **three**
+stub modules in `sys.modules` — `common` for the driver and logger,
+`client_manager` for `_scope_items`, and `decision_manager` for
+`db_list_decisions` — the same harness shape as `test_decision_log.py`. What it
+drives is the set of refusals and shortcuts that would each fail silently:
+
+- **exactly one scope is required.** Both ids and neither id are both refused;
+  "everything, sorted by date" is a different question (the global diary list)
+  and answering it under a client panel would make a mis-sent id look like an
+  empty engagement.
+- **an unknown scope is refused, not answered with an empty timeline**, through
+  `_scope_items` returning `None`.
+- **a shared panel skips the decision and commitment reads and says so in a
+  `note`.** The test asserts the decision loader was never called and that no
+  query mentioning `ActionItem` ran, then that the note is present, because
+  "these are not yours to see" and "there are none" must not render the same.
+  The meetings themselves still appear.
+- **a closed commitment is dated by when it closed**, not by `dueAt`: a due date
+  months earlier would file the row in the wrong month of the story.
+- **participants come from the existing `MENTIONS` edges** and the cap is per
+  entry, so a twelve-person meeting is a meeting and the last entry in the
+  result does not lose its attendees.
+
+Scope is read through `_scope_items` and therefore through the `FOR_CLIENT` /
+`IN_CONTEXT` **edges**, never a `clientId` property — that key is Qdrant-only and
+a property read answers `None` for every node, which is the defect that made
+every diary entry look unscoped in Build Graph mode.
 
 ### Dashboard Deduplication
 Service → **🧹 Deduplicate memories** provides a review-first merge workflow. It is on the

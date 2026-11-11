@@ -5,6 +5,58 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# The engagement timeline, and the order that was the feature
+
+**Why.** Everything needed to answer "where did this get to?" already existed in
+four separate places — the diary, the decision log, the commitments register and
+the fact list — and none of them could be read as a story. Handing an engagement
+to a colleague meant opening four panels and sorting the dates in your head,
+which is exactly the work a machine should do.
+
+**What shipped.** `timeline.py` (stdlib-only) merges the four streams, groups
+them by month and orders them; `timeline_manager.py` does the four reads;
+`GET /api/clients/{id}/timeline` and `GET /api/contexts/{id}/timeline`; the
+`client_timeline` tool; and a collapsed **Timeline (N)** block in each client
+and project panel.
+
+**The four decisions that are the feature, not the plumbing.**
+
+1. **A decision is not repeated when its meeting is in the same view.** It is
+   nested under the meeting, and promoted to its own row only when the source
+   entry is absent. A decision with no readable origin still has to be readable.
+2. **The cap runs before grouping, never per month.** A per-month cap truncates
+   the busiest month and shows a quiet one in full, which is the opposite of
+   what a reader wants.
+3. **Undated rows sort last, in one `Undated` group**, via a sentinel that keeps
+   the sort tuple total rather than a special case in the comparator.
+4. **A shared panel skips the decisions and commitments and says so.** Those are
+   read under the caller's `userId` and belong to the owner; rendering them
+   would be a leak, and rendering an empty list without the note would read as
+   "this engagement has no decisions", which is false.
+
+Scope comes from `_scope_items` and therefore from the `FOR_CLIENT` /
+`IN_CONTEXT` edges. A `clientId` property read was never an option: that key is
+Qdrant-only and answers `None` for every node, which is the defect that once
+made every diary entry look unscoped in Build Graph mode.
+
+**Two bugs found while writing the suite.** `summarise` counted only top-level
+rows, so a meeting with two decisions reported one — the number a reader quotes
+was wrong by exactly the nested ones. And `first`/`last` were documented as the
+span of the story but returned the newest date in `first`, because the list is
+newest-first; it now means start-of-story and end-of-story.
+
+**Tests.** `test_timeline.py` is the 27th suite, 41 tests. The merging half is
+imported and called; the manager half is exec'd against three stub modules.
+Full suite **1732 passing across 27 files**. `diff --check` clean, dashboard JS
+passes `node --check`.
+
+**The one thing to remember.** A timeline is never wrong because a record is
+missing — it is wrong because the *order* lies, and every one of those failures
+reads as a correct history. When the output is a narrative rather than a row,
+test the ordering and the promotion rule, not the presence of the data.
+
+---
+
 # The decision log: what was decided, and what replaced it
 
 **Why.** `## Decisions` in a diary entry is prose, and prose is where a decision

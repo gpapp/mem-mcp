@@ -79,6 +79,8 @@ from decision_manager import (
     describe_decision,
 )
 
+from timeline_manager import db_engagement_timeline
+
 # The brief is a read that composes the other managers; the module itself is
 # stdlib-only so the pure half is callable from a suite with no DB drivers.
 from brief_manager import (

@@ -25,28 +25,14 @@ surfaces them — which is why task 5 exists.
 
 | # | task | size |
 |---|---|---|
-| 9 | Engagement timeline | M |
 | 10 | Remaining skills (`hygiene`, `orientation`, `weekly-review`) | S |
 | 11 | Deliverables register | M |
 
-Tasks 1, 2, 3, 4, 5, 6, 7 and 8 are shipped (see `task_history.md`). They came first because the skill surface is what a client meets before it meets the vault: a discovery call
+Tasks 1, 2, 3, 4, 5, 6, 7, 8 and 9 are shipped (see `task_history.md`). They came first because the skill surface is what a client meets before it meets the vault: a discovery call
 that answers with three opaque filenames, and no skill that says how to read the
 vault, makes every later session worse.
 
 ---
-
-## 9. Engagement timeline
-
-Chronological narrative of one client or project, for "where did this get to?"
-and for handing an engagement to a colleague.
-
-- [ ] `GET /api/clients/{id}/timeline`: diary entries with headline, participants
-      and decisions; actions closed; facts added — one merged, date-sorted
-      stream.
-- [ ] Grouped by month, each row linking to its source.
-- [ ] Scope read through the edges (`FOR_CLIENT` / `IN_CONTEXT`), never a
-      `clientId` property — that key is Qdrant-only and reading it answers `None`
-      for every node.
 
 ## 10. Remaining skills
 

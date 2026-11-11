@@ -3085,6 +3085,18 @@
         const dj = await api.get('decisions?' + dparams);
         decisions = (dj && dj.items) || [];
       } catch(e) { decisions = []; }
+      // The timeline is the only block that answers "where did this get to?"
+      // rather than "where does it stand": it merges the meetings, the
+      // decisions taken in them, the commitments that closed and the records
+      // added into one stream, so a sequence is visible without opening six
+      // records. It reads scope from the edges server-side, which is why it
+      // shares the same clientId/contextId parameters as everything else.
+      let timeline = null;
+      try {
+        timeline = type === 'client'
+          ? await api.get('clients/' + id + '/timeline')
+          : await api.get('contexts/' + id + '/timeline');
+      } catch(e) { timeline = null; }
       // The brief is offered on every panel, including one with no items --
       // an engagement with nothing recorded is exactly when a person wants to
       // read the gap list before walking in.
@@ -3120,7 +3132,34 @@
             }).join('')
           + `</div></details>`
         : '';
-      const headerHtml = briefHtml + rosterHtml + decisionsHtml + (actions.length
+      // A month group per heading, newest first, undated last. The nested
+      // decision lines are the reason this block exists: a decision shown under
+      // the meeting that took it is history, while the same rows sorted by
+      // decision date are a register -- and the register already exists above.
+      const tlEvents = (timeline && timeline.events) || [];
+      const timelineHtml = tlEvents.length
+        ? `<details style="padding:.35rem .4rem;border-bottom:1px solid var(--border);">`
+          + `<summary style="cursor:pointer;font-size:.72rem;color:var(--muted);">`
+          + `Timeline (${tlEvents.length})</summary>`
+          + `<div style="font-size:.76rem;margin-top:.35rem;">`
+          + (timeline.note ? `<div style="color:var(--muted);margin-bottom:.3rem;">${escHtml(timeline.note)}</div>` : '')
+          + ((timeline.months) || []).map(g => {
+              const rows = (g.events || []).map(ev => {
+                const when = String(ev.at || '').slice(0, 10);
+                const inner = (ev.decisions || []).map(d =>
+                  `<div style="margin-left:.9rem;color:var(--muted);">decided: ${escHtml(d.title || '')}`
+                  + `${d.decider ? ' &mdash; ' + escHtml(d.decider) : ''}</div>`
+                ).join('');
+                const tail = ev.kind === 'decision' && ev.status && ev.status !== 'active'
+                  ? ` <span style="color:var(--muted);">(${escHtml(ev.status)})</span>` : '';
+                return `<div style="padding:.1rem 0;">&bull; ${escHtml(when)} &mdash; ${escHtml(ev.title || '(untitled)')}`
+                  + ` <span style="color:var(--muted);">(${escHtml(ev.kind || 'entry')})</span>${tail}</div>` + inner;
+              }).join('');
+              return `<div style="margin-top:.35rem;"><strong>${escHtml(g.label || 'Undated')}</strong>${rows}</div>`;
+            }).join('')
+          + `</div></details>`
+        : '';
+      const headerHtml = briefHtml + rosterHtml + decisionsHtml + timelineHtml + (actions.length
         ? `<div style="padding:.35rem .4rem;font-size:.72rem;color:var(--muted);border-bottom:1px solid var(--border);">Open items</div>`
           + renderActionRows(actions, {})
         : '');

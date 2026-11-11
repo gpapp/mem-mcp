@@ -30,10 +30,12 @@ mem-mcp/
 ├── client_manager.py     # :Client / :Context, scope, resolution
 ├── action_manager.py     # The :ActionItem register
 ├── decision_manager.py   # The :Decision register and its supersession links
+├── timeline_manager.py   # One engagement's story: meetings, decisions, closed items, facts
 ├── roster_manager.py     # Stakeholder roster (People facts, mentions, last-seen)
 ├── brief_manager.py      # Assembles a brief's material, then has the model polish it
 ├── matching_utils.py     # Pure matching, merge, scope, date/action parsing
 ├── roster.py             # Stdlib-only: role parsing, staleness, roster Markdown
+├── timeline.py           # Stdlib-only: the merge, month grouping and ordering rules
 ├── briefing.py           # Stdlib-only: the meeting-prep brief's layout rules
 ├── skill_catalogue.py    # Stdlib-only: reads skills/, front matter, descriptions
 ├── gui.py                # Every HTTP route, the live-notes WS proxy
@@ -55,7 +57,7 @@ mem-mcp/
 ├── reindex_chunks.py, reindex_diary_keywords.py  # CLI: backfill chunking / keywords
 ├── skills/               # Markdown workflows, discovered from the directory
 ├── templates/            # dashboard.html and the live-notes worklet
-└── test_*.py             # 26 dependency-light regression suites
+└── test_*.py             # 27 dependency-light regression suites
 ```
 
 Only the stdlib-only modules are importable on a machine with no fastapi, no
@@ -94,7 +96,7 @@ python3 -m unittest test_matching_regressions.py test_embedding_reliability.py \
   test_vault_migration.py test_sharing.py test_share_endpoints.py \
   test_sharing_readpaths.py test_live_notes.py test_skill_catalogue.py \
   test_action_items.py test_briefing.py test_roster.py test_model_bench.py \
-  test_decision_log.py
+  test_decision_log.py test_timeline.py
 ```
 
 Before committing: `python3 -m py_compile <file>.py` for Python, `node --check`

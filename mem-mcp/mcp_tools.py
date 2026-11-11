@@ -1429,6 +1429,165 @@ async def stakeholder_roster(client: str, context: Optional[str] = None):
     return mem.attach_open_actions(roster, actions).get("markdown") or ""
 
 
+_TIMELINE_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+_TIMELINE_KIND_LABEL = {
+    "diary": "meeting",
+    "decision": "decision",
+    "action": "commitment",
+    "fact": "record",
+}
+
+
+def _short_day(value) -> str:
+    """`2026-11-12T…` -> `12 Nov`. Anything unparseable renders as nothing."""
+    day = str(value or "")[:10]
+    if len(day) < 10 or day[4:5] != "-":
+        return ""
+    try:
+        month = int(day[5:7])
+    except ValueError:
+        return ""
+    if not 1 <= month <= 12:
+        return ""
+    try:
+        number = int(day[8:10])
+    except ValueError:
+        return ""
+    return f"{number} {_TIMELINE_MONTHS[month - 1]}"
+
+
+def _format_timeline(payload, heading="Timeline") -> str:
+    """Render a timeline payload as Markdown, newest month first."""
+    summary = payload.get("summary") or {}
+    lines = [f"## {heading}", ""]
+
+    note = payload.get("note")
+    if note:
+        lines.extend([f"_{note}_", ""])
+
+    if not payload.get("events"):
+        lines.append("_Nothing recorded for this engagement yet._")
+        return "\n".join(lines)
+
+    counts = []
+    for kind, label in (("diary", "meetings"), ("decision", "decisions"),
+                        ("action", "commitments closed"), ("fact", "records")):
+        value = summary.get(kind) or 0
+        if value:
+            counts.append(f"{value} {label}")
+    if counts:
+        lines.extend([" · ".join(counts), ""])
+
+    for group in payload.get("months") or ():
+        lines.append(f"### {group.get('label') or 'Undated'}")
+        lines.append("")
+        for event in group.get("events") or ():
+            when = _short_day(event.get("at"))
+            kind = _TIMELINE_KIND_LABEL.get(event.get("kind") or "", "entry")
+            title = (event.get("title") or "").strip() or "(untitled)"
+            row = f"- **{when}** — {title} *({kind})*" if when else f"- {title} *({kind})*"
+            if event.get("kind") == "decision":
+                who = (event.get("decider") or "").strip()
+                status = (event.get("status") or "active").strip()
+                bits = [b for b in (who, "" if status == "active" else status) if b]
+                if bits:
+                    row += " — " + ", ".join(bits)
+                if event.get("id"):
+                    row += f" _({event['id']})_"
+            lines.append(row)
+            for nested in event.get("decisions") or ():
+                nested_title = (nested.get("title") or "").strip() or "(untitled)"
+                extra = (nested.get("decider") or "").strip()
+                suffix = f" — {extra}" if extra else ""
+                lines.append(f"  - _decided:_ {nested_title}{suffix}")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _resolve_scope(client: str, context, user):
+    """Resolve names to `(client_row, context_id, error)`.
+
+    An unknown name is an error rather than a nearest-match: a timeline is read
+    out loud, so landing on the wrong engagement is worse than refusing.
+    """
+    clients = mem.db_list_clients(user) or []
+    wanted = (client or "").strip().lower()
+    found = None
+    for row in clients:
+        if (row.get("name") or "").strip().lower() == wanted:
+            found = row
+            break
+    if found is None:
+        for row in clients:
+            name = (row.get("name") or "").strip().lower()
+            if wanted and (wanted in name or name in wanted):
+                found = row
+                break
+    if found is None:
+        known = ", ".join(sorted(row.get("name") or "?" for row in clients)) or "none"
+        return None, None, f"No client matches '{client}'. Known clients: {known}."
+
+    if not context:
+        return found, None, None
+
+    wanted_context = context.strip().lower()
+    for row in found.get("contexts") or ():
+        if (row.get("name") or "").strip().lower() == wanted_context:
+            return found, row.get("id"), None
+    known = ", ".join(row.get("name") or "?" for row in found.get("contexts") or ()) or "none"
+    return found, None, (f"No project matches '{context}' under {found.get('name')}. "
+                         f"Known projects: {known}.")
+
+
+@mcp.tool()
+@monitor_mcp_tool("client_timeline", context_provider=_current_user)
+async def client_timeline(client: str, context: Optional[str] = None, limit: int = 200):
+    """
+    The chronological story of one engagement: meetings, the decisions taken in
+    them, the commitments that closed, and when records were added -- merged
+    into one date-sorted stream and grouped by month.
+
+    Use it to answer "where did this get to?" and to hand an engagement to a
+    colleague, both of which are questions about sequence rather than about
+    state. `client_brief` says where it stands now; this says how it got there.
+
+    `client` is a client name and `context` narrows it to one project; both
+    accept the spellings `list_clients` returns. Scope is read from the
+    `FOR_CLIENT` / `IN_CONTEXT` edges, so a record whose edges were just
+    changed moves immediately rather than on the next reclassify.
+
+    Returns Markdown, newest month first, with undated rows last. Decisions
+    carry their id so `supersede_decision` can be called on one. On an
+    engagement shared with you, the owner's decision log and commitments are
+    deliberately omitted -- a grant covers the client or project, not their
+    private registers -- and the output says so.
+    """
+    user = _current_user()
+    found, context_id, error = _resolve_scope(client, context, user)
+    if error:
+        return error
+
+    try:
+        payload = mem.db_engagement_timeline(
+            user, client_id=found["id"], context_id=context_id or "", limit=limit)
+    except ValueError as e:
+        return f"Could not build the timeline: {e}"
+    except RuntimeError as e:
+        return f"Could not build the timeline: {e}"
+
+    heading = found.get("name") or client
+    project = None
+    for row in found.get("contexts") or ():
+        if context_id and row.get("id") == context_id:
+            project = row.get("name")
+            break
+    if project:
+        heading = f"{heading} / {project}"
+    return _format_timeline(payload, heading)
+
+
 # ---------------------------------------------------------------------------
 # Skills & Resources
 # ---------------------------------------------------------------------------
