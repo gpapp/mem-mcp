@@ -78,7 +78,7 @@ own body and a namespace entry cannot reach that.
 
 ```bash
 cd mem-mcp
-python3 -m unittest -v test_matching_regressions.py test_embedding_reliability.py test_chunking.py test_cypher_safety.py test_backup_compression.py test_people_extraction.py test_graph_scope.py test_mobile_layout.py test_llm_reliability.py test_env_wiring.py test_status_monitor.py test_sessions.py test_auth_guard.py test_google_auth.py test_registration.py test_vault_migration.py test_sharing.py test_share_endpoints.py test_sharing_readpaths.py test_live_notes.py test_skill_catalogue.py test_action_items.py test_briefing.py test_roster.py test_model_bench.py test_decision_log.py test_timeline.py
+python3 -m unittest -v test_matching_regressions.py test_embedding_reliability.py test_chunking.py test_cypher_safety.py test_backup_compression.py test_people_extraction.py test_graph_scope.py test_mobile_layout.py test_llm_reliability.py test_env_wiring.py test_status_monitor.py test_sessions.py test_auth_guard.py test_google_auth.py test_registration.py test_vault_migration.py test_sharing.py test_share_endpoints.py test_sharing_readpaths.py test_live_notes.py test_skill_catalogue.py test_action_items.py test_briefing.py test_roster.py test_model_bench.py test_decision_log.py test_timeline.py test_deliverables.py
 ```
 
 This was a Windows path (`C:/tools/miniconda3/python.exe`) with PowerShell `Push-Location`/`Pop-Location`, and it does not exist on the Linux host these files are edited from — every suite "failed" on an interpreter that is not there. Any `python`/`python3` on `PATH` runs all of them; none of them import a DB driver.
@@ -2265,6 +2265,56 @@ Scope is read through `_scope_items` and therefore through the `FOR_CLIENT` /
 `IN_CONTEXT` **edges**, never a `clientId` property — that key is Qdrant-only and
 a property read answers `None` for every node, which is the defect that made
 every diary entry look unscoped in Build Graph mode.
+
+`test_deliverables.py` is the 28th suite. `:Deliverable` is the last of the
+three registers parsed out of a diary entry, and it is the one where the
+reconcile rule had to be **reversed**: for commitments, a section that stops
+listing an item withdraws it; for decisions, the row is kept and marked
+`withdrawn`. A delivered artifact is neither. A deck that was sent to the client
+was sent, and a later re-save of the minutes that no longer names it does not
+un-ship it, so `db_sync_deliverables` has **no `authoritative` flag at all** and
+never deletes. `test_a_delivered_artifact_is_never_deleted` asserts the absence
+of any `DELETE` in the queries it issues, because the failure mode here is
+destroying the only record that the work was delivered.
+
+**The status is read, never inferred.** `-- approved` in a bullet, or a leading
+`[sent]` marker, is a statement somebody made; the default for a new row is
+`draft`. A register that guesses "this was probably sent" is worse than one that
+says draft, and the same asymmetry the extraction split rests on applies here:
+a wrong status is quoted in a client meeting, a missing one prompts a question.
+`normalise_status` folds `In review`, `in-review` and `IN_REVIEW` into one value
+so a filter does not miss half the rows.
+
+**Only `approved` is terminal.** A sent deck can come back red-lined, so
+treating `sent` as final would report finished work the client has just
+reopened.
+
+**The status marker is stripped from the key, and that is what makes a re-save
+an update.** `normalise_deliverable_name` removes the bullet, the checkbox and
+the marker before normalising, so flipping a deliverable from `draft` to `sent`
+updates the row instead of forking a second artifact with the same name.
+`test_a_resave_never_resets_a_human_status` pins the other half: the update
+query sets the name and the kind and **deliberately does not touch
+`d.status`**, because a human's verdict outlives a re-extraction.
+
+**The kind is inferred from the name, and that is allowed here in a way it is
+not for scope.** Getting a bucket wrong costs one filter row in the wrong group;
+getting a scope wrong is permanent, because the verdict is stamped with
+`scopeCheckedSig`. `infer_kind` is a small ordered word list (`assessment`
+before `report`, so "readiness assessment report" is an assessment) and returns
+`other` rather than guessing.
+
+`deliverables.py` is stdlib-only and imported and **called** for all of the
+above; `deliverable_manager.py` is exec'd against a stub `common`, the same
+harness as `test_decision_log.py`, for the reconcile behaviour, the scope
+delete-then-MERGE, the `DELIVERED_IN` link, and the driver-absent paths that
+must not raise.
+
+**The diary badge is a second read, not a join.** `GET /api/deliverables`
+accepts `sourceId`, and `renderDiaryEntryView` fetches it after painting the
+entry. Artifacts are a different node type, so carrying them inline on every
+diary list row would be a join in the renderer for a badge most entries do not
+have.
 
 ### Dashboard Deduplication
 Service → **🧹 Deduplicate memories** provides a review-first merge workflow. It is on the

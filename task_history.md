@@ -5,6 +5,56 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# The deliverables register, and the reconcile rule that had to be reversed
+
+**Why.** A consultant is paid for artifacts, and the only trace of one in the
+vault was `original_file` in a diary entry's metadata — a filename that cannot
+say what the artifact was, whether it was sent, or which engagement it belonged
+to. The last of the three registers parsed out of a meeting had no home.
+
+**What shipped.** `:Deliverable {name, kind, status, deliveredAt, key, sourceId}`
+linked to client/context through the usual edges and to the diary entry through
+`DELIVERED_IN`; `deliverables.py` (stdlib-only) for parsing, kind inference,
+status normalisation, `describe_deliverable` and ordering; `deliverable_manager.py`
+for the Cypher; the two diary hooks beside actions and decisions;
+`GET /api/deliverables` (with `clientId` / `contextId` / `status` / `kind` /
+`sourceId`), two POSTs; three MCP tools; a collapsed **Deliverables (N)** block
+in each scope panel; and a 📦 badge on the diary entry that produced them.
+
+**The rule that had to be reversed.** Commitments withdraw when the source stops
+listing them; decisions are kept and marked `withdrawn`. A delivered artifact is
+neither — a deck that was sent was sent — so `db_sync_deliverables` has no
+`authoritative` flag at all and never deletes. The test asserts the absence of
+any `DELETE` in the queries it issues, because the failure mode is destroying the
+only record that the work was delivered.
+
+**Three smaller decisions.**
+- The status is **read** from a marker (`[sent]`, `-- approved`) and defaults to
+  `draft`; a register that guesses "probably sent" is quoted in a client meeting.
+- The status marker is stripped from the **key**, so flipping draft → sent
+  updates the row. The update query deliberately does not touch `d.status`, so a
+  human's verdict outlives a re-extraction.
+- Only `approved` is terminal. `sent` can come back red-lined.
+
+Kind is inferred from the name, which is allowed here in a way scope is not: a
+wrong bucket costs one filter row, a wrong scope is stamped permanently.
+
+**Tests.** `test_deliverables.py` is the 28th suite, 33 tests — the pure half
+imported and called, the manager exec'd against a stub `common`. Full suite
+**1774 passing across 28 files**. `diff --check` clean, dashboard JS passes
+`node --check`.
+
+**Queue.** That closes tasks 1-11; `tasks.md` now says nothing is open and asks
+the next piece of work to start from a problem rather than from the list.
+
+**The one thing to remember.** The same word means three different things across
+three registers: "the source no longer lists it" withdraws a commitment,
+withdraws a decision but keeps its row, and means **nothing at all** for a
+delivered artifact. Copying an existing reconcile rule into the new register is
+how a shipped deck silently disappears.
+
+---
+
 # Three read skills, and the misunderstandings each one prevents
 
 **Why.** The shipped skills were four write workflows and one read workflow.

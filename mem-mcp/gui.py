@@ -1832,6 +1832,70 @@ async def api_update_action_item(item_id: str, body: _ActionItemBody, request: R
     return result["item"]
 
 
+@web_app.get("/api/deliverables", response_class=JSONResponse)
+async def api_list_deliverables(request: Request, clientId: str = "", contextId: str = "",
+                                status: str = "", kind: str = "", sourceId: str = ""):
+    """Artifacts shipped for one engagement.
+
+    ``clientId`` / ``contextId`` **filter**, like commitments and decisions and
+    unlike search scope. Newest first, undated last.
+    """
+    user_id = _require_user(request)
+    try:
+        rows = mem.db_list_deliverables(user_id, client_id=clientId or None,
+                                        context_id=contextId or None,
+                                        status=status or None, kind=kind or None,
+                                        source_id=sourceId or None)
+        return {"items": [mem.describe_deliverable(r) for r in rows]}
+    except RuntimeError as e:
+        raise _service_unavailable(e)
+
+
+class _DeliverableBody(BaseModel):
+    name: str = ""
+    kind: Optional[str] = None
+    status: Optional[str] = None
+    deliveredAt: Optional[str] = None
+    clientId: Optional[str] = None
+    contextId: Optional[str] = None
+
+
+@web_app.post("/api/deliverables", response_class=JSONResponse)
+async def api_create_deliverable(body: _DeliverableBody, request: Request):
+    user_id = _require_user(request)
+    if not (body.name or "").strip():
+        raise HTTPException(status_code=400, detail="A deliverable needs a name.")
+    try:
+        result = mem.db_create_deliverable(user_id, body.name, kind=body.kind,
+                                           status=body.status,
+                                           delivered_at=body.deliveredAt,
+                                           client_id=body.clientId,
+                                           context_id=body.contextId)
+    except RuntimeError as e:
+        raise _service_unavailable(e)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("reason") or "Could not save.")
+    await mem.publish_db_event(user_id, "deliverables_changed", {"action": "add"})
+    return result["item"]
+
+
+@web_app.post("/api/deliverables/{item_id}", response_class=JSONResponse)
+async def api_update_deliverable(item_id: str, body: _DeliverableBody, request: Request):
+    user_id = _require_user(request)
+    try:
+        result = mem.db_update_deliverable(item_id, user_id,
+                                           name=(body.name or None),
+                                           kind=body.kind, status=body.status,
+                                           delivered_at=body.deliveredAt)
+    except RuntimeError as e:
+        raise _service_unavailable(e)
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail=result.get("reason") or "No such deliverable.")
+    await mem.publish_db_event(user_id, "deliverables_changed",
+                               {"action": "update", "id": item_id})
+    return result["item"]
+
+
 @web_app.get("/api/decisions", response_class=JSONResponse)
 async def api_list_decisions(request: Request, clientId: str = "", contextId: str = "",
                              status: str = "", includeInactive: bool = True):

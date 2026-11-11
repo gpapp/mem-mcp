@@ -79,6 +79,14 @@ from decision_manager import (
     describe_decision,
 )
 
+from deliverable_manager import (
+    db_create_deliverable,
+    db_list_deliverables,
+    db_sync_deliverables,
+    db_update_deliverable,
+    describe_deliverable,
+    sync_deliverables_from_text,
+)
 from timeline_manager import db_engagement_timeline
 
 # The brief is a read that composes the other managers; the module itself is

@@ -1588,6 +1588,101 @@ async def client_timeline(client: str, context: Optional[str] = None, limit: int
     return _format_timeline(payload, heading)
 
 
+_DELIVERABLE_KIND_LABEL = {
+    "assessment": "assessment",
+    "roadmap": "roadmap",
+    "deck": "deck",
+    "report": "report",
+    "other": "deliverable",
+}
+
+
+def _format_deliverables(rows, heading="Deliverables"):
+    """One line per artifact, newest first, with the state that matters.
+
+    The status is printed for every row because "was this sent" is the question
+    the register exists to answer, and a list of names does not answer it.
+    """
+    if not rows:
+        return "_No artifacts recorded for this engagement yet._"
+    lines = ["## " + heading, ""]
+    for item in rows:
+        kind = _DELIVERABLE_KIND_LABEL.get(item.get("kind") or "other", "deliverable")
+        when = (item.get("deliveredAt") or "")[:10]
+        prefix = "**%s**" % when if when else "_undated_"
+        status = item.get("statusLabel") or item.get("status") or "draft"
+        lines.append("- %s — %s (%s), %s" % (prefix, item.get("name"), kind, status))
+        lines.append("  _(id: %s)_" % item.get("id"))
+    return "\n".join(lines)
+
+
+@mcp.tool()
+@monitor_mcp_tool("list_deliverables", context_provider=_current_user)
+async def list_deliverables(client: str, context: Optional[str] = None,
+                            status: Optional[str] = None,
+                            kind: Optional[str] = None):
+    """List the artifacts delivered for a client or project, newest first.
+
+    `client` / `context` **filter** — an artifact from another engagement is a
+    wrong answer, not a lower-ranked one. `status` is one of draft, in-review,
+    sent, approved; `kind` is one of assessment, roadmap, deck, report, other.
+    """
+    user = _current_user()
+    row, context_id, error = _resolve_scope(client, context, user)
+    if error:
+        return "Error: " + error
+    try:
+        rows = mem.db_list_deliverables(user, client_id=row.get("id"),
+                                        context_id=context_id,
+                                        status=status, kind=kind)
+    except RuntimeError as e:
+        return "Error: %s" % e
+    heading = row.get("name") or client
+    for ctx in row.get("contexts") or ():
+        if context_id and ctx.get("id") == context_id:
+            heading = "%s / %s" % (heading, ctx.get("name"))
+    return _format_deliverables([mem.describe_deliverable(r) for r in rows], heading)
+
+
+@mcp.tool()
+@monitor_mcp_tool("save_deliverable", context_provider=_current_user)
+async def save_deliverable(name: str, client: str, context: Optional[str] = None,
+                           kind: Optional[str] = None, status: Optional[str] = None,
+                           deliveredAt: Optional[str] = None):
+    """Record an artifact that did not come out of a diary entry.
+
+    `kind` is inferred from the name when omitted. `status` defaults to draft —
+    the register never invents that something was sent.
+    """
+    user = _current_user()
+    row, context_id, error = _resolve_scope(client, context, user)
+    if error:
+        return "Error: " + error
+    result = mem.db_create_deliverable(user, name, kind=kind, status=status,
+                                       delivered_at=deliveredAt,
+                                       client_id=row.get("id"),
+                                       context_id=context_id)
+    if not result.get("ok"):
+        return "Error: " + (result.get("reason") or "Could not save.")
+    item = mem.describe_deliverable(result["item"])
+    return "Saved %s (%s, %s)." % (item.get("name"), item.get("kind"),
+                                   item.get("statusLabel"))
+
+
+@mcp.tool()
+@monitor_mcp_tool("update_deliverable", context_provider=_current_user)
+async def update_deliverable(id: str, status: Optional[str] = None,
+                             kind: Optional[str] = None, name: Optional[str] = None,
+                             deliveredAt: Optional[str] = None):
+    """Change a deliverable's status, kind, name or delivery date."""
+    result = mem.db_update_deliverable(id, _current_user(), name=name, kind=kind,
+                                       status=status, delivered_at=deliveredAt)
+    if not result.get("ok"):
+        return "Error: " + (result.get("reason") or "No such deliverable.")
+    item = mem.describe_deliverable(result["item"])
+    return "Updated %s — %s." % (item.get("name"), item.get("statusLabel"))
+
+
 # ---------------------------------------------------------------------------
 # Skills & Resources
 # ---------------------------------------------------------------------------

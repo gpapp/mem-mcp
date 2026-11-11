@@ -3097,6 +3097,17 @@
           ? await api.get('clients/' + id + '/timeline')
           : await api.get('contexts/' + id + '/timeline');
       } catch(e) { timeline = null; }
+      // Artifacts are the thing the client actually received. The register only
+      // adds and updates, so a re-saved entry that stops naming one does not
+      // un-ship it -- which is why this list is not derived from the entry.
+      let deliverables = [];
+      try {
+        const gparams = type === 'client'
+          ? 'clientId=' + encodeURIComponent(id)
+          : 'contextId=' + encodeURIComponent(id);
+        const gj = await api.get('deliverables?' + gparams);
+        deliverables = (gj && gj.items) || [];
+      } catch(e) { deliverables = []; }
       // The brief is offered on every panel, including one with no items --
       // an engagement with nothing recorded is exactly when a person wants to
       // read the gap list before walking in.
@@ -3159,7 +3170,21 @@
             }).join('')
           + `</div></details>`
         : '';
-      const headerHtml = briefHtml + rosterHtml + decisionsHtml + timelineHtml + (actions.length
+      const deliverableHtml = deliverables.length
+        ? `<details style="padding:.35rem .4rem;border-bottom:1px solid var(--border);">
+            <summary style="cursor:pointer;font-size:.78rem;">Deliverables (${deliverables.length})</summary>
+            <div style="padding:.3rem 0 .1rem;">` + deliverables.map(d => {
+              const when = (d.deliveredAt || '').slice(0, 10);
+              const status = d.statusLabel || d.status || 'draft';
+              const tone = status === 'approved' ? 'var(--ok,#2e7d32)'
+                : status === 'sent' ? 'var(--muted)' : 'var(--warn,#b26a00)';
+              return `<div style="padding:.1rem 0;">&bull; ${escHtml(when || 'undated')} &mdash; `
+                + `${escHtml(d.name || '(untitled)')} `
+                + `<span style="color:var(--muted);">(${escHtml(d.kind || 'other')})</span> `
+                + `<span style="color:${tone};font-size:.72rem;">${escHtml(status)}</span></div>`;
+            }).join('') + `</div></details>`
+        : '';
+      const headerHtml = briefHtml + rosterHtml + decisionsHtml + timelineHtml + deliverableHtml + (actions.length
         ? `<div style="padding:.35rem .4rem;font-size:.72rem;color:var(--muted);border-bottom:1px solid var(--border);">Open items</div>`
           + renderActionRows(actions, {})
         : '');
@@ -6612,6 +6637,31 @@
     viewEl.classList.remove('empty');
     viewEl.innerHTML = renderDiaryViewMode(entry);
     renderDiaryMetaDisplay(entry);
+    renderDiaryDeliverables(entry);
+  }
+
+  // The artifact a meeting produced is evidence about that meeting, so the
+  // badge belongs on the entry rather than only in the client panel. It is
+  // fetched separately because the register is a different node type: a diary
+  // list that carried every artifact inline would be a join in the renderer.
+  async function renderDiaryDeliverables(entry) {
+    const viewEl = document.getElementById('diary-view-content');
+    if (!viewEl || !entry || !entry.id) return;
+    const stale = document.getElementById('diary-deliverable-badge');
+    if (stale) stale.remove();
+    let items = [];
+    try {
+      const res = await api.get('deliverables?sourceId=' + encodeURIComponent(entry.id));
+      items = (res && res.items) || [];
+    } catch (e) { return; }
+    if (!items.length || !document.getElementById('diary-view-content')) return;
+    const badge = document.createElement('div');
+    badge.id = 'diary-deliverable-badge';
+    badge.style.cssText = 'margin:.5rem 0;font-size:.78rem;';
+    badge.innerHTML = '\u{1F4E6} Deliverables: ' + items.map(d =>
+      `${escHtml(d.name || '(untitled)')} <span style="color:var(--muted);">(${escHtml(d.statusLabel || d.status || 'draft')})</span>`
+    ).join(' \u00b7 ');
+    viewEl.insertBefore(badge, viewEl.firstChild);
   }
 
   function renderDiaryMetaDisplay(entry) {

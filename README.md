@@ -14,6 +14,7 @@ mem-mcp/
 ├── client_manager.py      # Client/Context nodes, scope inference, status management
 ├── action_manager.py      # The :ActionItem register — commitments parsed out of diary entries
 ├── decision_manager.py    # The :Decision register — what was decided, by whom, and what replaced it
+├── deliverable_manager.py # The :Deliverable register — what was shipped, in what state
 ├── timeline_manager.py    # One engagement's story: meetings, decisions, closed commitments, facts
 ├── roster_manager.py      # Stakeholder roster: People facts, their mentions, last-seen
 ├── brief_manager.py       # Assembles a brief's material, then has the model polish it
@@ -26,6 +27,7 @@ mem-mcp/
 ├── matching_utils.py      # Dependency-light matching, merge, prompt and date parsing helpers
 ├── roster.py              # Stdlib-only: role parsing, staleness, roster Markdown
 ├── timeline.py            # Stdlib-only: the merge, month grouping and ordering rules
+├── deliverables.py        # Stdlib-only: kind inference, status markers, register ordering
 ├── briefing.py            # Stdlib-only: the meeting-prep brief's layout rules
 ├── chunking.py            # Splitting a long record into several vectors, and searching them
 ├── scoped_ids.py          # The one place client/context ids are derived (uuid5)
@@ -44,7 +46,7 @@ mem-mcp/
 ├── search_diagnostics.py  # CLI: trace one query through Neo4j, Qdrant and the merge, to a jsonl log
 ├── search_batch_test.py   # CLI: run a fixed query suite and print a pass/fail summary table
 ├── search_report.py       # CLI: render that jsonl log as a markdown report
-├── test_*.py              # 27 dependency-light regression suites (see Testing)
+├── test_*.py              # 28 dependency-light regression suites (see Testing)
 ├── skills/                # Markdown skill workflows, loaded at request time
 ├── templates/             # Landing page and dashboard
 ├── requirements.txt
@@ -83,6 +85,7 @@ mem-mcp/
 - **Open Commitments** — Every meeting produces promises, and they used to die in a Markdown bullet. `## Actions` and `## Open Questions` are now parsed into `:ActionItem` nodes on every diary save and edit — deterministically, with no model call, because the one field that must be exact is the date. Each item carries an owner, an optional due date, and a status (`open` / `done` / `dropped`); a re-save reconciles rather than appends and never reopens something a human marked done. A record with no action section closes nothing, so re-saving minutes under a different heading cannot empty the register. The **My actions** card on the Clients page groups everything by overdue, due next, and undated.
 - **Decision Log** — `## Decisions` was prose, and prose is where "why did we choose X, and who signed off?" goes to be forgotten. Decision bullets are parsed into `:Decision` nodes on every diary save and edit, each carrying a decider, a date, a status and a link back to the record that stated it. Supersession is **explicit, never inferred**: a decision becomes `superseded` only from a sentence a human wrote (`(superseded by: …)`) or an explicit click, because a decision that quietly stops being followed is worse than one that was never logged — the log then says something false. Superseded rows stay in the list, struck through, so the history stays readable; `withdrawn` is revivable when the bullet returns, while `superseded` and `reversed` never silently reopen. A decision's date defaults to the record's own date, never the wall clock.
 - **Engagement Timeline** — “Where did this get to?” is the question you ask before handing an engagement to a colleague. The timeline merges four streams that already exist — the meetings (with their participants and the decisions taken in them), the decisions themselves, the commitments that closed, and the records that were added — into one date-ordered narrative grouped by month, newest first. A decision is not repeated as its own row when the meeting that produced it is in the same view; it is nested under the meeting, and only promoted to a top-level row when that meeting is not visible, because a decision with no readable origin still has to be readable. Nothing is inferred and nothing is written: scope comes from the `FOR_CLIENT` / `IN_CONTEXT` edges (never a `clientId` property, which is a Qdrant key and answers `None` for every node), and a shared engagement shows its meetings and records while saying plainly that the owner's decision log and commitments are not included — an empty list there would read as “this engagement has no decisions”, which is false.
+- **Deliverables Register** — A consultant is paid for artifacts, and until this existed the only trace of one was `original_file` in a diary entry's metadata: a filename that cannot say what the artifact was, whether it was sent, or which engagement it belonged to. A `## Deliverables` section is now parsed into `:Deliverable` nodes on every diary save and edit, each with a name, a kind (`assessment` / `roadmap` / `deck` / `report` / `other`, inferred from the name), a status (`draft` / `in-review` / `sent` / `approved`) and the entry it came from. Three rules make the register trustworthy: the status is **read** from a marker somebody wrote, never inferred, because "was this sent" is a fact about the world; a re-save never resets a status a human set; and **silence never un-ships an artifact** — unlike a commitment, a deck that was delivered was delivered, so extraction only adds and updates. Each client and project panel lists its own artifacts newest first, and the diary entry carries a badge back to what it produced.
 - **Stakeholder Roster** — People are `:Fact` rows in category `People`, and the people extractor already links them from diary entries, so "last seen" is a read of edges that already exist — no roster table, no migration. Both scope halves are read (a person scoped directly, or reachable only through a meeting that mentioned them), because a roster that reads one half is short *and* looks complete. A role is read from the fact body, never inferred; a person nobody has written about has no date at all rather than an invented one, and sorts first.
 - **Setup Tab** — MCP connection details and **Access Keys** (revocable `Bearer mvk_…` credentials for MCP clients), plus your live browser sessions.
 - **Admin-Only Service Tab** — Operations that act on the whole vault or the whole server rather than on one account live here, behind `MEM_ADMIN_USER`, in three sub-tabs:
@@ -263,6 +266,9 @@ identity itself as `X-Vault-User` after stripping any inbound copy.
 | `list_decisions` | The decision log for an engagement, newest first, including what each replaced. |
 | `save_decision` | Record a decision that did not come out of a diary entry. |
 | `supersede_decision` | Say explicitly that one decision replaced another. |
+| `list_deliverables` | The artifacts shipped for an engagement, newest first. `client`/`context` filter rather than rank. |
+| `save_deliverable` | Record an artifact that did not come out of a diary entry. |
+| `update_deliverable` | Change a deliverable's status, kind, name or delivery date. |
 | `client_timeline` | One engagement's story, newest first and grouped by month: meetings, decisions, closed commitments and records added. |
 | `client_brief` | Assemble a one-page briefing for one engagement out of what is already recorded. |
 | `stakeholder_roster` | Who is on this engagement, what their role is, and when each was last mentioned. |
@@ -339,7 +345,7 @@ permanent.
 ## Testing
 
 Run the focused dependency-light regression suite. Any `python` or `python3` on
-`PATH` runs all twenty-seven of them, and none of them needs Neo4j, Qdrant or
+`PATH` runs all twenty-eight of them, and none of them needs Neo4j, Qdrant or
 Ollama:
 
 ```bash
@@ -352,7 +358,7 @@ MEM_SESSION_DIR=/tmp/mem-vault-test-sessions python3 -m unittest -v \
   test_registration test_vault_migration test_sharing test_share_endpoints \
   test_sharing_readpaths test_live_notes test_skill_catalogue \
   test_action_items test_briefing test_roster test_model_bench test_decision_log \
-  test_timeline
+  test_timeline test_deliverables
 ```
 
 `MEM_SESSION_DIR` matters: without it the session and PSK tests write a
