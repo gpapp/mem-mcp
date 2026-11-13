@@ -5,6 +5,60 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# The dashboard UX pass: the panel switcher, the active-scope control, and the level meter
+
+**Why.** A review of all seven dashboard tabs found three places where the UI
+stated less than it knew and one where it stated nothing at all. The client
+panel answered six questions in six stacked collapsible blocks, so the one a
+reader wanted sat below the fold of the one they did not and every count was
+collapsed until it was opened. The client filter's active state lived only in
+the button's label — "which scope am I in" depended on remembering that the
+default reads "All clients". And the live recorder said "Recording" without
+saying whether any audio was flowing, which is indistinguishable from a quiet
+room.
+
+**What shipped** (`79d68ef`):
+
+- **Client panel navigation.** `toggleScopeItems` renders a segmented pill per
+  question (`Overview`, `Timeline (N)`, `Actions (N)`, `Decisions (N)`,
+  `Roster (N)`, `Deliverables (N)`) and shows one pane through
+  `_switchScopeTab`. All six fetches and their individual `try/catch` fallbacks
+  are untouched, and `Overview` still holds the brief button and the facts/diary
+  rows. The bar scrolls horizontally rather than wrapping, because wrapping six
+  pills pushes the pane below the fold — the defect the switcher removes.
+- **Active scope, stated and clearable.** `.cf-bar` carries an `is-active`
+  state and a `.cf-clear` button that `_cfUpdateBtn` shows only when
+  `clientFilter !== 'all'`; `_cfClear` closes the panel and applies
+  `'all', null`. The control stays a child of `.cf-bar` (which stays a child of
+  `.tabs`), so the mobile wrapping rules keep working, and it grows to a 2rem
+  thumb target below the breakpoint.
+- **Skills cheat-sheet.** `GET /api/skills` on the GUI app behind
+  `_require_user`, calling `skill_catalogue.list_skills()` — there is
+  deliberately no second list in the template. The Setup page's **Available
+  Skills & Workflows** card renders it and degrades with a sentence when the
+  fetch fails, because the skills are still reachable by an MCP client.
+- **Empty registers name their remedy.** A blank tab and a broken tab look
+  identical, so each empty pane states what to write: `## Actions`,
+  `## Decisions`, `## Deliverables`, and the roster says names in a diary entry
+  are linked automatically.
+- **Live level meter.** `LiveCapture._connectWorklet` computes an RMS over the
+  same 16-bit block it just sent and emits it throttled to every fourth block.
+  It is gated on `!this.paused`, cleared on `pausing`, and cleared again in
+  `onLiveCaptureStopped` — which `stopped`, `closed` and `error` all funnel
+  through. It is `opacity: 0` until a capture sends, because a meter that glows
+  while nothing is recording is indistinguishable from one that works.
+
+**The thing a future reader would otherwise rediscover.**
+`ScopePanelSwitcherTests` extracts the template literals before asserting no
+`<details>` survives. The first version asserted over the whole function segment
+and passed on a comment that quoted the old shape — the same
+`assertIn`-over-a-whole-file lesson this repo has been bitten by before, and the
+fix is to check the emitted markup rather than the prose around it.
+
+**Verified.** 1792 tests OK across the 28 suites. Both new guards were
+mutation-checked by re-injecting the defect and confirming the assertion — not
+an `IndentationError` — is what fails.
+
 # The deliverables register, and the reconcile rule that had to be reversed
 
 **Why.** A consultant is paid for artifacts, and the only trace of one in the

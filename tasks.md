@@ -14,6 +14,11 @@ person-bounded search, the commitments register, the meeting-prep brief, the
 stakeholder roster, the decision log, the engagement timeline, three orientation
 skills, and the deliverables register.
 
+The dashboard UX pass that followed it is shipped too: the client panel's
+segmented switcher, the active-scope control and its one-click clear, the
+Setup page's skills directory card, the empty-register hints, and the live level
+meter. That entry is in `task_history.md` as well.
+
 The next piece of work should start from a problem rather than from this list.
 Add it here with its acceptance criteria before starting, so the criteria are
 not written to match the implementation.
