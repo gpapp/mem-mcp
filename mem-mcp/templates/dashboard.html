@@ -90,6 +90,13 @@
     .live-toolbar .live-name { flex: 1 1 220px; }
     .live-controls { display: flex; gap: .4rem; flex-wrap: wrap; }
     .live-state { font-size: .8rem; color: var(--muted); flex-basis: 100%; }
+    /* The state text and the meter share one row, so the level is read beside
+       the words it qualifies rather than above or below them. */
+    .live-status { display: flex; align-items: center; gap: .5rem; flex-basis: 100%; min-width: 0; }
+    .live-state { font-size: .8rem; color: var(--muted); flex: 1 1 auto; }
+    .live-vu { display: flex; align-items: flex-end; gap: 2px; height: 1rem; flex-shrink: 0; opacity: 0; transition: opacity .2s; }
+    .live-vu.on { opacity: 1; }
+    .live-vu i { width: 3px; height: 15%; background: var(--border); border-radius: 2px; transition: height .08s linear, background .2s; }
     .live-token-missing { display: none; background: var(--primary-light);
                           border: 1px solid var(--primary); border-radius: var(--radius);
                           padding: .8rem 1rem; font-size: .88rem; }
@@ -675,6 +682,49 @@
        desktop that is fine; see the mobile block, which has to give it a
        row of its own because the bar becomes a horizontal scroller. */
     .cf-bar { margin-left: auto; display: flex; align-items: center; padding-bottom: .25rem; flex-shrink: 0; }
+    /* An active scope is stated on the bar itself, not only on the button
+       label: the label carries the client name, so the state has to be
+       readable without comparing it against "All clients". */
+    .cf-bar.is-active .cf-btn { border-color: var(--accent); background: rgba(99,102,241,.12); font-weight: 600; }
+    .cf-clear {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 1.5rem; height: 1.5rem; margin-left: .35rem; padding: 0;
+      border: 1px solid var(--border); border-radius: 50%;
+      background: transparent; color: var(--muted); font-size: .72rem;
+      cursor: pointer; flex-shrink: 0; line-height: 1;
+    }
+    .cf-clear:hover { color: var(--text); border-color: var(--accent); }
+    .cf-clear[hidden] { display: none; }
+
+    /* The scope panel's segmented switcher. Six pills with counts are wider
+       than a phone, so the bar scrolls horizontally rather than wrapping --
+       wrapping would push the pane below the fold, which is the same defect
+       the switcher exists to remove. */
+    .scope-tabs {
+      display: flex; gap: .25rem; padding: .3rem .35rem;
+      border-bottom: 1px solid var(--border);
+      overflow-x: auto; scrollbar-width: none;
+    }
+    .scope-tabs::-webkit-scrollbar { display: none; }
+    .scope-tab {
+      flex-shrink: 0; padding: .2rem .5rem; font-size: .72rem;
+      border: 1px solid var(--border); border-radius: 999px;
+      background: transparent; color: var(--muted); cursor: pointer;
+      white-space: nowrap; line-height: 1.2;
+    }
+    .scope-tab:hover { color: var(--text); border-color: var(--accent); }
+    .scope-tab.active {
+      background: var(--accent); border-color: var(--accent);
+      color: #fff; font-weight: 600;
+    }
+    .scope-empty {
+      padding: .5rem .4rem; margin: 0; font-size: .78rem; color: var(--muted);
+    }
+    .scope-empty code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: .74rem; background: rgba(127,127,127,.12);
+      padding: .05rem .25rem; border-radius: 3px;
+    }
     .cf-ctx { padding: 5px 12px 5px 26px; font-size: .8rem; color: var(--muted); }
     .cf-ctx:hover { background: var(--primary-light); color: var(--primary); }
     .cf-ctx.active { background: var(--primary-light); color: var(--primary); font-weight: 600; }
@@ -763,6 +813,7 @@
          buttons are all order 0 by default. */
       .tabs { flex-wrap: wrap; overflow-x: visible; row-gap: .3rem; }
       .cf-bar { order: 99; width: 100%; margin-left: 0; padding-bottom: .1rem; }
+      .cf-clear { width: 2rem; height: 2rem; margin-left: .4rem; }
       /* The panel is absolutely positioned. Inside a scroller it would be
          clipped to the rail and open as a sliver; with the rail no longer a
          scroller it hangs below the button and can be bounded on its own. */
@@ -920,11 +971,13 @@
   {% if IS_ADMIN %}
   <button class="tab-btn" data-tab="service" onclick="switchTab('service')">⚙️ Service</button>
   {% endif %}
-  <div class="cf-bar">
+  <div class="cf-bar" id="cf-bar">
     <div class="cf-wrap" id="cf-wrap">
       <button class="cf-btn" id="cf-btn" onclick="_cfToggle(event)">All clients</button>
       <div class="cf-panel" id="cf-panel"></div>
     </div>
+    <button class="cf-clear" id="cf-clear" onclick="_cfClear(event)"
+            title="Clear the client / project filter" hidden>✕</button>
   </div>
 </div>
 
@@ -1116,7 +1169,10 @@
             <button id="live-stop-btn" class="btn btn-sm" onclick="stopLiveRecording()" disabled>■ Stop</button>
             <button id="live-delete-btn" class="btn btn-sm" onclick="deleteLiveTranscription()">🗑 Delete</button>
           </div>
-          <div id="live-state" class="live-state">Not recording.</div>
+          <div class="live-status">
+            <div id="live-vu" class="live-vu" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div>
+            <div id="live-state" class="live-state">Not recording.</div>
+          </div>
         </div>
 
         <div class="mode-toggle" style="margin:0;">
@@ -1399,6 +1455,17 @@
       </div>
     </div>
 
+  </div>
+  <div class="card">
+    <h3 style="margin:0 0 .25rem;">Available Skills &amp; Workflows</h3>
+    <p style="font-size:.82rem;color:var(--muted);margin:.25rem 0 1rem;">
+      Skills are the workflows an MCP client loads by name
+      (<code>get_skill_workflow</code>) or by URI (<code>skill://&lt;name&gt;</code>).
+      They are discovered from the <code>skills/</code> directory, so dropping a
+      Markdown file there is all a new skill needs — there is no registration step
+      and no hand-written resource route to forget.
+    </p>
+    <div id="skills-list"><p style="font-size:.82rem;color:var(--muted);">Loading…</p></div>
   </div>
 </div>
 {% if IS_ADMIN %}
@@ -2001,6 +2068,21 @@
         const data = ev.data;
         if (!data || !data.pcm || !data.pcm.length) return;
         this._sendPcm(data.pcm);
+        // The level is computed from the same block that was just sent, so the
+        // meter cannot show audio the socket never received, and it is muted
+        // while paused because the block was not sent then either. Throttled to
+        // every fourth block: a DOM write per 32ms block is more refresh than
+        // a five-bar meter can express.
+        if (this.paused || !this.active) return;
+        this._levelBlocks = (this._levelBlocks || 0) + 1;
+        if (this._levelBlocks % 4) return;
+        const pcm = data.pcm;
+        let sum = 0;
+        for (let i = 0; i < pcm.length; i++) {
+          const v = pcm[i] / 32768;   // the worklet posts 16-bit PCM
+          sum += v * v;
+        }
+        this._emit('level', Math.min(1, Math.sqrt(sum / pcm.length) * 3));
       };
       this.source.connect(this.node);
     },
@@ -2080,6 +2162,7 @@
     if (document.getElementById('page-service')) loadSavepoints();  // admin only; deduped against switchTab('service')
     loadPSKs();  // same deal as loadSavepoints
     loadAsrToken();
+    loadSkills();
     initSSE();
     initStatusStream();
     switchTab(activeTab);
@@ -2767,6 +2850,22 @@
     }
     // Re-append the caret (textContent wipes it, so we use innerHTML carefully)
     btn.innerHTML = btn.textContent + ' <span style="font-size:.7rem;opacity:.7;">▾</span>';
+    // The bar states the scope independently of the label. The label carries
+    // the client's name, so "which scope am I in" should not depend on
+    // remembering that the default reads "All clients".
+    const bar = document.getElementById('cf-bar') || btn.closest('.cf-bar');
+    const clearBtn = document.getElementById('cf-clear');
+    const active = clientFilter !== 'all';
+    if (bar) bar.classList.toggle('is-active', active);
+    if (clearBtn) clearBtn.hidden = !active;
+  }
+
+  async function _cfClear(ev) {
+    // Separate from the panel so the click that clears a scope cannot also
+    // land on whatever the panel was about to open underneath it.
+    if (ev) { ev.stopPropagation(); ev.preventDefault(); }
+    _cfClose();
+    await _cfApply('all', null);
   }
 
   function _cfRenderPanel() {
@@ -3114,25 +3213,18 @@
       const briefHtml = `<div style="padding:.35rem .4rem;border-bottom:1px solid var(--border);">`
         + `<button class="btn btn-sm btn-ghost" style="padding:.15rem .5rem;font-size:.72rem;"`
         + ` onclick="event.stopPropagation(); showScopeBrief('${type}', '${id}')">📋 Brief</button></div>`;
-      // Who is in the room, and who has gone quiet. Collapsed by default
-      // because this is the longest of the three blocks and the panel is
-      // narrow, but the summary states the count and the quiet count so the
-      // number that matters is readable without opening it.
       const rosterRows = (roster && roster.rows) || [];
       const quietCount = (roster && roster.stale ? roster.stale.length : 0);
+      const tlEvents = (timeline && timeline.events) || [];
+      // An empty register is a state with a known remedy, so each one says what
+      // to write rather than rendering nothing. A blank tab and a broken tab
+      // look identical otherwise, and the reader's only move is to reload.
+      const scopeEmpty = (text) => `<p class="scope-empty">${text}</p>`;
       const rosterHtml = rosterRows.length
-        ? `<details style="padding:.35rem .4rem;border-bottom:1px solid var(--border);">`
-          + `<summary style="cursor:pointer;font-size:.72rem;color:var(--muted);">`
-          + `Stakeholders (${rosterRows.length}${quietCount ? ', ' + quietCount + ' quiet' : ''})`
-          + `</summary>`
-          + `<div class="markdown-body" style="font-size:.76rem;margin-top:.35rem;">`
-          + `${marked.parse(roster.markdown || '')}</div></details>`
-        : '';
+        ? `<div class="markdown-body" style="font-size:.76rem;">${marked.parse(roster.markdown || '')}</div>`
+        : scopeEmpty('Nobody is linked to this scope yet. Names mentioned in a diary entry are linked here automatically.');
       const decisionsHtml = decisions.length
-        ? `<details style="padding:.35rem .4rem;border-bottom:1px solid var(--border);">`
-          + `<summary style="cursor:pointer;font-size:.72rem;color:var(--muted);">`
-          + `Decisions (${decisions.length})</summary>`
-          + `<div style="font-size:.76rem;margin-top:.35rem;">`
+        ? `<div style="font-size:.76rem;">`
           + decisions.map(d => {
               const who = d.decider ? ' &mdash; <strong>' + escHtml(d.decider) + '</strong>' : '';
               const when = d.decidedAt ? ' &middot; ' + escHtml(String(d.decidedAt).slice(0,10)) : '';
@@ -3141,18 +3233,14 @@
                 : (d.status && d.status !== 'active' ? ' <span style="color:var(--muted);">(' + escHtml(d.status) + ')</span>' : '');
               return `<div style="padding:.15rem 0;">&bull; ${escHtml(d.text || '')}${who}${when}${mark}</div>`;
             }).join('')
-          + `</div></details>`
-        : '';
+          + `</div>`
+        : scopeEmpty('No decisions recorded. Write <code>## Decisions</code> in a diary entry, one per bullet.');
       // A month group per heading, newest first, undated last. The nested
       // decision lines are the reason this block exists: a decision shown under
       // the meeting that took it is history, while the same rows sorted by
       // decision date are a register -- and the register already exists above.
-      const tlEvents = (timeline && timeline.events) || [];
       const timelineHtml = tlEvents.length
-        ? `<details style="padding:.35rem .4rem;border-bottom:1px solid var(--border);">`
-          + `<summary style="cursor:pointer;font-size:.72rem;color:var(--muted);">`
-          + `Timeline (${tlEvents.length})</summary>`
-          + `<div style="font-size:.76rem;margin-top:.35rem;">`
+        ? `<div style="font-size:.76rem;">`
           + (timeline.note ? `<div style="color:var(--muted);margin-bottom:.3rem;">${escHtml(timeline.note)}</div>` : '')
           + ((timeline.months) || []).map(g => {
               const rows = (g.events || []).map(ev => {
@@ -3168,12 +3256,10 @@
               }).join('');
               return `<div style="margin-top:.35rem;"><strong>${escHtml(g.label || 'Undated')}</strong>${rows}</div>`;
             }).join('')
-          + `</div></details>`
-        : '';
+          + `</div>`
+        : scopeEmpty('No timeline yet. Every diary entry saved under this scope becomes a line here.');
       const deliverableHtml = deliverables.length
-        ? `<details style="padding:.35rem .4rem;border-bottom:1px solid var(--border);">
-            <summary style="cursor:pointer;font-size:.78rem;">Deliverables (${deliverables.length})</summary>
-            <div style="padding:.3rem 0 .1rem;">` + deliverables.map(d => {
+        ? `<div style="padding:.3rem 0 .1rem;">` + deliverables.map(d => {
               const when = (d.deliveredAt || '').slice(0, 10);
               const status = d.statusLabel || d.status || 'draft';
               const tone = status === 'approved' ? 'var(--ok,#2e7d32)'
@@ -3182,17 +3268,38 @@
                 + `${escHtml(d.name || '(untitled)')} `
                 + `<span style="color:var(--muted);">(${escHtml(d.kind || 'other')})</span> `
                 + `<span style="color:${tone};font-size:.72rem;">${escHtml(status)}</span></div>`;
-            }).join('') + `</div></details>`
-        : '';
-      const headerHtml = briefHtml + rosterHtml + decisionsHtml + timelineHtml + deliverableHtml + (actions.length
-        ? `<div style="padding:.35rem .4rem;font-size:.72rem;color:var(--muted);border-bottom:1px solid var(--border);">Open items</div>`
-          + renderActionRows(actions, {})
-        : '');
+            }).join('') + `</div>`
+        : scopeEmpty('No artifacts registered. Write <code>## Deliverables</code> in a diary entry, one per bullet.');
+      const actionsHtml = actions.length
+        ? renderActionRows(actions, {})
+        : scopeEmpty('No open commitments. Write <code>## Actions</code> in a diary entry, one bullet per commitment.');
+      // Six questions about one engagement, and the old shape was six stacked
+      // collapsible blocks: the one a reader wanted sat below the fold of the
+      // one they did not, and every count was collapsed. The switcher states
+      // the counts up front and puts one answer in front of the reader.
+      const tabs = [
+        { key: 'overview',     label: 'Overview' },
+        { key: 'timeline',     label: 'Timeline (' + tlEvents.length + ')' },
+        { key: 'actions',      label: 'Actions (' + actions.length + ')' },
+        { key: 'decisions',    label: 'Decisions (' + decisions.length + ')' },
+        { key: 'roster',       label: 'Roster (' + rosterRows.length + ')' },
+        { key: 'deliverables', label: 'Deliverables (' + deliverables.length + ')' },
+      ];
+      const tabBar = `<div class="scope-tabs" role="tablist">`
+        + tabs.map(t => `<button type="button" class="scope-tab" role="tab" data-scope-tab="${t.key}"`
+          + ` aria-selected="false" onclick="event.stopPropagation(); _switchScopeTab('${panelKey}', '${t.key}')">${t.label}</button>`).join('')
+        + `</div>`;
+      const panes = {
+        timeline: timelineHtml,
+        actions: actionsHtml,
+        decisions: decisionsHtml,
+        roster: rosterHtml,
+        deliverables: deliverableHtml,
+      };
       const rows = [];
       (data.facts || []).forEach(f => rows.push({kind:'fact', id: f.id, name: f.name, cat: f.category}));
       (data.diary || []).forEach(d => rows.push({kind:'diary', id: d.id, name: d.name, ts: d.timestamp}));
-      if (!rows.length) { panel.innerHTML = headerHtml + '<p style="padding:.4rem;font-size:.8rem;color:var(--muted);">No items linked yet.</p>'; return; }
-      panel.innerHTML = headerHtml + rows.map(r => {
+      const rowsHtml = rows.map(r => {
         if (r.kind === 'fact') {
           // The ✏️ is withheld on a record the caller may read but not write.
           // The row carries `readOnly` only on a shared panel, so an own panel
@@ -3212,7 +3319,30 @@
           </div>`;
         }
       }).join('');
+      panes.overview = briefHtml + (rows.length
+        ? rowsHtml
+        : scopeEmpty('No items linked yet. Facts and diary entries filed under this scope appear here.'));
+      panel.innerHTML = tabBar + `<div class="scope-panes">`
+        + tabs.map(t => `<div class="scope-pane" data-scope-pane="${t.key}" style="display:none;">${panes[t.key]}</div>`).join('')
+        + `</div>`;
+      _switchScopeTab(panelKey, 'overview');
     } catch(e) { panel.innerHTML = '<p style="padding:.4rem;font-size:.8rem;color:var(--muted);">⚠️ Could not load items.</p>'; }
+  }
+
+  /* One pill per question, one pane visible at a time. The panel is a fixed
+     height in the client drawer, so stacking six answers made the one a reader
+     wanted unreachable without scrolling past the other five. */
+  function _switchScopeTab(panelKey, tab) {
+    const panel = document.getElementById('scope-items-' + panelKey);
+    if (!panel) return;
+    panel.querySelectorAll('.scope-tab').forEach(b => {
+      const on = b.dataset.scopeTab === tab;
+      b.classList.toggle('active', on);
+      b.setAttribute('aria-selected', on ? 'true' : 'false');
+    });
+    panel.querySelectorAll('.scope-pane').forEach(p => {
+      p.style.display = (p.dataset.scopePane === tab) ? '' : 'none';
+    });
   }
 
   // Commitments. The register is filled by the diary save path; this is the
@@ -4103,6 +4233,35 @@
     }
   }
 
+  /* The level meter. It is lit only while a capture is actually sending: the
+     capture emits `level` only for blocks it sent, so a paused or stopped
+     recorder cannot leave the bars standing at the last level and read as live. */
+  function setLiveVu(level) {
+    const vu = document.getElementById('live-vu');
+    if (!vu) return;
+    const n = vu.children.length;
+    if (!n) return;
+    const clamped = Math.max(0, Math.min(1, Number(level) || 0));
+    const lit = Math.round(clamped * n);
+    vu.classList.add('on');
+    for (let i = 0; i < n; i++) {
+      const bar = vu.children[i];
+      const on = i < lit;
+      bar.style.height = on ? (35 + Math.round(65 * (i + 1) / n)) + '%' : '15%';
+      bar.style.background = on ? '' : 'var(--border)';
+    }
+  }
+
+  function clearLiveVu() {
+    const vu = document.getElementById('live-vu');
+    if (!vu) return;
+    vu.classList.remove('on');
+    for (let i = 0; i < vu.children.length; i++) {
+      vu.children[i].style.height = '15%';
+      vu.children[i].style.background = 'var(--border)';
+    }
+  }
+
   async function startLiveRecording() {
     if (!liveDetail || !liveDetail.transcription) return;
     if (liveRecording) return;
@@ -4163,11 +4322,13 @@
       pausing: () => {
         const state = document.getElementById('live-state');
         if (state) state.textContent = 'Finishing the current segment…';
+        clearLiveVu();
       },
       resuming: () => {
         const state = document.getElementById('live-state');
         if (state) state.textContent = 'Reconnecting the microphone…';
       },
+      level: (v) => setLiveVu(v),
       stopped: () => { onLiveCaptureStopped(id); },
       silent: (err) => {
         // The socket is open and the recorder looks live, but nothing has been
@@ -4207,6 +4368,7 @@
     const wasRecording = liveRecording;
     liveRecording = false;
     livePaused = false;
+    clearLiveVu();
     // The socket is gone but the server is still draining its writer and the
     // ASR tail, so the gate is not free yet. Ask it instead of assuming.
     if (wasRecording) liveGatePending = true;
@@ -4333,6 +4495,35 @@
       const el = document.getElementById('asr-token-state');
       if (el) el.textContent = 'Could not load the saved key' + (e && e.status ? ' (' + e.status + ')' : '') + '.';
     }
+  }
+
+  /* ── Skills directory ──────────────────────────────────────────────────
+     The catalogue is read by the server from skills/, so this list and the
+     MCP `find_skills` tool can never disagree about what exists. It is
+     fetched once per page load; a failure is stated rather than leaving a
+     spinner, because the skills are still reachable by an MCP client. */
+  async function loadSkills() {
+    const box = document.getElementById('skills-list');
+    if (!box) return;
+    if (box.dataset.loaded) return;
+    try {
+      const data = await api.get('skills');
+      box.dataset.loaded = '1';
+      renderSkills((data && data.skills) || []);
+    } catch (e) {
+      box.textContent = 'Skills could not be loaded. They are still available to MCP clients.';
+    }
+  }
+
+  function renderSkills(list) {
+    const box = document.getElementById('skills-list');
+    if (!box) return;
+    if (!list.length) { box.textContent = 'No skills found in the skills/ directory.'; return; }
+    box.innerHTML = '<ul style="list-style:none;margin:0;padding:0;">' + list.map(s =>
+      `<li style="padding:.45rem 0;border-bottom:1px solid var(--border);">`
+      + `<strong>${escHtml(s.name)}</strong>`
+      + `<div style="font-size:.78rem;color:var(--muted);margin-top:.15rem;">${escHtml(s.description || '')}</div>`
+      + `</li>`).join('') + '</ul>';
   }
 
   function loadAsrToken(opts) {

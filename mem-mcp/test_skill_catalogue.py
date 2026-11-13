@@ -34,7 +34,8 @@ def _function_source(source, name):
     """
     tree = ast.parse(source)
     node = next(n for n in tree.body
-                if isinstance(n, ast.FunctionDef) and n.name == name)
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and n.name == name)
     return ast.get_source_segment(source, node)
 
 
@@ -307,6 +308,54 @@ class NewReadSkillsTests(unittest.TestCase):
     def test_a_closed_commitment_is_not_reopened(self):
         self._has("weekly-review.md", "A closed commitment stays closed",
                   "the bullet is still in the minutes; the work was finished")
+
+
+class GuiSkillSurfaceTests(unittest.TestCase):
+    """The Setup page lists the same skills the MCP resources expose.
+
+    `gui.py` imports fastapi and cannot be imported on this box, so the
+    endpoint is lifted out of its source -- the same reason
+    `RegistrationSourceTests` reads `mcp_skills`. The template is read as
+    text. The property under test is that the GUI reads the one catalogue,
+    so a second list, a hard-coded card or a route on the wrong app is caught.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        with open(os.path.join(HERE, "gui.py"), "r", encoding="utf-8") as handle:
+            cls.gui = handle.read()
+        with open(os.path.join(HERE, "templates", "dashboard.html"),
+                  "r", encoding="utf-8") as handle:
+            cls.template = handle.read()
+
+    def test_the_endpoint_sits_on_the_gui_app_and_calls_the_catalogue(self):
+        segment = _function_source(self.gui, "api_list_skills")
+        self.assertTrue("_require_user(request)" in segment,
+                        "the endpoint must sit behind the same gate as every other")
+        self.assertTrue("skill_catalogue.list_skills()" in segment,
+                        "the GUI must ask the catalogue rather than a second list")
+        self.assertTrue('@web_app.get("/api/skills"' in self.gui,
+                        "the route belongs on the GUI app, not the MCP app")
+
+    def test_the_catalogue_is_imported_where_the_endpoint_can_see_it(self):
+        self.assertTrue("import skill_catalogue" in self.gui,
+                        "the route calls the module, so the module must be imported")
+
+    def test_the_setup_card_asks_the_endpoint(self):
+        self.assertTrue('id="skills-list"' in self.template,
+                        "the Setup card needs a container for the list")
+        self.assertTrue("api.get('skills')" in self.template,
+                        "the card must fetch the endpoint rather than hard-code skills")
+        self.assertTrue("loadSkills();" in self.template,
+                        "the card has to be loaded during init")
+
+    def test_the_card_handles_an_empty_catalogue_and_a_failed_fetch(self):
+        self.assertTrue("renderSkills((data && data.skills) || [])" in self.template,
+                        "the fetch hands its result to a renderer")
+        self.assertTrue("No skills found in the skills/ directory." in self.template,
+                        "an empty catalogue must say so rather than render nothing")
+        self.assertTrue("Skills could not be loaded." in self.template,
+                        "a failed fetch must degrade, not blank the Setup page")
 
 
 if __name__ == "__main__":

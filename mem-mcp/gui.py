@@ -64,6 +64,7 @@ from sessions import (VaultSession, VaultSessionMiddleware, create_session,
 import google_auth
 import audit
 import sharing
+import skill_catalogue
 from matching_utils import (MergeDraftTooLarge, execute_merge,
                              format_people_merge_text, merge_draft_output_budget)
 from live_notes import asr_segment
@@ -3651,6 +3652,13 @@ async def api_test_asr_token(request: Request):
             detail="No ASR token is stored. Save one before testing it.",
         )
     return await _probe_asr_token(token, user_id)
+
+
+@web_app.get("/api/skills", response_class=JSONResponse)
+async def api_list_skills(request: Request):
+    """List all available skill workflows discovered from the skills/ directory."""
+    _require_user(request)
+    return {"skills": skill_catalogue.list_skills()}
 
 
 # ---------------------------------------------------------------------------

@@ -28,7 +28,7 @@ After completing any code changes:
 
 ### Focused Tests
 
-The dependency-light regression suite covers matching, scope compatibility, scope-name and `Client:`-header resolution, duplicate scoring and clustering, merge validation, merge callback ordering, People candidate resolution, LLM prompt contracts, and the chunking split. Two more suites need no database either: `test_embedding_reliability.py` lifts the real functions out of `common.py` with `ast.get_source_segment`, and `test_cypher_safety.py` lints the Cypher in every module (see Gotchas for why). `test_backup_compression.py` uses the same `ast` lift for the snapshot compression helpers, since `backup.py` also cannot be imported without `httpx`. `test_people_extraction.py` lifts `people_extract_windows` and the whole of `extract_diary_keywords` out of `diary_manager.py` for the same reason, and *calls* the keyword extractor against a stub LLM rather than only reading its source. It also holds `ReclassifyIsScopeOnlyTests`, which lifts `_classify_and_link_diary` out of `migrate_client_context.py` and runs it with every people extractor bound to a stub that raises, so the test passes only if the function genuinely cannot reach them — a substring guard on that module could not see a twin defined in a sibling, and did not when it mattered. `test_graph_scope.py` lifts the graph scoping and cap policy out of `fact_manager.py` the same way. `test_matching_regressions.py` also holds the `RELEVANT_TO` selection tests — `RelatedClientSelectionTests` **calls** `_related_clients_for` lifted out of `migrate_client_context.py`, and `ScopePromptTests` pins the prompt *sentences* above, because a prompt is text and no other test in the suite notices when a sentence changes. `test_llm_reliability.py` lifts the chat path out of `common.py` the same way and, unlike the others, *raises* from its fake client: the defect it guards was the absence of a log line, which no source assertion can see. Its `ConflictLoggingTests` extends that to the 409 path, and is the reason `_def_segment()` exists — slicing a function to the next `"\ndef "` runs to EOF when the PEP8 two-blank-line gap intervenes, which an `assertIn` cannot detect and an `assertNotIn` only detects by finding something in the rest of the file. `test_mobile_layout.py` reads `templates/dashboard.html` and asserts the properties of the responsive stylesheet — no browser is available here, so it cannot check that the page looks right, only that the things a regression would silently undo are still in place. `test_env_wiring.py` reads `.env.example` and `docker-compose.yml` and asserts every documented variable actually reaches the container (see Gotchas for the incident). It also holds `ComposeGpuDeploymentTests`, which parses every `docker-compose*.yml` with a loader that preserves the `!reset` tag: one file may declare the GPU reservation, the base file must declare it, and the CPU overlay must *reset* `deploy`/`devices` rather than omit them (compose appends and overrides, it never removes, so an overlay that only stayed quiet would leave a CPU host with the request it cannot satisfy). The tag is the assertion, not the key — a key that is present without it passes a naive check and does nothing.
+The dependency-light regression suite covers matching, scope compatibility, scope-name and `Client:`-header resolution, duplicate scoring and clustering, merge validation, merge callback ordering, People candidate resolution, LLM prompt contracts, and the chunking split. Two more suites need no database either: `test_embedding_reliability.py` lifts the real functions out of `common.py` with `ast.get_source_segment`, and `test_cypher_safety.py` lints the Cypher in every module (see Gotchas for why). `test_backup_compression.py` uses the same `ast` lift for the snapshot compression helpers, since `backup.py` also cannot be imported without `httpx`. `test_people_extraction.py` lifts `people_extract_windows` and the whole of `extract_diary_keywords` out of `diary_manager.py` for the same reason, and *calls* the keyword extractor against a stub LLM rather than only reading its source. It also holds `ReclassifyIsScopeOnlyTests`, which lifts `_classify_and_link_diary` out of `migrate_client_context.py` and runs it with every people extractor bound to a stub that raises, so the test passes only if the function genuinely cannot reach them — a substring guard on that module could not see a twin defined in a sibling, and did not when it mattered. `test_graph_scope.py` lifts the graph scoping and cap policy out of `fact_manager.py` the same way. `test_matching_regressions.py` also holds the `RELEVANT_TO` selection tests — `RelatedClientSelectionTests` **calls** `_related_clients_for` lifted out of `migrate_client_context.py`, and `ScopePromptTests` pins the prompt *sentences* above, because a prompt is text and no other test in the suite notices when a sentence changes. `test_llm_reliability.py` lifts the chat path out of `common.py` the same way and, unlike the others, *raises* from its fake client: the defect it guards was the absence of a log line, which no source assertion can see. Its `ConflictLoggingTests` extends that to the 409 path, and is the reason `_def_segment()` exists — slicing a function to the next `"\ndef "` runs to EOF when the PEP8 two-blank-line gap intervenes, which an `assertIn` cannot detect and an `assertNotIn` only detects by finding something in the rest of the file. `test_mobile_layout.py` reads `templates/dashboard.html` and asserts the properties of the responsive stylesheet — no browser is available here, so it cannot check that the page looks right, only that the things a regression would silently undo are still in place. It also holds `ScopePanelSwitcherTests` (the client panel's six-question switcher, asserted against the emitted markup rather than the prose around it, because a comment quoting the old shape must neither satisfy nor defeat the guard) and `LiveLevelMeterTests` (the live level meter, including that its input is the block that was actually sent and that a paused recorder cannot leave the bars standing). `test_env_wiring.py` reads `.env.example` and `docker-compose.yml` and asserts every documented variable actually reaches the container (see Gotchas for the incident). It also holds `ComposeGpuDeploymentTests`, which parses every `docker-compose*.yml` with a loader that preserves the `!reset` tag: one file may declare the GPU reservation, the base file must declare it, and the CPU overlay must *reset* `deploy`/`devices` rather than omit them (compose appends and overrides, it never removes, so an overlay that only stayed quiet would leave a CPU host with the request it cannot satisfy). The tag is the assertion, not the key — a key that is present without it passes a naive check and does nothing.
 
 **A test of a helper is not a test of its call site.** `OllamaModelMatchTests` covers `_ollama_model_matches` directly, and re-injecting the old `if model in installed` into `ensure_ollama_models` left all of them green — the download bug lived in the caller. There is now a tenth test that asserts the call site, for the same reason `WriteOrderingGuardTests` exists. Whenever a bug is a wrong call rather than a wrong function, pin the call.
 
@@ -1214,7 +1214,7 @@ A status strip pinned to the bottom of the left rail of the **Memories**, **Diar
   - **`input, textarea, select { font-size: 16px }` is a functional fix, not a style preference.** Below 16px iOS zooms the viewport on focus and the zoom cannot be undone without a reload, so the form never recovers its layout.
   - **`overflow-x: clip` on `body`, never `hidden`.** `hidden` makes `body` a scroll container, which unsticks the `position: sticky` nav.
   - **`network.on("hold")` is the only way to reach the graph context menu on touch.** `oncontext` is a right-click; vis fires `hold` on long-press. Without the handler, Build Graph mode is unusable on a phone — the menu is the only way to add a neighbour. The `ResizeObserver` alongside it matters for the same reason: vis sizes its canvas once at construction, so stacking the layout leaves the canvas at the old width and clipped, and it must be disconnected in `rebuildNetwork()` before `network.destroy()`.
-  - **A control that lives inside a rail that becomes a scroller is not a styling problem.** The client filter is the last flex child of `.tabs`, and the mobile block made `.tabs` a horizontal scroller — so the filter sat after all seven tab buttons, off the right edge, with the scrollbar hidden. It was present in the DOM and fully functional; nothing about restyling the control would have found it. The fix is structural: `.tabs` wraps instead of scrolling, and `.cf-bar` (`order: 99; width: 100%`) takes a row of its own. The second half is the one that is easy to miss — `.cf-panel` is `position: absolute`, so in a scroller it is **clipped to the rail** and opens as a sliver; it needs `position: static` once the rail stops scrolling. `test_mobile_layout.py::ClientFilterOnMobileTests` pins all of it, including a test that the filter is still a child of `.tabs` — if it is ever moved out, the wrapping rules go inert silently.
+  - **A control that lives inside a rail that becomes a scroller is not a styling problem.** The client filter is the last flex child of `.tabs`, and the mobile block made `.tabs` a horizontal scroller — so the filter sat after all seven tab buttons, off the right edge, with the scrollbar hidden. It was present in the DOM and fully functional; nothing about restyling the control would have found it. The fix is structural: `.tabs` wraps instead of scrolling, and `.cf-bar` (`order: 99; width: 100%`) takes a row of its own. The second half is the one that is easy to miss — `.cf-panel` is `position: absolute`, so in a scroller it is **clipped to the rail** and opens as a sliver; it needs `position: static` once the rail stops scrolling. `test_mobile_layout.py::ClientFilterOnMobileTests` pins all of it, including a test that the filter is still a child of `.tabs` — if it is ever moved out, the wrapping rules go inert silently. **The clear control belongs to the same row and was added with it**: `.cf-clear` is a sibling of `.cf-wrap` inside `.cf-bar`, and `_cfUpdateBtn` shows it only when `clientFilter !== 'all'` (toggling `is-active` on the bar and `hidden` on the button). It is `1.5rem` on desktop and `2rem` on mobile because it is a thumb target, and `_cfClear` closes the panel before applying `'all', null` so the row does not stay open over a cleared filter. The same test class pins the sibling placement, both sizes, the `[hidden]` rule and the active state.
   - **The graph's own boxes carried inline styles, so the mobile rules for them were inert.** `.graph-sidebar` had `width: 200px` inline (making the block's `width: auto` a no-op) and `#graph-container` had `height: 70vh; min-height: 500px` inline (making its `height: 55vh` rule a no-op) — the *same* trap as `.graph-layout`, which was fixed two years of commits earlier while these two were left behind. vis.js sizes its canvas once from that box, so the rule that never applied was the rule deciding how much room the user has to pan. The mobile fix is `flex: 0 0 auto` plus an explicit `62vh`/`420px`: `flex: 1` is a **zero** flex basis, and in the stacked auto-height column the mobile block creates, that resolves against no available space — the same zero-basis trap as the scroll panes. `LayoutInlineStyleTests` now lints all five layout containers rather than three, and `GraphSizeOnMobileTests` pins the basis and the size.
   - **A zero flex basis also made the canvas grow the page without bound.** The desktop `#graph-container` was `flex: 1` in an auto-height column, so its height came from its content — the vis canvas. vis-network's `autoResize` defaults to **true**, so vis installs its own `ResizeObserver` and calls `Canvas.setSize()` on every size change; `setSize()` writes the canvas backing store from `clientWidth`/`clientHeight` and sets the frame's height to `100%`, which resolves to `auto` against a content-derived parent. Each pass therefore read `clientHeight` and wrote it back as `Math.round(clientHeight * devicePixelRatio)` — a fixed point at 1x (invisible) and a ~1.25x growth per pass on a HiDPI display, which is the "the page is resized constantly" report. The fix is a **definite** height: `flex: 0 0 auto; height: 70vh; overflow: hidden`, matching the mobile rule. `GraphHeightIsDefiniteTests` pins all three declarations against the desktop rules only (`_base_css()` strips the media blocks — `_declarations(CSS)` includes them, so the mobile copy of `flex: 0 0 auto` otherwise satisfies the assertion and the guard reports green on the bug).
 
@@ -1677,6 +1677,38 @@ Modify or delete links between memories directly from the UI.
   - Each candidate is `{kind, rec}`, and the kind survives into `st.targetKind`, because the relationship type is **meaningful only for a fact**. The server discards `relType` on a Fact→DiaryEntry link, so the field is hidden with an explanatory note (`#pane-link-relnote-<id>`) and `savePaneLink` sends `'MENTIONS'` itself — requiring a type there would block the link on an input that is thrown away.
   - `loadDiary` is lazy (the diary tab fetches on first visit), so a picker opened on the Memories tab has an empty `diaryEntries`. `ensureDiaryEntries()` fetches the list *without* `loadDiary`'s side effects (it selects an entry and re-renders the sidebar, month pager and graph category sidebar) and de-duplicates concurrent calls.
   - An entry already linked to the fact needs no separate exclusion: it arrives in `source.links` as an incoming `MENTIONS`, so the existing `linked` set already covers it. A second MENTIONS to the same fact is a duplicate, not a new link.
+
+### Client Panel Navigation
+Opening a client or project shows one panel that answers six questions: what is
+linked, where it got to, what is outstanding, why it is the way it is, who is in
+the room, and what the client received.
+
+- **The six answers are a segmented switcher, not a stack.** They used to be six
+  collapsible blocks under a brief button: the one a reader wanted sat below the
+  fold of the one they did not, and every count was collapsed until it was
+  opened. `toggleScopeItems` now renders a pill per question (`Overview`,
+  `Timeline (N)`, `Actions (N)`, `Decisions (N)`, `Roster (N)`,
+  `Deliverables (N)`) and shows one pane, so the counts are readable without
+  opening anything.
+- **The bar scrolls horizontally rather than wrapping.** Six pills with counts
+  are wider than a phone, and wrapping them pushes the pane below the fold —
+  which is the same defect the switcher exists to remove.
+- **Every one of the six fetches keeps its own `try/catch`.** A switcher that
+  dropped a fetch, or let one module's failure blank the others, would be a
+  regression dressed as a layout change.
+- **An empty register names the diary heading that fills it.** A blank tab and a
+  broken tab look identical, and the reader's only move is to reload — so
+  `## Actions`, `## Decisions` and `## Deliverables` are stated in the empty
+  pane, and the roster says names in a diary entry are linked automatically.
+- **`Overview` is the default and holds what the panel always held**: the brief
+  button and the facts/diary rows. The rows are not behind a second click.
+- **`_switchScopeTab` is the only thing that moves between panes**, and it sets
+  `aria-selected` as well as the display, so the active pill is not the sole
+  indication of which pane is showing.
+- **`ScopePanelSwitcherTests` checks the emitted markup, not the prose around
+  it.** The guard extracts the template literals before asserting no `<details>`
+  survives, because a comment quoting the old shape must neither satisfy nor
+  defeat it — the `assertIn`-over-a-whole-file lesson in Gotchas.
 
 ### Diary Screen Layout
 
@@ -2476,6 +2508,18 @@ Pluggable skill workflows loaded from Markdown files in `mem-mcp/skills/`.
   those assertions are the `assertIn`-checks-a-token lesson: "the loop is
   present" is not "every skill has a URI", so the shipped files are enumerated
   against the directory rather than the source.
+- **The Setup page lists the same catalogue, and there is deliberately no
+  second list.** `GET /api/skills` (`api_list_skills`, gui.py) calls
+  `skill_catalogue.list_skills()` behind `_require_user`, and the Setup page's
+  **Available Skills & Workflows** card renders it through `loadSkills()` /
+  `renderSkills()`. The card is a read-only view of what an MCP client can
+  already address as `skill://<name>`; a hard-coded list in the template would
+  drift from the directory the moment a `.md` file is added. `GuiSkillSurfaceTests`
+  lifts the endpoint out of `gui.py` with the AST (which is why
+  `_function_source` now matches `ast.AsyncFunctionDef`) and pins the gate, the
+  catalogue call and the `@web_app.get` route, then reads the template for the
+  container, the fetch and the init call — the same lift-and-pin shape as
+  `RegistrationSourceTests`.
 
 **The shipped skills split into two kinds, and only one kind existed for a long
 time.** `process-transcription`, `process-directory` and `memory-deduplication`
@@ -2684,6 +2728,28 @@ Two habits keep it fixed, and neither is optional:
   against a fake audio graph and asserts the context is created before the
   microphone and the socket, and that a stuck context refuses before the socket
   opens. Both were mutation-checked by swapping the two calls back.
+
+### The level meter says whether audio is actually flowing
+`#live-state` says "Recording"; it used to say nothing about whether the
+microphone was producing anything, and a recorder that is open but silent is
+indistinguishable from a quiet room.
+
+- **The level comes from the block that was sent, not from a separate probe.**
+  `LiveCapture._connectWorklet` computes an RMS over the same `data.pcm` the
+  worklet posted and the socket was just handed, so the meter cannot show audio
+  the socket never received. The worklet posts 16-bit PCM, so the RMS is scaled
+  by `/ 32768` before it is a fraction.
+- **It is muted while paused and cleared when the capture ends.** `paused` gates
+  the emit (the block is not sent then either), `pausing` clears the meter, and
+  `stopped` / `closed` / `error` all funnel through `onLiveCaptureStopped`,
+  which clears it too — one clear covers all three exits.
+- **It is throttled to every fourth block.** A DOM write per 32 ms block is more
+  refresh than a five-bar meter can express.
+- **The meter is dark until a capture sends.** `opacity: 0` in the stylesheet,
+  with `.on` added by `setLiveVu`; a meter that glows while nothing is recording
+  is indistinguishable from one that works.
+- **`LiveLevelMeterTests` pins the shape**, including that the level is computed
+  after `_sendPcm` and gated on `!this.paused`.
 
 ### A pause ends the stream; it does not hang up on it
 

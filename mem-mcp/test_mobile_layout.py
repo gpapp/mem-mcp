@@ -954,6 +954,42 @@ class ClientFilterOnMobileTests(unittest.TestCase):
             self, self.base, ".cf-bar", "margin-left: auto",
             "the filter belongs to the right of the tab bar on desktop")
 
+    def test_the_clear_control_sits_in_the_filter_row(self):
+        start = SOURCE.index('id="cf-bar"')
+        end = SOURCE.index('id="cf-clear"')
+        self.assertGreater(
+            end, start, "the clear control belongs to the client filter row")
+        self.assertIn(
+            'id="cf-wrap"', SOURCE[start:end],
+            "the clear control is a sibling of the filter button")
+
+    def test_the_clear_control_is_hidden_until_a_filter_is_active(self):
+        _assert_declares(
+            self, self.base, ".cf-clear[hidden]", "display: none",
+            "a clear button with nothing to clear must not show")
+        _assert_declares(
+            self, self.base, ".cf-bar.is-active .cf-btn", "font-weight: 600",
+            "an active filter needs a visible state")
+
+    def test_the_clear_control_has_a_definite_size_on_desktop(self):
+        _assert_declares(
+            self, self.base, ".cf-clear", "width: 1.5rem",
+            "the control must not collapse to the glyph's intrinsic size")
+        _assert_declares(
+            self, self.base, ".cf-clear", "height: 1.5rem",
+            "the control must not collapse to the glyph's intrinsic size")
+        _assert_declares(
+            self, self.base, ".cf-clear", "flex-shrink: 0",
+            "the control must not be squeezed out of the row")
+
+    def test_the_clear_control_is_a_thumb_target_on_mobile(self):
+        _assert_declares(
+            self, self.tablet, ".cf-clear", "width: 2rem",
+            "the clear control must grow to a thumb target")
+        _assert_declares(
+            self, self.tablet, ".cf-clear", "height: 2rem",
+            "the clear control must grow to a thumb target")
+
 
 class DiaryColumnOrderTests(unittest.TestCase):
     """The diary tab is three columns, and only one order of them is the design.
@@ -1695,6 +1731,125 @@ class FactDedupMenuTests(unittest.TestCase):
                       msg="a tall modal must scroll inside the overlay, not "
                           "push the three-pane layout past its height cap")
         self.assertIn("max-width: 860px", _decls(base, ".fact-dedup-box"))
+
+
+class ScopePanelSwitcherTests(unittest.TestCase):
+    """Six questions about one engagement, and the shape they are asked in.
+
+    The panel used to stack five `<details>` blocks under the brief button: the
+    one a reader wanted sat below the fold of the one they did not, and every
+    count was collapsed until it was opened. The switcher states the counts in
+    the pills and shows one answer at a time.
+    """
+
+    @staticmethod
+    def _segment(start, end):
+        i = SOURCE.index(start)
+        j = SOURCE.index(end, i)
+        return SOURCE[i:j]
+
+    def test_the_panel_is_a_switcher_and_not_a_stack(self):
+        seg = self._segment("async function toggleScopeItems(", "  /* One pill per question")
+        self.assertIn('class="scope-tabs"', seg)
+        self.assertIn('data-scope-tab="', seg)
+        self.assertIn('data-scope-pane="', seg)
+        # Only the emitted markup is checked, not the prose around it: a
+        # comment that quotes the old shape must neither satisfy nor defeat
+        # this guard, which is the substring-guard lesson in AGENTS.md.
+        emitted = "".join(re.findall(r"`([^`]*)`", seg))
+        self.assertNotIn("<details", emitted,
+                         msg="the stacked blocks are the defect: a count that "
+                             "has to be opened to be read is a count not shown")
+        self.assertNotIn("<summary", emitted)
+
+    def test_every_pill_carries_its_count(self):
+        seg = self._segment("async function toggleScopeItems(", "  /* One pill per question")
+        for pill in ("'Timeline (' + tlEvents.length + ')'",
+                     "'Actions (' + actions.length + ')'",
+                     "'Decisions (' + decisions.length + ')'",
+                     "'Roster (' + rosterRows.length + ')'",
+                     "'Deliverables (' + deliverables.length + ')'"):
+            self.assertIn(pill, seg)
+        self.assertIn("_switchScopeTab(panelKey, 'overview')", seg,
+                      msg="Overview is the default, so the facts and diary "
+                          "rows are what a reader sees first")
+
+    def test_an_empty_register_names_the_diary_heading_that_fills_it(self):
+        seg = self._segment("async function toggleScopeItems(", "  /* One pill per question")
+        for heading in ("## Actions", "## Decisions", "## Deliverables"):
+            self.assertIn("<code>" + heading + "</code>", seg,
+                          msg="a blank tab and a broken tab look identical; "
+                              "the remedy has to be stated")
+
+    def test_the_switch_shows_exactly_one_pane(self):
+        seg = self._segment("function _switchScopeTab(", "  // Commitments.")
+        self.assertIn("p.dataset.scopePane === tab", seg)
+        self.assertIn("'none'", seg)
+        self.assertIn("aria-selected", seg)
+
+    def test_the_switcher_scrolls_rather_than_wraps(self):
+        base = _declarations(_base_css())
+        self.assertIn("overflow-x: auto", _decls(base, ".scope-tabs"),
+                      msg="six pills are wider than a phone; wrapping them "
+                          "pushes the pane below the fold, which is the "
+                          "defect the switcher exists to remove")
+        self.assertIn("border-radius: 999px", _decls(base, ".scope-tab"))
+        self.assertIn("background: var(--accent)", _decls(base, ".scope-tab.active"),
+                      msg="the active pill is the only indication of which "
+                          "pane is showing")
+
+
+class LiveLevelMeterTests(unittest.TestCase):
+    """The recording state says "Recording"; it used to say nothing about
+    whether audio was actually flowing. A recorder that is open but silent is
+    indistinguishable from a quiet room, which is the failure the silence
+    watchdog exists to name -- the meter makes it visible continuously.
+    """
+
+    @staticmethod
+    def _segment(start, end):
+        i = SOURCE.index(start)
+        j = SOURCE.index(end, i)
+        return SOURCE[i:j]
+
+    def test_the_meter_shares_the_state_row(self):
+        i = SOURCE.index('id="live-vu"')
+        j = SOURCE.index('id="live-state"')
+        self.assertLess(i, j, "the meter sits beside the state text, not above it")
+        self.assertIn('class="live-status"', SOURCE)
+
+    def test_the_meter_is_dark_until_a_capture_sends(self):
+        base = _declarations(_base_css())
+        self.assertIn("opacity: 0", _decls(base, ".live-vu"),
+                      msg="a meter that glows while nothing is recording is "
+                          "indistinguishable from one that works")
+        self.assertIn("opacity: 1", _decls(base, ".live-vu.on"))
+
+    def test_the_level_comes_from_the_block_that_was_sent(self):
+        seg = self._segment("_connectWorklet() {", "_sendPcm(pcm) {")
+        self.assertIn("this._sendPcm(data.pcm)", seg)
+        self.assertIn("this.paused || !this.active", seg,
+                      msg="a paused recorder must not leave the bars standing "
+                          "at the last level")
+        self.assertIn("/ 32768", seg,
+                      msg="the worklet posts 16-bit PCM, so the RMS is only a "
+                          "level once it is scaled back to a fraction")
+        self.assertIn("_emit('level'", seg)
+
+    def test_the_level_is_throttled(self):
+        seg = self._segment("_connectWorklet() {", "_sendPcm(pcm) {")
+        self.assertIn("% 4", seg,
+                      msg="a DOM write per 32ms block is more refresh than a "
+                          "five-bar meter can express")
+
+    def test_the_meter_is_cleared_when_the_capture_ends(self):
+        seg = self._segment("async function onLiveCaptureStopped(",
+                            "async function pauseLiveRecording(")
+        self.assertIn("clearLiveVu()", seg,
+                      msg="stopped, closed and error all funnel through this "
+                          "handler, so one clear covers all three")
+        handlers = self._segment("const handlers = {", "await LiveCapture.start(")
+        self.assertIn("level: (v) => setLiveVu(v)", handlers)
 
 
 if __name__ == "__main__":
