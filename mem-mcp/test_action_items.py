@@ -323,13 +323,14 @@ class CallSiteTests(unittest.TestCase):
 
 
 class DashboardWiringTests(unittest.TestCase):
-    """The panel half, which no Python test can reach.
+    """The surface half, which no Python test can reach.
 
     The register is worthless if the only way to read it is an MCP client: the
-    person who owes the work reads it on the Clients page. These pin the three
-    things a regression would silently undo -- the list is loaded with the page,
-    a panel fetches its own engagement's items, and a closed item stops offering
-    a button it has already honoured.
+    person who owes the work reads it on the Actions tab. These pin the things a
+    regression would silently undo -- the tab loads its list, the list follows
+    the global client filter, the tab is a table, a panel fetches its own
+    engagement's items, and a closed item stops offering a button it has already
+    honoured.
     """
 
     @classmethod
@@ -337,10 +338,24 @@ class DashboardWiringTests(unittest.TestCase):
         import test_auth_guard
         cls._js = staticmethod(test_auth_guard._js_function_source)
 
-    def test_the_client_page_loads_the_list(self):
-        body = self._js("templates/dashboard.html", "loadClients")
+    def test_the_actions_tab_loads_the_list(self):
+        body = self._js("templates/dashboard.html", "switchTab")
         self.assertIn("loadMyActions()", body,
                       msg="a register nobody opens is a list of guilt")
+
+    def test_the_list_follows_the_client_filter(self):
+        body = self._js("templates/dashboard.html", "loadMyActions")
+        self.assertIn("clientFilter", body,
+                      msg="a tab that ignores the filter shows every client's commitments")
+        self.assertIn("params.clientId", body,
+                      msg="a named client has to reach the endpoint as a server-side filter")
+        self.assertIn("params.contextId", body,
+                      msg="a named project has to reach the endpoint too")
+
+    def test_the_tab_is_a_table(self):
+        body = self._js("templates/dashboard.html", "renderActionTable")
+        self.assertIn("<table", body)
+        self.assertIn("<th", body)
 
     def test_a_panel_fetches_its_own_engagement(self):
         body = self._js("templates/dashboard.html", "toggleScopeItems")

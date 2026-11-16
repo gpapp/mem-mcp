@@ -1983,8 +1983,7 @@ query would either have to filter it out or carry it.
 
 Surfaces: three MCP tools (`list_action_items`, `save_action_item`,
 `update_action_item`), three GUI routes (`GET /api/action-items`,
-`POST /api/action-items`, `POST /api/action-items/{id}`), the **My actions** card
-at the top of the Clients page, and an "Open items" block inside each client and
+`POST /api/action-items`, `POST /api/action-items/{id}`), the top-level **✅ Actions** tab (a table filtered by the global client filter), and an "Open items" block inside each client and
 project panel fetched by `toggleScopeItems`.
 
 `test_action_items.py` is the 22nd suite. It lifts `db_sync_action_items`,

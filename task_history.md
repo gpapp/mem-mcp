@@ -5,6 +5,40 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# My Actions moved to a dedicated Actions tab
+
+**Why.** "My actions" lived at the top of the Clients tab, which mixed a
+cross-cutting commitment register with client/project management. The register
+is useful regardless of which client a user is browsing, and it needed a view
+that could be scanned quickly.
+
+**What shipped.**
+
+- **Dedicated tab and table view.** Added a top-level **✅ Actions** tab
+  (`data-tab="actions"`, `#page-actions`) after Clients. The register renders as
+  a table (`renderActionTable`: Owner, Scope, Due, Commitment, ✓ complete)
+  instead of the previous card/list in the Clients page.
+- **Global client filter integration.** `loadMyActions()` follows the tab rail's
+  client/project filter: passes `clientId`/`contextId` to `GET /api/action-items`
+  when a concrete scope is selected, always requests `status=open`, and
+  post-filters `unassigned` and `active` modes to match `memPassesScope`
+  semantics (including unscoped items passing the active view). `switchTab`
+  loads actions on entry and `_cfApply` refreshes the tab when open.
+- **Existing surfaces preserved.** `renderActionRows` and the client/project
+  panel "Open items" block remain unchanged; create/complete flows still refresh
+  the list and close any open scope panel as before. `loadClients()` no longer
+  loads the register.
+- **Tests and docs.** `DashboardWiringTests` in `mem-mcp/test_action_items.py`
+  updated/pinned for the new tab, filter wiring, and table rendering. `AGENTS.md`
+  and `README.md` updated to describe the Actions tab surface.
+
+**Verified.** `node --check` on extracted dashboard JS, `python3 -m py_compile`
+on modified Python, `git -c core.whitespace=cr-at-eol diff --check` clean, and
+`cd mem-mcp && python3 -m unittest -q test_action_items.py test_mobile_layout.py test_auth_guard.py`
+→ 210 tests OK.
+
+---
+
 # The dashboard UX pass: the panel switcher, the active-scope control, and the level meter
 
 **Why.** A review of all seven dashboard tabs found three places where the UI

@@ -964,6 +964,7 @@
   <button class="tab-btn" data-tab="live" onclick="switchTab('live')">🎙️ Live notes</button>
   <button class="tab-btn" data-tab="graph" onclick="switchTab('graph')">🕸️ Graph</button>
   <button class="tab-btn" data-tab="clients" onclick="switchTab('clients')">🏢 Clients</button>
+  <button class="tab-btn" data-tab="actions" onclick="switchTab('actions')">✅ Actions</button>
   <button class="tab-btn" data-tab="setup" onclick="switchTab('setup')">🔌 Setup</button>
   {# Loaded models, backup/restore, reclassify and dedup act on the whole
      vault or the whole server rather than on one account, so the tab is
@@ -1244,20 +1245,6 @@
 
 <!-- ═══ CLIENTS PAGE ═══ -->
 <div id="page-clients" class="page">
-  <div class="card" id="my-actions-card">
-    <h2 style="margin-top:0;">✅ My actions</h2>
-    <p style="font-size:.85rem;color:var(--muted);margin-bottom:.6rem;">
-      Open commitments, extracted from every meeting's <code>## Actions</code>
-      and <code>## Open Questions</code> bullets. Overdue first.
-    </p>
-    <div style="display:flex;gap:.5rem;margin-bottom:.6rem;flex-wrap:wrap;">
-      <input id="new-action-text" type="text" placeholder="What is owed…" style="max-width:320px;width:auto;flex:1;" onkeydown="if(event.key==='Enter') createActionItem()">
-      <input id="new-action-owner" type="text" placeholder="Owner" style="max-width:120px;width:auto;">
-      <input id="new-action-due" type="date" style="max-width:150px;width:auto;">
-      <button class="btn btn-primary btn-sm" onclick="createActionItem()">＋ Add</button>
-    </div>
-    <div id="my-actions-list"><p class="empty">Loading…</p></div>
-  </div>
   <div class="card" style="margin-top:.75rem;">
     <h2 style="margin-top:0;">🏢 Clients</h2>
     <p style="font-size:.85rem;color:var(--muted);margin-bottom:.75rem;">
@@ -1275,6 +1262,25 @@
     <div id="shared-with-me"><p class="empty">Loading…</p></div>
   </div>
 {% endif %}
+</div>
+
+<!-- ═══ ACTIONS PAGE ═══ -->
+<div id="page-actions" class="page">
+  <div class="card" id="my-actions-card">
+    <h2 style="margin-top:0;">✅ My actions</h2>
+    <p style="font-size:.85rem;color:var(--muted);margin-bottom:.6rem;">
+      Open commitments, extracted from every meeting's <code>## Actions</code>
+      and <code>## Open Questions</code> bullets. Overdue first. The list follows
+      the client filter above — pick a client to see only their commitments.
+    </p>
+    <div style="display:flex;gap:.5rem;margin-bottom:.6rem;flex-wrap:wrap;">
+      <input id="new-action-text" type="text" placeholder="What is owed…" style="max-width:320px;width:auto;flex:1;" onkeydown="if(event.key==='Enter') createActionItem()">
+      <input id="new-action-owner" type="text" placeholder="Owner" style="max-width:120px;width:auto;">
+      <input id="new-action-due" type="date" style="max-width:150px;width:auto;">
+      <button class="btn btn-primary btn-sm" onclick="createActionItem()">＋ Add</button>
+    </div>
+    <div id="my-actions-list"><p class="empty">Loading…</p></div>
+  </div>
 </div>
 
 <div id="page-setup" class="page">
@@ -2571,6 +2577,7 @@
     if (tab === 'diary' && !diaryEntries.length) loadDiary();
     if (tab === 'graph' && !graphLoaded) loadGraph();
     if (tab === 'clients') loadClients();
+    if (tab === 'actions') loadMyActions();
     if (tab === 'live') {
       switchLiveTab(liveTab, {silent: true});
       loadLive({force: true});
@@ -2960,6 +2967,11 @@
     // previous scope until the tab was revisited, which is indistinguishable
     // from the filter not working.
     if (activeTab === 'graph') loadGraph();
+    // The actions table is a separate fetch too, and it is scoped by the same
+    // filter: leaving it alone means picking a client while the Actions tab is
+    // open keeps the previous scope until the tab is revisited, which reads as
+    // the filter not working.
+    if (activeTab === 'actions') loadMyActions();
     saveSessionState();
   }
 
@@ -2980,7 +2992,6 @@
 
 
   async function loadClients() {
-    loadMyActions();
     const el = document.getElementById('client-list');
     if (!el) return;
     try {
@@ -3366,12 +3377,61 @@
     }).join('');
   }
 
+  // The Actions tab is a table, not the compact row list the client panel uses.
+  // The panel's rows are read at a glance in a narrow pane; the tab has the
+  // width to lay owner, scope, due date and the commitment out in columns.
+  function renderActionTable(items) {
+    if (!items.length) return '<p class="empty" style="font-size:.85rem;">Nothing outstanding.</p>';
+    const rows = items.map(a => {
+      const due = a.dueAt ? String(a.dueAt).slice(0,10) : '';
+      const overdue = a.overdue && a.status === 'open';
+      const dueCell = due
+        ? `<span style="color:${overdue ? '#e5484d' : 'inherit'};">${overdue ? '⚠️ ' : ''}${escHtml(due)}</span>`
+        : '';
+      const scope = a.clientName
+        ? escHtml(a.clientName + (a.contextName ? ' › ' + a.contextName : ''))
+        : (a.contextName ? escHtml(a.contextName) : '');
+      const done = a.status !== 'open' ? '' :
+        `<button class="btn btn-sm btn-ghost" style="padding:.1rem .4rem;font-size:.7rem;" title="Mark done" onclick="event.stopPropagation(); completeActionItem('${a.id}')">✓</button>`;
+      return `<tr style="border-bottom:1px solid var(--border);">
+        <td style="padding:.4rem .5rem;white-space:nowrap;">${a.owner ? escHtml(a.owner) : ''}</td>
+        <td style="padding:.4rem .5rem;">${scope}</td>
+        <td style="padding:.4rem .5rem;white-space:nowrap;">${dueCell}</td>
+        <td style="padding:.4rem .5rem;">${escHtml(a.text || '')}</td>
+        <td style="padding:.4rem .5rem;text-align:right;">${done}</td>
+      </tr>`;
+    }).join('');
+    return `<table style="width:100%; border-collapse:collapse; font-size:.85rem;">
+      <thead><tr style="text-align:left; border-bottom:1px solid var(--border);">
+        <th style="padding:.4rem .5rem;">Owner</th>
+        <th style="padding:.4rem .5rem;">Scope</th>
+        <th style="padding:.4rem .5rem;">Due</th>
+        <th style="padding:.4rem .5rem;">Commitment</th>
+        <th style="padding:.4rem .5rem;text-align:right;"></th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+  }
+
   async function loadMyActions() {
     const el = document.getElementById('my-actions-list');
     if (!el) return;
     try {
-      const data = await api.get('action-items');
-      el.innerHTML = renderActionRows((data && data.items) || [], {showScope: true});
+      // The register is scoped by the same client filter as the rest of the
+      // app. A concrete client or project is a server-side filter; 'active'
+      // and 'unassigned' are modes the endpoint cannot express, so they are
+      // applied here over the fetched set — matching memPassesScope's rule
+      // that an unscoped record passes 'active' but not a named client.
+      const params = {status: 'open'};
+      if (clientFilter && clientFilter !== 'all' && clientFilter !== 'active' && clientFilter !== 'unassigned') {
+        params.clientId = clientFilter;
+      }
+      if (contextFilter) params.contextId = contextFilter;
+      const data = await api.get('action-items', params);
+      let items = (data && data.items) || [];
+      if (clientFilter === 'unassigned') items = items.filter(a => !a.clientId);
+      else if (clientFilter === 'active') items = items.filter(a => !a.clientId || clientActiveMap[a.clientId] !== false);
+      el.innerHTML = renderActionTable(items);
     } catch(e) { el.innerHTML = '<p class="empty">⚠️ Could not load actions.</p>'; }
   }
 
