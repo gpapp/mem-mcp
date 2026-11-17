@@ -1248,10 +1248,13 @@ class ShareDialogClosePathTests(unittest.TestCase):
         anywhere in the application.
         """
         code = "\n".join(self.lines)
-        listener = re.search(r"addEventListener\s*\(\s*['\"]keydown['\"]", code)
+        listener = re.search(r"document\.addEventListener\s*\(\s*['\"]keydown['\"]", code)
         self.assertTrue(listener,
-                        msg="no keydown listener -- the dialog cannot be "
-                            "dismissed with Escape at all")
+                        msg="no document-level keydown listener -- the dialog "
+                            "cannot be dismissed with Escape at all")
+        # Anchored on the document listener: a scoped one on a textarea or an
+        # input cannot dismiss a global dialog, and the first keydown listener
+        # in the file is not guaranteed to be this one.
         window = code[listener.start():listener.start() + 400]
         self.assertTrue(
             "share-overlay" in window and ".contains(" in window,

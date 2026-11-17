@@ -912,7 +912,8 @@ async def get_llm_response(prompt: str, system: str = "", model: str = "",
                            options: Optional[dict] = None,
                            tools: Optional[list] = None,
                            history: Optional[list] = None,
-                           return_message: bool = False):
+                           return_message: bool = False,
+                           label: str = ""):
     """Call Ollama /api/chat and return the assistant's text response.
 
     Uses LLM_QUERY_MODEL (default: qwen3.5:0.8b) unless overridden by `model`.
@@ -920,6 +921,9 @@ async def get_llm_response(prompt: str, system: str = "", model: str = "",
     to shorten it for a call that sits in front of a user waiting on it.
     Strips <think>…</think> blocks produced by reasoning models (e.g. Qwen3).
     Pass num_predict > 0 to cap/guarantee the output token budget.
+    Pass `label` on the extraction calls to have the response's Ollama timings
+    (prompt_eval_count and friends) logged at INFO under that label — the
+    prompt-cache receipt that says whether the KV prefix was reused.
 
     Every failure mode is logged with the model, the prompt size and the elapsed
     time, and the ones that mean "no answer is possible" raise RuntimeError
@@ -1031,6 +1035,25 @@ async def get_llm_response(prompt: str, system: str = "", model: str = "",
             f"Ollama returned an unreadable body for model {resolved_model!r} "
             f"(HTTP {resp.status_code}): {exc}"
         ) from exc
+    if label:
+        # The prompt-cache receipt for the labelled extraction calls. Ollama
+        # reuses the KV cache for the longest common token prefix of
+        # consecutive requests to a loaded model, and `prompt_eval_count` is
+        # what it actually evaluated — so a count well below the prompt's
+        # ~len/3 tokens (the same ratio the merge guard sizes with) is the
+        # signature of a cache hit, and a full count says the prefix diverged.
+        # INFO, and only on labelled calls: it is a measurement line for the
+        # extraction path, not chat traffic. A diagnostic line must never fail
+        # the call it diagnoses, hence the guard.
+        try:
+            timing = _ollama_timing(resp.text)
+        except Exception:
+            timing = ""
+        if timing:
+            logger.info(
+                f"[{label}] {timing} (prompt_chars={len(prompt)}, "
+                f"~{len(prompt) // 3} tok)"
+            )
     # Strip any residual <think>…</think> blocks just in case
     import re as _re
     content = _re.sub(r"<think>.*?</think>", "", content, flags=_re.DOTALL).strip()
@@ -1166,7 +1189,7 @@ async def get_extraction_response(prompt: str, system: str = "", model: str = ""
         try:
             answer = await get_llm_response(
                 prompt, system=system, model=model, num_predict=num_predict,
-                timeout=timeout, options=options,
+                timeout=timeout, options=options, label=tag,
             )
         except Exception as exc:
             if not is_repeat_abort(exc) or attempt:

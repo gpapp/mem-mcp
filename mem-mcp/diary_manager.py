@@ -133,8 +133,26 @@ async def _delete_diary_chunks(entry_id: str) -> None:
         )
 
 
-_KEYWORD_EXTRACT_SYSTEM = (
-    "Extract searchable keywords from a diary entry excerpt. "
+# Both extraction passes read the SAME window text through the SAME model
+# (EXTRACT_MODEL), and Ollama reuses the KV cache for the longest common token
+# prefix of consecutive requests to a loaded model. The task instruction used
+# to be the system message, so the two calls of one window diverged at token 1
+# and every window was prompt-evaluated twice. The preamble below is now the
+# identical system message of both calls and each task's instruction moved to
+# the END of the user message, after the window text: the window text is then
+# the shared prefix, the keyword call pays the prompt evaluation, and the
+# people call that follows it is served from the cache up to its instruction
+# tail. Task-specific rules stay whole in their own instruction — the two
+# fields are never asked for in one call, because a model asked for two fields
+# fills both.
+_EXTRACT_PREAMBLE = (
+    "You are reading one window of a meeting diary entry. "
+    "The text may be machine speech recognition: it can lack punctuation, "
+    "repeat itself and mishear proper nouns. Read past that."
+)
+
+_KEYWORD_EXTRACT_TASK = (
+    "TASK: extract searchable keywords from the diary excerpt above. "
     "Return ONLY JSON: {\"keywords\": [\"kw1\", \"kw2\", ...]}. "
     "Up to 10 items per excerpt, lowercase, 1-3 words each. "
     "Include: people names, places, projects, technologies, topics. "
@@ -155,6 +173,16 @@ KEYWORD_EXTRACT_WARN_WINDOWS = 6
 # things that can spuriously match. Bounded so the payload stays small -- it is
 # duplicated onto every chunk of the entry.
 KEYWORD_LIMIT = max(5, int(os.getenv("MEM_KEYWORD_LIMIT", "20")))
+
+# The save path runs both extraction passes over the SAME windows, so the
+# people call of each window can reuse the keyword call's prompt evaluation
+# (see extract_diary_signals). The keyword geometry is the one that pays the
+# full prompt evaluation, so it sets the shape; MEM_PEOPLE_WINDOW /
+# MEM_PEOPLE_OVERLAP now tune only the standalone names-only path
+# (_extract_people_names, reached from find_people_candidates).
+_EXTRACT_WINDOW = KEYWORD_EXTRACT_WINDOW
+_EXTRACT_OVERLAP = KEYWORD_EXTRACT_OVERLAP
+_EXTRACT_WARN_WINDOWS = KEYWORD_EXTRACT_WARN_WINDOWS
 
 
 def _clean_keywords(values, limit: int = 0) -> list:
@@ -177,11 +205,36 @@ def _clean_keywords(values, limit: int = 0) -> list:
     return out[:limit] if limit else out
 
 
+async def _extract_keywords_for_window(text: str, label: str) -> list:
+    """One keyword pass over one already-built window text.
+
+    The instruction travels at the END of the user message and the system
+    message is the shared preamble, so the people call that follows this one
+    (extract_diary_signals) reuses this request's prompt evaluation up to the
+    instruction tail. Errors propagate: the caller's per-window handler decides
+    what a failed window costs the union.
+    """
+    raw = await get_llm_response(
+        f"{text}\n\n{_KEYWORD_EXTRACT_TASK}",
+        system=_EXTRACT_PREAMBLE,
+        model=EXTRACT_MODEL, label=label)
+    raw = re.sub(r"```[a-z]*\n?", "", raw).strip()
+    json_match = re.search(r'\{[^{}]*"keywords"[^{}]*\}', raw, re.DOTALL)
+    if not json_match:
+        logger.debug(f"[{label}] had no JSON object")
+        return []
+    data = json.loads(json_match.group())
+    return _clean_keywords(data.get("keywords", []))
+
+
 async def extract_diary_keywords(name: str, content: str) -> list:
     """Use the query LLM to extract searchable keywords from a diary entry.
 
     Runs once per window (see text_windows) and unions the results, so keywords
-    come from the whole entry rather than its first paragraph.
+    come from the whole entry rather than its first paragraph. This is the
+    keywords-only pass; the save path uses extract_diary_signals instead, which
+    pairs each keyword call with the people call of the same window so the
+    second one is a prompt-cache hit.
 
     Returns a list of lowercase keyword strings, capped at KEYWORD_LIMIT.
     Falls back to an empty list on any error so saves are never blocked.
@@ -202,17 +255,8 @@ async def extract_diary_keywords(name: str, content: str) -> list:
         # a fragment of, and the name is one of the better keywords anyway.
         text = f"{name}\n{window}" if name else window
         try:
-            raw = await get_llm_response(text, system=_KEYWORD_EXTRACT_SYSTEM,
-                                         model=EXTRACT_MODEL)
-            raw = re.sub(r"```[a-z]*\n?", "", raw).strip()
-            json_match = re.search(r'\{[^{}]*"keywords"[^{}]*\}', raw, re.DOTALL)
-            if not json_match:
-                logger.debug(
-                    f"[extract_diary_keywords] window {index + 1}/{len(windows)} had no JSON object"
-                )
-                continue
-            data = json.loads(json_match.group())
-            found.extend(_clean_keywords(data.get("keywords", [])))
+            found.extend(await _extract_keywords_for_window(
+                text, f"extract_diary_keywords window {index + 1}/{len(windows)}"))
         except Exception as exc:
             # One bad window must not discard the keywords the others found.
             logger.debug(
@@ -227,8 +271,9 @@ async def extract_diary_keywords(name: str, content: str) -> list:
 # People auto-linking: extract person names from diary content and create
 # MENTIONS edges to matching People facts.
 # ---------------------------------------------------------------------------
-_PEOPLE_EXTRACT_SYSTEM = (
-    "Extract full names of people explicitly mentioned in the text. "
+_PEOPLE_EXTRACT_TASK = (
+    "TASK: extract the full names of people explicitly mentioned in the diary "
+    "excerpt above. "
     "Return ONLY a JSON array: [\"Alice Smith\", \"Bob Jones\"]. "
     "Return [] if none. No explanations. "
     "Ignore: speaker labels (SPEAKER1, SPEAKER 2, SPEAKER#3). "
@@ -259,6 +304,36 @@ PEOPLE_EXTRACT_MAX_TOKENS = max(
 )
 
 
+async def _extract_names_for_window(text: str, label: str) -> list:
+    """One people pass over one already-built window text, through the decode guard.
+
+    Same prefix discipline as `_extract_keywords_for_window`: the instruction
+    sits at the END of the user message and the system message is the shared
+    preamble, so a keyword call over the same window text makes this one a
+    prompt-cache hit. A genuine `[]` means "no people in this window" and must
+    not be retried; a sentence of `A A A` does not parse to an array and must
+    be. That is why the predicate is the parse, not emptiness. An unparseable
+    answer is reported and yields no names; an exception propagates to the
+    caller's per-window handler.
+    """
+    raw = await get_extraction_response(
+        f"{text}\n\n{_PEOPLE_EXTRACT_TASK}",
+        system=_EXTRACT_PREAMBLE,
+        model=EXTRACT_MODEL,
+        num_predict=PEOPLE_EXTRACT_MAX_TOKENS,
+        label=label,
+        is_good=lambda answer: parse_people_name_array(answer) is not None,
+    )
+    names = parse_people_name_array(raw)
+    if names is None:
+        logger.warning(
+            f"[{label}] no JSON array in the answer — this window "
+            f"contributes no names"
+        )
+        return []
+    return clean_extracted_people_names(names)
+
+
 def people_extract_windows(content: str, window: int = 0, overlap: int = 0) -> list:
     """Split diary content into overlapping windows for name extraction.
 
@@ -287,6 +362,11 @@ async def _extract_people_names(content: str) -> list:
     Runs once per window (see people_extract_windows) and unions the results.
     Every name in the entry has to be seen by the extractor, not just the ones
     that happen to fall in the first paragraph.
+
+    This is the names-only pass, reached from find_people_candidates and as
+    `_auto_link_people`'s fallback; the save path uses extract_diary_signals
+    instead, which pairs each people call with the keyword call of the same
+    window so the second one is a prompt-cache hit.
     """
     windows = people_extract_windows(content)
     logger.debug(
@@ -304,25 +384,7 @@ async def _extract_people_names(content: str) -> list:
     for index, window in enumerate(windows):
         label = f"extract_people_names window {index + 1}/{len(windows)}"
         try:
-            raw = await get_extraction_response(
-                window,
-                system=_PEOPLE_EXTRACT_SYSTEM,
-                model=EXTRACT_MODEL,
-                num_predict=PEOPLE_EXTRACT_MAX_TOKENS,
-                label=label,
-                # A genuine `[]` means "no people in this window" and must not be
-                # retried; a sentence of `A A A` does not parse to an array and
-                # must be. That is why the predicate is the parse, not emptiness.
-                is_good=lambda text: parse_people_name_array(text) is not None,
-            )
-            names = parse_people_name_array(raw)
-            if names is None:
-                logger.warning(
-                    f"[{label}] no JSON array in the answer — this window "
-                    f"contributes no names"
-                )
-                continue
-            found.extend(clean_extracted_people_names(names))
+            found.extend(await _extract_names_for_window(window, label))
         except Exception as exc:
             # One bad window must not discard the names the other windows found.
             # Logged at WARNING, not DEBUG: production runs at WARNING, and a
@@ -337,6 +399,66 @@ async def _extract_people_names(content: str) -> list:
     extracted = clean_extracted_people_names(found)
     logger.debug(f"[extract_people_names] completed (count={len(extracted)})")
     return extracted
+
+
+async def extract_diary_signals(name: str, content: str) -> tuple:
+    """Extract keywords AND person names in one interleaved pass per window.
+
+    The save path used to run two separate window loops over the same entry:
+    every window was prompt-evaluated once for keywords and then again, from
+    scratch, for people names. Both passes read the same text through the same
+    model (EXTRACT_MODEL), so the loops are interleaved here —
+    `for window: keywords(window); people(window)` — and both calls share one
+    prompt shape: `_EXTRACT_PREAMBLE` as the system message, then the window
+    text, then the task's instruction at the end. The common token prefix is
+    therefore the whole window, Ollama serves the second call of each window
+    from its KV cache, and only the instruction tail plus the answer are
+    evaluated again.
+
+    The two tasks stay two calls on purpose: a model asked for two fields fills
+    both, and a hallucinated name becomes a wrong MENTIONS edge while a bad
+    keyword is only a mild boost. Each call keeps its own guard and its own
+    per-window try/except, so one bad window still cannot discard the other
+    windows' results.
+
+    Returns `(keywords, names)`, cleaned and capped exactly as each extractor's
+    own callers expect.
+    """
+    windows = text_windows(content, _EXTRACT_WINDOW, _EXTRACT_OVERLAP)
+    logger.debug(
+        f"[extract_diary_signals] started (content_len={len(content)}, windows={len(windows)})"
+    )
+    if len(windows) > _EXTRACT_WARN_WINDOWS:
+        logger.warning(
+            f"[extract_diary_signals] entry is {len(content)} chars, so each of the two "
+            f"extraction passes runs {len(windows)} times — raise MEM_KEYWORD_WINDOW "
+            f"to trade recall for cost"
+        )
+    keywords, found_names = [], []
+    for index, window in enumerate(windows):
+        # The entry name leads every window — a middle window has no other way
+        # to know which entry it is a fragment of, and it keeps the two calls'
+        # user messages byte-identical up to the instruction tail.
+        text = f"{name}\n{window}" if name else window
+        try:
+            keywords.extend(await _extract_keywords_for_window(
+                text, f"extract_diary_keywords window {index + 1}/{len(windows)}"))
+        except Exception as exc:
+            logger.debug(
+                f"[extract_diary_keywords] window {index + 1}/{len(windows)} failed: {exc}"
+            )
+        try:
+            found_names.extend(await _extract_names_for_window(
+                text, f"extract_people_names window {index + 1}/{len(windows)}"))
+        except Exception as exc:
+            logger.warning(
+                f"[extract_people_names window {index + 1}/{len(windows)}] "
+                f"failed: {type(exc).__name__}: {exc}"
+            )
+    return (
+        _clean_keywords(keywords, KEYWORD_LIMIT),
+        clean_extracted_people_names(found_names),
+    )
 
 
 async def _bind_people_llm(prompt: str, system: str = "", num_predict: int = 0) -> str:
@@ -402,19 +524,24 @@ async def find_people_candidates(entry_id: str, content: str, user_id: str) -> l
 
 
 async def _auto_link_people(entry_id: str, content: str, user_id: str,
-                             fact_ids: Optional[list] = None) -> int:
+                             fact_ids: Optional[list] = None,
+                             names: Optional[list] = None) -> int:
     """Reconcile automatically detected People links for a diary entry.
 
     If fact_ids is provided, link exactly those facts (skipping LLM extraction).
-    Otherwise extract names from content and link resolved People facts.
-    Returns count of new edges created.
+    Otherwise resolve `names` — when the caller already extracted them (the
+    save/update paths do, so the entry is not read a second time) — or extract
+    them from content, and link the resolved People facts. `names=[]` means
+    "extracted, and there were none" and is used as-is; only `None` means
+    nobody extracted yet. Returns count of new edges created.
     """
     neo4j_driver = get_neo4j()
     if not neo4j_driver:
         return 0
     if fact_ids is None:
-        # Auto mode: extract names, resolve candidates, and remove stale auto links.
-        names = await _extract_people_names(content) if content else []
+        # Auto mode: resolve candidates from the names and remove stale auto links.
+        if names is None:
+            names = await _extract_people_names(content) if content else []
         created = 0
         from fact_manager import db_find_people_matches
 
@@ -551,8 +678,11 @@ async def db_save_diary(content: str, user_id: str, timestamp: str, name: str, m
     # Keep a plain date string for display / grouping purposes
     entry_date = timestamp[:10]
 
-    # Extract keywords asynchronously — non-blocking; empty list on failure
-    keywords = await extract_diary_keywords(name or "", content)
+    # Both extraction passes in one interleaved window loop: keywords feed the
+    # payload below and the names ride to _auto_link_people at the end, which
+    # would otherwise re-read the whole entry a second time. See
+    # extract_diary_signals for why the two calls share one prompt shape.
+    keywords, people_names = await extract_diary_signals(name or "", content)
 
     payload = {"content": content, "name": name, "date": entry_date, "timestamp": timestamp, "userId": user_id}
     if keywords:
@@ -626,8 +756,10 @@ async def db_save_diary(content: str, user_id: str, timestamp: str, name: str, m
         "date": entry_date,
         "timestamp": timestamp
     })
-    # Auto-link People facts mentioned by name (add-only, fire-and-forget)
-    await _auto_link_people(doc_id, content, user_id)
+    # Auto-link People facts mentioned by name (add-only, fire-and-forget).
+    # The names were extracted alongside the keywords above, so the binding hop
+    # starts straight from them instead of re-reading the entry.
+    await _auto_link_people(doc_id, content, user_id, names=people_names)
     # Commitments come out of the same body the keywords and participants come
     # from, and are reconciled against what this entry already had rather than
     # appended. `today` is the entry's own date: "by Friday" means the Friday
@@ -1096,8 +1228,10 @@ async def db_update_diary(entry_id: str, user_id: str, content: Optional[str] = 
         elif existing.get("contextName"):
             scope["contextName"] = existing["contextName"]
 
-        # Extract/regenerate keywords asynchronously — non-blocking; empty list on failure
-        keywords = await extract_diary_keywords(new_name or "", new_content)
+        # Both extraction passes in one interleaved window loop — same shape as
+        # db_save_diary, and for the same reason: the names ride to
+        # _auto_link_people below instead of a second full read of the entry.
+        keywords, people_names = await extract_diary_signals(new_name or "", new_content)
         if keywords:
             if new_metadata is None:
                 new_metadata = {}
@@ -1155,8 +1289,10 @@ async def db_update_diary(entry_id: str, user_id: str, content: Optional[str] = 
             _stamp_manual_scope(entry_id, "DiaryEntry", user_id)
 
     await publish_db_event(user_id, "diary_changed", {"action": "update", "id": entry_id, "date": entry_date})
-    # Auto-link People facts mentioned by name (add-only, fire-and-forget)
-    await _auto_link_people(entry_id, new_content, user_id)
+    # Auto-link People facts mentioned by name (add-only, fire-and-forget).
+    # The names came out of the interleaved extraction above, so the binding
+    # hop starts straight from them instead of re-reading the entry.
+    await _auto_link_people(entry_id, new_content, user_id, names=people_names)
     # Same reconciliation the save path runs, against the same entry id, so an
     # edit updates the register instead of duplicating it.
     await sync_actions_from_text(entry_id, "DiaryEntry", user_id, new_content,

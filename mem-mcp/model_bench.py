@@ -388,10 +388,18 @@ def _local_string(module: str, function: str, name: str) -> str:
 
 
 def shipping_prompts() -> dict:
+    # The two diary extractors now share one system preamble and carry their
+    # task instruction at the END of the user message, so the people call of
+    # a window is a prompt-cache hit on the keyword call's evaluated prefix.
+    # The bench measures the pair as the app sends it: the preamble as the
+    # system, the instruction appended after the fixture text (build_cases).
+    preamble = _module_string("diary_manager.py", "_EXTRACT_PREAMBLE")
     return {
         "scope": _module_string("migrate_client_context.py", "_SCOPE_SYSTEM"),
-        "keywords": _module_string("diary_manager.py", "_KEYWORD_EXTRACT_SYSTEM"),
-        "people": _module_string("diary_manager.py", "_PEOPLE_EXTRACT_SYSTEM"),
+        "keywords": preamble,
+        "keywords_task": _module_string("diary_manager.py", "_KEYWORD_EXTRACT_TASK"),
+        "people": preamble,
+        "people_task": _module_string("diary_manager.py", "_PEOPLE_EXTRACT_TASK"),
         # The only role that runs on LLM_QUERY_MODEL: `_bind_people_llm` is the
         # single call site left that is not an explicit SCOPE/EXTRACT/MERGE
         # override, so a benchmark without this role never measures the query
@@ -833,14 +841,17 @@ def build_cases(prompts: dict, long_people: bool = True) -> dict:
         ],
         "keywords": [
             {"id": "platform-sync", "system": prompts["keywords"],
-             "prompt": f"ENTRY: Data platform migration sync\n\n{KEYWORD_MEETING}",
+             "prompt": (f"ENTRY: Data platform migration sync\n\n{KEYWORD_MEETING}"
+                        f"\n\n{prompts['keywords_task']}"),
              "num_predict": 200, "expect": {"source": KEYWORD_MEETING}},
             {"id": "short-note", "system": prompts["keywords"],
-             "prompt": f"ENTRY: Licence renewal\n\n{KEYWORD_SHORT}",
+             "prompt": (f"ENTRY: Licence renewal\n\n{KEYWORD_SHORT}"
+                        f"\n\n{prompts['keywords_task']}"),
              "num_predict": 200, "expect": {"source": KEYWORD_SHORT}},
         ],
         "people": [
-            {"id": "participants-long", "system": prompts["people"], "prompt": people_text,
+            {"id": "participants-long", "system": prompts["people"],
+             "prompt": f"{people_text}\n\n{prompts['people_task']}",
              "num_predict": 400,
              "expect": {"names": ["Alice Smith", "Bob Jones", "Carol Meyer",
                                   "David Okonkwo", "Eva Lindqvist", "Frank Moreau"]}},

@@ -88,6 +88,7 @@ class Recorder:
         self.client_timeouts = []
         self.warnings = []
         self.errors = []
+        self.infos = []
 
 
 class FakeLogger:
@@ -99,6 +100,9 @@ class FakeLogger:
 
     def error(self, msg, *a, **kw):
         self._rec.errors.append(str(msg))
+
+    def info(self, msg, *a, **kw):
+        self._rec.infos.append(str(msg))
 
     def debug(self, msg, *a, **kw):
         pass
@@ -559,6 +563,52 @@ class ContentLoggingTests(unittest.TestCase):
         # the sizes are still there, which is the point of the knob
         self.assertIn("prompt_chars=", joined)
         self.assertIn("content_chars=", joined)
+
+
+# ---------------------------------------------------------------------------
+# The prompt-cache receipt
+# ---------------------------------------------------------------------------
+class ExtractionTimingLogTests(unittest.TestCase):
+    """A labelled call logs Ollama's own timings at INFO; an unlabelled one does not.
+
+    Ollama reuses the KV cache for the longest common token prefix of
+    consecutive requests to a loaded model, and `prompt_eval_count` is what it
+    actually evaluated — so this receipt is how the interleaved diary
+    extraction (extract_diary_signals) is verified in production: a count well
+    below the prompt's ~len/3 tokens says the prefix was served from the cache,
+    and a full count says the prefix diverged. The line is gated on `label`
+    because it is a measurement for the extraction path, not chat traffic.
+    """
+
+    def setUp(self):
+        self.rec = Recorder()
+
+    def test_a_labelled_call_logs_one_timing_line(self):
+        # prompt_eval_count and prompt_eval_duration both > 0 so the summary
+        # carries the prompt half, not only `answer=N tok`.
+        payload = {"message": {"content": "ok"}, "prompt_eval_count": 120,
+                   "prompt_eval_duration": 400_000_000, "eval_count": 40,
+                   "eval_duration": 300_000_000}
+        ns = _load(self.rec, lambda url, body, n: FakeResponse(200, payload))
+        asyncio.run(ns[_FUNCTION]("p", label="extract_diary_keywords window 1/1"))
+        self.assertEqual(len(self.rec.infos), 1)
+        line = self.rec.infos[0]
+        for needle in ("[extract_diary_keywords window 1/1]", "prompt=120 tok",
+                       "prompt_chars=1", "answer=40 tok"):
+            self.assertTrue(needle in line, msg=f"{needle!r} missing from: {line}")
+
+    def test_an_unlabelled_call_writes_no_timing_line(self):
+        ns = _load(self.rec, _ok("ok"))
+        asyncio.run(ns[_FUNCTION]("p"))
+        self.assertEqual(self.rec.infos, [])
+
+    def test_a_failed_call_writes_no_timing_line(self):
+        """The receipt is for an answer; the failure paths have their own lines."""
+        ns = _load(self.rec,
+                   lambda url, body, n: FakeTimeoutException("read timed out"))
+        with self.assertRaises(RuntimeError):
+            asyncio.run(ns[_FUNCTION]("p", label="extraction"))
+        self.assertEqual(self.rec.infos, [])
 
 
 # ---------------------------------------------------------------------------

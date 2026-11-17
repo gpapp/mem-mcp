@@ -107,13 +107,25 @@ def _lift_keyword_extractor(llm, recorder=None, **overrides):
         "logger": recorder,
         "get_llm_response": llm,
         "_clean_keywords": clean,
-        "_KEYWORD_EXTRACT_SYSTEM": "stub system prompt",
+        "_EXTRACT_PREAMBLE": "stub system prompt",
         # The function passes this explicitly now that extraction has its own
         # model. The stub LLM asserts on `model`, so a NameError here would be
         # indistinguishable from a broken extractor.
         "EXTRACT_MODEL": "stub-extract-model",
         "re": re,
         "json": json,
+        # The window loop now delegates each window to the shared per-window
+        # helper, which is lifted with the same stub LLM so the assertions on
+        # what was sent still inspect the actual request.
+        "_extract_keywords_for_window": _lift(
+            "_extract_keywords_for_window",
+            get_llm_response=llm,
+            _EXTRACT_PREAMBLE="stub system prompt",
+            _KEYWORD_EXTRACT_TASK="stub task instruction",
+            _clean_keywords=clean,
+            EXTRACT_MODEL="stub-extract-model",
+            logger=recorder,
+        ),
     }
     namespace.update(overrides)
     return _lift("extract_diary_keywords", **namespace)
@@ -262,9 +274,12 @@ class ExtractLoopTests(unittest.TestCase):
 
     def test_it_loops_over_windows(self):
         self.assertIn("for index, window in enumerate(windows):", self.body)
-        self.assertIn("get_extraction_response(", self.body)
+        # The guard moved into the shared per-window helper; the loop's own
+        # responsibility is to route each window through it with the window as
+        # the prompt.
+        self.assertIn("_extract_names_for_window(", self.body)
         self.assertIn(
-            "window,", self.body,
+            "_extract_names_for_window(window", self.body,
             msg="the window must be the prompt the guarded helper is handed",
         )
 
@@ -358,18 +373,40 @@ class PeopleExtractionCallSiteTests(unittest.TestCase):
             "PEOPLE_EXTRACT_OVERLAP": 600,
             "PEOPLE_EXTRACT_WARN_WINDOWS": 6,
             "PEOPLE_EXTRACT_MAX_TOKENS": 800,
-            "_PEOPLE_EXTRACT_SYSTEM": "stub system prompt",
+            "_EXTRACT_PREAMBLE": "stub system prompt",
             "EXTRACT_MODEL": "stub-extract-model",
             "clean_extracted_people_names": dedupe_names,
             "parse_people_name_array": parse_people_name_array,
             "get_extraction_response": llm,
+            # The loop now delegates each window to the shared per-window
+            # helper, lifted with the same stub guard so the assertions on what
+            # was sent still inspect the actual request.
+            "_extract_names_for_window": _lift(
+                "_extract_names_for_window",
+                get_extraction_response=llm,
+                _EXTRACT_PREAMBLE="stub system prompt",
+                _PEOPLE_EXTRACT_TASK="stub task instruction",
+                EXTRACT_MODEL="stub-extract-model",
+                PEOPLE_EXTRACT_MAX_TOKENS=800,
+                parse_people_name_array=parse_people_name_array,
+                clean_extracted_people_names=dedupe_names,
+                logger=recorder,
+            ),
         }
         return _lift("_extract_people_names", **namespace), recorder
 
     def test_the_extractor_calls_the_guarded_helper_not_the_bare_chat_call(self):
+        """Two halves, because the guard moved into the shared per-window
+        helper: the names loop must go through that helper (a test of the
+        helper is not a test of its call site), and the helper must go through
+        the decode guard."""
         _source, _tree, _target, segment = _segment("_extract_people_names")
-        self.assertIn("get_extraction_response(", segment)
+        self.assertIn("_extract_names_for_window(", segment)
         self.assertNotIn("get_llm_response(", segment,
+                         msg="the bare chat call is the greedy decode that looped")
+        _src2, _tree2, _target2, helper = _segment("_extract_names_for_window")
+        self.assertIn("get_extraction_response(", helper)
+        self.assertNotIn("get_llm_response(", helper,
                          msg="the bare chat call is the greedy decode that looped")
 
     def test_the_guard_gets_the_window_label_and_the_extraction_model(self):
@@ -518,7 +555,8 @@ class KeywordWindowTests(unittest.TestCase):
         self.marker = "HEDRON-ATLAS-PILOT"
 
     def _extractor(self, responder, **overrides):
-        async def llm(prompt, system=None, num_predict=None, model=None, timeout=None):
+        async def llm(prompt, system=None, num_predict=None, model=None, timeout=None,
+                      label=None):
             # The call site now names the extraction model explicitly, so the
             # stub must accept it. It also asserts below that the model it is
             # handed is the extraction one and not a leftover default.
@@ -649,11 +687,164 @@ class KeywordWindowTests(unittest.TestCase):
     def test_no_error_leaves_a_save_blocked(self):
         """The contract: keyword extraction is best-effort and returns []."""
 
-        async def llm(prompt, system=None, num_predict=None):
+        async def llm(prompt, system=None, num_predict=None, label=None):
             raise RuntimeError("ollama down")
 
         extract = _lift_keyword_extractor(llm, self.recorder)
         self.assertEqual(asyncio.run(extract("Tuesday", "some content")), [])
+
+
+class DiarySignalDriverTests(unittest.TestCase):
+    """The save path's interleaved extraction, driven.
+
+    ``extract_diary_signals`` pairs the two passes per window so the second
+    call of each window is a prompt-cache hit. That pairing is a property of
+    the call site, not of either helper: run the windows in the wrong order,
+    or run the passes back to back over the whole entry, and every behavioural
+    test of the helpers still passes while the cache never fires.
+    """
+
+    def _driver(self, kw_llm, ppl_llm):
+        recorder = _Recorder()
+
+        def keep_names(names):
+            # Mirrors clean_extracted_people_names' contract the driver relies
+            # on: dedupe across the union, because a name spanning the window
+            # overlap is found twice.
+            seen, out = set(), []
+            for name in names or []:
+                key = name.strip().lower()
+                if key and key not in seen:
+                    seen.add(key)
+                    out.append(name.strip())
+            return out
+
+        namespace = {
+            "text_windows": text_windows,
+            "_EXTRACT_WINDOW": 6000,
+            "_EXTRACT_OVERLAP": 600,
+            "_EXTRACT_WARN_WINDOWS": 6,
+            "KEYWORD_LIMIT": 20,
+            "logger": recorder,
+            "_clean_keywords": _lift("_clean_keywords"),
+            "clean_extracted_people_names": keep_names,
+            "_extract_keywords_for_window": _lift(
+                "_extract_keywords_for_window",
+                get_llm_response=kw_llm,
+                _EXTRACT_PREAMBLE="shared preamble",
+                _KEYWORD_EXTRACT_TASK="kw task instruction",
+                _clean_keywords=_lift("_clean_keywords"),
+                EXTRACT_MODEL="stub-extract-model",
+                logger=recorder,
+            ),
+            "_extract_names_for_window": _lift(
+                "_extract_names_for_window",
+                get_extraction_response=ppl_llm,
+                _EXTRACT_PREAMBLE="shared preamble",
+                _PEOPLE_EXTRACT_TASK="people task instruction",
+                EXTRACT_MODEL="stub-extract-model",
+                PEOPLE_EXTRACT_MAX_TOKENS=800,
+                parse_people_name_array=parse_people_name_array,
+                clean_extracted_people_names=keep_names,
+                logger=recorder,
+            ),
+        }
+        return _lift("extract_diary_signals", **namespace), recorder
+
+    def test_the_two_calls_of_a_window_share_the_prefix(self):
+        """The whole point: same system message and the same user text up to
+        the task tail. The instruction travels at the END of the user message,
+        so the keyword call pays the prompt evaluation and the people call of
+        the same window is a cache hit up to its instruction."""
+        order = []
+
+        async def kw_llm(prompt, system=None, **kw):
+            order.append(("kw", prompt, system))
+            return json.dumps({"keywords": ["alpha"]})
+
+        async def ppl_llm(prompt, system=None, **kw):
+            order.append(("ppl", prompt, system))
+            return '["Anna Weber"]'
+
+        content = "word " * 1400  # 7000 chars -> two 6000/600 windows
+        driver, _ = self._driver(kw_llm, ppl_llm)
+        keywords, names = asyncio.run(driver("Handover", content))
+        self.assertEqual([tag for tag, _, _ in order], ["kw", "ppl", "kw", "ppl"])
+        # Each pair is one window: the identical window text under the
+        # identical name lead — the shared prefix — with only the task
+        # instruction differing at the tail, and the identical preamble as
+        # the system message in front of both.
+        window1 = f"Handover\n{content[:6000]}"
+        window2 = f"Handover\n{content[5400:]}"
+        self.assertEqual(order[0][1], f"{window1}\n\nkw task instruction")
+        self.assertEqual(order[1][1], f"{window1}\n\npeople task instruction")
+        self.assertEqual(order[2][1], f"{window2}\n\nkw task instruction")
+        self.assertEqual(order[3][1], f"{window2}\n\npeople task instruction")
+        self.assertEqual(os.path.commonprefix([order[0][1], order[1][1]]),
+                         f"{window1}\n\n", msg="the shared user-text prefix diverged")
+        self.assertEqual(order[0][2], "shared preamble")
+        self.assertEqual(order[1][2], "shared preamble")
+        self.assertEqual((keywords, names), (["alpha"], ["Anna Weber"]))
+
+    def test_a_failing_keyword_window_does_not_discard_the_names(self):
+        calls = []
+
+        async def kw_llm(prompt, system=None, **kw):
+            calls.append("kw")
+            raise RuntimeError("boom")
+
+        async def ppl_llm(prompt, system=None, **kw):
+            calls.append("ppl")
+            return '["Anna Weber"]'
+
+        driver, _ = self._driver(kw_llm, ppl_llm)
+        keywords, names = asyncio.run(driver("", "Anna Weber writes."))
+        self.assertEqual(calls, ["kw", "ppl"])
+        self.assertEqual(keywords, [])
+        self.assertEqual(names, ["Anna Weber"])
+
+    def test_a_failing_people_window_does_not_discard_the_keywords(self):
+        async def kw_llm(prompt, system=None, **kw):
+            return json.dumps({"keywords": ["alpha"]})
+
+        async def ppl_llm(prompt, system=None, **kw):
+            raise RuntimeError("boom")
+
+        driver, _ = self._driver(kw_llm, ppl_llm)
+        keywords, names = asyncio.run(driver("", "Anna Weber writes."))
+        self.assertEqual(keywords, ["alpha"])
+        self.assertEqual(names, [])
+
+
+class DiarySignalCallSiteTests(unittest.TestCase):
+    """The save paths must run the interleaved driver and hand its names over.
+
+    A helper tested in isolation is not a test of its call site: the old save
+    path re-read the whole entry a second time inside `_auto_link_people`,
+    and no behavioural test of the driver could see that.
+    """
+
+    def test_the_save_path_extracts_both_signals_in_one_pass(self):
+        _source, _tree, _target, segment = _segment("db_save_diary")
+        self.assertTrue(
+            "await extract_diary_signals(name or \"\", content)" in segment,
+            msg="db_save_diary must call the interleaved driver",
+        )
+        self.assertTrue(
+            "_auto_link_people(doc_id, content, user_id, names=people_names)" in segment,
+            msg="the extracted names must reach the binder without a second extraction",
+        )
+
+    def test_the_update_path_extracts_both_signals_in_one_pass(self):
+        _source, _tree, _target, segment = _segment("db_update_diary")
+        self.assertTrue(
+            "await extract_diary_signals(new_name or \"\", new_content)" in segment,
+            msg="db_update_diary must call the interleaved driver",
+        )
+        self.assertTrue(
+            "_auto_link_people(entry_id, new_content, user_id, names=people_names)" in segment,
+            msg="the extracted names must reach the binder without a second extraction",
+        )
 
 
 class KeywordSourceTests(unittest.TestCase):

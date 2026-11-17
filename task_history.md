@@ -5,6 +5,65 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# Diary extraction runs both passes per window, so the second call is a prompt-cache hit
+
+**Why.** Every diary save ran two full window loops over the same entry — keywords
+first, then people names — so every window's prompt was evaluated twice from
+scratch. Ollama reuses the KV cache for the longest common token prefix of
+consecutive requests, but the two loops were separated by the whole entry and their
+system messages differed at token 1, so the cache never applied. On a long
+transcription that is the most expensive thing a save does, twice over.
+
+**What shipped.**
+
+- **`extract_diary_signals(name, content) -> (keywords, names)`** in
+  `diary_manager.py` is the driver both save paths now call: for each window it
+  makes the keyword call and then the people call, so the names call is served
+  from the keyword call's evaluated prefix.
+- **One shared system message (`_EXTRACT_PREAMBLE`) and the task instruction at
+  the END of the user message** (`_KEYWORD_EXTRACT_TASK` / `_PEOPLE_EXTRACT_TASK`).
+  Two calls stay two calls: a model asked for two fields fills both. The
+  per-window helpers `_extract_keywords_for_window` / `_extract_names_for_window`
+  hold the actual requests.
+- **`_EXTRACT_WINDOW` / `_EXTRACT_OVERLAP` / `_EXTRACT_WARN_WINDOWS`** alias the
+  keyword geometry (8000/500), because both passes run over the same windows and
+  the keyword call pays the full prompt eval. `MEM_PEOPLE_WINDOW` /
+  `MEM_PEOPLE_OVERLAP` now tune only the standalone `_extract_people_names` path
+  (`find_people_candidates`, and `_auto_link_people`'s `names=None` fallback).
+- **`_auto_link_people(..., names=people_names)`** on both save paths: `None`
+  means nobody extracted (extract), `[]` means extracted and none found (must
+  not). Before this the save path re-read the whole entry for the binder, paying
+  for the window loop a second time and defeating the interleaving.
+- **`get_llm_response(..., label=...)`** logs one INFO line with Ollama's own
+  timings — `[label] prompt=… answer=… (prompt_chars=N, ~N//3 tok)` — gated on the
+  label and guarded by `try/except`. `prompt_eval_count` well below `N//3` is the
+  documented cache-hit signature; the line is how this change is verified in
+  production, and only the extraction calls pass a label.
+- **`model_bench.shipping_prompts()` now lifts the prompt as the pair the app
+  actually sends** (`keywords`/`people` preamble plus `keywords_task`/
+  `people_task`, appended to the fixture prompt by `build_cases`), because
+  benching the preamble alone measures a request the app never makes.
+
+**The one thing to rediscover the hard way.** `_KEYWORD_EXTRACT_TASK` and
+`_PEOPLE_EXTRACT_TASK` were defined and *never referenced* in the first cut of
+this change: the helpers sent the window text verbatim, so the model got the
+preamble with no instruction and no JSON shape. Nothing failed — the keyword parse
+returned `[]` and the names parse returned `None`, both of which are also the
+legitimate "nothing found" answers. The lift-harness tests hid it because a
+missing constant raises `NameError` **inside** the per-window `try/except`, which
+is swallowed; the symptom was zero recorded prompts rather than an error. Every
+namespace that lifts these helpers must carry both task constants, and a test that
+asserts on the prompt that reached the model is the only thing that sees it.
+
+**Verified.** All 27 dependency-light suites green (1636 tests), including the new
+`DiarySignalDriverTests` (interleaving order, shared prefix per window, one pass
+failing does not discard the other's result) and `DiarySignalCallSiteTests` (both
+save paths call the driver and pass `names=` through), `ExtractionTimingLogTests`,
+and the updated `ModelRoleRoutingTests` (exactly two `system=_EXTRACT_PREAMBLE`
+calls, each passing `model=EXTRACT_MODEL`).
+
+---
+
 # My Actions moved to a dedicated Actions tab
 
 **Why.** "My actions" lived at the top of the Clients tab, which mixed a

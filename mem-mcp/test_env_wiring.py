@@ -206,20 +206,23 @@ class ModelRoleRoutingTests(unittest.TestCase):
 
         Half a split is the failure that survives review: the keyword call is
         moved and the people call is missed, and both look correct in the diff.
+        The two calls now share one preamble as their system message — that is
+        what makes the people call a prompt-cache hit on the keyword call's
+        evaluated prefix — so the pin is: every `system=_EXTRACT_PREAMBLE` call
+        passes model=EXTRACT_MODEL, and there are exactly two of them.
         """
-        # Match the CALL, not the prompt's definition. Finding the constant's
-        # name finds its assignment first -- which is a prompt string hundreds
-        # of lines from the call that uses it, so the first version of this test
-        # failed against correct code.
-        for system_name in ("_KEYWORD_EXTRACT_SYSTEM", "_PEOPLE_EXTRACT_SYSTEM"):
-            calls = [c for c in self._call_sites("diary_manager.py", system_name)
-                     if f"system={system_name}" in c]
-            self.assertTrue(calls, msg=f"no call passes {system_name}")
-            for call in calls:
-                self.assertIn("model=EXTRACT_MODEL", call,
-                              msg=(f"the {system_name} call does not pass "
-                                   f"model=EXTRACT_MODEL, so it inherits "
-                                   f"LLM_QUERY_MODEL"))
+        calls = [c for c in self._call_sites("diary_manager.py", "_EXTRACT_PREAMBLE")
+                 if "system=_EXTRACT_PREAMBLE" in c]
+        self.assertTrue(calls, msg="no call passes _EXTRACT_PREAMBLE")
+        self.assertEqual(
+            len(calls), 2,
+            msg=("the preamble is the system message of exactly two calls "
+                 "(keywords, people names); a third call sharing the prefix "
+                 "would be one request asked for two fields"))
+        for call in calls:
+            self.assertIn("model=EXTRACT_MODEL", call,
+                          msg=(f"the call does not pass model=EXTRACT_MODEL, so it "
+                               f"inherits LLM_QUERY_MODEL"))
 
     def test_merge_review_uses_a_judgement_model(self):
         """Duplicate adjudication goes to the scope model, not the extract model.

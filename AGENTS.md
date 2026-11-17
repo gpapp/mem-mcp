@@ -1128,6 +1128,8 @@ A reclassify returned `503 Service Unavailable` and was read as "out of memory l
 - **A call may pass its own sampling, and the live-note rewrite has to.** `get_llm_response(..., options={...})` merges over the default `{"temperature": 0.0}`, with the caller's keys winning — including temperature, or a retry would be the same greedy decode again. Greedy is right for short JSON answers and wrong for the one call that rewrites a long Markdown document, where `granite3.3:2b` looped until Ollama aborted with `{"error":"prediction aborted, token repeat limit reached"}` (HTTP 500, which reads like a service failure and is not). See Live Notes → "A rewrite that repeats itself is a decoder failure".
 - **An empty answer is logged, not raised.** A model that loads and then produces nothing is the memory-pressure shape the user suspected — and it used to return `""` in total silence while callers fell back to the raw query or to no keywords, so the vault quietly got worse. Raising here would break those deliberate fallbacks and turn a degraded search into a failed request, so the fix is the ERROR line, not an exception. Keep it that way: *log* the empty answer, never throw on it.
 - **The log carries the content, not just the size.** `prompt_chars=3572` tells you a call was big; it does not tell you what the model was shown or what it said, so a mis-scoped or hallucinating verdict could not be checked without reproducing the call. `_llm_excerpt()` adds `system=`, `prompt=` and `content=` (and the raw `body=`) capped at `LLM_LOG_CHARS` (`MEM_LLM_LOG_CHARS`, default 1000), with `…+N more chars` so the total is still known. It **escapes newlines, tabs and backslashes** — prompts are multi-line by nature, and a raw newline in a `RotatingFileHandler` record makes one event span several lines, at which point `grep` reports a fragment as if it were the whole message. `MEM_LLM_LOG_CHARS=0` restores sizes-only, and that is a privacy switch, not an "unlimited" one: this writes entry and meeting text into the log file. The 1K cap is per field, not per line, so a 40k-char entry cannot put 40k chars on a reclassify line.
+- **A labelled call logs Ollama's own timings at INFO, and that is the prompt-cache receipt.** `get_llm_response(..., label="extract_diary_keywords window 1/2")` writes one INFO line:
+  `[extract_diary_keywords window 1/2] prompt=1200 tok in 3.2s (375 tok/s), answer=40 tok (prompt_chars=7650, ~2550 tok)`. Only the extraction calls pass a label, and an unlabelled call writes nothing, so this cannot bury chat traffic. `prompt_eval_count` is what Ollama *actually evaluated*: a count well below `prompt_chars / 3` means the KV prefix was served from the cache, and a full count means it diverged — which is how the interleaved diary extraction ("Diary Keyword Extraction") is verified in production. The render is guarded by `try/except` and the line is only written when `_ollama_timing` produced something: it parses a body the model has already answered with successfully, and a diagnostic that can 500 a save is worse than no diagnostic.
 - **A 503 must say why.** All 44 `except RuntimeError` handlers in `gui.py` route through `_service_unavailable(e)`, which logs the reason before building the response. The detail used to be formatted into an `HTTPException` and discarded: the access log recorded the status and nothing recorded the cause. "Another maintenance operation is running" and "Ollama timed out" are completely different problems, and the most informative message in the codebase was the one that never got logged. Do not reintroduce a bare `raise HTTPException(status_code=503, detail=str(e))` — `ServiceUnavailableLoggingTests` checks for it.
 - **A 503 from a single-item reclassify is usually a lock collision, not a failure.** `reclassify_single_*` holds the per-user maintenance lock for the whole run and releases it in a `finally`. With the windowing above, a reclassify is several LLM calls at tens of seconds each, so a second click is very likely to arrive while the first is still running and get an instant 503 with `"Another maintenance operation (backup/restore/reclassify) is running"`. Read the lock message as "the first one is still going", and check whether it completed before assuming the reclassify failed.
 
@@ -2152,6 +2154,17 @@ deliberately exempt: their prompts are assembled from graph candidates the
 script cannot see, so they are reproduced at contract level and the report says
 so.
 
+**The two diary extraction roles are lifted as a pair, because the app sends a
+pair.** The shipped request is `_EXTRACT_PREAMBLE` as the system message plus the
+window text with a task instruction appended (`_KEYWORD_EXTRACT_TASK` /
+`_PEOPLE_EXTRACT_TASK`), so `shipping_prompts()` carries `keywords`/`people`
+(the shared preamble) *and* `keywords_task`/`people_task`, and `build_cases`
+appends the task to the fixture prompt. Lifting only the preamble would bench a
+request the app never sends — an unlabelled excerpt with no instruction — and
+scoring that answer measures the harness. When a role's prompt moves, the lift
+is supposed to fail loudly rather than measure a stale copy; when a role's prompt
+*gains a part*, add the part to the bench instead of approximating it.
+
 **Sampling is per model, and that is a measured decision, not a preference.**
 The app pins `temperature: 0.0` in `get_llm_response`, which is right for short
 JSON answers and wrong as a benchmark setting: a model whose card specifies
@@ -2576,6 +2589,37 @@ Every diary save/update triggers automatic keyword extraction via the query LLM 
 - Backfill existing entries: `python mem-mcp/reindex_diary_keywords.py -u <user_id>`
 - CLI options: `-f/--force` (re-extract even if keywords exist), `-d/--dry-run`, `-c/--concurrency` (default 3)
 
+**The save path runs both extraction passes interleaved, per window.**
+`extract_diary_signals(name, content)` in `diary_manager.py` is the driver the two
+save paths call: for each window it makes the **keyword call, then the people
+call**, and returns `(keywords, names)`. The point is Ollama's prompt cache: it
+reuses the KV cache for the longest common token prefix of consecutive requests,
+so the two calls of a window share one system message (`_EXTRACT_PREAMBLE`) and
+one user prefix (the name + the window text) while each task's instruction
+(`_KEYWORD_EXTRACT_TASK` / `_PEOPLE_EXTRACT_TASK`) sits at the **END of the user
+message** — the keyword call pays the full prompt evaluation and the people call
+is served from the cache up to its instruction tail. Moving an instruction back
+into the system message of one call diverges at token 1 and re-prompt-evaluates
+every window; a merged two-field call is worse still (a model asked for two
+fields fills both). The per-window helpers `_extract_keywords_for_window` /
+`_extract_names_for_window` hold the actual calls; the two passes stay two
+separate requests.
+
+- `_EXTRACT_WINDOW` / `_EXTRACT_OVERLAP` / `_EXTRACT_WARN_WINDOWS` are aliases of
+  the keyword geometry (8000/500): the save path runs both passes over the SAME
+  windows, and the keyword call's full prompt eval is the expensive one, so it
+  sets the shape. `MEM_PEOPLE_WINDOW` / `MEM_PEOPLE_OVERLAP` now tune only the
+  **standalone names-only path** `_extract_people_names` (reached from
+  `find_people_candidates` and `_auto_link_people`'s fallback).
+- `_auto_link_people(..., names=people_names)` on both save paths: `None` means
+  nobody extracted (extract), `[]` means extracted and none found (must not
+  re-extract). The save path therefore reads the entry's text once, not once per
+  pass.
+- The keyword pass's per-window failure is logged at DEBUG and costs that
+  window's keywords; the people pass's failure is logged at WARNING
+  (`[{label}] failed: ...`) and costs that window's names — neither aborts the
+  other, and the drivers of both keep the surviving windows.
+
 **The union is capped; the window count is not.** `KEYWORD_LIMIT` bounds what a
 long entry can add, and the truncation keeps the *front* of the list because each
 window's prompt asks for the most important keywords first. `KEYWORD_EXTRACT_WARN_WINDOWS`
@@ -2591,6 +2635,23 @@ entry name is prepended to **every** window, not just the first: a window from t
 middle of a long entry has no other way to know which entry it belongs to.
 `KeywordWindowTests` asserts on the prompt that reached the model, because a
 call-count assertion cannot tell the two implementations apart — both make calls.
+
+**Verify the cache hit in production with the labelled timing line**, which both
+extraction helpers request through `get_llm_response(..., label=...)` /
+`get_extraction_response(..., label=...)`:
+
+```
+[extract_people_names window 1/2] prompt=... tok in ...s, answer=... tok (prompt_chars=N, ~N//3 tok)
+```
+
+`prompt_eval_count` well below the `~N//3` estimate is the KV-cache-hit
+signature; a count at or above it means the people call re-evaluated the whole
+window and the two prompts no longer share their prefix — check that the system
+message is still `_EXTRACT_PREAMBLE` for both and that the task instruction is
+still appended after the window text rather than folded into the system one.
+`grep '\[extract_people_names window' memory-vault.log` is the command; seeing
+these lines at all is the second check, since `MEM_LLM_LOG_CHARS` does not gate
+them but an unlabelled call site would.
 
 ### People Candidate Resolution
 
@@ -2628,16 +2689,34 @@ what the prompt actually contained and which bindings survived it.
 
 ### Diary People Extraction
 
-Diary people extraction runs the **whole entry**, in overlapping windows, not a prefix. `_extract_people_names()` in `diary_manager.py` iterates `people_extract_windows(content)` and unions the results.
+Diary people extraction runs the **whole entry**, in overlapping windows, not a prefix.
 
-The prefix form is the one to avoid. It sent `content[:2000]`, so on a 40k-char transcription every person named after character 2000 was silently missed — no error, just a missing `MENTIONS` edge nobody was looking for. Keyword extraction (above) now windows the same way, so the two paths agree on what "the entry" means.
+**On the save path it is half of the interleaved driver**, not a second pass over
+the entry: `extract_diary_signals` (see "Diary Keyword Extraction") calls
+`_extract_names_for_window` immediately after `_extract_keywords_for_window` for
+the same window, so the names call is a prompt-cache hit on the keyword call's
+evaluated prefix. The save paths then hand the returned names straight to
+`_auto_link_people(..., names=people_names)` — `None` means nobody extracted
+(so the helper extracts via the standalone path), `[]` means extracted and none
+found (so it must not). Without that argument the save path re-read the whole
+entry a second time for the binder, which paid for the window loop twice and
+defeated the interleaving entirely.
+
+The standalone path is `_extract_people_names()`, still reachable from
+`find_people_candidates` and from the `names=None` fallback, and it iterates
+`people_extract_windows(content)` — which is why `MEM_PEOPLE_WINDOW` and
+`MEM_PEOPLE_OVERLAP` still exist and still tune *that* path (the save path uses
+the `_EXTRACT_*` keyword geometry, since both passes run over the same windows).
+
+The prefix form is the one to avoid. It sent `content[:2000]`, so on a 40k-char transcription every person named after character 2000 was silently missed — no error, just a missing `MENTIONS` edge nobody was looking for. Keyword extraction (above) windows the same way, so the two paths agree on what "the entry" means.
 
 - `people_extract_windows(content, window=0, overlap=0)` is pure and unit-tested (`test_people_extraction.py`): blank → `[]`, a doc that fits the window → one element (short entries cost what they always did), otherwise `body[i:i+size] for i in range(0, len(body), size - overlap)`.
 - The overlap exists because a name straddling a boundary is cut in half, and both halves then look like garbage to the extractor. `step` is clamped to `size - 1` so a degenerate overlap cannot make the loop non-terminating.
-- `MEM_PEOPLE_WINDOW` (6000) and `MEM_PEOPLE_OVERLAP` (600) tune it.
+- `MEM_PEOPLE_WINDOW` (6000) and `MEM_PEOPLE_OVERLAP` (600) tune the standalone path only.
 - **Do not cap the window count.** Capping would reintroduce exactly the silent tail-drop the windowing fixed. Above `PEOPLE_EXTRACT_WARN_WINDOWS` (6) the entry is expensive (one LLM call per window) and logs a WARNING naming the knob instead. This is chat traffic, so WARNING is the right level per the logging policy in "Embedding Reliability".
-- Each window is wrapped in its own `try/except` inside the loop, so one bad window cannot discard the names the other windows found. `clean_extracted_people_names(found)` dedupes the union, since a name spanning the overlap is found twice.
+- Each window is wrapped in its own `try/except` inside the loop, so one bad window cannot discard the names the other windows found. `clean_extracted_people_names(found)` dedupes the union, since a name spanning the overlap is found twice — the driver relies on that, and a stub that does not dedupe makes the overlap window report the same person twice.
 - **That failure is logged at WARNING, and it goes through the extraction decode guard.** Both halves were DEBUG-only, which is why a third of one day's windows producing nothing surfaced as "granite is unresponsive on name extraction" while the log held the HTTP 500 that caused it — see "LLM Chat Reliability" for `get_extraction_response`, `EXTRACT_SAMPLING` and the retry. The two shapes here are different and both matter: `names is None` is "the answer did not parse" (reported, and no names from this window), while an exception is "the call failed" (reported, and the other windows still apply). A genuine `[]` is neither — it means no people in that window, and the guard is told so via `is_good`.
+- **The task instruction is part of the user message, not the system one.** `_PEOPLE_EXTRACT_TASK` is appended after the window text by `_extract_names_for_window`; both extractors share `_EXTRACT_PREAMBLE` as their system message so the pair of calls per window shares its prefix. A helper lifted in a test needs both constants in its namespace — without the task constant the lifted copy raises `NameError` inside the per-window `try/except`, which is *swallowed*, so the test records zero prompts and an empty result instead of failing loudly.
 
 ## Live Notes
 

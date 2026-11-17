@@ -207,11 +207,17 @@ class KeywordScoringTests(unittest.TestCase):
 
 
 class PromptLiftTests(unittest.TestCase):
-    def test_all_four_shipped_prompts_are_found(self):
-        """A prompt that moved must fail here, not silently measure a stale copy."""
+    def test_all_shipped_prompts_are_found(self):
+        """A prompt that moved must fail here, not silently measure a stale copy.
+
+        The keyword/people roles split into preamble + task when the two diary
+        extractors started sharing one system message, so the dict carries both
+        halves and build_cases composes them.
+        """
         prompts = mb.shipping_prompts()
         self.assertEqual(set(prompts),
-                         {"scope", "keywords", "people", "people_bind", "search_rewrite"})
+                         {"scope", "keywords", "keywords_task", "people",
+                          "people_task", "people_bind", "search_rewrite"})
         for role, text in prompts.items():
             self.assertGreater(len(text), 100, role)
 
