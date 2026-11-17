@@ -24,6 +24,7 @@ because a docstring that names the function is not a call to it.
 import ast
 import asyncio
 import os
+import re
 import types
 import unittest
 
@@ -272,6 +273,78 @@ class ListFiltersTests(unittest.TestCase):
     def test_a_missing_graph_is_an_empty_list(self):
         self.assertEqual(self._list(None)("alice"), [])
 
+    def test_a_source_filter_narrows_to_one_record(self):
+        driver = _FakeDriver(lambda query, params: _FakeResult(rows=[]))
+        self._list(driver)("alice", source_id="e1")
+        query, params = driver.queries[0], driver.params[0]
+        self.assertIn("a.sourceId = $sourceId", query,
+                      msg="the read half of RAISED_IN: without it the source "
+                          "cannot show what it extracted")
+        self.assertEqual(params.get("sourceId"), "e1")
+
+    def test_narrowing_filters_share_one_where(self):
+        # The regression: client_id + dueBefore without status used to emit
+        # `MATCH … AND a.dueAt …` — a syntax error the except below turned into
+        # a silent empty list, which reads as "nothing outstanding".
+        driver = _FakeDriver(lambda query, params: _FakeResult(rows=[]))
+        self._list(driver)("alice", client_id="c1", due_before="2026-05-31")
+        query = driver.queries[0]
+        self.assertIn("WHERE", query,
+                      msg="a narrowing filter with no WHERE is a syntax error, "
+                          "and the except answers an empty list")
+        self.assertNotIn(") AND", query,
+                         msg="an AND appended outside the WHERE clause")
+        self.assertLess(query.index("WHERE"), query.index("AND a.dueAt"),
+                        msg="the dueAt narrowing must sit inside the one WHERE")
+
+    def test_status_and_source_narrow_in_one_where(self):
+        driver = _FakeDriver(lambda query, params: _FakeResult(rows=[]))
+        self._list(driver)("alice", status="open", source_id="e1")
+        query = driver.queries[0]
+        self.assertEqual(query.count("WHERE"), 1)
+        self.assertIn("a.status = $status", query)
+        self.assertIn("a.sourceId = $sourceId", query)
+
+
+class FormatSourceTests(unittest.TestCase):
+    """The MCP read names the record an item was raised in.
+
+    mcp_tools.py imports fastmcp, so the formatter is lifted and exec'd against
+    a stub `mem` -- the same shape every lift in this file uses.
+    """
+
+    @staticmethod
+    def _format(rows):
+        namespace = {
+            "__builtins__": __builtins__,
+            "mem": types.SimpleNamespace(
+                describe_action_item=lambda row: {**row, "overdue": False}),
+        }
+        exec(compile(_source(MCP_TOOLS, "_format_action_items"),
+                     MCP_TOOLS, "exec"), namespace)
+        return namespace["_format_action_items"](rows)
+
+    def test_a_diary_sourced_item_names_the_entry(self):
+        out = self._format([{"id": "a1", "text": "send the doc",
+                             "status": "open", "owner": "Tim",
+                             "dueAt": "2026-05-31", "clientName": "DB",
+                             "contextName": "", "sourceId": "e1",
+                             "sourceLabel": "DiaryEntry"}])
+        self.assertIn("raised in diary entry `e1`", out)
+
+    def test_a_fact_sourced_item_names_the_fact(self):
+        out = self._format([{"id": "a1", "text": "send the doc",
+                             "status": "open", "dueAt": "",
+                             "sourceId": "f1", "sourceLabel": "Fact"}])
+        self.assertIn("raised in fact `f1`", out)
+
+    def test_a_manual_item_says_nothing(self):
+        out = self._format([{"id": "a1", "text": "send the doc",
+                             "status": "open", "dueAt": "",
+                             "sourceId": None, "sourceLabel": "manual"}])
+        self.assertNotIn("raised in", out,
+                         msg="a manual item has no record to trace back to")
+
 
 class AnnotationsAreSaneTests(unittest.TestCase):
     def test_no_python_311_illegal_construct_is_used(self):
@@ -369,6 +442,201 @@ class DashboardWiringTests(unittest.TestCase):
         self.assertIn("a.status === 'open'", body,
                       msg="a closed item must not offer the button that closes it")
 
+    def test_the_table_links_to_the_source(self):
+        body = self._js("templates/dashboard.html", "renderActionTable")
+        self.assertIn("a.sourceId", body)
+        self.assertIn("openActionSource(", body,
+                      msg="a Source column nobody can click is decoration")
+
+    def test_the_deep_link_reaches_both_record_kinds(self):
+        body = self._js("templates/dashboard.html", "openActionSource")
+        self.assertIn("selectDiaryEntry", body,
+                      msg="a diary source must open the diary tab")
+        self.assertIn("showFactInMemories", body)
+
+    def test_the_diary_view_shows_what_it_raised(self):
+        body = self._js("templates/dashboard.html", "renderDiaryEntryView")
+        self.assertIn("renderDiaryActions(entry)", body,
+                      msg="the badge lives on the entry that raised the items")
+
+    def test_the_diary_badge_reads_the_raised_in_edge(self):
+        body = self._js("templates/dashboard.html", "renderDiaryActions")
+        self.assertIn("sourceId=", body,
+                      msg="without the query param the badge is the whole "
+                          "register, not this entry's items")
+
+    def test_the_route_forwards_the_source_filter(self):
+        body = _source(os.path.join(HERE, "gui.py"), "api_list_action_items")
+        self.assertIn("source_id=", body,
+                      msg="a sourceId the browser sends and the route drops is "
+                          "a filter that does nothing")
+
+    def test_the_editor_is_wired_into_the_panes(self):
+        for fn, needle in (("clearFactPane", "mdEditorWire('new-text')"),
+                           ("renderFactPane", "mdEditorWire('ep-text')"),
+                           ("renderDiaryEditMode",
+                            "mdEditorWire('de-content')")):
+            with self.subTest(fn=fn):
+                body = self._js("templates/dashboard.html", fn)
+                self.assertIn(needle, body,
+                              msg="an editor component nobody mounts is dead code")
+
+
+class EditorAndSourceNodeTests(unittest.TestCase):
+    """The editor and the source link, driven the way the browser drives them.
+
+    `mdPrefixLines` replaces a marker that is already there and `mdWrap` wraps a
+    selection -- both are invisible in a source read, and the shared fake DOM
+    has no selection semantics, so each case builds its own textarea over
+    `_fakeEl`. Skipped when `node` is absent, like every render test that owns
+    the harness.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import shutil
+        cls.node = shutil.which("node")
+        if cls.node is None:
+            raise unittest.SkipTest("node is not installed")
+        with open(os.path.join(HERE, "templates", "dashboard.html"),
+                  encoding="utf-8") as handle:
+            cls.source = handle.read()
+        cls.blocks = re.findall(r"<script[^>]*>(.*?)</script>", cls.source, re.S)
+
+    def _run(self, cases):
+        import json
+        import subprocess
+        import tempfile
+        import test_share_endpoints
+        # The editor dispatches an `input` event after every edit, and the fake
+        # DOM has neither an Event constructor nor selection semantics, so the
+        # prelude builds a textarea with just those pieces bolted on.
+        prelude = (
+            "function _ta(id, value, s, e) {\n"
+            "  const el = _fakeEl(id);\n"
+            "  el.value = value;\n"
+            "  el.selectionStart = s; el.selectionEnd = e;\n"
+            "  el.setRangeText = (text, start, end) => {\n"
+            "    el.value = el.value.slice(0, start) + text + el.value.slice(end);\n"
+            "    el.selectionStart = start;\n"
+            "    el.selectionEnd = start + text.length; };\n"
+            "  el.setSelectionRange = (a, b) => {\n"
+            "    el.selectionStart = a; el.selectionEnd = b; };\n"
+            "  el.dispatchEvent = () => {};\n"
+            "  _els.set(id, el);\n"
+            "  return el;\n"
+            "}\n"
+            "global.Event = function (t) { this.type = t; };\n")
+        payload = "".join(
+            "  try { out[%r] = (%s); } catch (e) { out[%r] = 'THREW: ' + e.message; }\n"
+            % (name, expr, name) for name, expr in cases)
+        harness = (test_share_endpoints._NODE_HARNESS
+                   .replace("__APP_JS__", "\n".join(self.blocks[2:]))
+                   .replace("__CASES__", prelude + payload))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "harness.js")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(harness)
+            proc = subprocess.run([self.node, path], capture_output=True,
+                                  text=True, timeout=120)
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr[:400])
+        out = json.loads(proc.stdout)
+        if "fatal" in out:
+            self.fail(out["fatal"])
+        return out
+
+    def test_the_boot_mounts_the_editor_on_the_static_panes(self):
+        # The boot IIFE awaits `whoami` before mounting, so the case yields a
+        # tick before reading the guard back.
+        out = self._run([("wired", """
+(async () => {
+  await new Promise(r => setTimeout(r, 0));
+  return [_getEl('new-text').dataset.mdWired,
+          _getEl('diary-content').dataset.mdWired].join('|');
+})()
+""")])
+        self.assertEqual(out["wired"], "1|1",
+                         msg="the boot IIFE must mount the editor on the static "
+                             "markup, or those panes ship a bare textarea")
+
+    def test_a_sourced_item_renders_a_source_button(self):
+        out = self._run([("table", """
+renderActionTable([{id: 'a1', text: 'send the doc', owner: 'Tim',
+  dueAt: '2026-05-31', status: 'open', sourceId: 'e1',
+  sourceLabel: 'DiaryEntry', clientName: 'DB', contextName: ''}])
+""")])
+        self.assertIn("openActionSource('e1','DiaryEntry')", out["table"])
+        self.assertIn("📝 Meeting", out["table"])
+
+    def test_a_manual_item_renders_no_source_button(self):
+        out = self._run([("table", """
+renderActionTable([{id: 'a1', text: 'send the doc', owner: 'Tim',
+  dueAt: '', status: 'open', sourceId: null, sourceLabel: 'manual',
+  clientName: '', contextName: ''}])
+""")])
+        self.assertNotIn("openActionSource(", out["table"])
+
+    def test_a_bullet_click_replaces_the_markers_already_there(self):
+        out = self._run([("v", """
+(() => {
+  _ta('de-content', '## Done\\nsend the doc\\n- [ ] old task\\n\\nnext para', 0, 100);
+  mdPrefixLines('de-content', '- ', false);
+  return _getEl('de-content').value;
+})()
+""")])
+        self.assertEqual(out["v"],
+                         "- Done\n- send the doc\n- old task\n\n- next para",
+                         msg="a list click over a heading and a task must strip "
+                             "their markers, not nest a list inside them")
+
+    def test_a_heading_click_toggles(self):
+        out = self._run([
+            ("add", """
+(() => {
+  _ta('h-el', 'Title line', 0, 10);
+  mdPrefixLines('h-el', '## ', true);
+  return _getEl('h-el').value;
+})()
+"""),
+            ("remove", """
+(() => {
+  _ta('h-el2', '## Title line', 0, 13);
+  mdPrefixLines('h-el2', '## ', true);
+  return _getEl('h-el2').value;
+})()
+"""),
+        ])
+        self.assertEqual(out["add"], "## Title line")
+        self.assertEqual(out["remove"], "Title line",
+                         msg="once=true is a toggle: a second click on the same "
+                             "line removes the prefix it added")
+
+    def test_bold_wraps_the_selection(self):
+        out = self._run([("v", """
+(() => {
+  _ta('b-el', 'hello world', 6, 11);
+  mdWrap('b-el', '**');
+  return _getEl('b-el').value;
+})()
+""")])
+        self.assertEqual(out["v"], "hello **world**",
+                         msg="the wrapper must not touch the text outside the "
+                             "selection")
+
+    def test_preview_round_trips_without_losing_the_text(self):
+        out = self._run([("v", """
+(() => {
+  _ta('p-el', 'hello preview', 0, 5);
+  mdTogglePreview('p-el');
+  const shown = _getEl('md-preview-p-el').innerHTML;
+  mdShowWrite('p-el');
+  return [shown, _getEl('p-el').value,
+          _getEl('md-preview-p-el').style.display].join('|');
+})()
+""")])
+        self.assertEqual(out["v"], "hello preview|hello preview|none",
+                         msg="Write/Preview is a view toggle over the textarea, "
+                             "never a copy of the text into the preview")
 
 
 if __name__ == "__main__":

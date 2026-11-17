@@ -5,6 +5,62 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# A Markdown editor for the diary and fact textareas, and actions that name their source
+
+**Why.** Diary and fact entries are Markdown — the viewer renders it — but the
+editing surface was a bare `<textarea>`, so a user who wanted a heading or a
+task list had to type the markers and hope. Separately, an extracted action item
+knew its client and project but not *which record it came from*: the `RAISED_IN`
+edge existed on the write path and nothing read it back, so a commitment could
+not be traced to the meeting that produced it.
+
+**What shipped.**
+
+- **The editor is a toolbar plus a Write/Preview toggle around the existing
+  `<textarea>`**, not a CDN library and not `contenteditable`. The textarea
+  stays the single source of truth, so every save path that reads `.value` is
+  untouched; formatting goes through `setRangeText` so native undo survives.
+  `mdWrap` wraps a selection (bold / italic / code / link), `mdPrefixLines`
+  re-prefixes the selected lines (heading, quote, bullet, ordered, task) and
+  **strips a marker that is already there**, so a task click toggles and a
+  heading click un-headings. Preview reuses the `marked` already loaded for the
+  viewer (`{gfm, breaks}`), so the preview is the rendering. CSS:
+  `.md-toolbar`, `.md-btn`, `.md-tabs`, `.md-tab(.on)`, `.md-preview`.
+- **Wired into four textareas**: `clearFactPane` (`new-text`),
+  `renderFactPane` (`ep-text`) and `renderDiaryEditMode` (`de-content`) call
+  `mdEditorWire` when they rebuild; `mdEditorMount` at boot wraps the two that
+  are in the static markup (`new-text`, `diary-content`).
+- **`db_list_action_items` takes `source_id`** and returns `sourceId` /
+  `sourceLabel`; `GET /api/action-items` takes `sourceId`. The Actions tab
+  gained a **Source** column (`renderActionTable`) whose button deep-links —
+  `openActionSource` sends a diary source to `selectDiaryEntry` and a fact to
+  `showFactInMemories` — and the diary entry view paints an actions badge
+  (`renderDiaryActions`, id `diary-actions-badge`) by fetching
+  `action-items?sourceId=<entry id>` after the entry renders, the same
+  fetch-after-paint pattern as the deliverables badge. That fetch passes no
+  `status`, so a closed item is still shown.
+- **`_format_action_items` (MCP) names the source** — `raised in diary entry
+  \`<id>\`` / `raised in fact \`<id>\`` — so an agent can navigate from a
+  commitment back to the meeting. A manually added item (`sourceLabel:
+  'manual'`) says nothing.
+
+**The one thing to rediscover the hard way.** The `AND` without a `WHERE`.
+`db_list_action_items` assembled its narrowing clauses and appended
+`AND a.dueAt …` unconditionally, so `client_id` + `dueBefore` with no `status`
+produced `MATCH … AND a.dueAt …` — a Cypher syntax error the `except` swallowed
+into an empty list. All narrowing filters now go into one `WHERE … AND …`.
+`test_narrowing_filters_share_one_where` pins it, and the whole read half is
+pinned behaviourally: `ListFiltersTests` drives the query, `FormatSourceTests`
+drives the MCP formatter, `DashboardWiringTests` pins the column / deep link /
+badge / route, and `EditorAndSourceNodeTests` drives the toolbar against the
+dashboard's own script in the node harness.
+
+**Verified.** `node --check` on the extracted dashboard script blocks, `python3 -m
+py_compile` on the edited Python, and the full dependency-light suite — 1821
+tests OK, with `test_action_items.py` at 42 tests.
+
+---
+
 # Diary extraction runs both passes per window, so the second call is a prompt-cache hit
 
 **Why.** Every diary save ran two full window loops over the same entry — keywords

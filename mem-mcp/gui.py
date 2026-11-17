@@ -1779,19 +1779,22 @@ async def api_context_timeline(request: Request, context_id: str, limit: int = 2
 
 @web_app.get("/api/action-items", response_class=JSONResponse)
 async def api_list_action_items(request: Request, clientId: str = "", contextId: str = "",
-                                status: str = "", dueBefore: str = ""):
+                                status: str = "", dueBefore: str = "", sourceId: str = ""):
     """Commitments, filtered by engagement.
 
     ``clientId`` / ``contextId`` **filter** here, unlike search scope: the panel
     asks a closed question, so an item from another engagement is a wrong answer
-    rather than a lower-ranked one. `dueBefore` and `status` narrow further.
+    rather than a lower-ranked one. `dueBefore` and `status` narrow further;
+    `sourceId` narrows to the items one record raised — the read half of the
+    `RAISED_IN` edge, which is what lets the source show what it extracted.
     """
     user_id = _require_user(request)
     try:
         rows = mem.db_list_action_items(user_id, client_id=clientId or None,
                                         context_id=contextId or None,
                                         status=status or None,
-                                        due_before=dueBefore or None)
+                                        due_before=dueBefore or None,
+                                        source_id=sourceId or None)
         return {"items": [mem.describe_action_item(r) for r in rows]}
     except RuntimeError as e:
         raise _service_unavailable(e)

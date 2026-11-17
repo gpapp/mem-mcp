@@ -18,7 +18,11 @@ closed, and an item a human marked `done` is never reopened by a re-extraction.
 **Scope is copied from the record the item was raised in, and follows it.** An
 item inherits its source's `FOR_CLIENT` / `IN_CONTEXT` edges, so the client
 panel can list what is outstanding for that client without a second lookup, and
-a re-scope of the source carries its open items with it.
+a re-scope of the source carries its open items with it. The source itself is
+named too: ``(item)-[:RAISED_IN]->(source)`` plus a ``sourceId``/``sourceLabel``
+property, so the register can link back to the meeting a commitment came from
+and the meeting can show what it raised — read through ``db_list_action_items`'s
+``source_id`` filter.
 """
 
 import uuid
@@ -202,13 +206,23 @@ async def db_sync_action_items(source_id: str, source_label: str, user_id: str,
 
 
 def db_list_action_items(user_id: str, client_id=None, context_id=None,
-                         status=None, due_before=None, limit: int = 200) -> list:
+                         status=None, due_before=None, limit: int = 200,
+                         source_id=None) -> list:
     """Open (or all) commitments, newest deadline first.
 
     ``client_id`` / ``context_id`` **filter** rather than rank, unlike search
     scope, because the panel is asking a closed question: what is outstanding
     for *this* engagement. An item with no scope has no engagement to belong to
-    and is only returned when neither filter is given.
+    and is only returned when neither filter is given. ``source_id`` narrows to
+    the items one record raised — the read half of the ``RAISED_IN`` edge, so
+    the source can show what it extracted as well as the register showing where
+    an item came from.
+
+    Every narrowing filter lands in ONE ``WHERE``, assembled here: appending
+    ``AND …`` clauses to a clause list that only has a ``WHERE`` under some
+    combinations is how ``client_id`` + ``dueBefore`` without ``status`` used
+    to emit ``MATCH … AND a.dueAt …`` — a syntax error the ``except`` below
+    turned into a silent empty list.
     """
     driver = get_neo4j()
     if not driver:
@@ -222,14 +236,20 @@ def db_list_action_items(user_id: str, client_id=None, context_id=None,
     if context_id:
         clauses.append("MATCH (a)-[:IN_CONTEXT]->(:Context {id: $contextId, userId: $userId})")
         params["contextId"] = context_id
+    where = []
     if status:
-        clauses.append("WHERE a.status = $status")
+        where.append("a.status = $status")
         params["status"] = _clean_status(status)
     elif not client_id and not context_id:
-        clauses.append("WHERE coalesce(a.status, 'open') = 'open'")
+        where.append("coalesce(a.status, 'open') = 'open'")
+    if source_id:
+        where.append("a.sourceId = $sourceId")
+        params["sourceId"] = source_id
     if due_before:
-        clauses.append("AND a.dueAt IS NOT NULL AND a.dueAt <= $dueBefore")
+        where.append("a.dueAt IS NOT NULL AND a.dueAt <= $dueBefore")
         params["dueBefore"] = str(due_before)[:10]
+    if where:
+        clauses.append("WHERE " + " AND ".join(where))
     clauses.append(
         "OPTIONAL MATCH (a)-[:FOR_CLIENT]->(c:Client) "
         "OPTIONAL MATCH (a)-[:IN_CONTEXT]->(x:Context) "

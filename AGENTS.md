@@ -1914,6 +1914,40 @@ Search diary entries from the calendar rail.
 - Clearing the input restores the full date history list
 - API endpoint: `GET /api/diary/search?q=<text>&limit=10&top_p=0.4`
 
+### Markdown Editor
+
+The diary and fact content textareas are wrapped in a hand-rolled formatting
+toolbar with a **Write / Preview** toggle. It is deliberately not a CDN
+library and not `contenteditable`: the `<textarea>` stays the single source of
+truth, so every save path that reads `.value` — diary and fact, new and edit,
+GUI and MCP — is untouched by the toolbar.
+
+- **Formatting goes through `setRangeText`, never by rebuilding the value.**
+  `mdWrap` (bold / italic / code / link) wraps the selection and puts the caret
+  back inside the marks; `mdPrefixLines` (heading, quote, bullet, ordered,
+  task) re-prefixes the selected lines. `setRangeText` keeps the browser's
+  native undo stack, so Ctrl+Z still undoes one edit at a time — assigning
+  `ta.value` would drop the whole history.
+- **`mdPrefixLines` strips an existing marker before re-prefixing.** A line that
+  is already `- [ ] x` becomes `- x` when the task button is pressed again, and
+  a heading click toggles. The `once=true` form (headings) toggles the first
+  selected line; the plain form re-prefixes every line, and a line whose bare
+  text is empty is left alone rather than becoming a bare `- `.
+- **Preview reuses the `marked` already loaded for the entry viewer**
+  (`{gfm: true, breaks: true}`), so what is previewed is what the viewer
+  renders. The preview div (`md-preview-<id>`) is filled from `ta.value` on
+  toggle and never written back; Write restores the textarea untouched.
+- **`mdEditorWire(taId)` is guarded by `ta.dataset.mdWired`** and wires the
+  `input` listener plus Ctrl+B / Ctrl+I; the dynamic panes call it because they
+  rebuild their textarea (`clearFactPane` → `new-text`, `renderFactPane` →
+  `ep-text`, `renderDiaryEditMode` → `de-content`). `mdEditorMount(taId)`
+  inserts the bar and the preview around a textarea that is already in the
+  static markup and is called once at boot for `new-text` and `diary-content`.
+- CSS: `.md-toolbar`, `.md-btn`, `.md-tabs`, `.md-tab(.on)`, `.md-preview`.
+  `EditorAndSourceNodeTests` in `test_action_items.py` drives the toolbar and
+  the rendered source button against the dashboard's own script in the shared
+  node harness — the caret behaviour is invisible in a source read.
+
 ### Open Commitments
 
 Every meeting produces commitments and they used to die in a Markdown bullet. The
@@ -1973,6 +2007,25 @@ query would either have to filter it out or carry it.
   source's `FOR_CLIENT` / `IN_CONTEXT` edges, and `_apply_scope` is called only
   when the caller actually knows the scope — deleting then re-adding nothing is a
   silent unscope, so an unknown scope must leave the edges alone.
+- **An item is linked to the record it was extracted from, and the read half is
+  part of the feature.** `db_sync_action_items` writes
+  `(:ActionItem)-[:RAISED_IN]->(source)` on the create path; `db_list_action_items`
+  takes `source_id` and returns `sourceId` / `sourceLabel` on every row. The
+  **✅ Actions** tab has a Source column (`renderActionTable`) that deep-links —
+  a diary source goes to `selectDiaryEntry`, a fact to `showFactInMemories`
+  (`openActionSource`) — and the diary entry view paints an actions badge
+  (`renderDiaryActions`, id `diary-actions-badge`) by fetching
+  `action-items?sourceId=<entry id>` after the entry renders, the same
+  fetch-after-paint pattern as the deliverables badge. That fetch asks for no
+  `status`, so a closed item is still shown: it is history, not noise.
+  `_format_action_items` (MCP) appends `raised in diary entry \`<id>\`` /
+  `raised in fact \`<id>\`` so an agent can navigate back to the meeting, and
+  `GET /api/action-items` takes `sourceId`.
+- **All narrowing filters share one `WHERE`.** `db_list_action_items` collects
+  status / source / due-before into a single `WHERE … AND …` clause. The old
+  assembly appended `AND a.dueAt …` unconditionally, so `client_id` +
+  `dueBefore` with no `status` emitted `MATCH … AND a.dueAt …` — a Cypher syntax
+  error the `except` turned into a silent empty list.
 - **The list filters; it does not rank.** `db_list_action_items` takes
   `client_id` / `context_id` as a `MATCH`, unlike search scope. The panel asks a
   closed question, so an item from another engagement is a wrong answer rather
@@ -1985,7 +2038,7 @@ query would either have to filter it out or carry it.
 
 Surfaces: three MCP tools (`list_action_items`, `save_action_item`,
 `update_action_item`), three GUI routes (`GET /api/action-items`,
-`POST /api/action-items`, `POST /api/action-items/{id}`), the top-level **✅ Actions** tab (a table filtered by the global client filter), and an "Open items" block inside each client and
+`POST /api/action-items`, `POST /api/action-items/{id}`), the top-level **✅ Actions** tab (a table filtered by the global client filter, with a Source column that deep-links to the record an item was raised in), the diary entry view's actions badge, and an "Open items" block inside each client and
 project panel fetched by `toggleScopeItems`.
 
 `test_action_items.py` is the 22nd suite. It lifts `db_sync_action_items`,
@@ -1998,6 +2051,11 @@ shape of the code. The parser is covered separately in
 the wiring, because re-injecting the missing call into `db_save_diary` left every
 parser test green — the same "a test of a helper is not a test of its call site"
 lesson, and the reason that class is an AST walk rather than a substring search.
+`FormatSourceTests` drives the MCP formatter's source line (sourceId /
+sourceLabel → `raised in …`; manual says nothing), the added `ListFiltersTests`
+cases pin the `source_id` read half and the one-`WHERE` assembly, and
+`DashboardWiringTests` pins the Source column, the deep link, the diary badge
+and the route wiring.
 
 ### Meeting-Prep Brief
 

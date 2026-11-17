@@ -241,6 +241,25 @@
       outline: none; border-color: var(--primary); background: #fff;
     }
     textarea { resize: vertical; min-height: 100px; }
+
+    /* Markdown editor: a toolbar + Write/Preview pair around a plain
+       textarea. The textarea stays the source of truth — every save path
+       keeps reading `.value` — and the preview renders through the same
+       `marked` the viewers use, so what preview shows is what the reader
+       gets. */
+    .md-toolbar { display:flex; flex-wrap:wrap; align-items:center; gap:.1rem;
+                  border:1px solid var(--border); border-bottom:0;
+                  border-radius:6px 6px 0 0; padding:.15rem .25rem; background:var(--bg); }
+    .md-toolbar .md-btn { border:1px solid transparent; background:none; cursor:pointer;
+                          border-radius:4px; padding:.12rem .45rem; font-size:.78rem;
+                          color:var(--text); line-height:1.3; }
+    .md-toolbar .md-btn:hover { background:var(--border); }
+    .md-toolbar .md-tabs { margin-left:auto; display:flex; gap:.1rem; }
+    .md-toolbar .md-tab { font-weight:600; }
+    .md-toolbar .md-tab.on { background:var(--primary-light); color:var(--primary); }
+    .md-preview { display:none; border:1px solid var(--border); border-radius:0 0 6px 6px;
+                  margin-top:-1px; padding:.5rem; min-height:80px; max-height:60vh;
+                  overflow-y:auto; background:var(--surface); }
     .form-row { display: flex; gap: .75rem; align-items: flex-end; flex-wrap: wrap; }
     .form-row > * { flex: 1 1 160px; }
     label { display: block; font-size: .8rem; font-weight: 600; color: var(--muted);
@@ -1606,6 +1625,144 @@
 <script>
   // Enable GFM (task lists, tables, etc.) — marked v18 default renderer handles checkboxes
   marked.use({ gfm: true, breaks: true });
+
+  // ---- Markdown editor: a toolbar + Write/Preview pair around a plain
+  // textarea. The textarea stays the source of truth — every save path keeps
+  // reading `.value` — and formatting goes through `setRangeText`, which
+  // preserves the browser's native undo stack (a contenteditable rewrite of
+  // the value would not). Preview renders through the same `marked` the
+  // viewers use, so what preview shows is what the reader gets. The task
+  // button exists because `## Actions` / `- [ ]` bullets are the format the
+  // commitments register parses on save.
+  function mdBarHtml(taId) {
+    const b = (kind, label, title) =>
+      `<button type="button" class="md-btn" title="${title}" onmousedown="event.preventDefault()" onclick="mdFormat('${taId}','${kind}')">${label}</button>`;
+    return `<div class="md-toolbar" id="md-bar-${taId}">`
+      + b('bold', '<strong>B</strong>', 'Bold (Ctrl+B)')
+      + b('italic', '<em>I</em>', 'Italic (Ctrl+I)')
+      + b('h2', 'H2', 'Heading — the ## Actions sections the register parses')
+      + b('ul', '• —', 'Bullet list')
+      + b('ol', '1.', 'Numbered list')
+      + b('task', '☑', 'Task checkbox — becomes an action item on save')
+      + b('quote', '❝', 'Blockquote')
+      + b('code', '&lt;/&gt;', 'Inline code')
+      + b('link', '🔗', 'Link')
+      + `<span class="md-tabs">`
+      + `<button type="button" class="md-btn md-tab on" id="md-write-${taId}" onclick="mdShowWrite('${taId}')">Write</button>`
+      + `<button type="button" class="md-btn md-tab" id="md-preview-tab-${taId}" onclick="mdTogglePreview('${taId}')">Preview</button>`
+      + `</span></div>`;
+  }
+  function mdPreviewHtml(taId) {
+    return `<div class="md-preview markdown-body" id="md-preview-${taId}"></div>`;
+  }
+  // Wire one textarea: live preview refresh and the two shortcuts the browser
+  // has no native meaning for in a plain textarea. Guarded on mdWired so a
+  // re-render cannot stack a second listener.
+  function mdEditorWire(taId) {
+    const ta = document.getElementById(taId);
+    if (!ta || ta.dataset.mdWired) return;
+    ta.dataset.mdWired = '1';
+    ta.addEventListener('input', () => mdRefreshPreview(taId));
+    ta.addEventListener('keydown', (e) => {
+      if (!(e.ctrlKey || e.metaKey) || e.shiftKey || e.altKey) return;
+      const k = (e.key || '').toLowerCase();
+      if (k === 'b') { e.preventDefault(); mdFormat(taId, 'bold'); }
+      else if (k === 'i') { e.preventDefault(); mdFormat(taId, 'italic'); }
+    });
+  }
+  // For a textarea already in static markup (the new-diary form): the render
+  // functions inline mdBarHtml/mdPreviewHtml into their own innerHTML instead.
+  function mdEditorMount(taId) {
+    const ta = document.getElementById(taId);
+    if (!ta) return;
+    ta.insertAdjacentHTML('beforebegin', mdBarHtml(taId));
+    ta.insertAdjacentHTML('afterend', mdPreviewHtml(taId));
+    mdEditorWire(taId);
+  }
+  // Wrap the selection in a marker pair, then select the wrapped text so
+  // typing replaces it. An empty selection types the markers in.
+  function mdWrap(taId, mark) {
+    const ta = document.getElementById(taId);
+    if (!ta) return;
+    const s = ta.selectionStart, e = ta.selectionEnd;
+    const sel = ta.value.slice(s, e);
+    ta.setRangeText(mark + sel + mark, s, e, 'end');
+    ta.setSelectionRange(s + mark.length, s + mark.length + sel.length);
+    ta.focus();
+    ta.dispatchEvent(new Event('input', {bubbles: true}));
+  }
+  function mdLink(taId) {
+    const ta = document.getElementById(taId);
+    if (!ta) return;
+    const s = ta.selectionStart, e = ta.selectionEnd;
+    const sel = ta.value.slice(s, e) || 'text';
+    ta.setRangeText(`[${sel}](url)`, s, e, 'end');
+    const u0 = s + sel.length + 3;           // inside the (url) placeholder
+    ta.setSelectionRange(u0, u0 + 3);
+    ta.focus();
+    ta.dispatchEvent(new Event('input', {bubbles: true}));
+  }
+  // Prefix each selected line, replacing a marker that is already there —
+  // a bullet clicked twice must not become `- - item`. `once` restricts the
+  // prefix to the first line and toggles it: the heading/quote shape, where
+  // `## Title` going in again should come back out as plain text.
+  function mdPrefixLines(taId, prefix, once) {
+    const ta = document.getElementById(taId);
+    if (!ta) return;
+    const s = ta.selectionStart, e = ta.selectionEnd, v = ta.value;
+    const ls = v.lastIndexOf('\n', s - 1) + 1;
+    let le = v.indexOf('\n', e); if (le === -1) le = v.length; else le += 1;
+    const trailing = v.slice(ls, le).endsWith('\n');
+    const lines = v.slice(ls, le).replace(/\n$/, '').split('\n');
+    const out = lines.map((line, i) => {
+      const bare = line.replace(/^(\s*)(?:#{1,6} |> |[-*] \[[ xX]\] |[-*] |\d+\. )+/, '$1');
+      if (once) {
+        if (i > 0) return bare;
+        return line.startsWith(prefix) ? bare : prefix + bare;
+      }
+      return bare.trim() ? prefix + bare : bare;
+    }).join('\n') + (trailing ? '\n' : '');
+    ta.setRangeText(out, ls, le, 'end');
+    ta.setSelectionRange(ls, ls + out.length);
+    ta.focus();
+    ta.dispatchEvent(new Event('input', {bubbles: true}));
+  }
+  function mdFormat(taId, kind) {
+    if (kind === 'bold') return mdWrap(taId, '**');
+    if (kind === 'italic') return mdWrap(taId, '*');
+    if (kind === 'code') return mdWrap(taId, '`');
+    if (kind === 'link') return mdLink(taId);
+    if (kind === 'h2') return mdPrefixLines(taId, '## ', true);
+    if (kind === 'quote') return mdPrefixLines(taId, '> ', false);
+    if (kind === 'ul') return mdPrefixLines(taId, '- ', false);
+    if (kind === 'ol') return mdPrefixLines(taId, '1. ', false);
+    if (kind === 'task') return mdPrefixLines(taId, '- [ ] ', false);
+  }
+  // Preview is a read of the textarea's current value; Write restores it
+  // untouched, so a preview that is closed without editing loses nothing.
+  function mdTogglePreview(taId) {
+    const ta = document.getElementById(taId);
+    const pv = document.getElementById('md-preview-' + taId);
+    if (!ta || !pv) return;
+    const show = pv.style.display !== 'block';
+    pv.style.display = show ? 'block' : 'none';
+    ta.style.display = show ? 'none' : '';
+    const w = document.getElementById('md-write-' + taId);
+    const p = document.getElementById('md-preview-tab-' + taId);
+    if (w) w.classList.toggle('on', !show);
+    if (p) p.classList.toggle('on', show);
+    if (show) pv.innerHTML = marked.parse(ta.value || '');
+  }
+  function mdShowWrite(taId) {
+    const pv = document.getElementById('md-preview-' + taId);
+    if (pv && pv.style.display === 'block') mdTogglePreview(taId);
+  }
+  function mdRefreshPreview(taId) {
+    const pv = document.getElementById('md-preview-' + taId);
+    if (!pv || pv.style.display !== 'block') return;
+    const ta = document.getElementById(taId);
+    pv.innerHTML = marked.parse((ta && ta.value) || '');
+  }
 
   const apiBase = "{{BASE_URL}}/api";
   // Server-owned cap (gui.py MERGE_MAX_CLUSTER). Passed in rather than repeated
@@ -3369,9 +3526,15 @@
       const scope = opts.showScope && a.clientName ? `<span class="scope-item-type">${escHtml(a.clientName)}</span>` : '';
       const done = a.status !== 'open' ? '' :
         `<button class="btn btn-sm btn-ghost" style="padding:.1rem .4rem;font-size:.7rem;" title="Mark done" onclick="event.stopPropagation(); completeActionItem('${a.id}')">✓</button>`;
+      // The compact source link — the same RAISED_IN read the Actions tab's
+      // Source column renders, shrunk to an icon for the narrow pane.
+      const src = a.sourceId
+        ? `<button class="btn btn-sm btn-ghost" style="padding:.1rem .35rem;font-size:.7rem;" title="Open the record this was extracted from" onclick="event.stopPropagation(); openActionSource('${a.sourceId}','${a.sourceLabel || ''}')">${a.sourceLabel === 'DiaryEntry' ? '📝' : '📄'}</button>`
+        : '';
       return `<div class="scope-item-row">
         ${owner}${scope}${dueTxt}
         <span class="scope-item-name">${escHtml(a.text || '')}</span>
+        ${src}
         ${done}
       </div>`;
     }).join('');
@@ -3393,11 +3556,19 @@
         : (a.contextName ? escHtml(a.contextName) : '');
       const done = a.status !== 'open' ? '' :
         `<button class="btn btn-sm btn-ghost" style="padding:.1rem .4rem;font-size:.7rem;" title="Mark done" onclick="event.stopPropagation(); completeActionItem('${a.id}')">✓</button>`;
+      // The read half of RAISED_IN: a commitment the register extracted names
+      // the record its text came from, so "what did I promise in that
+      // meeting" is one click away from the meeting itself. A manual item
+      // (sourceLabel 'manual', no sourceId) has nothing to link to.
+      const src = a.sourceId
+        ? `<button class="btn btn-sm btn-ghost" style="padding:.1rem .4rem;font-size:.7rem;" title="Open the record this was extracted from" onclick="event.stopPropagation(); openActionSource('${a.sourceId}','${escHtml(a.sourceLabel || '')}')">${a.sourceLabel === 'DiaryEntry' ? '📝 Meeting' : '📄 Record'}</button>`
+        : '';
       return `<tr style="border-bottom:1px solid var(--border);">
         <td style="padding:.4rem .5rem;white-space:nowrap;">${a.owner ? escHtml(a.owner) : ''}</td>
         <td style="padding:.4rem .5rem;">${scope}</td>
         <td style="padding:.4rem .5rem;white-space:nowrap;">${dueCell}</td>
         <td style="padding:.4rem .5rem;">${escHtml(a.text || '')}</td>
+        <td style="padding:.4rem .5rem;white-space:nowrap;">${src}</td>
         <td style="padding:.4rem .5rem;text-align:right;">${done}</td>
       </tr>`;
     }).join('');
@@ -3407,10 +3578,21 @@
         <th style="padding:.4rem .5rem;">Scope</th>
         <th style="padding:.4rem .5rem;">Due</th>
         <th style="padding:.4rem .5rem;">Commitment</th>
+        <th style="padding:.4rem .5rem;">Source</th>
         <th style="padding:.4rem .5rem;text-align:right;"></th>
       </tr></thead>
       <tbody>${rows}</tbody>
     </table>`;
+  }
+
+  // Deep-link from a commitment to the record its text was extracted from.
+  // selectDiaryEntry already handles an entry the diary tab has not loaded
+  // yet (it refetches and retries), so the diary branch is two calls.
+  function openActionSource(id, label) {
+    if (!id) return;
+    const isDiary = String(label || '').toLowerCase() in {diary: 1, diaryentry: 1, diary_entry: 1};
+    if (isDiary) { switchTab('diary'); selectDiaryEntry(id); }
+    else showFactInMemories(id);
   }
 
   async function loadMyActions() {
@@ -5299,7 +5481,9 @@
             </div>
             <div class="fact-edit-field">
               <label for="new-text">Fact / Memory</label>
+              ${mdBarHtml('new-text')}
               <textarea id="new-text" placeholder="e.g. I prefer dark mode editors" style="min-height:80px;"></textarea>
+              ${mdPreviewHtml('new-text')}
             </div>
             <div class="fact-edit-row">
               <div class="fact-edit-field">
@@ -5320,6 +5504,7 @@
       </div>`;
     // Repopulate datalist
     renderCategorySidebar();
+    mdEditorWire('new-text');
     saveSessionState();
   }
 
@@ -5341,7 +5526,9 @@
             </div>
             <div class="fact-edit-field">
               <label for="ep-text">Fact / Memory</label>
+              ${mdBarHtml('ep-text')}
               <textarea id="ep-text" style="min-height:120px;">${escHtml(m.text)}</textarea>
+              ${mdPreviewHtml('ep-text')}
             </div>
             <div class="fact-edit-row">
               <div class="fact-edit-field">
@@ -5395,6 +5582,7 @@
       document.getElementById('ep-client').value = m.clientId || '';
       fillEpProjects(m.clientId, m.contextId);
       renderMetaEditor(m);
+      mdEditorWire('ep-text');
     } else {
       // A record another owner shared with this user. Every mutation below is
       // refused by the server with a 403, so on a read-only share these
@@ -6889,6 +7077,7 @@
     viewEl.innerHTML = renderDiaryViewMode(entry);
     renderDiaryMetaDisplay(entry);
     renderDiaryDeliverables(entry);
+    renderDiaryActions(entry);
   }
 
   // The artifact a meeting produced is evidence about that meeting, so the
@@ -6913,6 +7102,33 @@
       `${escHtml(d.name || '(untitled)')} <span style="color:var(--muted);">(${escHtml(d.statusLabel || d.status || 'draft')})</span>`
     ).join(' \u00b7 ');
     viewEl.insertBefore(badge, viewEl.firstChild);
+  }
+
+  // The mirror image of the Actions tab's source column: the commitments this
+  // entry raised, read by sourceId off the RAISED_IN edge. Fetched after the
+  // paint because the register is a different node type — carrying it inline
+  // on every diary list row would be a join in the renderer. Every status is
+  // shown, because "what did this meeting raise" is a closed question: an item
+  // the meeting produced does not stop being raised by it when it is done.
+  async function renderDiaryActions(entry) {
+    const viewEl = document.getElementById('diary-view-content');
+    if (!viewEl || !entry || !entry.id) return;
+    const stale = document.getElementById('diary-actions-badge');
+    if (stale) stale.remove();
+    let items = [];
+    try {
+      const res = await api.get('action-items?sourceId=' + encodeURIComponent(entry.id));
+      items = (res && res.items) || [];
+    } catch (e) { return; }
+    if (!items.length || !document.getElementById('diary-view-content')) return;
+    const badge = document.createElement('div');
+    badge.id = 'diary-actions-badge';
+    badge.style.cssText = 'margin:.5rem 0;font-size:.78rem;';
+    badge.innerHTML = '\u{2705} Actions raised here: ' + items.map(a =>
+      `<span style="${a.status !== 'open' ? 'text-decoration:line-through;color:var(--muted);' : ''}">${escHtml(a.text || '')}</span>`
+    ).join(' \u00b7 ');
+    const anchor = document.getElementById('diary-deliverable-badge');
+    viewEl.insertBefore(badge, anchor ? anchor.nextSibling : viewEl.firstChild);
   }
 
   function renderDiaryMetaDisplay(entry) {
@@ -7263,7 +7479,9 @@
         </div>
         <div style="margin-bottom:.5rem;">
           <label style="font-size:.75rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;display:block;margin-bottom:.2rem;">Content</label>
+          ${mdBarHtml('de-content')}
           <textarea id="de-content"${roAttr} style="width:100%;min-height:200px;padding:.4rem .5rem;border:1px solid var(--border);border-radius:6px;font-size:.85rem;font-family:inherit;">${escHtml(entry.content || '')}</textarea>
+          ${mdPreviewHtml('de-content')}
         </div>
         <div style="margin-bottom:.5rem;display:flex;gap:.75rem;flex-wrap:wrap;">
           <div style="flex:1;min-width:120px;">
@@ -7296,6 +7514,7 @@
       </div>`;
     renderDiaryMetaEditor(entry);
     fillDeProjects(entry.clientId, entry.contextId);
+    mdEditorWire('de-content');
   }
 
   function renderDiaryMetaEditor(entry) {
@@ -8744,6 +8963,11 @@ let contextMenu = null;
 
   (async () => {
     try { const info = await api.get('whoami'); document.getElementById('user-badge').textContent = '👤 ' + info.user; } catch(_) {}
+    // The two forms whose markup ships with the page rather than being
+    // rendered by a function: their toolbars are mounted onto the static
+    // textareas once, here.
+    mdEditorMount('new-text');
+    mdEditorMount('diary-content');
     loadMemories();
   })();
   /* ---- sharing dialog ---------------------------------------------------

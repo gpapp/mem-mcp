@@ -19,13 +19,9 @@ segmented switcher, the active-scope control and its one-click clear, the
 Setup page's skills directory card, the empty-register hints, and the live level
 meter. That entry is in `task_history.md` as well.
 
+The diary/fact Markdown editor and the actions-to-source links shipped as well
+(see `task_history.md`).
+
 The next piece of work should start from a problem rather than from this list.
 Add it here with its acceptance criteria before starting, so the criteria are
 not written to match the implementation.
-
----
-
-Explicitly out of scope for now: calendaring integration (the vault should not
-become a calendar), per-user task assignment across accounts (that is sharing
-territory, `MEM_SHARING_ENABLED` is 0 by default), and any automatic write from
-an extracted date into an external system.

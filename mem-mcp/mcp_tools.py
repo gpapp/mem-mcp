@@ -1033,7 +1033,16 @@ def _format_action_items(rows, heading="Action Items"):
                 scope = f" — {item['clientName']}"
                 if item.get("contextName"):
                     scope += f" / {item['contextName']}"
-            lines.append(f"- `{item['status']}` {item['text']}{owner}{due}{scope} "
+            # The read half of RAISED_IN: a commitment is only as good as the
+            # meeting it can be traced back to, so the row names the record the
+            # text was extracted from. `list_diary_entries` / `get_diary_entry`
+            # take this id; a manual item has none and says nothing.
+            source = ""
+            if item.get("sourceId") and item.get("sourceLabel") != "manual":
+                kind = ("diary entry" if str(item.get("sourceLabel")).lower()
+                        in ("diary", "diaryentry", "diary_entry") else "fact")
+                source = f" — raised in {kind} `{item['sourceId']}`"
+            lines.append(f"- `{item['status']}` {item['text']}{owner}{due}{scope}{source} "
                          f"_(id: {item['id']})_")
         lines.append("")
     return "\n".join(lines)
