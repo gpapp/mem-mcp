@@ -89,6 +89,31 @@
     .live-toolbar input, .live-toolbar select { min-width: 130px; }
     .live-toolbar .live-name { flex: 1 1 220px; }
     .live-controls { display: flex; gap: .4rem; flex-wrap: wrap; }
+    /* ASR mishear corrections. The dictionary is entered where the client is
+       already selected (the live toolbar) rather than in a settings page that
+       would need its own client picker and could drift from this one. */
+    .lc-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.45);
+      display: none; align-items: center; justify-content: center;
+      z-index: 60; padding: 1rem; }
+    .lc-overlay.open { display: flex; }
+    .lc-panel { background: #fff; border-radius: 10px; width: 100%; max-width: 640px;
+      max-height: 85vh; overflow-y: auto; padding: 1rem 1.1rem;
+      box-shadow: 0 12px 40px rgba(0,0,0,.3); }
+    .lc-head { display: flex; align-items: center; gap: .5rem; margin-bottom: .5rem; }
+    .lc-head h3 { margin: 0; font-size: 1rem; flex: 1; }
+    .lc-add { display: flex; gap: .4rem; flex-wrap: wrap; margin: .6rem 0; }
+    .lc-add input { flex: 1 1 140px; }
+    .lc-list { border-top: 1px solid var(--border); }
+    .lc-row { display: flex; align-items: center; gap: .4rem; padding: .35rem 0;
+      border-bottom: 1px solid var(--border); font-size: .9rem; }
+    .lc-wrong { font-family: ui-monospace, SFMono-Regular, monospace; color: #b4453f; }
+    .lc-right { font-family: ui-monospace, SFMono-Regular, monospace; font-weight: 600; }
+    .lc-arrow { opacity: .5; }
+    .lc-spacer { flex: 1; }
+    .lc-note { font-size: .82rem; color: var(--muted); margin: .3rem 0 .5rem; }
+    .lc-preview { font-size: .85rem; background: rgba(0,0,0,.04);
+      border-radius: 6px; padding: .5rem .6rem; margin-top: .6rem; white-space: pre-wrap; }
+    .lc-actions { display: flex; gap: .4rem; flex-wrap: wrap; margin-top: .8rem; }
     .live-state { font-size: .8rem; color: var(--muted); flex-basis: 100%; }
     /* The state text and the meter share one row, so the level is read beside
        the words it qualifies rather than above or below them. */
@@ -1139,6 +1164,32 @@
 
 <!-- ═══ LIVE NOTES PAGE ═══ -->
 <div id="page-live" class="page">
+  <!-- ASR mishear corrections, scoped to the client selected on this
+       recording above. The list is the dictionary; Preview and Apply are the
+       sweep over text that is already stored. -->
+  <div id="corrections-overlay" class="lc-overlay"
+       onclick="if (event.target === this) closeCorrections()">
+    <div class="lc-panel">
+      <div class="lc-head">
+        <h3>📖 Mishear corrections</h3>
+        <span id="corrections-client" style="font-size:.85rem;color:var(--muted);"></span>
+        <button class="btn btn-sm" onclick="closeCorrections()">Close</button>
+      </div>
+      <div class="lc-note" id="corrections-note"></div>
+      <div class="lc-add">
+        <input id="corrections-wrong" placeholder="heard as (Deutche Bank)">
+        <input id="corrections-right" placeholder="should be (Deutsche Bank)">
+        <button class="btn btn-sm btn-primary" onclick="addCorrection()">Add</button>
+      </div>
+      <div id="corrections-list" class="lc-list"></div>
+      <div class="lc-actions">
+        <button class="btn btn-sm" onclick="previewCorrections()">Preview changes</button>
+        <button class="btn btn-sm" id="corrections-apply"
+                onclick="applyCorrections()" disabled>Apply to existing records</button>
+      </div>
+      <div id="corrections-preview" class="lc-preview" hidden></div>
+    </div>
+  </div>
   <div class="live-layout">
     <aside class="live-sidebar">
       <div class="live-sidebar-head">
@@ -1188,6 +1239,7 @@
             <button id="live-resume-btn" class="btn btn-sm" onclick="resumeLiveRecording()" disabled>▶ Resume</button>
             <button id="live-stop-btn" class="btn btn-sm" onclick="stopLiveRecording()" disabled>■ Stop</button>
             <button id="live-delete-btn" class="btn btn-sm" onclick="deleteLiveTranscription()">🗑 Delete</button>
+            <button id="live-corrections-btn" class="btn btn-sm" onclick="openCorrections()" title="Find and replace this client's recurring mishears">📖 Corrections</button>
           </div>
           <div class="live-status">
             <div id="live-vu" class="live-vu" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div>
@@ -7110,6 +7162,176 @@
   // on every diary list row would be a join in the renderer. Every status is
   // shown, because "what did this meeting raise" is a closed question: an item
   // the meeting produced does not stop being raised by it when it is done.
+  // ---------------------------------------------------------------------
+  // ASR mishear corrections, scoped to the client selected on the recording.
+  //
+  // The same dictionary is applied automatically on every diary save for that
+  // client (the inbound path a processed transcription takes), so this panel
+  // has two jobs: maintain the list, and sweep what was stored before a rule
+  // existed. Preview is a real dry run -- it counts and writes nothing -- which
+  // is why Apply is disabled until a preview says there is something to change.
+  // ---------------------------------------------------------------------
+  let correctionsClientId = null;
+
+  function lcEsc(text) {
+    return String(text == null ? '' : text)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  function correctionsScope() {
+    const t = (typeof liveDetail !== 'undefined' && liveDetail)
+      ? liveDetail.transcription : null;
+    return t ? { id: t.clientId || null, name: t.clientName || '' } : { id: null, name: '' };
+  }
+
+  function openCorrections() {
+    const scope = correctionsScope();
+    correctionsClientId = scope.id;
+    const overlay = document.getElementById('corrections-overlay');
+    const note = document.getElementById('corrections-note');
+    const list = document.getElementById('corrections-list');
+    const preview = document.getElementById('corrections-preview');
+    document.getElementById('corrections-client').textContent =
+      scope.name ? `for ${scope.name}` : '';
+    list.innerHTML = '';
+    preview.hidden = true;
+    preview.textContent = '';
+    document.getElementById('corrections-apply').disabled = true;
+    overlay.classList.add('open');
+    if (!scope.id) {
+      // A rule is scoped to one client, so there is nothing to show and nothing
+      // safe to guess. Saying which control to use is the whole remedy.
+      note.textContent = 'Choose a client on this recording first — a correction belongs to one client, so there is nothing to edit until one is selected.';
+      return;
+    }
+    note.textContent = 'Every save for this client is corrected automatically. Apply rewrites what is already stored.';
+    loadCorrections();
+  }
+
+  function closeCorrections() {
+    document.getElementById('corrections-overlay').classList.remove('open');
+  }
+
+  async function loadCorrections() {
+    if (!correctionsClientId) return;
+    try {
+      const data = await api.get('live/corrections', { clientId: correctionsClientId });
+      renderCorrections(data.corrections || []);
+    } catch (e) {
+      toastApiError(e, 'Could not load the corrections.');
+    }
+  }
+
+  function renderCorrections(rules) {
+    const list = document.getElementById('corrections-list');
+    if (!rules.length) {
+      list.innerHTML = '<div class="lc-note">No corrections yet for this client. Add one above — "Deutche Bank" in the left field, "Deutsche Bank" in the right.</div>';
+      return;
+    }
+    list.innerHTML = rules.map(r => `
+      <div class="lc-row" data-id="${lcEsc(r.id)}">
+        <span class="lc-wrong">${lcEsc(r.wrong)}</span>
+        <span class="lc-arrow">→</span>
+        <span class="lc-right">${lcEsc(r.right)}</span>
+        <span class="lc-spacer"></span>
+        <button class="btn btn-sm" onclick="editCorrection('${lcEsc(r.id)}')" title="Edit">✏️</button>
+        <button class="btn btn-sm" onclick="deleteCorrection('${lcEsc(r.id)}')" title="Delete">🗑</button>
+      </div>`).join('');
+  }
+
+  async function addCorrection() {
+    const wrong = document.getElementById('corrections-wrong').value.trim();
+    const right = document.getElementById('corrections-right').value.trim();
+    if (!wrong || !right) {
+      toast('Both sides of a correction are required.', 3000);
+      return;
+    }
+    try {
+      await api.post('live/corrections', { clientId: correctionsClientId, wrong, right });
+      document.getElementById('corrections-wrong').value = '';
+      document.getElementById('corrections-right').value = '';
+      await loadCorrections();
+    } catch (e) {
+      toastApiError(e, 'Could not add the correction.');
+    }
+  }
+
+  async function editCorrection(id) {
+    const row = document.querySelector(`.lc-row[data-id="${id}"]`);
+    if (!row) return;
+    const wrong = prompt('Heard as:', row.querySelector('.lc-wrong').textContent);
+    if (wrong === null) return;
+    const right = prompt('Should be:', row.querySelector('.lc-right').textContent);
+    if (right === null) return;
+    try {
+      await api.patch('live/corrections/' + encodeURIComponent(id), { wrong, right });
+      await loadCorrections();
+    } catch (e) {
+      toastApiError(e, 'Could not change the correction.');
+    }
+  }
+
+  async function deleteCorrection(id) {
+    if (!confirm('Delete this correction? Text already rewritten stays as it is.')) return;
+    try {
+      await api.delete('live/corrections/' + encodeURIComponent(id));
+      await loadCorrections();
+    } catch (e) {
+      toastApiError(e, 'Could not delete the correction.');
+    }
+  }
+
+  function describeCorrectionPreview(r) {
+    if (!r.ruleCount) return 'No corrections are defined for this client yet.';
+    const seg = `${r.segments.changed} of ${r.segments.scanned} transcript segments`;
+    const ent = `${r.entries.changed} of ${r.entries.scanned} diary entries`;
+    const total = r.segments.changes + r.entries.changes;
+    if (!total) {
+      return `Nothing to change — the ${seg} and ${ent} already read correctly.`;
+    }
+    const lines = [`${total} change(s): ${seg}, ${ent}.`];
+    (r.segments.samples || []).concat(r.entries.samples || [])
+      .slice(0, 8)
+      .forEach(s => lines.push(`· ${s.wrong} → ${s.right}`));
+    return lines.join('\n');
+  }
+
+  async function previewCorrections() {
+    const box = document.getElementById('corrections-preview');
+    const apply = document.getElementById('corrections-apply');
+    box.hidden = false;
+    box.textContent = 'Counting…';
+    apply.disabled = true;
+    try {
+      const r = await api.post('live/corrections/preview', { clientId: correctionsClientId });
+      box.textContent = describeCorrectionPreview(r);
+      apply.disabled = (r.segments.changed + r.entries.changed) === 0;
+    } catch (e) {
+      box.textContent = 'Could not preview: ' + (e.detail || e.message || e);
+    }
+  }
+
+  async function applyCorrections() {
+    const box = document.getElementById('corrections-preview');
+    const apply = document.getElementById('corrections-apply');
+    apply.disabled = true;
+    box.hidden = false;
+    box.textContent = 'Applying…';
+    try {
+      const r = await api.post('live/corrections/apply', { clientId: correctionsClientId });
+      const failed = r.segments.errors + r.entries.errors;
+      box.textContent =
+        `Applied: ${r.segments.changed} transcript segment(s) and ` +
+        `${r.entries.changed} diary entr(y/ies) rewritten.` +
+        (failed ? ` ${failed} could not be rewritten — see the server log.` : '') +
+        '\nRebuild a note to regenerate it from the corrected transcript.';
+    } catch (e) {
+      box.textContent = 'Could not apply: ' + (e.detail || e.message || e);
+      apply.disabled = false;
+    }
+  }
+
   async function renderDiaryActions(entry) {
     const viewEl = document.getElementById('diary-view-content');
     if (!viewEl || !entry || !entry.id) return;

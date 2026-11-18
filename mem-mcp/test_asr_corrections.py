@@ -13,6 +13,7 @@ engine.
 """
 
 import ast
+import asyncio
 import os
 import sys
 import unittest
@@ -248,9 +249,12 @@ def _lift_manager(*names, **extra_globals):
     }
     namespace.update(extra_globals)
     for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name in wanted:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in wanted:
             # One namespace for every requested name: `_correction_dict` is a
-            # global to `db_create_correction`, not an argument to it.
+            # global to `db_create_correction`, not an argument to it. Async
+            # functions are matched too — `db_apply_corrections_to_client` is
+            # one, and a lift that silently skips it says "not found" about a
+            # function that is right there.
             module = ast.Module(body=[node], type_ignores=[])
             ast.fix_missing_locations(module)
             exec(compile(module, path, "exec"), namespace)
@@ -686,6 +690,271 @@ class InboundSaveCallSiteTests(unittest.TestCase):
         self.assertIn('scope.get("clientId")', body,
                       msg="db_update_diary must correct against the entry's own "
                           "client, not only the one the caller resent")
+
+
+class RetroactiveCorrectionTests(unittest.TestCase):
+    """The dry run and the sweep, driven against a fake graph.
+
+    The failure this class exists for is a preview that writes. The button that
+    shows the count and the button that rewrites the vault are one route apart,
+    and a "dry run" that patched just the one row is the kind of defect nobody
+    notices until the text has already changed.
+    """
+
+    RULES = [{"wrong": "1dp", "right": "OneDP"}]
+
+    def _lift(self, segments, entries, writes=None, client=_known_client, log=None):
+        def handler(query, params):
+            if ":TermCorrection" in query:
+                return _FakeResult(rows=list(self.RULES))
+            if "HAS_SEGMENT" in query:
+                return _FakeResult(rows=list(segments))
+            if "FOR_CLIENT" in query:
+                return _FakeResult(rows=list(entries))
+            if "SET s.text" in query:
+                if writes is not None:
+                    writes.append((params["id"], params["text"]))
+                return _FakeResult()
+            raise AssertionError(f"unexpected query: {query}")
+
+        funcs = _lift_manager(
+            "db_client_correction_rules", "_correction_candidates",
+            "_summarise_changes", "_correction_target",
+            "db_preview_corrections", "db_apply_corrections_to_client",
+            _require_driver=lambda: _FakeDriver(handler),
+            _resolve_client_by_id=client,
+            apply_corrections=apply_corrections,
+            CORRECTION_SAMPLE_LIMIT=10,
+            logger=log or _RecordingLogger(),
+        )
+        return funcs
+
+    def test_the_dry_run_counts_everything_and_writes_nothing(self):
+        writes = []
+        funcs = self._lift(
+            [{"id": "s1", "text": "the 1dp team"}, {"id": "s2", "text": "nothing here"}],
+            [{"id": "d1", "content": "1dp update"}],
+            writes,
+        )
+        report = funcs["db_preview_corrections"]("alice", "c1")
+
+        self.assertEqual(report["ruleCount"], 1)
+        self.assertEqual(report["clientName"], "Deutsche Bank (DB)")
+        self.assertEqual(report["segments"]["scanned"], 2)
+        self.assertEqual(report["segments"]["changed"], 1)
+        self.assertEqual(report["segments"]["changes"], 1)
+        self.assertEqual(report["segments"]["samples"],
+                         [{"id": "s1", "wrong": "1dp", "right": "OneDP"}])
+        self.assertEqual(report["entries"]["changed"], 1)
+        self.assertEqual(writes, [],
+                         msg="the dry run must not patch a segment")
+
+    def test_the_dry_run_issues_no_write_statement(self):
+        issued = []
+
+        def handler(query, params):
+            issued.append(query)
+            if ":TermCorrection" in query:
+                return _FakeResult(rows=list(self.RULES))
+            if "HAS_SEGMENT" in query:
+                return _FakeResult(rows=[{"id": "s1", "text": "1dp"}])
+            if "FOR_CLIENT" in query:
+                return _FakeResult(rows=[{"id": "d1", "content": "1dp"}])
+            raise AssertionError(f"unexpected query: {query}")
+
+        funcs = _lift_manager(
+            "db_client_correction_rules", "_correction_candidates",
+            "_summarise_changes", "_correction_target", "db_preview_corrections",
+            _require_driver=lambda: _FakeDriver(handler),
+            _resolve_client_by_id=_known_client,
+            apply_corrections=apply_corrections,
+            CORRECTION_SAMPLE_LIMIT=10,
+            logger=_RecordingLogger(),
+        )
+        funcs["db_preview_corrections"]("alice", "c1")
+        for query in issued:
+            for verb in (" SET ", "CREATE ", "DELETE "):
+                self.assertFalse(verb in query,
+                                 msg=f"the dry run issued a write: {query}")
+
+    def test_an_unknown_client_is_refused_before_anything_is_read(self):
+        funcs = self._lift([], [], client=lambda *a, **k: None)
+        with self.assertRaises(ValueError) as caught:
+            funcs["db_preview_corrections"]("alice", "nope")
+        self.assertIn("Unknown client", str(caught.exception))
+
+    def test_the_sweep_corrects_segments_and_entries(self):
+        writes, calls = [], []
+
+        async def fake_update(entry_id, user_id, content=None):
+            calls.append((entry_id, user_id, content))
+            return True
+
+        funcs = self._lift([{"id": "s1", "text": "the 1dp team"}],
+                           [{"id": "d1", "content": "1dp update"}], writes)
+        result = asyncio.run(funcs["db_apply_corrections_to_client"](
+            "alice", "c1", update_diary=fake_update))
+
+        self.assertEqual(writes, [("s1", "the OneDP team")])
+        self.assertEqual(calls, [("d1", "alice", "OneDP update")],
+                         msg="a diary entry must go through the ordinary update, "
+                             "so its vector and keywords are rebuilt")
+        self.assertEqual(result["segments"]["changed"], 1)
+        self.assertEqual(result["entries"]["changed"], 1)
+
+    def test_a_failed_row_is_counted_and_the_run_continues(self):
+        writes = []
+
+        def handler(query, params):
+            if ":TermCorrection" in query:
+                return _FakeResult(rows=list(self.RULES))
+            if "HAS_SEGMENT" in query:
+                return _FakeResult(rows=[{"id": "s1", "text": "1dp"},
+                                         {"id": "s2", "text": "1dp"}])
+            if "FOR_CLIENT" in query:
+                return _FakeResult(rows=[])
+            if "SET s.text" in query:
+                if params["id"] == "s1":
+                    raise RuntimeError("graph went away")
+                writes.append((params["id"], params["text"]))
+                return _FakeResult()
+            raise AssertionError(f"unexpected query: {query}")
+
+        async def fake_update(entry_id, user_id, content=None):
+            return True
+
+        funcs = _lift_manager(
+            "db_client_correction_rules", "_correction_candidates",
+            "_summarise_changes", "_correction_target",
+            "db_apply_corrections_to_client", "db_preview_corrections",
+            _require_driver=lambda: _FakeDriver(handler),
+            _resolve_client_by_id=_known_client,
+            apply_corrections=apply_corrections,
+            CORRECTION_SAMPLE_LIMIT=10,
+            logger=_RecordingLogger(),
+        )
+        result = asyncio.run(funcs["db_apply_corrections_to_client"](
+            "alice", "c1", update_diary=fake_update))
+
+        self.assertEqual(result["segments"]["errors"], 1)
+        self.assertEqual(result["segments"]["changed"], 1)
+        self.assertEqual(writes, [("s2", "OneDP")],
+                         msg="one bad row must not abandon the rest")
+
+    def test_no_rules_reads_no_text_and_writes_nothing(self):
+        issued = []
+
+        def handler(query, params):
+            issued.append(query)
+            return _FakeResult(rows=[])
+
+        async def fake_update(entry_id, user_id, content=None):
+            self.fail("no rule exists, so no entry should be rewritten")
+
+        funcs = _lift_manager(
+            "db_client_correction_rules", "_correction_candidates",
+            "_summarise_changes", "_correction_target",
+            "db_apply_corrections_to_client", "db_preview_corrections",
+            _require_driver=lambda: _FakeDriver(handler),
+            _resolve_client_by_id=_known_client,
+            apply_corrections=apply_corrections,
+            CORRECTION_SAMPLE_LIMIT=10,
+            logger=_RecordingLogger(),
+        )
+        result = asyncio.run(funcs["db_apply_corrections_to_client"](
+            "alice", "c1", update_diary=fake_update))
+
+        self.assertEqual(result["ruleCount"], 0)
+        self.assertEqual(result["segments"]["scanned"], 0)
+        self.assertEqual(len(issued), 1, msg="only the rules read should run")
+
+    def test_a_row_that_already_reads_correctly_is_scanned_not_changed(self):
+        funcs = self._lift([{"id": "s1", "text": "the OneDP team"}], [])
+        report = funcs["db_preview_corrections"]("alice", "c1")
+        self.assertEqual(report["segments"]["scanned"], 1)
+        self.assertEqual(report["segments"]["changed"], 0)
+
+
+class CorrectionSurfaceTests(unittest.TestCase):
+    """The wiring, which no helper test can see: routes, the lock, the hooks, the panel."""
+
+    HERE = os.path.dirname(os.path.abspath(__file__))
+
+    def _gui_function(self, name):
+        path = os.path.join(self.HERE, "gui.py")
+        with open(path, "r", encoding="utf-8") as handle:
+            source = handle.read()
+        for node in ast.parse(source).body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+                return ast.get_source_segment(source, node)
+        self.fail(f"not found in gui.py: {name}")
+
+    def _template(self):
+        with open(os.path.join(self.HERE, "templates", "dashboard.html"),
+                  "r", encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_every_route_requires_a_session(self):
+        for name in ("api_list_corrections", "api_create_correction",
+                     "api_preview_corrections", "api_apply_corrections",
+                     "api_update_correction", "api_delete_correction"):
+            body = self._gui_function(name)
+            self.assertIn("_require_user(request)", body,
+                          msg=f"{name} is reachable without a session")
+
+    def test_the_apply_route_takes_the_maintenance_lock_and_releases_it(self):
+        body = self._gui_function("api_apply_corrections")
+        self.assertIn("claim_maintenance", body)
+        self.assertIn("release_maintenance", body)
+        self.assertIn("finally:", body,
+                      msg="a lock released only on success is a lock held for ever "
+                          "after one failed sweep")
+        self.assertIn("409", body,
+                      msg="a busy vault must say why rather than 500")
+
+    def test_the_dry_run_route_does_not_take_the_lock(self):
+        # It writes nothing, so holding the lock for it would refuse a preview
+        # during a backup for no reason.
+        body = self._gui_function("api_preview_corrections")
+        self.assertNotIn("claim_maintenance", body)
+
+    def test_the_live_socket_reads_the_rules_once_and_corrects_before_storing(self):
+        body = self._gui_function("live_stream")
+        self.assertEqual(body.count("db_client_correction_rules"), 1,
+                         msg="a per-segment lookup would put a Neo4j round trip "
+                             "in front of the microphone")
+        self.assertLess(body.index("apply_corrections("),
+                        body.index("queue.put_nowait(item)"),
+                        msg="correcting after the queue stores the mishear")
+        self.assertIn("asyncio.to_thread", body.split("db_client_correction_rules")[0][-80:],
+                      msg="a blocking Neo4j read must not run on the event loop")
+
+    def test_the_panel_is_scoped_to_the_selected_client(self):
+        html = self._template()
+        self.assertIn('id="live-corrections-btn"', html)
+        self.assertIn("openCorrections()", html)
+        self.assertIn('id="corrections-overlay"', html)
+        self.assertIn("liveDetail.transcription", html,
+                      msg="the panel must read the client off the open recording")
+
+    def test_the_panel_refuses_to_edit_without_a_client(self):
+        html = self._template()
+        self.assertIn("correctionsClientId", html)
+        self.assertIn("Choose a client on this recording first", html)
+
+    def test_apply_is_disabled_until_a_preview_finds_something(self):
+        html = self._template()
+        self.assertIn('id="corrections-apply"', html)
+        apply_tag = html.split('id="corrections-apply"', 1)[1][:200]
+        self.assertIn("disabled", apply_tag,
+                      msg="Apply must not be pressable before a dry run")
+        self.assertIn("apply.disabled = (r.segments.changed + r.entries.changed) === 0", html)
+
+    def test_the_rows_are_escaped(self):
+        # A rule's text is user input and it is rendered into innerHTML.
+        html = self._template()
+        self.assertIn("lcEsc(r.wrong)", html)
+        self.assertIn("lcEsc(r.right)", html)
 
 
 if __name__ == "__main__":

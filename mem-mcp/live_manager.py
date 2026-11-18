@@ -589,6 +589,205 @@ def db_client_correction_rules(user_id: str, client_id: Optional[str]) -> list:
             for r in (rows or []) if r.get("wrong") and r.get("right")]
 
 
+CORRECTION_SAMPLE_LIMIT = 10
+
+
+def _correction_candidates(user_id: str, client_id: str) -> tuple:
+    """Every stored text this client's rules can reach, with what it says now.
+
+    Two reads, because the two stores answer differently. A **segment** is
+    reached through the transcription that carries the scope — that is the row
+    the ASR wrote, so it is where the mishear was born. A **diary entry** is
+    reached through its own ``FOR_CLIENT`` edge, because the entry is the thing
+    the ``process-transcription`` skill saves and it may never have had a
+    transcription row at all.
+
+    Consumed segments are included deliberately. The note is a snapshot written
+    from what the segments said at the time, so correcting a consumed segment
+    changes nothing until somebody presses **Rebuild note** — and that is
+    exactly when they would want the corrected text rather than the mishear.
+    """
+    driver = _require_driver()
+    with driver.session() as s:
+        segments = s.run(
+            """
+            MATCH (t:Transcription {userId: $userId, clientId: $clientId})
+                  -[:HAS_SEGMENT]->(s:TranscriptionSegment)
+            RETURN s.id AS id, s.text AS text
+            """,
+            userId=user_id, clientId=client_id,
+        ).data() or []
+        entries = s.run(
+            """
+            MATCH (d:DiaryEntry {userId: $userId})-[:FOR_CLIENT]->(c:Client {id: $clientId})
+            RETURN d.id AS id, d.content AS content
+            """,
+            userId=user_id, clientId=client_id,
+        ).data() or []
+    return list(segments), list(entries)
+
+
+def _summarise_changes(rows: list, rules: list, field: str) -> dict:
+    """Count what applying the rules would change in one set of rows.
+
+    ``scanned`` counts rows with text at all, ``changed`` counts rows the rules
+    would touch, and ``changes`` counts individual substitutions — the three are
+    different numbers and the dry run is useless if it reports only one of them.
+    A row that already reads correctly is scanned and not changed, which is the
+    difference between "there is nothing here" and "there is nothing left to do".
+    """
+    scanned = changed = total = 0
+    samples = []
+    for row in rows:
+        text = row.get(field)
+        if not text:
+            continue
+        scanned += 1
+        _new_text, changes = apply_corrections(text, rules)
+        if not changes:
+            continue
+        changed += 1
+        total += len(changes)
+        for change in changes:
+            if len(samples) < CORRECTION_SAMPLE_LIMIT:
+                samples.append({"id": row.get("id"),
+                                "wrong": change["wrong"],
+                                "right": change["right"]})
+    return {"scanned": scanned, "changed": changed,
+            "changes": total, "samples": samples}
+
+
+def _correction_target(user_id: str, client_id: str) -> dict:
+    """Validate the caller and the client, and return the resolved client."""
+    if not (user_id or "").strip():
+        raise ValueError("user_id is required.")
+    if not (client_id or "").strip():
+        raise ValueError("A correction belongs to a client.")
+    client = _resolve_client_by_id(client_id, user_id)
+    if not client:
+        raise ValueError(f"Unknown client '{client_id}'.")
+    return client
+
+
+def db_preview_corrections(user_id: str, client_id: str) -> dict:
+    """What applying this client's rules would change. **Writes nothing.**
+
+    The dry run is the whole reason the apply is safe to press: a rule is a
+    regular-expression-free literal substitution scoped to one client, but it
+    is still a bulk rewrite of stored text, and the user should be able to see
+    the count before it happens — including the zero, which says the dictionary
+    has already been applied rather than that it is broken.
+    """
+    client = _correction_target(user_id, client_id)
+    rules = db_client_correction_rules(user_id, client["id"])
+    report = {
+        "clientId": client["id"],
+        "clientName": client["name"],
+        "ruleCount": len(rules),
+        "segments": {"scanned": 0, "changed": 0, "changes": 0, "samples": []},
+        "entries": {"scanned": 0, "changed": 0, "changes": 0, "samples": []},
+    }
+    if not rules:
+        return report
+    segments, entries = _correction_candidates(user_id, client["id"])
+    report["segments"] = _summarise_changes(segments, rules, "text")
+    report["entries"] = _summarise_changes(entries, rules, "content")
+    return report
+
+
+async def db_apply_corrections_to_client(user_id: str, client_id: str,
+                                        update_diary=None) -> dict:
+    """Rewrite this client's stored segments and diary entries.
+
+    **Segments are patched in place**, because a segment's text is the only copy
+    of it and the note is a separate snapshot the user regenerates on purpose.
+
+    **Diary entries go through the ordinary diary update**, because an entry is
+    three things at once — a node, a chunk family of vectors and a set of
+    extracted registers. Writing ``d.content`` directly would leave a vector
+    describing the mishear and keywords that no longer match the body, and the
+    entry would stop being findable by the spelling the user just corrected it
+    to. That path also re-derives the commitments, decisions and deliverables
+    from the corrected text, which is the same property the save hook has.
+
+    One row's failure is counted and the run continues: this is a bulk repair,
+    and aborting on the fourth of fifty rows leaves the remaining forty-six
+    unfixed with nothing to say which ones were done.
+    """
+    client = _correction_target(user_id, client_id)
+    rules = db_client_correction_rules(user_id, client["id"])
+    result = {
+        "clientId": client["id"],
+        "clientName": client["name"],
+        "ruleCount": len(rules),
+        "segments": {"scanned": 0, "changed": 0, "errors": 0},
+        "entries": {"scanned": 0, "changed": 0, "errors": 0},
+    }
+    if not rules:
+        return result
+
+    # Function-local, and overridable, for two separate reasons. Local: the
+    # `diary_manager` module imports this one for the save hook, so a
+    # module-level import here would be a cycle. Overridable: this module cannot
+    # be imported on a box with no Neo4j driver, so a suite that drives this
+    # function needs the same kind of seam `resolve_people_candidates` takes for
+    # its model call.
+    if update_diary is None:
+        from diary_manager import db_update_diary as update_diary
+
+    segments, entries = _correction_candidates(user_id, client["id"])
+    driver = _require_driver()
+
+    for row in segments:
+        text = row.get("text")
+        if not text:
+            continue
+        result["segments"]["scanned"] += 1
+        new_text, changes = apply_corrections(text, rules)
+        if not changes:
+            continue
+        try:
+            with driver.session() as s:
+                s.run(
+                    """
+                    MATCH (s:TranscriptionSegment {id: $id, userId: $userId})
+                    SET s.text = $text, s.updatedAt = datetime()
+                    """,
+                    id=row["id"], userId=user_id, text=new_text,
+                )
+            result["segments"]["changed"] += 1
+        except Exception as exc:
+            result["segments"]["errors"] += 1
+            logger.warning(f"corrections: could not rewrite segment {row.get('id')}: {exc}")
+
+    for row in entries:
+        content = row.get("content")
+        if not content:
+            continue
+        result["entries"]["scanned"] += 1
+        new_text, changes = apply_corrections(content, rules)
+        if not changes:
+            continue
+        try:
+            updated = await update_diary(row["id"], user_id, content=new_text)
+        except Exception as exc:
+            result["entries"]["errors"] += 1
+            logger.warning(f"corrections: could not rewrite diary entry {row.get('id')}: {exc}")
+            continue
+        if updated:
+            result["entries"]["changed"] += 1
+        else:
+            result["entries"]["errors"] += 1
+            logger.warning(f"corrections: diary entry {row.get('id')} was not rewritten")
+
+    logger.info(
+        f"corrections: applied {len(rules)} rule(s) for client {client['id']} — "
+        f"segments {result['segments']['changed']}/{result['segments']['scanned']}, "
+        f"entries {result['entries']['changed']}/{result['entries']['scanned']}"
+    )
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Segments
 # ---------------------------------------------------------------------------

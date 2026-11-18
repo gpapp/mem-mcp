@@ -35,6 +35,7 @@ import httpx
 
 import memory as mem
 import status_monitor
+from asr_corrections import apply_corrections
 from backup import list_savepoints, start_backup, start_restore, get_backup_status
 from migrate_client_context import (
     start_reclassify_scope, get_reclassify_status,
@@ -3221,6 +3222,106 @@ async def api_list_live_transcriptions(request: Request):
     }
 
 
+class CorrectionCreate(BaseModel):
+    clientId: str
+    wrong: str
+    right: str
+
+
+class CorrectionUpdate(BaseModel):
+    wrong: Optional[str] = None
+    right: Optional[str] = None
+
+
+class CorrectionClient(BaseModel):
+    clientId: str
+
+
+# -- ASR mishear corrections -------------------------------------------------
+# Scoped per client, because "1dp" means OneDP on one engagement and nothing at
+# all on the next, so a global dictionary would rewrite somebody else's text.
+# The CRUD routes are the dictionary; `preview` and `apply` are the retroactive
+# sweep over text that is already stored, which is a bulk rewrite across two
+# stores and therefore takes the per-user maintenance lock.
+
+@web_app.get("/api/live/corrections", response_class=JSONResponse)
+async def api_list_corrections(request: Request, clientId: str = ""):
+    user_id = _require_user(request)
+    try:
+        rules = await asyncio.to_thread(mem.db_list_corrections, user_id, clientId)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"corrections": rules}
+
+
+@web_app.post("/api/live/corrections", response_class=JSONResponse)
+async def api_create_correction(request: Request, body: CorrectionCreate):
+    user_id = _require_user(request)
+    try:
+        rule = await asyncio.to_thread(
+            mem.db_create_correction, user_id, body.clientId, body.wrong, body.right)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(status_code=201, content={"correction": rule})
+
+
+@web_app.post("/api/live/corrections/preview", response_class=JSONResponse)
+async def api_preview_corrections(request: Request, body: CorrectionClient):
+    """The dry run. Writes nothing, so it needs no lock."""
+    user_id = _require_user(request)
+    try:
+        report = await asyncio.to_thread(
+            mem.db_preview_corrections, user_id, body.clientId)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        raise _service_unavailable(exc)
+    return report
+
+
+@web_app.post("/api/live/corrections/apply", response_class=JSONResponse)
+async def api_apply_corrections(request: Request, body: CorrectionClient):
+    user_id = _require_user(request)
+    if not mem.claim_maintenance(user_id, "corrections"):
+        raise HTTPException(
+            status_code=409,
+            detail="Another maintenance operation is running — wait for it to finish.",
+        )
+    try:
+        result = await mem.db_apply_corrections_to_client(user_id, body.clientId)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        raise _service_unavailable(exc)
+    finally:
+        mem.release_maintenance(user_id)
+    return result
+
+
+@web_app.patch("/api/live/corrections/{correction_id}", response_class=JSONResponse)
+async def api_update_correction(request: Request, correction_id: str,
+                                body: CorrectionUpdate):
+    user_id = _require_user(request)
+    try:
+        rule = await asyncio.to_thread(
+            mem.db_update_correction, correction_id, user_id, body.wrong, body.right)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if rule is None:
+        raise HTTPException(status_code=404, detail="Correction not found.")
+    return {"correction": rule}
+
+
+@web_app.delete("/api/live/corrections/{correction_id}", response_class=JSONResponse)
+async def api_delete_correction(request: Request, correction_id: str):
+    user_id = _require_user(request)
+    deleted = await asyncio.to_thread(
+        mem.db_delete_correction, correction_id, user_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Correction not found.")
+    return {"deleted": True}
+
+
 @web_app.post("/api/live/transcriptions", response_class=JSONResponse)
 async def api_create_live_transcription(request: Request,
                                         body: LiveTranscriptionCreate):
@@ -3892,6 +3993,15 @@ async def live_stream(websocket: WebSocket, transcription_id: str):
         None, None, "recording",
     )
 
+    # The client's mishear dictionary is read ONCE per connection. A lookup per
+    # segment would put a Neo4j round trip in front of the microphone, and the
+    # rules cannot change while a meeting is being recorded. A session with no
+    # client has no dictionary -- an empty list, which leaves the reader below
+    # exactly as it was.
+    correction_rules = await asyncio.to_thread(
+        mem.db_client_correction_rules, user_id, record.get("clientId"),
+    )
+
     queue: asyncio.Queue = asyncio.Queue()
     writer_task = None
     upstream = None
@@ -3965,6 +4075,15 @@ async def live_stream(websocket: WebSocket, transcription_id: str):
                     continue
                 item = asr_segment(payload, offset)
                 if item:
+                    # Corrected before the queue, not in the writer. The browser
+                    # has already been sent the raw text (it is a transcript of
+                    # what was heard), but what is STORED is what every later
+                    # note, search and retroactive pass is built from -- and a
+                    # segment already stored with the mishear would have to be
+                    # found again by the sweep.
+                    if correction_rules:
+                        item["text"], _applied = apply_corrections(
+                            item["text"], correction_rules)
                     queue.put_nowait(item)
         except asyncio.CancelledError:
             raise

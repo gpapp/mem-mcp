@@ -64,6 +64,9 @@ from live_manager import (
     db_note_fact_candidates, release_note_segments,
     start_note_job, note_job_status, NoteJobDeferred, NoteJobBusy,
     repair_stale_recording_status, db_reset_dead_session_statuses,
+    db_list_corrections, db_create_correction, db_update_correction,
+    db_delete_correction, db_client_correction_rules,
+    db_preview_corrections, db_apply_corrections_to_client,
 )
 
 from action_manager import (
