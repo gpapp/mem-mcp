@@ -39,6 +39,7 @@ from common import (
     ASR_WS_URL,
     LIVE_MODEL, get_llm_response, get_neo4j, logger, publish_db_event,
 )
+from asr_corrections import normalise_rule
 from client_manager import _resolve_client_by_id, _resolve_context_by_id
 from live_notes import (
     COMPACT_SYSTEM_PROMPT,
@@ -388,6 +389,160 @@ async def db_delete_transcription(transcription_id: str, user_id: str,
             id=transcription_id, userId=user_id,
         )
     return {"deleted": True, "noteId": note_id, "noteDeleted": note_deleted}
+
+
+# ---------------------------------------------------------------------------
+# ASR mishear corrections
+# ---------------------------------------------------------------------------
+
+def _correction_dict(node) -> dict:
+    return {
+        "id": node.get("id"),
+        "userId": node.get("userId"),
+        "clientId": node.get("clientId"),
+        "clientName": node.get("clientName"),
+        "wrong": node.get("wrong"),
+        "right": node.get("right"),
+        "createdAt": _stamp(node.get("createdAt")),
+        "updatedAt": _stamp(node.get("updatedAt")),
+    }
+
+
+def db_list_corrections(user_id: str, client_id: str) -> list:
+    """Every ``wrong -> right`` rule for one client, longest phrase first.
+
+    The engine sorts longest-first when it applies rules, so the stored order
+    is the order the UI should show: the reader sees the most specific rule
+    above the shorter one it would otherwise win against.
+    """
+    if not (user_id or "").strip():
+        raise ValueError("user_id is required.")
+    if not (client_id or "").strip():
+        raise ValueError("A correction belongs to a client.")
+    client = _resolve_client_by_id(client_id, user_id)
+    if not client:
+        raise ValueError(f"Unknown client '{client_id}'.")
+    driver = _require_driver()
+    with driver.session() as s:
+        rows = s.run(
+            """
+            MATCH (c:TermCorrection {userId: $userId, clientId: $clientId})
+            RETURN c
+            ORDER BY size(c.wrong) DESC, toLower(c.wrong) ASC
+            """,
+            userId=user_id, clientId=client["id"],
+        ).data()
+    return [_correction_dict(row["c"]) for row in rows]
+
+
+def db_create_correction(user_id: str, client_id: str,
+                         wrong: str, right: str) -> dict:
+    """Store one rule. Returns the stored record.
+
+    The pair is normalised by :mod:`asr_corrections` first, which refuses a
+    rule whose replacement contains its own trigger as a word — applying that
+    once would already be wrong and applying it twice is worse.
+    """
+    if not (user_id or "").strip():
+        raise ValueError("user_id is required.")
+    if not (client_id or "").strip():
+        raise ValueError("A correction belongs to a client.")
+    client = _resolve_client_by_id(client_id, user_id)
+    if not client:
+        raise ValueError(f"Unknown client '{client_id}'.")
+    clean_wrong, clean_right = normalise_rule(wrong, right)
+
+    driver = _require_driver()
+    with driver.session() as s:
+        existing = s.run(
+            "MATCH (c:TermCorrection {userId: $userId, clientId: $clientId}) "
+            "RETURN c.wrong AS wrong",
+            userId=user_id, clientId=client["id"],
+        ).data()
+    if any((row["wrong"] or "").lower() == clean_wrong.lower() for row in existing):
+        raise ValueError(
+            f"A correction for '{clean_wrong}' already exists for this client."
+        )
+
+    correction_id = str(uuid.uuid4())
+    with driver.session() as s:
+        node = s.run(
+            """
+            CREATE (c:TermCorrection {
+                id: $id, userId: $userId, clientId: $clientId,
+                clientName: $clientName, wrong: $wrong, right: $right,
+                createdAt: datetime(), updatedAt: datetime()
+            })
+            RETURN c
+            """,
+            id=correction_id, userId=user_id, clientId=client["id"],
+            clientName=client["name"], wrong=clean_wrong, right=clean_right,
+        ).single()["c"]
+    return _correction_dict(node)
+
+
+def db_update_correction(correction_id: str, user_id: str,
+                         wrong: Optional[str] = None,
+                         right: Optional[str] = None) -> Optional[dict]:
+    """Replace either phrase of a rule owned by the caller.
+
+    ``None`` leaves a side alone; naming neither is refused rather than
+    reported as an update that changed nothing. Returns ``None`` when the id
+    is not the caller's, the same answer as every other scoped delete/update
+    here.
+    """
+    if wrong is None and right is None:
+        raise ValueError("Nothing to update.")
+    driver = _require_driver()
+    with driver.session() as s:
+        row = s.run(
+            "MATCH (c:TermCorrection {id: $id, userId: $userId}) RETURN c",
+            id=correction_id, userId=user_id,
+        ).single()
+    if not row:
+        return None
+
+    current = _correction_dict(row["c"])
+    clean_wrong, clean_right = normalise_rule(
+        current["wrong"] if wrong is None else wrong,
+        current["right"] if right is None else right,
+    )
+    with driver.session() as s:
+        clash = s.run(
+            "MATCH (c:TermCorrection {userId: $userId, clientId: $clientId}) "
+            "WHERE c.id <> $id AND toLower(c.wrong) = toLower($wrong) "
+            "RETURN count(c) AS n",
+            userId=user_id, clientId=current["clientId"],
+            id=correction_id, wrong=clean_wrong,
+        ).single()
+    if clash and clash["n"]:
+        raise ValueError(
+            f"A correction for '{clean_wrong}' already exists for this client."
+        )
+
+    with driver.session() as s:
+        node = s.run(
+            "MATCH (c:TermCorrection {id: $id, userId: $userId}) "
+            "SET c.wrong = $wrong, c.right = $right, c.updatedAt = datetime() "
+            "RETURN c",
+            id=correction_id, userId=user_id,
+            wrong=clean_wrong, right=clean_right,
+        ).single()["c"]
+    return _correction_dict(node)
+
+
+def db_delete_correction(correction_id: str, user_id: str) -> bool:
+    """Remove a rule. Scoped by ``user_id``, so another account's id is False."""
+    if not (user_id or "").strip():
+        raise ValueError("user_id is required.")
+    driver = _require_driver()
+    with driver.session() as s:
+        row = s.run(
+            "MATCH (c:TermCorrection {id: $id, userId: $userId}) "
+            "DELETE c RETURN count(c) AS n",
+            id=correction_id, userId=user_id,
+        ).single()
+    return bool(row and row["n"])
 
 
 # ---------------------------------------------------------------------------

@@ -365,6 +365,9 @@ def get_neo4j():
                     s.run("CREATE INDEX transcription_user_id_index IF NOT EXISTS FOR (t:Transcription) ON (t.userId)")
                     s.run("CREATE INDEX segment_transcription_user_index IF NOT EXISTS FOR (s:TranscriptionSegment) ON (s.transcriptionId, s.userId)")
                     s.run("CREATE INDEX segment_consumed_by_index IF NOT EXISTS FOR (s:TranscriptionSegment) ON (s.consumedBy)")
+                    # ASR mishear corrections are always looked up by the user
+                    # and the client they belong to.
+                    s.run("CREATE INDEX term_correction_user_client_index IF NOT EXISTS FOR (c:TermCorrection) ON (c.userId, c.clientId)")
                     s.run("OPTIONAL MATCH (a)-[:MENTIONS]->(b) RETURN 1 LIMIT 0")
             except Exception as e:
                 logger.error(f"Neo4j init error: {e}")

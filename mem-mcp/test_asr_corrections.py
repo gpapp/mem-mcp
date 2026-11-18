@@ -174,5 +174,277 @@ class CompileRulesTests(unittest.TestCase):
             compile_rules([("Bank", "Deutsche Bank")])
 
 
+# ---------------------------------------------------------------------------
+# Storage -- lifted out of live_manager.py
+# ---------------------------------------------------------------------------
+
+class _FakeResult:
+    def __init__(self, rows=None, single=None):
+        self._rows = list(rows or [])
+        self._single = single
+
+    def single(self):
+        return self._single
+
+    def data(self):
+        return list(self._rows)
+
+
+class _FakeSession:
+    def __init__(self, handler):
+        self.handler = handler
+        self.queries = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def run(self, query, **params):
+        self.queries.append((query, params))
+        return self.handler(query, params)
+
+
+class _FakeDriver:
+    def __init__(self, handler):
+        self.handler = handler
+        self.sessions = []
+
+    def session(self):
+        session = _FakeSession(self.handler)
+        self.sessions.append(session)
+        return session
+
+    @property
+    def queries(self):
+        return [query for session in self.sessions for query, _ in session.queries]
+
+
+def _lift_manager(*names, **extra_globals):
+    """Exec named functions out of ``live_manager.py`` with stub imports.
+
+    The same constraint `test_live_notes.py` documents for its own lifts:
+    ``live_manager`` imports ``common``, which imports httpx, so it cannot be
+    imported on a machine with no web dependencies.
+    """
+    import ast
+    import types
+
+    from asr_corrections import normalise_rule
+
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_manager.py")
+    with open(path, "r", encoding="utf-8") as handle:
+        tree = ast.parse(handle.read())
+    wanted = set(names)
+    found = {}
+    namespace = {
+        "__builtins__": __builtins__,
+        "uuid": types.SimpleNamespace(uuid4=lambda: "corr-1"),
+        "Optional": object,
+        "normalise_rule": normalise_rule,
+        "_stamp": lambda value: None if value is None else str(value),
+    }
+    namespace.update(extra_globals)
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name in wanted:
+            # One namespace for every requested name: `_correction_dict` is a
+            # global to `db_create_correction`, not an argument to it.
+            module = ast.Module(body=[node], type_ignores=[])
+            ast.fix_missing_locations(module)
+            exec(compile(module, path, "exec"), namespace)
+            found[node.name] = namespace[node.name]
+    missing = wanted - set(found)
+    if missing:
+        raise AssertionError(f"not found in live_manager.py: {sorted(missing)}")
+    return found
+
+
+def _known_client(client_id, user_id, name="Deutsche Bank (DB)"):
+    return {"id": client_id, "name": name} if client_id else None
+
+
+class CorrectionStorageTests(unittest.TestCase):
+    """The CRUD half, driven against a fake driver.
+
+    What is worth guarding here is the refusals, because every one of them is a
+    query plus a branch and none is visible in the shape of the code: an
+    unknown client, a duplicate trigger, an update that names nothing, and a
+    delete scoped to the caller.
+    """
+
+    def _lift(self, *names, driver, client=_known_client):
+        return _lift_manager(
+            "_correction_dict", *names,
+            _require_driver=lambda: driver,
+            _resolve_client_by_id=client,
+        )
+
+    def test_create_stores_the_normalised_pair(self):
+        def handler(query, params):
+            if "RETURN c.wrong AS wrong" in query:
+                return _FakeResult(rows=[])
+            if "CREATE (c:TermCorrection" in query:
+                node = {key: params[key] for key in
+                        ("id", "userId", "clientId", "clientName",
+                         "wrong", "right")}
+                return _FakeResult(single={"c": node})
+            return _FakeResult()
+
+        driver = _FakeDriver(handler)
+        funcs = self._lift("db_create_correction", driver=driver)
+        stored = funcs["db_create_correction"](
+            "alice", "c1", "  Deutche   Bank ", "Deutsche Bank")
+        self.assertEqual(stored["wrong"], "Deutche Bank")
+        self.assertEqual(stored["right"], "Deutsche Bank")
+        self.assertEqual(stored["clientName"], "Deutsche Bank (DB)")
+        self.assertEqual(stored["id"], "corr-1")
+        self.assertIn(":TermCorrection", driver.queries[-1])
+
+    def test_a_duplicate_trigger_is_refused_case_insensitively(self):
+        def handler(query, params):
+            if "RETURN c.wrong AS wrong" in query:
+                return _FakeResult(rows=[{"wrong": "Deutche Bank"}])
+            return _FakeResult()
+
+        driver = _FakeDriver(handler)
+        funcs = self._lift("db_create_correction", driver=driver)
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            funcs["db_create_correction"](
+                "alice", "c1", "deutche bank", "Deutsche Bank")
+        self.assertFalse(
+            any("CREATE (c:TermCorrection" in q for q in driver.queries))
+
+    def test_an_unknown_client_is_refused_before_any_write(self):
+        driver = _FakeDriver(lambda query, params: _FakeResult())
+        funcs = self._lift("db_create_correction", driver=driver,
+                           client=lambda client_id, user_id: None)
+        with self.assertRaisesRegex(ValueError, "Unknown client 'c-nope'."):
+            funcs["db_create_correction"]("alice", "c-nope", "NJX", "EngX")
+        self.assertEqual(driver.queries, [])
+
+    def test_a_correction_must_belong_to_a_client(self):
+        driver = _FakeDriver(lambda query, params: _FakeResult())
+        funcs = self._lift("db_create_correction", driver=driver)
+        with self.assertRaisesRegex(ValueError, "belongs to a client"):
+            funcs["db_create_correction"]("alice", "", "NJX", "EngX")
+        self.assertEqual(driver.queries, [])
+
+    def test_a_rule_that_would_match_its_own_output_is_refused(self):
+        driver = _FakeDriver(lambda query, params: _FakeResult())
+        funcs = self._lift("db_create_correction", driver=driver)
+        with self.assertRaises(CorrectionRuleError):
+            funcs["db_create_correction"]("alice", "c1", "Bank", "Deutsche Bank")
+        self.assertFalse(
+            any("CREATE (c:TermCorrection" in q for q in driver.queries))
+
+    def test_list_returns_the_rules_for_that_client(self):
+        first = {"id": "a", "userId": "alice", "clientId": "c1",
+                 "clientName": "DB", "wrong": "Southern TIO", "right": "TO"}
+        second = {"id": "b", "userId": "alice", "clientId": "c1",
+                  "clientName": "DB", "wrong": "TIO", "right": "TO"}
+
+        def handler(query, params):
+            self.assertEqual(params["userId"], "alice")
+            self.assertEqual(params["clientId"], "c1")
+            return _FakeResult(rows=[{"c": first}, {"c": second}])
+
+        driver = _FakeDriver(handler)
+        funcs = self._lift("db_list_corrections", driver=driver)
+        rules = funcs["db_list_corrections"]("alice", "c1")
+        self.assertEqual([rule["id"] for rule in rules], ["a", "b"])
+        self.assertIn("$userId", driver.queries[0])
+        self.assertIn("$clientId", driver.queries[0])
+
+    def test_list_refuses_an_unknown_or_missing_client(self):
+        driver = _FakeDriver(lambda query, params: _FakeResult())
+        funcs = self._lift("db_list_corrections", driver=driver,
+                           client=lambda client_id, user_id: None)
+        with self.assertRaisesRegex(ValueError, "Unknown client 'c-nope'."):
+            funcs["db_list_corrections"]("alice", "c-nope")
+        with self.assertRaisesRegex(ValueError, "belongs to a client"):
+            funcs["db_list_corrections"]("alice", "")
+        self.assertEqual(driver.queries, [])
+
+    def _current(self, **over):
+        node = {"id": "corr-1", "userId": "alice", "clientId": "c1",
+                "clientName": "DB", "wrong": "1dp", "right": "OneDP"}
+        node.update(over)
+        return node
+
+    def test_update_changes_one_side_and_leaves_the_other(self):
+        def handler(query, params):
+            if "SET c.wrong = $wrong" in query:
+                node = dict(self._current(), wrong=params["wrong"],
+                            right=params["right"])
+                return _FakeResult(single={"c": node})
+            if "WHERE c.id <> $id" in query:
+                return _FakeResult(single={"n": 0})
+            return _FakeResult(single={"c": self._current()})
+
+        driver = _FakeDriver(handler)
+        funcs = self._lift("db_update_correction", driver=driver)
+        stored = funcs["db_update_correction"]("corr-1", "alice", wrong="One DP")
+        self.assertEqual(stored["wrong"], "One DP")
+        self.assertEqual(stored["right"], "OneDP")
+
+    def test_update_scopes_every_query_to_the_caller(self):
+        seen = []
+
+        def handler(query, params):
+            seen.append(params)
+            if "SET c.wrong = $wrong" in query:
+                return _FakeResult(single={"c": self._current()})
+            if "WHERE c.id <> $id" in query:
+                return _FakeResult(single={"n": 0})
+            return _FakeResult(single={"c": self._current()})
+
+        driver = _FakeDriver(handler)
+        funcs = self._lift("db_update_correction", driver=driver)
+        funcs["db_update_correction"]("corr-1", "alice", right="One DP")
+        self.assertTrue(seen)
+        for params in seen:
+            self.assertEqual(params["userId"], "alice")
+
+    def test_update_refuses_a_trigger_another_rule_already_owns(self):
+        def handler(query, params):
+            if "WHERE c.id <> $id" in query:
+                return _FakeResult(single={"n": 1})
+            return _FakeResult(single={"c": self._current()})
+
+        driver = _FakeDriver(handler)
+        funcs = self._lift("db_update_correction", driver=driver)
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            funcs["db_update_correction"]("corr-1", "alice", wrong="TIO")
+        self.assertFalse(any("SET c.wrong" in q for q in driver.queries))
+
+    def test_updating_someone_elses_rule_answers_none(self):
+        driver = _FakeDriver(lambda query, params: _FakeResult(single=None))
+        funcs = self._lift("db_update_correction", driver=driver)
+        self.assertIsNone(funcs["db_update_correction"]("corr-x", "alice",
+                                                       wrong="TIO"))
+        self.assertEqual(len(driver.queries), 1)
+
+    def test_naming_neither_side_is_refused(self):
+        driver = _FakeDriver(lambda query, params: _FakeResult())
+        funcs = self._lift("db_update_correction", driver=driver)
+        with self.assertRaisesRegex(ValueError, "Nothing to update"):
+            funcs["db_update_correction"]("corr-1", "alice")
+        self.assertEqual(driver.queries, [])
+
+    def test_delete_removes_only_the_callers_rule(self):
+        driver = _FakeDriver(lambda query, params: _FakeResult(single={"n": 1}))
+        funcs = self._lift("db_delete_correction", driver=driver)
+        self.assertTrue(funcs["db_delete_correction"]("corr-1", "alice"))
+        query = driver.queries[0]
+        self.assertIn("DELETE c", query)
+        self.assertIn("$userId", query)
+
+    def test_deleting_another_users_rule_is_false(self):
+        driver = _FakeDriver(lambda query, params: _FakeResult(single={"n": 0}))
+        funcs = self._lift("db_delete_correction", driver=driver)
+        self.assertFalse(funcs["db_delete_correction"]("corr-1", "bob"))
+
+
 if __name__ == "__main__":
     unittest.main()
