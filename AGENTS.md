@@ -78,7 +78,7 @@ own body and a namespace entry cannot reach that.
 
 ```bash
 cd mem-mcp
-python3 -m unittest -v test_matching_regressions.py test_embedding_reliability.py test_chunking.py test_cypher_safety.py test_backup_compression.py test_people_extraction.py test_graph_scope.py test_mobile_layout.py test_llm_reliability.py test_env_wiring.py test_status_monitor.py test_sessions.py test_auth_guard.py test_google_auth.py test_registration.py test_vault_migration.py test_sharing.py test_share_endpoints.py test_sharing_readpaths.py test_live_notes.py test_skill_catalogue.py test_action_items.py test_briefing.py test_roster.py test_model_bench.py test_decision_log.py test_timeline.py test_deliverables.py
+python3 -m unittest -v test_matching_regressions.py test_embedding_reliability.py test_chunking.py test_cypher_safety.py test_backup_compression.py test_people_extraction.py test_graph_scope.py test_mobile_layout.py test_llm_reliability.py test_env_wiring.py test_status_monitor.py test_sessions.py test_auth_guard.py test_google_auth.py test_registration.py test_vault_migration.py test_sharing.py test_share_endpoints.py test_sharing_readpaths.py test_live_notes.py test_skill_catalogue.py test_action_items.py test_briefing.py test_roster.py test_model_bench.py test_decision_log.py test_timeline.py test_deliverables.py test_asr_corrections.py
 ```
 
 This was a Windows path (`C:/tools/miniconda3/python.exe`) with PowerShell `Push-Location`/`Pop-Location`, and it does not exist on the Linux host these files are edited from — every suite "failed" on an interpreter that is not there. Any `python`/`python3` on `PATH` runs all of them; none of them import a DB driver.
@@ -3587,3 +3587,112 @@ Two consequences worth keeping:
   calls the 426 route, and `AsrTokenProbeTests` drives the probe against a fake
   `httpx` client — including that a `200` never opens a socket, because the
   socket is the model load the change exists to avoid.
+
+
+## ASR Mishear Corrections
+
+ASR gets the same words wrong every time. On one engagement `Deutche Bank` is
+always misspelled, `1dp` is always `OneDP`, `NJX` is always `EngX`. A per-client
+substitution dictionary fixes that once, at the point where text enters the
+vault, and can be swept back over what was already stored.
+
+**A correction is `wrong phrase -> right phrase`, scoped to one client.** Not to
+the vault: `1dp` means OneDP on one engagement and nothing at all on the next, so
+a global dictionary would rewrite somebody else's text. The rule is a
+`:TermCorrection` node (`userId`, `clientId`, `wrong`, `right`, timestamps) and
+the scope comes from the `:Transcription` row's own `clientId` — or, for a diary
+entry, the client it is filed under.
+
+**The engine is `asr_corrections.py`, and it is stdlib-only.** Every rule about
+matching lives there so a suite can *call* it: case-insensitive, word
+boundaries, longest trigger first at each position, **one non-overlapping pass
+that never chains** (so `a->b` and `b->c` cannot turn `a` into `c`), and a rule
+whose right side contains its wrong side is refused (`Bank -> Deutsche Bank`
+re-inserts the trigger it exists to remove; `TO -> Toronto` is fine). The right
+side is emitted verbatim — there is deliberately no case guessing, because it
+would turn `1dp` into `Onedp`.
+
+**The inbound save is the reason the feature exists.** The
+`process-transcription` skill saves MS Teams + ASR text that already contains the
+mishears, so `_correct_inbound_text` runs inside `db_save_diary` and
+`db_update_diary` whenever the entry has a client. One hook covers the GUI save,
+the GUI edit, the MCP tool and the skill. Two properties are load-bearing:
+
+- **It runs before anything derives from the text.** Keywords, participants,
+  commitments, decisions, deliverables and the embedded vector all read the
+  corrected body, so a search for the right spelling finds the entry. Correcting
+  after the write would store the right words beside an index of the wrong ones.
+- **The edit path corrects against the client the entry is *filed under*, not
+  only the one the caller resent.** An edit from the entry view does not repeat
+  `client_id`, and reading only the argument would skip the correction for
+  exactly the review step where a processed file is read.
+
+`db_client_correction_rules` is the save path's read, and it is deliberately
+**not** `db_list_corrections`: it does not resolve the client and never raises.
+A save may carry a client that was deleted in another tab or a share that was
+revoked, `db_save_diary` already tolerates that by dropping the scope key, and a
+convenience must not turn a working save into a refused one. An unreachable
+graph answers an empty list with a WARNING.
+
+**The retroactive sweep is two steps, and the first one writes nothing.**
+`db_preview_corrections` counts rows scanned, rows changed and individual
+substitutions, with samples; `db_apply_corrections_to_client` does the work. The
+three counts are different numbers on purpose — "nothing here" and "nothing left
+to do" must not read the same.
+
+- **Segments are patched in place.** A segment's text is the only copy, and the
+  note is a separate snapshot, so a corrected segment changes nothing until
+  somebody presses **Rebuild note** — which is exactly when they want the
+  corrected text.
+- **Diary entries go through the ordinary diary update.** Writing `d.content`
+  directly would leave a vector describing the mishear and keywords that no
+  longer match the body, and the entry would stop being findable by the spelling
+  it was just corrected to. That path also re-derives the three registers.
+- **One bad row is counted and the run continues.** A bulk repair that abandons
+  the remaining rows on the fourth has nothing to say about which ones it did.
+
+**The live socket corrects too, secondarily.** `live_stream` reads the rules
+**once per connection** — a per-segment lookup would put a Neo4j round trip in
+front of the microphone — and corrects `item["text"]` in `asr_reader` before the
+queue, so what is *stored* is what every later note and search is built from.
+The browser has already been sent the raw text: it is a transcript of what was
+heard.
+
+**The panel is in the live toolbar, because that is where a client is already
+selected.** A settings-page version would need its own client picker and could
+drift from the one the recording uses. `📖 Corrections` opens a list with
+add / edit / delete, **Preview changes**, and **Apply to existing records** —
+which stays disabled until a dry run finds something. Apply takes the per-user
+maintenance lock and answers 409 with the usual reason; preview does not, because
+it writes nothing.
+
+Routes: `GET` / `POST /api/live/corrections`, `PATCH` / `DELETE
+/api/live/corrections/{id}`, `POST /api/live/corrections/preview` and `POST
+/api/live/corrections/apply`, all behind `_require_user`.
+
+`test_asr_corrections.py` is the 29th suite, and it **calls** the engine rather
+than reading it: matching, boundaries, longest-wins, non-overlap between two
+rules, no chaining, the self-containing refusal and the verbatim right side are
+all behavioural, because a substitution rule is defined by what it emits. The
+storage CRUD is lifted out of `live_manager.py` with `ast` (that module imports
+`common`), the save hook out of `diary_manager.py`, and the preview/apply sweep
+driven against a fake graph — including a preview that issues no `SET`, a failed
+row that does not abandon the run, and an apply that routes entries through the
+diary update rather than patching the node. Two harness lessons came out of
+writing it and are worth keeping: **a lift harness must supply every module-level
+name the lifted function reads** (`_correction_dict`, then `normalise_rule`), and
+**it must match `AsyncFunctionDef` as well as `FunctionDef`** — a lift that
+silently skips an async function reports "not found" about a function that is
+right there.
+
+`CorrectionSurfaceTests` pins the parts no helper test can see: every route
+behind `_require_user`, the apply route's lock **and its `finally`**, the preview
+route *not* taking one, the socket reading the rules once and correcting before
+`queue.put_nowait`, the panel reading the client off the open recording,
+refusing to edit without one, Apply disabled until a dry run, and the rule rows
+escaped before they reach `innerHTML`.
+
+**Do not apply a rule at write time but not on save.** The two halves must agree,
+or a transcription corrected automatically and a diary entry saved from the same
+text disagree about the client's own name — which is the defect the feature is
+here to remove.

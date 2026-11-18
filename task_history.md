@@ -5,6 +5,74 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# Per-client ASR mishear corrections, on save and retroactively
+
+**Why.** asr-mcp mishears the same terms every time on an engagement — `Deutche
+Bank`, `1dp` for OneDP, `NJX` for EngX. The wrong text was stored verbatim, the
+running note was generated from it, and a diary entry created from a
+`process-transcription` run inherited it, so the same mistake had to be fixed by
+hand in every record it had ever touched.
+
+**What shipped.**
+
+- **A pure engine, `mem-mcp/asr_corrections.py`**, stdlib-only so a suite can
+  call it. A rule is `wrong -> right`; matching is case-insensitive on word
+  boundaries, longest trigger first at each position, **one non-overlapping pass
+  that never chains**, and a rule whose right side contains its wrong side is
+  refused (`Bank -> Deutsche Bank` re-inserts its own trigger). The right side is
+  emitted verbatim — no case guessing, or `1dp` becomes `Onedp`.
+- **Storage as `:TermCorrection`** (`userId`, `clientId`, `wrong`, `right`,
+  timestamps) with a boot index, and CRUD in `live_manager.py`
+  (`db_list_corrections` / `db_create_correction` / `db_update_correction` /
+  `db_delete_correction`). A duplicate `(client, wrong)` is refused
+  case-insensitively; an unknown client is refused before any write.
+- **The inbound save hook.** `_correct_inbound_text` runs inside
+  `db_save_diary` and `db_update_diary` when the entry has a client, so one hook
+  covers the GUI save, the GUI edit, the MCP tool and the skill. It runs before
+  anything derives from the text — keywords, participants, commitments,
+  decisions, deliverables and the embedded vector all read the corrected body —
+  and the edit path uses the client the entry is *filed under*, not only the one
+  the caller resent, because an edit from the entry view does not repeat
+  `client_id`.
+- **The retroactive sweep**, `db_preview_corrections` (counts scanned, changed
+  and substituted, with samples, and writes nothing) and
+  `db_apply_corrections_to_client`. Segments are patched in place; diary entries
+  go through the ordinary diary update so the vector is re-embedded and the
+  keywords and three registers are re-derived. A failed row is counted and the
+  run continues.
+- **The live socket**, which reads the rules once per connection (a per-segment
+  lookup would put a Neo4j round trip in front of the microphone) and corrects
+  each segment before the queue, so what is stored is what every later note and
+  search is built from.
+- **A panel in the live toolbar** (`📖 Corrections`), because that is where a
+  client is already selected: list / add / edit / delete, **Preview changes**,
+  and **Apply to existing records**, disabled until a dry run finds something.
+  Apply takes the per-user maintenance lock; preview does not.
+
+**The one thing to rediscover the hard way.** `db_client_correction_rules` is
+not `db_list_corrections`, and the difference is deliberate. The CRUD read
+refuses an unknown client, which is right for a form and wrong underneath a
+save: `db_save_diary` already tolerates a stale client by dropping the scope key
+from the payload, and a convenience that turned a working save into a refused one
+would be a worse trade than a mishear that survives a single save. It never
+raises — an unreachable graph answers an empty list with a WARNING. The same
+asymmetry shapes the sweep: preview is a genuine dry run (the test asserts no
+`SET` is issued), and applying a diary entry must go through
+`db_update_diary` rather than a property write, or the entry keeps a vector and
+keywords describing the mishear and stops being findable by the spelling it was
+just corrected to.
+
+**Verified.** `node --check` on the extracted dashboard script blocks,
+`py_compile` on the edited Python, and the full dependency-light suite — 1887
+tests OK, with `test_asr_corrections.py` at 66. Two harness lessons are recorded
+in `AGENTS.md`: a lift harness must supply every module-level name the lifted
+function reads, and it must match `AsyncFunctionDef` as well as `FunctionDef`.
+
+Commits: `a85bdf2` (engine), `fea64ba` (storage), `c120639` (save hook),
+`787eb0b` (sweep, live hook, panel), and the docs/commit that moved this entry.
+
+---
+
 # A Markdown editor for the diary and fact textareas, and actions that name their source
 
 **Why.** Diary and fact entries are Markdown — the viewer renders it — but the
