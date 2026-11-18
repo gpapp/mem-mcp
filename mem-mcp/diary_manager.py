@@ -56,6 +56,8 @@ import sharing  # Phase 3: shared-vault read access policy layer
 # test suites until it raises ModuleNotFoundError on a box with no qdrant_client.
 from fact_manager import (_shared_record_visible, _record_related_ids_sync,
                           _shared_records_visible)
+from asr_corrections import apply_corrections
+from live_manager import db_client_correction_rules
 
 # ---------------------------------------------------------------------------
 # Diary helpers
@@ -63,6 +65,42 @@ from fact_manager import (_shared_record_visible, _record_related_ids_sync,
 
 def _diary_id(user_id: str, timestamp: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"diary_{user_id}_{timestamp}"))
+
+
+def _correct_inbound_text(content, name, user_id, client_id):
+    """Apply one client's mishear rules to text that is about to be stored.
+
+    This is the hook the feature exists for: a transcription processed by the
+    ``process-transcription`` skill arrives already misheard (``Deutche Bank``,
+    ``1dp``, ``NJX``), and correcting it *here* means everything derived from
+    the body agrees with it — the keywords, the participants, the commitments,
+    the decisions, the deliverables and the embedded vector all read the
+    corrected text, so a later search for the right spelling finds the entry
+    instead of the one the ASR heard.
+
+    Both halves are corrected, because the mishear is in the title as often as
+    in the body: "Meeting with Deutche Bank" is the entry's *name*, not its
+    first line. Returns ``(content, name, changes)``.
+
+    Deliberately total — no client, no rules, an unknown client or an
+    unreachable graph all return the text unchanged. A correction dictionary is
+    a convenience, and a save that fails because one could not be read is a
+    worse trade than a mishear that survives a single save.
+    """
+    if not client_id:
+        return content, name, []
+    rules = db_client_correction_rules(user_id, client_id)
+    if not rules:
+        return content, name, []
+    changes = []
+    new_content, found = (apply_corrections(content, rules) if content
+                          else (content, []))
+    changes.extend(found)
+    new_name, found = (apply_corrections(name, rules) if name else (name, []))
+    changes.extend(found)
+    if changes:
+        logger.info(f"corrections: {len(changes)} applied on save for client {client_id}")
+    return new_content, new_name, changes
 
 
 # ---------------------------------------------------------------------------
@@ -673,6 +711,13 @@ async def db_save_diary(content: str, user_id: str, timestamp: str, name: str, m
     if not qdrant or not neo4j_driver:
         raise RuntimeError("Database connections not established.")
 
+    # Apply this client's mishear rules before ANYTHING derives from the text.
+    # The keyword/participant extraction below, the commitments and decisions
+    # parsed out of the body, and the vector embedded a few lines down all read
+    # what this returns. Correcting after the write would fix the stored text and
+    # leave everything already derived from the mishear in place.
+    content, name, _corrections = _correct_inbound_text(content, name, user_id, client_id)
+
     # Derive a stable ID from user + timestamp so the same timestamp always maps to the same node
     doc_id   = _diary_id(user_id, timestamp)
     # Keep a plain date string for display / grouping purposes
@@ -1227,6 +1272,14 @@ async def db_update_diary(entry_id: str, user_id: str, content: Optional[str] = 
                 scope["contextId"] = None
         elif existing.get("contextName"):
             scope["contextName"] = existing["contextName"]
+
+        # The same hook as the save path, against the client the entry is
+        # actually filed under rather than only the one the caller resent. An
+        # edit that does not repeat `client_id` still belongs to its client, and
+        # the extraction below must see the corrected body or the keywords and
+        # participants are regenerated from the mishear.
+        new_content, new_name, _corrections = _correct_inbound_text(
+            new_content, new_name, user_id, scope.get("clientId"))
 
         # Both extraction passes in one interleaved window loop — same shape as
         # db_save_diary, and for the same reason: the names ride to

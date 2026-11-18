@@ -39,7 +39,7 @@ from common import (
     ASR_WS_URL,
     LIVE_MODEL, get_llm_response, get_neo4j, logger, publish_db_event,
 )
-from asr_corrections import normalise_rule
+from asr_corrections import apply_corrections, normalise_rule
 from client_manager import _resolve_client_by_id, _resolve_context_by_id
 from live_notes import (
     COMPACT_SYSTEM_PROMPT,
@@ -543,6 +543,50 @@ def db_delete_correction(correction_id: str, user_id: str) -> bool:
             id=correction_id, userId=user_id,
         ).single()
     return bool(row and row["n"])
+
+
+def db_client_correction_rules(user_id: str, client_id: Optional[str]) -> list:
+    """The mishear rules that apply to text stored under one client, longest first.
+
+    This is the read the **save** paths use, and it is deliberately different
+    from ``db_list_corrections`` in three ways, each of which is a property the
+    write path needs:
+
+    - It does not resolve the client. ``db_list_corrections`` refuses an unknown
+      client id, which is right for a CRUD form and wrong here: a save may carry
+      a client the caller can no longer read (a share that was revoked, a client
+      deleted in another tab), and ``db_save_diary`` already tolerates that by
+      dropping the scope key from the payload. Turning a tolerant save into a
+      refused one is a worse trade than a mishear that survives one save.
+    - It returns only the pair, because that is all ``apply_corrections`` reads.
+    - It never raises. An unreachable graph answers an empty list with a
+      WARNING, for the same reason: **a convenience must not fail a write.**
+
+    Ordering comes from the query rather than from Python, so the ordering the
+    engine relies on and the ordering the database returns cannot drift.
+    """
+    if not (user_id or "").strip() or not (client_id or "").strip():
+        return []
+    try:
+        driver = _require_driver()
+    except RuntimeError:
+        return []
+    try:
+        with driver.session() as s:
+            rows = s.run(
+                """
+                MATCH (c:TermCorrection {userId: $userId, clientId: $clientId})
+                RETURN c.wrong AS wrong, c.right AS right
+                ORDER BY size(c.wrong) DESC, toLower(c.wrong) ASC
+                """,
+                userId=user_id, clientId=client_id,
+            ).data()
+    except Exception as exc:
+        logger.warning(f"corrections: could not read the rules for client "
+                       f"{client_id}: {exc}")
+        return []
+    return [{"wrong": r["wrong"], "right": r["right"]}
+            for r in (rows or []) if r.get("wrong") and r.get("right")]
 
 
 # ---------------------------------------------------------------------------

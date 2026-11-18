@@ -12,6 +12,7 @@ said. None of those raises, and none of them is visible without calling the
 engine.
 """
 
+import ast
 import os
 import sys
 import unittest
@@ -444,6 +445,247 @@ class CorrectionStorageTests(unittest.TestCase):
         driver = _FakeDriver(lambda query, params: _FakeResult(single={"n": 0}))
         funcs = self._lift("db_delete_correction", driver=driver)
         self.assertFalse(funcs["db_delete_correction"]("corr-1", "bob"))
+
+
+# ---------------------------------------------------------------------------
+# The save-path read, and the pre-save hook that uses it
+# ---------------------------------------------------------------------------
+
+class _RecordingLogger:
+    """Captures the level and text of every line, so a silent catch is visible."""
+
+    def __init__(self):
+        self.lines = []
+
+    def info(self, message):
+        self.lines.append(("info", message))
+
+    def warning(self, message):
+        self.lines.append(("warning", message))
+
+    def error(self, message):
+        self.lines.append(("error", message))
+
+
+def _diary_source():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "diary_manager.py")
+    with open(path, "r", encoding="utf-8") as handle:
+        source = handle.read()
+    return path, source, ast.parse(source)
+
+
+def _lift_diary(*names, **extra_globals):
+    """Exec named functions out of ``diary_manager.py`` with stub imports.
+
+    Same constraint as ``_lift_manager``: ``diary_manager`` imports ``common``,
+    which imports httpx, so it cannot be imported on a machine without the web
+    dependencies. The namespace is shared across every requested name for the
+    same reason it is over there — a sibling function is a global, not an
+    argument.
+    """
+    path, _source, tree = _diary_source()
+    wanted = set(names)
+    found = {}
+    namespace = {
+        "__builtins__": __builtins__,
+        "Optional": object,
+        "apply_corrections": apply_corrections,
+        "logger": _RecordingLogger(),
+    }
+    namespace.update(extra_globals)
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name in wanted:
+            module = ast.Module(body=[node], type_ignores=[])
+            ast.fix_missing_locations(module)
+            exec(compile(module, path, "exec"), namespace)
+            found[node.name] = namespace[node.name]
+    missing = wanted - set(found)
+    if missing:
+        raise AssertionError(f"not found in diary_manager.py: {sorted(missing)}")
+    return found
+
+
+class CorrectionRuleLoaderTests(unittest.TestCase):
+    """``db_client_correction_rules`` is the save path's read, so it must not raise.
+
+    ``db_list_corrections`` is the CRUD read and refuses an unknown client. This
+    one deliberately does not, because it runs underneath a diary save: a share
+    revoked in another tab, or a client deleted while the form was open, must not
+    turn a working save into a refused one.
+    """
+
+    def _load(self, handler, log=None):
+        driver = _FakeDriver(handler)
+        funcs = _lift_manager("db_client_correction_rules",
+                              _require_driver=lambda: driver,
+                              logger=log or _RecordingLogger())
+        return funcs["db_client_correction_rules"], driver
+
+    def test_it_reads_the_rules_for_one_client_in_stored_order(self):
+        def handler(query, params):
+            self.assertIn(":TermCorrection", query)
+            self.assertEqual(params, {"userId": "alice", "clientId": "c1"})
+            # The ordering the engine relies on is stated in the query, so the
+            # two cannot drift: longest trigger first, then alphabetical.
+            self.assertIn("ORDER BY size(c.wrong) DESC", query)
+            self.assertIn("toLower(c.wrong) ASC", query)
+            return _FakeResult(rows=[
+                {"wrong": "Deutche Bank", "right": "Deutsche Bank"},
+                {"wrong": "1dp", "right": "OneDP"},
+            ])
+
+        load, _driver = self._load(handler)
+        self.assertEqual(load("alice", "c1"), [
+            {"wrong": "Deutche Bank", "right": "Deutsche Bank"},
+            {"wrong": "1dp", "right": "OneDP"},
+        ])
+
+    def test_a_missing_client_reads_nothing(self):
+        load, driver = self._load(lambda query, params: _FakeResult(rows=[]))
+        self.assertEqual(load("alice", None), [])
+        self.assertEqual(load("alice", ""), [])
+        self.assertEqual(load("", "c1"), [])
+        self.assertEqual(driver.queries, [])
+
+    def test_an_unreachable_graph_answers_empty_rather_than_raising(self):
+        def boom():
+            raise RuntimeError("Neo4j not connected.")
+
+        funcs = _lift_manager("db_client_correction_rules",
+                              _require_driver=boom,
+                              logger=_RecordingLogger())
+        self.assertEqual(funcs["db_client_correction_rules"]("alice", "c1"), [])
+
+    def test_a_failed_query_is_logged_and_swallowed(self):
+        log = _RecordingLogger()
+
+        def handler(query, params):
+            raise RuntimeError("Neo4j went away")
+
+        load, _driver = self._load(handler, log=log)
+        self.assertEqual(load("alice", "c1"), [])
+        self.assertEqual([level for level, _line in log.lines], ["warning"],
+                         msg="a swallowed read must say so, or the mishear looks "
+                             "like there is no rule for it")
+
+    def test_a_half_written_rule_is_ignored_rather_than_applied(self):
+        load, _driver = self._load(lambda query, params: _FakeResult(rows=[
+            {"wrong": "1dp", "right": None},
+            {"wrong": None, "right": "OneDP"},
+            {"wrong": "NJX", "right": "EngX"},
+        ]))
+        self.assertEqual(load("alice", "c1"), [{"wrong": "NJX", "right": "EngX"}])
+
+
+class InboundSaveHookTests(unittest.TestCase):
+    """`_correct_inbound_text` is the pre-save hook the whole feature exists for."""
+
+    def _hook(self, rules, log=None):
+        calls = []
+
+        def loader(user_id, client_id):
+            calls.append((user_id, client_id))
+            return rules
+
+        funcs = _lift_diary("_correct_inbound_text",
+                            db_client_correction_rules=loader,
+                            logger=log or _RecordingLogger())
+        return funcs["_correct_inbound_text"], calls
+
+    def test_the_body_and_the_title_are_both_corrected(self):
+        hook, _calls = self._hook([{"wrong": "Deutche Bank", "right": "Deutsche Bank"}])
+        content, name, changes = hook(
+            "Met Deutche Bank about the estate.",
+            "Deutche Bank - architecture review",
+            "alice", "c1",
+        )
+        self.assertEqual(content, "Met Deutsche Bank about the estate.")
+        self.assertEqual(name, "Deutsche Bank - architecture review")
+        self.assertEqual(len(changes), 2,
+                         msg="the mishear is in the title as often as in the body")
+
+    def test_the_example_mishears_from_the_report_are_applied(self):
+        hook, _calls = self._hook([
+            {"wrong": "Deutche Bank", "right": "Deutsche Bank"},
+            {"wrong": "1dp", "right": "OneDP"},
+            {"wrong": "NJX", "right": "EngX"},
+        ])
+        content, _name, _changes = hook(
+            "Deutche Bank, the 1dp programme and NJX", "", "alice", "c1")
+        self.assertEqual(content, "Deutsche Bank, the OneDP programme and EngX")
+
+    def test_no_client_means_no_read_and_no_change(self):
+        hook, calls = self._hook([{"wrong": "1dp", "right": "OneDP"}])
+        self.assertEqual(hook("the 1dp team", "t", "alice", None),
+                         ("the 1dp team", "t", []))
+        self.assertEqual(calls, [], msg="an unscoped entry has no dictionary to consult")
+
+    def test_no_rules_leaves_the_text_untouched(self):
+        hook, calls = self._hook([])
+        self.assertEqual(hook("the 1dp team", "t", "alice", "c1"),
+                         ("the 1dp team", "t", []))
+        self.assertEqual(calls, [("alice", "c1")],
+                         msg="the rules are read for the client the entry is filed under")
+
+    def test_a_missing_title_stays_missing(self):
+        hook, _calls = self._hook([{"wrong": "1dp", "right": "OneDP"}])
+        _content, name, _changes = hook("1dp", None, "alice", "c1")
+        self.assertIsNone(name,
+                          msg="a None title must not become an empty string on the way to Neo4j")
+
+    def test_a_counted_change_is_logged(self):
+        log = _RecordingLogger()
+        hook, _calls = self._hook([{"wrong": "1dp", "right": "OneDP"}], log=log)
+        hook("1dp", "", "alice", "c1")
+        self.assertEqual([level for level, _line in log.lines], ["info"])
+
+
+class InboundSaveCallSiteTests(unittest.TestCase):
+    """A hook tested in isolation is not a test of its call site.
+
+    `test_action_items` documents the incident this pins against: the helper was
+    added and the call was never wired, and every helper test stayed green.
+    """
+
+    def _body(self, name):
+        _path, source, tree = _diary_source()
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+                return ast.get_source_segment(source, node)
+        self.fail(f"not found in diary_manager.py: {name}")
+
+    def test_both_write_paths_apply_the_corrections(self):
+        for name in ("db_save_diary", "db_update_diary"):
+            body = self._body(name)
+            self.assertTrue("_correct_inbound_text(" in body,
+                            msg=f"{name} no longer applies the client's corrections")
+
+    def test_the_correction_runs_before_anything_derives_from_the_text(self):
+        # The ordering is the property, not the call: keywords, participants,
+        # commitments, decisions and the embedded vector all read this text, so
+        # correcting afterwards stores the right words beside an index of the
+        # wrong ones.
+        for name in ("db_save_diary", "db_update_diary"):
+            body = self._body(name)
+            self.assertLess(
+                body.index("_correct_inbound_text("),
+                body.index("extract_diary_signals("),
+                msg=f"{name} corrects after the extraction, so the keywords "
+                    f"describe the mishear",
+            )
+
+    def test_the_save_path_uses_the_client_it_was_given(self):
+        body = self._body("db_save_diary")
+        self.assertIn("_correct_inbound_text(content, name, user_id, client_id)", body)
+
+    def test_the_edit_path_uses_the_client_the_entry_is_filed_under(self):
+        # An edit that does not repeat client_id still belongs to its client.
+        # Reading only the argument would skip the correction for every edit
+        # made from the entry view, which is where an inbound file is reviewed.
+        body = self._body("db_update_diary")
+        self.assertIn('scope.get("clientId")', body,
+                      msg="db_update_diary must correct against the entry's own "
+                          "client, not only the one the caller resent")
 
 
 if __name__ == "__main__":
