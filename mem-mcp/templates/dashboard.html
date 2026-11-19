@@ -7373,7 +7373,7 @@
     const dro = !!entry.readOnly;
     const badge = document.createElement('div');
     badge.id = 'diary-actions-badge';
-    badge.style.cssText = 'margin:.75rem 0;padding:.5rem .6rem;border:1px solid var(--border);border-radius:6px;background:var(--bg-subtle,#f8fafc);';
+    badge.style.cssText = 'margin-top:1.25rem;padding-top:.75rem;border-top:1px solid var(--border);';
     const rows = items.map(a => {
       const id = String(a.id || '');
       const status = String(a.status || 'open').toLowerCase();
@@ -7389,19 +7389,20 @@
       if (a.overdue) meta.push('<span style="color:#b4453f;">overdue</span>');
       if (dropped) meta.push('<span style="color:var(--muted);">(dropped)</span>');
       const metaHtml = meta.length
-        ? `<div style="font-size:.75rem;color:var(--muted);margin-left:1.45rem;">${meta.join(' · ')}</div>`
+        ? `<div style="font-size:.75rem;color:var(--muted);margin-top:.1rem;line-height:1.3;">${meta.join(' · ')}</div>`
         : '';
-      return `<label style="display:block;padding:.2rem 0;cursor:${dro ? 'default' : 'pointer'};">
+      return `<label style="display:flex;align-items:flex-start;gap:.5rem;padding:.3rem 0;cursor:${dro ? 'default' : 'pointer'};">
         <input type="checkbox" ${checked ? 'checked' : ''} ${dro ? 'disabled' : ''}
                onchange="toggleDiaryAction(this,'${escHtml(id)}','${escHtml(entry.id)}')"
-               style="margin-right:.45rem;vertical-align:middle;">
-        <span style="font-size:.88rem;${textStyle}">${escHtml(a.text || '')}</span>
-        ${metaHtml}
+               style="margin-top:.15rem;flex:0 0 auto;">
+        <span style="min-width:0;">
+          <span style="font-size:.9rem;line-height:1.4;${textStyle}">${escHtml(a.text || '')}</span>
+          ${metaHtml}
+        </span>
       </label>`;
     }).join('');
-    badge.innerHTML = `<div style="font-size:.78rem;font-weight:700;text-transform:uppercase;color:var(--muted);letter-spacing:.4px;margin-bottom:.3rem;">✅ Actions</div>${rows}`;
-    const anchor = document.getElementById('diary-deliverable-badge');
-    viewEl.insertBefore(badge, anchor ? anchor.nextSibling : viewEl.firstChild);
+    badge.innerHTML = `<div style="font-size:.75rem;font-weight:700;text-transform:uppercase;color:var(--muted);letter-spacing:.5px;margin-bottom:.35rem;">✅ Actions</div>${rows}`;
+    viewEl.appendChild(badge);
   }
 
   async function toggleDiaryAction(cb, itemId, entryId) {
