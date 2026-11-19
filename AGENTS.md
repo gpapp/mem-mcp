@@ -3670,6 +3670,13 @@ which stays disabled until a dry run finds something. Apply takes the per-user
 maintenance lock and answers 409 with the usual reason; preview does not, because
 it writes nothing.
 
+**The panel markup lives outside every `.page`, at body level, and that is not
+tidiness.** It opened from the Clients tab too, and `.page { display: none }`
+hides descendants even when the popup's own `.open` rule says `display: flex` —
+so a nested overlay made the client card's button look like it did nothing while
+the Live tab was not showing. Any modal reached from more than one tab belongs
+beside `#share-overlay`, after the pages.
+
 Routes: `GET` / `POST /api/live/corrections`, `PATCH` / `DELETE
 /api/live/corrections/{id}`, `POST /api/live/corrections/preview` and `POST
 /api/live/corrections/apply`, all behind `_require_user`.

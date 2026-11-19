@@ -969,6 +969,19 @@ class CorrectionSurfaceTests(unittest.TestCase):
         branch = branch.split("`;", 1)[0]
         self.assertIn("openClientCorrections(", branch)
 
+    def test_the_popup_is_not_trapped_inside_a_hidden_page(self):
+        # `.page { display: none }` hides descendants even when the popup's own
+        # `.open` rule says `display: flex`, so nesting the panel inside
+        # #page-live made the client card's button open nothing at all while the
+        # Clients tab was showing. Both entry points need a body-level overlay.
+        html = self._template()
+        live = html.split('<div id="page-live"', 1)[1]
+        live = live.split('<!-- /page-live -->', 1)[0]
+        self.assertFalse('id="corrections-overlay"' in live,
+                         msg="the corrections popup lives inside #page-live, so "
+                             "opening it from a client card renders into a page "
+                             "that is not showing")
+
     def test_the_live_entry_point_still_reads_the_recording(self):
         # Both entry points must resolve through the same `openCorrections`, or
         # the two surfaces can drift about what a rule applies to.

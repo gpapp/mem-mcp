@@ -90,8 +90,9 @@
     .live-toolbar .live-name { flex: 1 1 220px; }
     .live-controls { display: flex; gap: .4rem; flex-wrap: wrap; }
     /* ASR mishear corrections. The dictionary is entered where the client is
-       already selected (the live toolbar) rather than in a settings page that
-       would need its own client picker and could drift from this one. */
+       already selected (the live toolbar, or a client card's edit row) rather
+       than in a settings page that would need its own client picker and could
+       drift from the one the recording uses. */
     .lc-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.45);
       display: none; align-items: center; justify-content: center;
       z-index: 60; padding: 1rem; }
@@ -1164,32 +1165,6 @@
 
 <!-- ═══ LIVE NOTES PAGE ═══ -->
 <div id="page-live" class="page">
-  <!-- ASR mishear corrections, scoped to the client selected on this
-       recording above. The list is the dictionary; Preview and Apply are the
-       sweep over text that is already stored. -->
-  <div id="corrections-overlay" class="lc-overlay"
-       onclick="if (event.target === this) closeCorrections()">
-    <div class="lc-panel">
-      <div class="lc-head">
-        <h3>📖 Mishear corrections</h3>
-        <span id="corrections-client" style="font-size:.85rem;color:var(--muted);"></span>
-        <button class="btn btn-sm" onclick="closeCorrections()">Close</button>
-      </div>
-      <div class="lc-note" id="corrections-note"></div>
-      <div class="lc-add">
-        <input id="corrections-wrong" placeholder="heard as (Deutche Bank)">
-        <input id="corrections-right" placeholder="should be (Deutsche Bank)">
-        <button class="btn btn-sm btn-primary" onclick="addCorrection()">Add</button>
-      </div>
-      <div id="corrections-list" class="lc-list"></div>
-      <div class="lc-actions">
-        <button class="btn btn-sm" onclick="previewCorrections()">Preview changes</button>
-        <button class="btn btn-sm" id="corrections-apply"
-                onclick="applyCorrections()" disabled>Apply to existing records</button>
-      </div>
-      <div id="corrections-preview" class="lc-preview" hidden></div>
-    </div>
-  </div>
   <div class="live-layout">
     <aside class="live-sidebar">
       <div class="live-sidebar-head">
@@ -9401,6 +9376,36 @@ let contextMenu = null;
     }, 'Access revoked');
   }
 </script>
+<!-- ASR mishear corrections panel. This is deliberately outside every `.page`:
+     the same panel opens from the live toolbar and from a client card's edit
+     row, and `.page { display: none }` hides descendants even when the popup's
+     own `.open` rule says `display: flex`. Nested inside #page-live the button
+     on the Clients tab opened into a page that was not showing, which looked
+     exactly like a button that did nothing. -->
+<div id="corrections-overlay" class="lc-overlay"
+     onclick="if (event.target === this) closeCorrections()">
+  <div class="lc-panel">
+    <div class="lc-head">
+      <h3>📖 Mishear corrections</h3>
+      <span id="corrections-client" style="font-size:.85rem;color:var(--muted);"></span>
+      <button class="btn btn-sm" onclick="closeCorrections()">Close</button>
+    </div>
+    <div class="lc-note" id="corrections-note"></div>
+    <div class="lc-add">
+      <input id="corrections-wrong" placeholder="heard as (Deutche Bank)">
+      <input id="corrections-right" placeholder="should be (Deutsche Bank)">
+      <button class="btn btn-sm btn-primary" onclick="addCorrection()">Add</button>
+    </div>
+    <div id="corrections-list" class="lc-list"></div>
+    <div class="lc-actions">
+      <button class="btn btn-sm" onclick="previewCorrections()">Preview changes</button>
+      <button class="btn btn-sm" id="corrections-apply"
+              onclick="applyCorrections()" disabled>Apply to existing records</button>
+    </div>
+    <div id="corrections-preview" class="lc-preview" hidden></div>
+  </div>
+</div>
+
 <div id="share-overlay" class="share-overlay" hidden>
   <div class="share-modal" role="dialog" aria-modal="true" aria-labelledby="share-title">
     <div class="share-modal-head">
