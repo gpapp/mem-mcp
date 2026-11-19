@@ -692,6 +692,36 @@ class InboundSaveCallSiteTests(unittest.TestCase):
                           "client, not only the one the caller resent")
 
 
+class FactInboundCorrectionCallSiteTests(unittest.TestCase):
+    """Facts carry the same mishears and must be corrected the same way."""
+
+    @staticmethod
+    def _body(name):
+        path = os.path.join(os.path.dirname(__file__), "fact_manager.py")
+        with open(path, "r", encoding="utf-8") as handle:
+            source = handle.read()
+        for node in ast.parse(source).body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+                return ast.get_source_segment(source, node)
+        raise AssertionError(f"not found in fact_manager.py: {name}")
+
+    def test_add_memory_corrects_before_embedding(self):
+        body = self._body("db_add_memory")
+        self.assertIn("_correct_fact_text(text, name, user_id, client_id)", body)
+        self.assertLess(body.index("_correct_fact_text"),
+                        body.index("_upsert_fact_points"),
+                        msg="correct before embedding or the vector describes the mishear")
+
+    def test_update_memory_corrects_against_the_facts_client(self):
+        body = self._body("db_update_memory")
+        self.assertIn("fact_client_id", body,
+                      msg="an edit must correct against the fact's filed client")
+        self.assertIn("_correct_fact_text(new_text, new_name, user_id, fact_client_id)", body)
+        self.assertLess(body.index("_correct_fact_text(new_text, new_name"),
+                        body.index("_upsert_fact_points"),
+                        msg="correct before embedding")
+
+
 class RetroactiveCorrectionTests(unittest.TestCase):
     """The dry run and the sweep, driven against a fake graph.
 
@@ -703,14 +733,17 @@ class RetroactiveCorrectionTests(unittest.TestCase):
 
     RULES = [{"wrong": "1dp", "right": "OneDP"}]
 
-    def _lift(self, segments, entries, writes=None, client=_known_client, log=None):
+    def _lift(self, segments, entries, writes=None, client=_known_client, log=None, facts=None):
+        facts = facts or []
         def handler(query, params):
             if ":TermCorrection" in query:
                 return _FakeResult(rows=list(self.RULES))
             if "HAS_SEGMENT" in query:
                 return _FakeResult(rows=list(segments))
-            if "FOR_CLIENT" in query:
+            if ":DiaryEntry" in query and "FOR_CLIENT" in query:
                 return _FakeResult(rows=list(entries))
+            if ":Fact" in query and "FOR_CLIENT" in query:
+                return _FakeResult(rows=list(facts))
             if "SET s.text" in query:
                 if writes is not None:
                     writes.append((params["id"], params["text"]))
@@ -719,7 +752,7 @@ class RetroactiveCorrectionTests(unittest.TestCase):
 
         funcs = _lift_manager(
             "db_client_correction_rules", "_correction_candidates",
-            "_summarise_changes", "_correction_target",
+            "_summarise_changes", "_summarise_fact_changes", "_correction_target",
             "db_preview_corrections", "db_apply_corrections_to_client",
             _require_driver=lambda: _FakeDriver(handler),
             _resolve_client_by_id=client,
@@ -758,13 +791,15 @@ class RetroactiveCorrectionTests(unittest.TestCase):
                 return _FakeResult(rows=list(self.RULES))
             if "HAS_SEGMENT" in query:
                 return _FakeResult(rows=[{"id": "s1", "text": "1dp"}])
-            if "FOR_CLIENT" in query:
+            if ":DiaryEntry" in query and "FOR_CLIENT" in query:
                 return _FakeResult(rows=[{"id": "d1", "content": "1dp"}])
+            if ":Fact" in query and "FOR_CLIENT" in query:
+                return _FakeResult(rows=[])
             raise AssertionError(f"unexpected query: {query}")
 
         funcs = _lift_manager(
             "db_client_correction_rules", "_correction_candidates",
-            "_summarise_changes", "_correction_target", "db_preview_corrections",
+            "_summarise_changes", "_summarise_fact_changes", "_correction_target", "db_preview_corrections",
             _require_driver=lambda: _FakeDriver(handler),
             _resolve_client_by_id=_known_client,
             apply_corrections=apply_corrections,
@@ -793,7 +828,7 @@ class RetroactiveCorrectionTests(unittest.TestCase):
         funcs = self._lift([{"id": "s1", "text": "the 1dp team"}],
                            [{"id": "d1", "content": "1dp update"}], writes)
         result = asyncio.run(funcs["db_apply_corrections_to_client"](
-            "alice", "c1", update_diary=fake_update))
+            "alice", "c1", update_diary=fake_update, update_memory=lambda *a, **k: True))
 
         self.assertEqual(writes, [("s1", "the OneDP team")])
         self.assertEqual(calls, [("d1", "alice", "OneDP update")],
@@ -801,6 +836,38 @@ class RetroactiveCorrectionTests(unittest.TestCase):
                              "so its vector and keywords are rebuilt")
         self.assertEqual(result["segments"]["changed"], 1)
         self.assertEqual(result["entries"]["changed"], 1)
+        self.assertEqual(result["facts"]["scanned"], 0)
+
+    def test_the_preview_and_sweep_include_facts(self):
+        mem_calls = []
+
+        async def fake_update_memory(fact_id, name, text, category, user_id):
+            mem_calls.append((fact_id, name, text, category, user_id))
+            return True
+
+        funcs = self._lift(
+            [],
+            [],
+            facts=[{"id": "f1", "text": "1dp plan", "name": "1dp"},
+                   {"id": "f2", "text": "clean text", "name": "clean"}],
+        )
+        report = funcs["db_preview_corrections"]("alice", "c1")
+        self.assertEqual(report["facts"]["scanned"], 2)
+        self.assertEqual(report["facts"]["changed"], 1)
+        self.assertEqual(report["facts"]["changes"], 2)
+        self.assertEqual(report["facts"]["samples"],
+                         [{"id": "f1", "wrong": "1dp", "right": "OneDP"}] * 2)
+
+        result = asyncio.run(funcs["db_apply_corrections_to_client"](
+            "alice", "c1",
+            update_diary=lambda *a, **k: True,
+            update_memory=fake_update_memory,
+        ))
+        self.assertEqual(mem_calls, [("f1", "OneDP", "OneDP plan", None, "alice")],
+                         msg="a fact must go through the ordinary update so its "
+                             "vector is rebuilt from the corrected text")
+        self.assertEqual(result["facts"]["scanned"], 2)
+        self.assertEqual(result["facts"]["changed"], 1)
 
     def test_a_failed_row_is_counted_and_the_run_continues(self):
         writes = []
@@ -811,7 +878,9 @@ class RetroactiveCorrectionTests(unittest.TestCase):
             if "HAS_SEGMENT" in query:
                 return _FakeResult(rows=[{"id": "s1", "text": "1dp"},
                                          {"id": "s2", "text": "1dp"}])
-            if "FOR_CLIENT" in query:
+            if ":DiaryEntry" in query and "FOR_CLIENT" in query:
+                return _FakeResult(rows=[])
+            if ":Fact" in query and "FOR_CLIENT" in query:
                 return _FakeResult(rows=[])
             if "SET s.text" in query:
                 if params["id"] == "s1":
@@ -825,7 +894,7 @@ class RetroactiveCorrectionTests(unittest.TestCase):
 
         funcs = _lift_manager(
             "db_client_correction_rules", "_correction_candidates",
-            "_summarise_changes", "_correction_target",
+            "_summarise_changes", "_summarise_fact_changes", "_correction_target",
             "db_apply_corrections_to_client", "db_preview_corrections",
             _require_driver=lambda: _FakeDriver(handler),
             _resolve_client_by_id=_known_client,
@@ -853,7 +922,7 @@ class RetroactiveCorrectionTests(unittest.TestCase):
 
         funcs = _lift_manager(
             "db_client_correction_rules", "_correction_candidates",
-            "_summarise_changes", "_correction_target",
+            "_summarise_changes", "_summarise_fact_changes", "_correction_target",
             "db_apply_corrections_to_client", "db_preview_corrections",
             _require_driver=lambda: _FakeDriver(handler),
             _resolve_client_by_id=_known_client,
@@ -866,6 +935,8 @@ class RetroactiveCorrectionTests(unittest.TestCase):
 
         self.assertEqual(result["ruleCount"], 0)
         self.assertEqual(result["segments"]["scanned"], 0)
+        self.assertEqual(result["entries"]["scanned"], 0)
+        self.assertEqual(result["facts"]["scanned"], 0)
         self.assertEqual(len(issued), 1, msg="only the rules read should run")
 
     def test_a_row_that_already_reads_correctly_is_scanned_not_changed(self):
@@ -948,7 +1019,8 @@ class CorrectionSurfaceTests(unittest.TestCase):
         apply_tag = html.split('id="corrections-apply"', 1)[1][:200]
         self.assertIn("disabled", apply_tag,
                       msg="Apply must not be pressable before a dry run")
-        self.assertIn("apply.disabled = (r.segments.changed + r.entries.changed) === 0", html)
+        self.assertIn("facts", html.split("async function previewCorrections", 1)[1].split("async function applyCorrections", 1)[0])
+        self.assertIn("apply.disabled = (r.segments.changed + r.entries.changed + (facts.changed || 0)) === 0", html)
 
     def test_the_rows_are_escaped(self):
         # A rule's text is user input and it is rendered into innerHTML.

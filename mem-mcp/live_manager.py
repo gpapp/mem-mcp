@@ -595,12 +595,11 @@ CORRECTION_SAMPLE_LIMIT = 10
 def _correction_candidates(user_id: str, client_id: str) -> tuple:
     """Every stored text this client's rules can reach, with what it says now.
 
-    Two reads, because the two stores answer differently. A **segment** is
-    reached through the transcription that carries the scope — that is the row
-    the ASR wrote, so it is where the mishear was born. A **diary entry** is
-    reached through its own ``FOR_CLIENT`` edge, because the entry is the thing
-    the ``process-transcription`` skill saves and it may never have had a
-    transcription row at all.
+    Three reads, because the stores and the records answer differently. A
+    **segment** is reached through the transcription that carries the scope —
+    that is the row the ASR wrote, so it is where the mishear was born. A
+    **diary entry** and a **fact** are reached through their own ``FOR_CLIENT``
+    edge, because each is the durable record the vault searches and shows.
 
     Consumed segments are included deliberately. The note is a snapshot written
     from what the segments said at the time, so correcting a consumed segment
@@ -624,7 +623,14 @@ def _correction_candidates(user_id: str, client_id: str) -> tuple:
             """,
             userId=user_id, clientId=client_id,
         ).data() or []
-    return list(segments), list(entries)
+        facts = s.run(
+            """
+            MATCH (f:Fact {userId: $userId})-[:FOR_CLIENT]->(c:Client {id: $clientId})
+            RETURN f.id AS id, f.text AS text, f.name AS name
+            """,
+            userId=user_id, clientId=client_id,
+        ).data() or []
+    return list(segments), list(entries), list(facts)
 
 
 def _summarise_changes(rows: list, rules: list, field: str) -> dict:
@@ -644,6 +650,37 @@ def _summarise_changes(rows: list, rules: list, field: str) -> dict:
             continue
         scanned += 1
         _new_text, changes = apply_corrections(text, rules)
+        if not changes:
+            continue
+        changed += 1
+        total += len(changes)
+        for change in changes:
+            if len(samples) < CORRECTION_SAMPLE_LIMIT:
+                samples.append({"id": row.get("id"),
+                                "wrong": change["wrong"],
+                                "right": change["right"]})
+    return {"scanned": scanned, "changed": changed,
+            "changes": total, "samples": samples}
+
+
+def _summarise_fact_changes(rows: list, rules: list) -> dict:
+    """Count what applying the rules would change in scoped facts.
+
+    A fact carries text and a name; either may hold the mishear, so both are
+    checked and their substitutions are summed per fact. ``changes`` is the
+    total substitution count, not the fact count.
+    """
+    scanned = changed = total = 0
+    samples = []
+    for row in rows:
+        text = row.get("text") or ""
+        name = row.get("name") or ""
+        if not text and not name:
+            continue
+        scanned += 1
+        _new_text, t_changes = apply_corrections(text, rules) if text else (text, [])
+        _new_name, n_changes = apply_corrections(name, rules) if name else (name, [])
+        changes = t_changes + n_changes
         if not changes:
             continue
         changed += 1
@@ -686,29 +723,30 @@ def db_preview_corrections(user_id: str, client_id: str) -> dict:
         "ruleCount": len(rules),
         "segments": {"scanned": 0, "changed": 0, "changes": 0, "samples": []},
         "entries": {"scanned": 0, "changed": 0, "changes": 0, "samples": []},
+        "facts": {"scanned": 0, "changed": 0, "changes": 0, "samples": []},
     }
     if not rules:
         return report
-    segments, entries = _correction_candidates(user_id, client["id"])
+    segments, entries, facts = _correction_candidates(user_id, client["id"])
     report["segments"] = _summarise_changes(segments, rules, "text")
     report["entries"] = _summarise_changes(entries, rules, "content")
+    report["facts"] = _summarise_fact_changes(facts, rules)
     return report
 
 
 async def db_apply_corrections_to_client(user_id: str, client_id: str,
-                                        update_diary=None) -> dict:
-    """Rewrite this client's stored segments and diary entries.
+                                        update_diary=None,
+                                        update_memory=None) -> dict:
+    """Rewrite this client's stored segments, diary entries and facts.
 
     **Segments are patched in place**, because a segment's text is the only copy
     of it and the note is a separate snapshot the user regenerates on purpose.
 
-    **Diary entries go through the ordinary diary update**, because an entry is
-    three things at once — a node, a chunk family of vectors and a set of
-    extracted registers. Writing ``d.content`` directly would leave a vector
-    describing the mishear and keywords that no longer match the body, and the
-    entry would stop being findable by the spelling the user just corrected it
-    to. That path also re-derives the commitments, decisions and deliverables
-    from the corrected text, which is the same property the save hook has.
+    **Diary entries and facts go through their ordinary updates**, because each
+    is more than a text field: a diary entry carries a chunk family of vectors
+    and extracted registers, a fact carries its own vector, and writing the
+    graph directly would leave a record that no longer matches what search and
+    the UI read from it.
 
     One row's failure is counted and the run continues: this is a bulk repair,
     and aborting on the fourth of fifty rows leaves the remaining forty-six
@@ -722,6 +760,7 @@ async def db_apply_corrections_to_client(user_id: str, client_id: str,
         "ruleCount": len(rules),
         "segments": {"scanned": 0, "changed": 0, "errors": 0},
         "entries": {"scanned": 0, "changed": 0, "errors": 0},
+        "facts": {"scanned": 0, "changed": 0, "errors": 0},
     }
     if not rules:
         return result
@@ -735,7 +774,7 @@ async def db_apply_corrections_to_client(user_id: str, client_id: str,
     if update_diary is None:
         from diary_manager import db_update_diary as update_diary
 
-    segments, entries = _correction_candidates(user_id, client["id"])
+    segments, entries, facts = _correction_candidates(user_id, client["id"])
     driver = _require_driver()
 
     for row in segments:
@@ -780,10 +819,41 @@ async def db_apply_corrections_to_client(user_id: str, client_id: str,
             result["entries"]["errors"] += 1
             logger.warning(f"corrections: diary entry {row.get('id')} was not rewritten")
 
+    if facts and update_memory is None:
+        from fact_manager import db_update_memory as update_memory
+    for row in facts:
+        text = row.get("text") or ""
+        name = row.get("name") or ""
+        if not text and not name:
+            continue
+        result["facts"]["scanned"] += 1
+        new_text, t_changes = apply_corrections(text, rules) if text else (text, [])
+        new_name, n_changes = apply_corrections(name, rules) if name else (name, [])
+        if not t_changes and not n_changes:
+            continue
+        try:
+            updated = await update_memory(
+                row["id"],
+                new_name if n_changes else None,
+                new_text if t_changes else None,
+                None,
+                user_id,
+            )
+        except Exception as exc:
+            result["facts"]["errors"] += 1
+            logger.warning(f"corrections: could not rewrite fact {row.get('id')}: {exc}")
+            continue
+        if updated:
+            result["facts"]["changed"] += 1
+        else:
+            result["facts"]["errors"] += 1
+            logger.warning(f"corrections: fact {row.get('id')} was not rewritten")
+
     logger.info(
         f"corrections: applied {len(rules)} rule(s) for client {client['id']} — "
         f"segments {result['segments']['changed']}/{result['segments']['scanned']}, "
-        f"entries {result['entries']['changed']}/{result['entries']['scanned']}"
+        f"entries {result['entries']['changed']}/{result['entries']['scanned']}, "
+        f"facts {result['facts']['changed']}/{result['facts']['scanned']}"
     )
     return result
 

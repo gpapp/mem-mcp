@@ -3601,7 +3601,7 @@ the vault: `1dp` means OneDP on one engagement and nothing at all on the next, s
 a global dictionary would rewrite somebody else's text. The rule is a
 `:TermCorrection` node (`userId`, `clientId`, `wrong`, `right`, timestamps) and
 the scope comes from the `:Transcription` row's own `clientId` — or, for a diary
-entry, the client it is filed under.
+entry or fact, the client it is filed under (`FOR_CLIENT`).
 
 **The engine is `asr_corrections.py`, and it is stdlib-only.** Every rule about
 matching lives there so a suite can *call* it: case-insensitive, word
@@ -3616,13 +3616,17 @@ would turn `1dp` into `Onedp`.
 `process-transcription` skill saves MS Teams + ASR text that already contains the
 mishears, so `_correct_inbound_text` runs inside `db_save_diary` and
 `db_update_diary` whenever the entry has a client. One hook covers the GUI save,
-the GUI edit, the MCP tool and the skill. Two properties are load-bearing:
+the GUI edit, the MCP tool and the skill. **Scoped facts are corrected the same
+way:** `fact_manager._correct_fact_text` runs inside `db_add_memory` and
+`db_update_memory` (against the fact's `FOR_CLIENT` on edit), correcting text and
+name before embedding so the stored record and its vectors agree. Two properties
+are load-bearing:
 
 - **It runs before anything derives from the text.** Keywords, participants,
   commitments, decisions, deliverables and the embedded vector all read the
   corrected body, so a search for the right spelling finds the entry. Correcting
   after the write would store the right words beside an index of the wrong ones.
-- **The edit path corrects against the client the entry is *filed under*, not
+- **The edit path corrects against the client the record is *filed under*, not
   only the one the caller resent.** An edit from the entry view does not repeat
   `client_id`, and reading only the argument would skip the correction for
   exactly the review step where a processed file is read.
@@ -3636,18 +3640,19 @@ graph answers an empty list with a WARNING.
 
 **The retroactive sweep is two steps, and the first one writes nothing.**
 `db_preview_corrections` counts rows scanned, rows changed and individual
-substitutions, with samples; `db_apply_corrections_to_client` does the work. The
-three counts are different numbers on purpose — "nothing here" and "nothing left
-to do" must not read the same.
+substitutions, with samples, across transcript segments, diary entries and facts;
+`db_apply_corrections_to_client` does the work. The three counts are different
+numbers on purpose — "nothing here" and "nothing left to do" must not read the
+same.
 
 - **Segments are patched in place.** A segment's text is the only copy, and the
   note is a separate snapshot, so a corrected segment changes nothing until
   somebody presses **Rebuild note** — which is exactly when they want the
   corrected text.
-- **Diary entries go through the ordinary diary update.** Writing `d.content`
-  directly would leave a vector describing the mishear and keywords that no
-  longer match the body, and the entry would stop being findable by the spelling
-  it was just corrected to. That path also re-derives the three registers.
+- **Diary entries and facts go through their ordinary updates.** Writing text
+  directly would leave vectors (and, for diary, keywords/registers) describing
+  the mishear, and the record would stop being findable by the spelling it was
+  just corrected to.
 - **One bad row is counted and the run continues.** A bulk repair that abandons
   the remaining rows on the fourth has nothing to say about which ones it did.
 
@@ -3686,12 +3691,13 @@ than reading it: matching, boundaries, longest-wins, non-overlap between two
 rules, no chaining, the self-containing refusal and the verbatim right side are
 all behavioural, because a substitution rule is defined by what it emits. The
 storage CRUD is lifted out of `live_manager.py` with `ast` (that module imports
-`common`), the save hook out of `diary_manager.py`, and the preview/apply sweep
-driven against a fake graph — including a preview that issues no `SET`, a failed
-row that does not abandon the run, and an apply that routes entries through the
-diary update rather than patching the node. Two harness lessons came out of
-writing it and are worth keeping: **a lift harness must supply every module-level
-name the lifted function reads** (`_correction_dict`, then `normalise_rule`), and
+`common`), the save hooks out of `diary_manager.py` and the call sites pinned in
+`fact_manager.py`, and the preview/apply sweep driven against a fake graph —
+including a preview that issues no `SET`, a failed row that does not abandon the
+run, and an apply that routes diary entries and facts through their ordinary
+updates rather than patching the nodes. Two harness lessons came out of writing
+it and are worth keeping: **a lift harness must supply every module-level name
+the lifted function reads** (`_correction_dict`, then `normalise_rule`), and
 **it must match `AsyncFunctionDef` as well as `FunctionDef`** — a lift that
 silently skips an async function reports "not found" about a function that is
 right there.
@@ -3704,6 +3710,6 @@ refusing to edit without one, Apply disabled until a dry run, and the rule rows
 escaped before they reach `innerHTML`.
 
 **Do not apply a rule at write time but not on save.** The two halves must agree,
-or a transcription corrected automatically and a diary entry saved from the same
-text disagree about the client's own name — which is the defect the feature is
-here to remove.
+or a transcription corrected automatically and a diary entry or fact saved from
+the same text disagree about the client's own name — which is the defect the
+feature is here to remove.

@@ -7272,14 +7272,18 @@
 
   function describeCorrectionPreview(r) {
     if (!r.ruleCount) return 'No corrections are defined for this client yet.';
+    const facts = r.facts || { scanned: 0, changed: 0, changes: 0, samples: [] };
     const seg = `${r.segments.changed} of ${r.segments.scanned} transcript segments`;
     const ent = `${r.entries.changed} of ${r.entries.scanned} diary entries`;
-    const total = r.segments.changes + r.entries.changes;
+    const fct = `${facts.changed} of ${facts.scanned} facts`;
+    const total = r.segments.changes + r.entries.changes + (facts.changes || 0);
     if (!total) {
-      return `Nothing to change — the ${seg} and ${ent} already read correctly.`;
+      return `Nothing to change — the ${seg}, ${ent} and ${fct} already read correctly.`;
     }
-    const lines = [`${total} change(s): ${seg}, ${ent}.`];
-    (r.segments.samples || []).concat(r.entries.samples || [])
+    const lines = [`${total} change(s): ${seg}, ${ent}, ${fct}.`];
+    (r.segments.samples || [])
+      .concat(r.entries.samples || [])
+      .concat(facts.samples || [])
       .slice(0, 8)
       .forEach(s => lines.push(`· ${s.wrong} → ${s.right}`));
     return lines.join('\n');
@@ -7293,8 +7297,9 @@
     apply.disabled = true;
     try {
       const r = await api.post('live/corrections/preview', { clientId: correctionsClientId });
+      const facts = r.facts || { changed: 0 };
       box.textContent = describeCorrectionPreview(r);
-      apply.disabled = (r.segments.changed + r.entries.changed) === 0;
+      apply.disabled = (r.segments.changed + r.entries.changed + (facts.changed || 0)) === 0;
     } catch (e) {
       box.textContent = 'Could not preview: ' + (e.detail || e.message || e);
     }
@@ -7308,10 +7313,11 @@
     box.textContent = 'Applying…';
     try {
       const r = await api.post('live/corrections/apply', { clientId: correctionsClientId });
-      const failed = r.segments.errors + r.entries.errors;
+      const facts = r.facts || { changed: 0, errors: 0 };
+      const failed = r.segments.errors + r.entries.errors + (facts.errors || 0);
       box.textContent =
-        `Applied: ${r.segments.changed} transcript segment(s) and ` +
-        `${r.entries.changed} diary entr(y/ies) rewritten.` +
+        `Applied: ${r.segments.changed} transcript segment(s), ` +
+        `${r.entries.changed} diary entr(y/ies) and ${facts.changed || 0} fact(s) rewritten.` +
         (failed ? ` ${failed} could not be rewritten — see the server log.` : '') +
         '\nRebuild a note to regenerate it from the corrected transcript.';
     } catch (e) {

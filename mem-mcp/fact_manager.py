@@ -12,6 +12,7 @@ import difflib
 from qdrant_client.models import (PointStruct, Filter, FieldCondition, MatchValue,
                                   MatchAny, PointIdsList)
 import sharing
+from asr_corrections import apply_corrections
 
 from common import (
     get_qdrant, get_neo4j, logger, get_embedding, get_llm_response, publish_db_event,
@@ -224,6 +225,33 @@ def extract_people_metadata(name: Optional[str]) -> dict:
 
     return meta
 
+def _correct_fact_text(text, name, user_id, client_id):
+    """Apply this client's mishear rules to a fact's text and name.
+
+    Same rule as the diary inbound path: correct before anything is derived
+    from the text (embedding, scope inference). A fact with no client has no
+    dictionary to read, so it is returned unchanged. A convenience must not
+    fail a write — db_client_correction_rules never raises and returns [] on
+    any read failure.
+    """
+    if not (client_id or "").strip():
+        return text, name
+    # Function-local: live_manager reaches back into this module in places, so
+    # a module-level import would be a cycle risk and is not needed here.
+    from live_manager import db_client_correction_rules
+    rules = db_client_correction_rules(user_id, client_id)
+    if not rules:
+        return text, name
+    new_text, t_changes = (apply_corrections(text, rules) if text else (text, []))
+    new_name, n_changes = (apply_corrections(name, rules) if name else (name, []))
+    if t_changes or n_changes:
+        logger.info(
+            f"corrections: {len(t_changes) + len(n_changes)} applied on fact save "
+            f"for client {client_id}"
+        )
+    return new_text, new_name
+
+
 # ---------------------------------------------------------------------------
 # CRUD helpers – single source of truth for Qdrant + Neo4j consistency
 # ---------------------------------------------------------------------------
@@ -233,6 +261,10 @@ async def db_add_memory(text: str, category: str, user_id: str, metadata: Option
     neo4j_driver = get_neo4j()
     if not qdrant or not neo4j_driver:
         raise RuntimeError("Database connections not established.")
+
+    # Apply mishear corrections for the scoped client before anything derives
+    # from the text (embedding). Same rule as diary saves.
+    text, name = _correct_fact_text(text, name, user_id, client_id)
 
     doc_id   = str(uuid.uuid4())
     category = category.strip().capitalize()
@@ -325,17 +357,27 @@ async def db_update_memory(memory_id: str, name: Optional[str], text: Optional[s
 
     # Get current to see what's changing
     with neo4j_driver.session() as s:
-        res = s.run("MATCH (f:Fact {id: $id, userId: $userId}) RETURN f", id=memory_id, userId=user_id)
+        res = s.run(
+            "MATCH (f:Fact {id: $id, userId: $userId}) "
+            "OPTIONAL MATCH (f)-[:FOR_CLIENT]->(c:Client) "
+            "RETURN f, c.id AS clientId",
+            id=memory_id, userId=user_id,
+        )
         existing = res.single()
         if not existing:
             logger.warning(f"[db_update_memory] Memory {memory_id} not found")
             return False
         old_fact = existing["f"]
+        fact_client_id = existing.get("clientId")
 
     new_text = text if text is not None else old_fact.get("text")
     new_name = name if name is not None else old_fact.get("name")
     new_cat  = category.strip().capitalize() if category else old_fact.get("category")
     new_meta = metadata or {}
+    # Apply this client's mishear rules against the client the fact is filed
+    # under, so an edit that does not resend scope still corrects the text the
+    # embedding and stored record are about to carry.
+    new_text, new_name = _correct_fact_text(new_text, new_name, user_id, fact_client_id)
     if new_cat.lower() == "people" and new_name:
         name_meta = extract_people_metadata(new_name)
         new_meta = {**name_meta, **new_meta}
