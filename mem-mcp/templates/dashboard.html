@@ -7320,6 +7320,44 @@
     }
   }
 
+  // Action-shaped headings are stripped from the rendered diary body in view
+  // mode because the commitments they list are shown below as an interactive
+  // checklist (driven by the action-items register). Keeping the markdown
+  // section would duplicate it as a static list with unclickable boxes.
+  // Titles mirror matching_utils._ACTION_SECTIONS.
+  const DIARY_ACTION_SECTION_TITLES = new Set([
+    'action','actions','action item','action items','action point','action points',
+    'next step','next steps','follow up','follow ups','follow-up','follow-ups',
+    'commitment','commitments','todo','todos','to do','to dos',
+    'open question','open questions','outstanding','outstanding items','open items'
+  ]);
+
+  function stripDiaryActionSectionsForView(md) {
+    const lines = String(md || '').split('\n');
+    const out = [];
+    let skipLevel = null;
+    for (const line of lines) {
+      const m = line.match(/^(#{1,6})\s+(.+?)\s*#*\s*$/);
+      if (m) {
+        const level = m[1].length;
+        const title = m[2].replace(/\s+/g, ' ').trim().replace(/:+$/, '').toLowerCase();
+        if (skipLevel !== null && level <= skipLevel) {
+          skipLevel = null; // the action section ended; re-evaluate this heading
+        }
+        if (skipLevel === null && DIARY_ACTION_SECTION_TITLES.has(title)) {
+          skipLevel = level;
+          continue; // drop the action heading itself
+        }
+        if (skipLevel !== null) continue;
+        out.push(line);
+      } else {
+        if (skipLevel !== null) continue;
+        out.push(line);
+      }
+    }
+    return out.join('\n').replace(/\n{3,}/g, '\n\n').replace(/\s+$/, '');
+  }
+
   async function renderDiaryActions(entry) {
     const viewEl = document.getElementById('diary-view-content');
     if (!viewEl || !entry || !entry.id) return;
@@ -7331,14 +7369,57 @@
       items = (res && res.items) || [];
     } catch (e) { return; }
     if (!items.length || !document.getElementById('diary-view-content')) return;
+
+    const dro = !!entry.readOnly;
     const badge = document.createElement('div');
     badge.id = 'diary-actions-badge';
-    badge.style.cssText = 'margin:.5rem 0;font-size:.78rem;';
-    badge.innerHTML = '\u{2705} Actions raised here: ' + items.map(a =>
-      `<span style="${a.status !== 'open' ? 'text-decoration:line-through;color:var(--muted);' : ''}">${escHtml(a.text || '')}</span>`
-    ).join(' \u00b7 ');
+    badge.style.cssText = 'margin:.75rem 0;padding:.5rem .6rem;border:1px solid var(--border);border-radius:6px;background:var(--bg-subtle,#f8fafc);';
+    const rows = items.map(a => {
+      const id = String(a.id || '');
+      const status = String(a.status || 'open').toLowerCase();
+      const done = status === 'done';
+      const dropped = status === 'dropped';
+      const checked = done || dropped;
+      const textStyle = (done || dropped)
+        ? 'text-decoration:line-through;color:var(--muted);'
+        : '';
+      const meta = [];
+      if (a.owner) meta.push('👤 ' + escHtml(String(a.owner)));
+      if (a.dueAt) meta.push('📅 ' + escHtml(String(a.dueAt).slice(0, 10)));
+      if (a.overdue) meta.push('<span style="color:#b4453f;">overdue</span>');
+      if (dropped) meta.push('<span style="color:var(--muted);">(dropped)</span>');
+      const metaHtml = meta.length
+        ? `<div style="font-size:.75rem;color:var(--muted);margin-left:1.45rem;">${meta.join(' · ')}</div>`
+        : '';
+      return `<label style="display:block;padding:.2rem 0;cursor:${dro ? 'default' : 'pointer'};">
+        <input type="checkbox" ${checked ? 'checked' : ''} ${dro ? 'disabled' : ''}
+               onchange="toggleDiaryAction(this,'${escHtml(id)}','${escHtml(entry.id)}')"
+               style="margin-right:.45rem;vertical-align:middle;">
+        <span style="font-size:.88rem;${textStyle}">${escHtml(a.text || '')}</span>
+        ${metaHtml}
+      </label>`;
+    }).join('');
+    badge.innerHTML = `<div style="font-size:.78rem;font-weight:700;text-transform:uppercase;color:var(--muted);letter-spacing:.4px;margin-bottom:.3rem;">✅ Actions</div>${rows}`;
     const anchor = document.getElementById('diary-deliverable-badge');
     viewEl.insertBefore(badge, anchor ? anchor.nextSibling : viewEl.firstChild);
+  }
+
+  async function toggleDiaryAction(cb, itemId, entryId) {
+    const newStatus = cb.checked ? 'done' : 'open';
+    const prev = !cb.checked;
+    cb.disabled = true;
+    try {
+      await api.post('action-items/' + encodeURIComponent(itemId), { status: newStatus });
+      toast(newStatus === 'done' ? '✅ Action marked done' : '↩️ Action reopened');
+    } catch (e) {
+      cb.checked = prev;
+      cb.disabled = false;
+      toastApiError(e, 'Could not update the action.');
+      return;
+    }
+    cb.disabled = false;
+    const entry = (typeof diaryEntries !== 'undefined' ? diaryEntries : []).find(e => e.id === entryId);
+    if (entry) renderDiaryActions(entry);
   }
 
   function renderDiaryMetaDisplay(entry) {
@@ -7400,7 +7481,7 @@
         ${(entry.relevantClients||[]).filter(rc=>rc.id!==entry.clientId && rc.id!==entry.contextId).map(rc=>`<span class="scope-chip scope-chip--relevant">${rc.kind === 'context' ? '📁 ' : ''}${escHtml(rc.name)}${dro ? '' : `<button class="scope-chip-remove" onclick="_diaryRemoveRelevant('${entry.id}','${rc.id}')" title="Remove">×</button>`}</span>`).join('')}
         ${dro ? '' : `<button class="scope-chip scope-chip--add" onclick="_diaryAddRelevant(this,'${entry.id}')" title="Add relevant client">＋</button>`}
       </div>
-      <div class="markdown-body">${marked.parse(entry.content || '')}</div>
+      <div class="markdown-body">${marked.parse(stripDiaryActionSectionsForView(entry.content || ''))}</div>
       <div id="diary-detail-meta" style="margin-top:1rem;"></div>
       <div style="margin-top:1.5rem; padding-top:1rem; border-top:1px solid var(--border);">
         <div style="font-size:.75rem; font-weight:700; text-transform:uppercase; color:var(--muted); letter-spacing:.5px; margin-bottom:.4rem;">Linked Facts ${mentions ? '(' + (entry.mentions||[]).length + ')' : ''}</div>
