@@ -3660,7 +3660,11 @@ heard.
 
 **The panel is in the live toolbar, because that is where a client is already
 selected.** A settings-page version would need its own client picker and could
-drift from the one the recording uses. `📖 Corrections` opens a list with
+drift from the one the recording uses. **The same panel is also on each client
+card's edit row in the Clients tab** — a correction belongs to a client, so that
+is where a user goes to edit one — and both entry points call one
+`openCorrections(scope)`, so the scope is the only difference and the two
+surfaces cannot disagree. `📖 Corrections` opens a list with
 add / edit / delete, **Preview changes**, and **Apply to existing records** —
 which stays disabled until a dry run finds something. Apply takes the per-user
 maintenance lock and answers 409 with the usual reason; preview does not, because

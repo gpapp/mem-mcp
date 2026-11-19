@@ -3253,6 +3253,7 @@
     const clientActions = c.shared ? '' : `
           <button class="btn btn-sm btn-ghost" onclick="toggleClient('${c.id}', ${on ? 'false' : 'true'})">${on ? 'Deactivate' : 'Activate'}</button>
           <button class="btn btn-sm btn-ghost" onclick="toggleCrossClient('${c.id}', ${c.crossClient ? 'false' : 'true'})" title="Toggle cross-client flag">${c.crossClient ? 'Un-cross' : 'Cross-client'}</button>
+          <button class="btn btn-sm btn-ghost" onclick="openClientCorrections('${c.id}')" title="Find and replace this client's recurring mishears">📖 Corrections</button>
           <button class="btn btn-sm btn-ghost" onclick="renameClient('${c.id}')">✏️ Rename</button>
           <button class="btn btn-sm btn-danger" onclick="deleteClient('${c.id}')">🗑️</button>
           ${SHARING_ENABLED ? `<button class="btn btn-sm btn-ghost" onclick="openShareDialog('client','${c.id}','${escHtml(c.name)}')">🔗 Share</button>` : ''}`;
@@ -7185,24 +7186,36 @@
     return t ? { id: t.clientId || null, name: t.clientName || '' } : { id: null, name: '' };
   }
 
-  function openCorrections() {
-    const scope = correctionsScope();
-    correctionsClientId = scope.id;
+  // The client editing surface reaches the same panel through a client id. The
+  // name is resolved here rather than interpolated into the onclick, so a client
+  // name containing a quote or an apostrophe cannot break the attribute.
+  function openClientCorrections(clientId) {
+    const c = (clientListCache || []).find(x => x.id === clientId) || {};
+    openCorrections({ id: clientId, name: c.name || '' });
+  }
+
+  function openCorrections(scope) {
+    // An explicit scope is the client card; with none, the live recording's
+    // client. Both open the same dictionary and the same sweep -- the scope is
+    // the only thing that differs, so the client editing surface and the
+    // recording toolbar cannot drift apart.
+    const resolved = scope || correctionsScope();
+    correctionsClientId = resolved.id;
     const overlay = document.getElementById('corrections-overlay');
     const note = document.getElementById('corrections-note');
     const list = document.getElementById('corrections-list');
     const preview = document.getElementById('corrections-preview');
     document.getElementById('corrections-client').textContent =
-      scope.name ? `for ${scope.name}` : '';
+      resolved.name ? `for ${resolved.name}` : '';
     list.innerHTML = '';
     preview.hidden = true;
     preview.textContent = '';
     document.getElementById('corrections-apply').disabled = true;
     overlay.classList.add('open');
-    if (!scope.id) {
+    if (!resolved.id) {
       // A rule is scoped to one client, so there is nothing to show and nothing
       // safe to guess. Saying which control to use is the whole remedy.
-      note.textContent = 'Choose a client on this recording first — a correction belongs to one client, so there is nothing to edit until one is selected.';
+      note.textContent = 'Choose a client first — a correction belongs to one client, so there is nothing to edit until one is selected.';
       return;
     }
     note.textContent = 'Every save for this client is corrected automatically. Apply rewrites what is already stored.';

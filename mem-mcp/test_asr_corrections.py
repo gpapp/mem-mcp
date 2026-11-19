@@ -940,7 +940,7 @@ class CorrectionSurfaceTests(unittest.TestCase):
     def test_the_panel_refuses_to_edit_without_a_client(self):
         html = self._template()
         self.assertIn("correctionsClientId", html)
-        self.assertIn("Choose a client on this recording first", html)
+        self.assertIn("Choose a client first", html)
 
     def test_apply_is_disabled_until_a_preview_finds_something(self):
         html = self._template()
@@ -955,6 +955,26 @@ class CorrectionSurfaceTests(unittest.TestCase):
         html = self._template()
         self.assertIn("lcEsc(r.wrong)", html)
         self.assertIn("lcEsc(r.right)", html)
+
+    def test_the_client_card_reaches_the_same_panel(self):
+        # A correction belongs to a client, so the client's own edit row is where
+        # it should be reachable -- not only from a recording toolbar.
+        html = self._template()
+        self.assertIn("openClientCorrections('${c.id}')", html)
+        self.assertIn("function openClientCorrections(clientId)", html)
+        # `clientActions` is the owned branch: a grantee reading somebody else's
+        # vault gets `''` and therefore no button, because a rule is a write
+        # into the owner's vault.
+        branch = html.split("const clientActions = c.shared ? '' : `", 1)[1]
+        branch = branch.split("`;", 1)[0]
+        self.assertIn("openClientCorrections(", branch)
+
+    def test_the_live_entry_point_still_reads_the_recording(self):
+        # Both entry points must resolve through the same `openCorrections`, or
+        # the two surfaces can drift about what a rule applies to.
+        html = self._template()
+        self.assertIn("function openCorrections(scope)", html)
+        self.assertIn("const resolved = scope || correctionsScope();", html)
 
 
 if __name__ == "__main__":
