@@ -252,7 +252,7 @@ def db_list_transcriptions(user_id: str) -> list:
             OPTIONAL MATCH (t)-[:HAS_SEGMENT]->(seg:TranscriptionSegment)
             WITH t, count(seg) AS segmentCount,
                  coalesce(max(seg.endSec), 0.0) AS lastEnd,
-                 count(CASE WHEN seg.consumedBy IS NULL THEN 1 END) AS unconsumed
+                 sum(CASE WHEN seg.consumedBy IS NULL THEN 1 ELSE 0 END) AS unconsumed
             OPTIONAL MATCH (n:Fact {userId: $userId}) WHERE n.id = t.noteId
             RETURN """ + _TRANSCRIPTION_RETURN + """
             ORDER BY t.createdAt DESC
@@ -272,7 +272,7 @@ def db_get_transcription(transcription_id: str, user_id: str) -> Optional[dict]:
             OPTIONAL MATCH (t)-[:HAS_SEGMENT]->(seg:TranscriptionSegment)
             WITH t, count(seg) AS segmentCount,
                  coalesce(max(seg.endSec), 0.0) AS lastEnd,
-                 count(CASE WHEN seg.consumedBy IS NULL THEN 1 END) AS unconsumed
+                 sum(CASE WHEN seg.consumedBy IS NULL THEN 1 ELSE 0 END) AS unconsumed
             OPTIONAL MATCH (n:Fact {userId: $userId}) WHERE n.id = t.noteId
             RETURN """ + _TRANSCRIPTION_RETURN,
             id=transcription_id, userId=user_id,
@@ -981,7 +981,7 @@ def db_transcription_state(transcription_id: str, user_id: str) -> Optional[dict
             RETURN count(seg) AS segmentCount,
                    coalesce(max(seg.seq), 0) AS maxSeq,
                    coalesce(max(seg.endSec), 0.0) AS maxEnd,
-                   count(CASE WHEN seg.consumedBy IS NULL THEN 1 END) AS unconsumed
+                   sum(CASE WHEN seg.consumedBy IS NULL THEN 1 ELSE 0 END) AS unconsumed
             """,
             id=transcription_id, userId=user_id,
         ).single()
