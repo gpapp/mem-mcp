@@ -9,6 +9,7 @@ mem-mcp/
 ├── server.py              # Entry point – unified FastAPI server (Port 8080)
 ├── memory.py              # Facade: re-exports from common, fact_manager, diary_manager, client_manager
 ├── common.py              # Config, DB clients (Qdrant, Neo4j, Ollama), helpers
+├── asr_corrections.py      # Stdlib-only: per-client ASR mishear corrections, on save and retroactively
 ├── fact_manager.py        # Fact CRUD, search, dedup, graph operations
 ├── diary_manager.py       # Diary CRUD, search, keyword extraction, consistency
 ├── client_manager.py      # Client/Context nodes, scope inference, status management
@@ -46,7 +47,7 @@ mem-mcp/
 ├── search_diagnostics.py  # CLI: trace one query through Neo4j, Qdrant and the merge, to a jsonl log
 ├── search_batch_test.py   # CLI: run a fixed query suite and print a pass/fail summary table
 ├── search_report.py       # CLI: render that jsonl log as a markdown report
-├── test_*.py              # 28 dependency-light regression suites (see Testing)
+├── test_*.py              # 30 dependency-light regression suites (see Testing)
 ├── skills/                # Markdown skill workflows, loaded at request time
 ├── templates/             # Landing page and dashboard
 ├── requirements.txt
@@ -349,7 +350,7 @@ permanent.
 ## Testing
 
 Run the focused dependency-light regression suite. Any `python` or `python3` on
-`PATH` runs all twenty-eight of them, and none of them needs Neo4j, Qdrant or
+`PATH` runs all thirty of them, and none of them needs Neo4j, Qdrant or
 Ollama:
 
 ```bash
@@ -362,7 +363,7 @@ MEM_SESSION_DIR=/tmp/mem-vault-test-sessions python3 -m unittest -v \
   test_registration test_vault_migration test_sharing test_share_endpoints \
   test_sharing_readpaths test_live_notes test_skill_catalogue \
   test_action_items test_briefing test_roster test_model_bench test_decision_log \
-  test_timeline test_deliverables
+  test_timeline test_deliverables test_asr_corrections test_docs_trees
 ```
 
 `MEM_SESSION_DIR` matters: without it the session and PSK tests write a

@@ -25,6 +25,7 @@ mem-mcp/
 ├── server.py             # Lifespan, middleware order, uvicorn entry
 ├── memory.py             # The fan-out module: re-exports every manager
 ├── common.py             # Config, Ollama chat/embed, Neo4j driver, graph lock
+├── asr_corrections.py     # Stdlib-only: per-client ASR mishear corrections, on save and retroactively
 ├── fact_manager.py       # :Fact CRUD, search, merge, consistency, chunks
 ├── diary_manager.py      # :DiaryEntry CRUD, keyword + people extraction
 ├── client_manager.py     # :Client / :Context, scope, resolution
@@ -59,7 +60,7 @@ mem-mcp/
 ├── reindex_chunks.py, reindex_diary_keywords.py  # CLI: backfill chunking / keywords
 ├── skills/               # Markdown workflows, discovered from the directory
 ├── templates/            # dashboard.html and the live-notes worklet
-└── test_*.py             # 28 dependency-light regression suites
+└── test_*.py             # 30 dependency-light regression suites
 ```
 
 Only the stdlib-only modules are importable on a machine with no fastapi, no
