@@ -5,6 +5,40 @@ recorded in `AGENTS.md` (Task Tracking).
 
 ---
 
+# Doc-tree drift repaired, and a guard so it cannot recur
+
+**Why.** A review — a full pass over `tasks.md`, the module trees in
+`README.md`/`CLAUDE.md`, the documented suite command in `AGENTS.md`, and a
+run of the suite — found the repo's recurring lesson all over again: the
+docs' hand-maintained lists drift, and nothing fails when they do.
+
+**What shipped.**
+
+- **The drift:** `asr_corrections.py` — the pure engine from the
+  per-client mishear-corrections series (`a85bdf2`) — was in **neither**
+  tree, and both docs claimed "28" dependency-light regression suites while
+  the directory holds 30.
+- `README.md`: the tree gains the `asr_corrections.py` line; the claim goes
+  28 → 30; the Testing command now runs `test_asr_corrections` (it was
+  missing since its series) and the new `test_docs_trees`; "all twenty-eight
+  of them" → "thirty".
+- `CLAUDE.md`: the tree gains the `asr_corrections.py` line; claim 28 → 30.
+- `AGENTS.md`: the documented suite command gains `test_docs_trees.py`
+  (same commit, the two-halves rule).
+- **New suite** `mem-mcp/test_docs_trees.py` (`DocTreeDriftTests`, 3 tests,
+  stdlib-only, no DB): every non-test module in `mem-mcp/*.py` is named in
+  the README and CLAUDE trees; no tree entry names a module that is not on
+  disk; the suite count both docs claim equals the actual number of
+  `test_*.py` files.
+
+**Verified.** Full suite: `Ran 1896 tests in 61.5s — OK` (the previous run
+was 1893; the guard adds 3). `py_compile` on the new suite; `git -c
+core.whitespace=cr-at-eol diff --check` clean.
+
+Commit: `98dbfd7` — see `git show 98dbfd7`.
+
+---
+
 # Per-client ASR mishear corrections, on save and retroactively
 
 **Why.** asr-mcp mishears the same terms every time on an engagement — `Deutche
